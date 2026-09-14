@@ -1,0 +1,728 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2024-2026 We-Amp B.V.
+
+#pragma once
+
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <span>
+#include <thread>
+#include <utility>
+
+#include "cyclone/key.hpp"
+#include "directory.hpp"
+
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <immintrin.h>
+#endif
+
+// TSan annotations for seqlock synchronization on DirEntry fields.
+// Defined as no-ops when ThreadSanitizer is not active.
+#ifndef CYCLONE_TSAN_ANNOTATIONS_DEFINED
+#define CYCLONE_TSAN_ANNOTATIONS_DEFINED
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#include <sanitizer/tsan_interface.h>
+#define CYCLONE_TSAN_ACQUIRE(addr) __tsan_acquire(addr)
+#define CYCLONE_TSAN_RELEASE(addr) __tsan_release(addr)
+#else
+#define CYCLONE_TSAN_ACQUIRE(addr)
+#define CYCLONE_TSAN_RELEASE(addr)
+#endif
+#elif defined(__SANITIZE_THREAD__)
+#include <sanitizer/tsan_interface.h>
+#define CYCLONE_TSAN_ACQUIRE(addr) __tsan_acquire(addr)
+#define CYCLONE_TSAN_RELEASE(addr) __tsan_release(addr)
+#else
+#define CYCLONE_TSAN_ACQUIRE(addr)
+#define CYCLONE_TSAN_RELEASE(addr)
+#endif
+#endif
+
+namespace cyclone {
+
+// Per-stripe outstanding-borrow accounting: a packed
+// {generation:8, count:8} slot manipulated with seq_cst RMWs.  Shared by
+// the cross-process slot in MmapDirectory::Header (offset 34, via
+// std::atomic_ref) and the process-local Stripe slot (std::atomic) —
+// template on the atomic-like type so both use one implementation.
+//
+// count — live disk-hit borrows (open ReadHandles) on the stripe.  The
+// wrap gate (Volume::lease_permits_wrap) defers a wrap only while
+// count > 0 AND the read lease is live: a closed handle releases write
+// capacity immediately instead of blocking writers for the rest of its
+// lease (the write-starvation fix).  Saturates at 255: a borrow
+// acquired at saturation rides along uncounted (counted == false) and its
+// release is a no-op — the slot stays maximally protective and drains as
+// the counted holders close.
+//
+// generation — ABA guard for leaked counts.  A ceiling-forced wrap calls
+// force_reset (generation+1, count = 0) so a count leaked by a crashed
+// borrow holder starves the stripe for at most one lease_wrap_ceiling
+// episode; release() drops decrements whose generation no longer matches
+// (their increment is gone with the reset).  Residual risk: an 8-bit
+// generation recurs after exactly 256 forced-wrap resets, so a handle
+// held across 256 ceiling episodes (>= 256 x lease_wrap_ceiling, ~4h at
+// defaults, its bytes long since force-overwritten) that closes at that
+// precise recurrence mis-decrements one live borrow — accepted as
+// negligible against the 2-byte budget the shared header has left.
+namespace borrow_slot {
+
+inline constexpr uint16_t kCountMask = 0x00FFU;
+inline constexpr unsigned kGenerationShift = 8;
+inline constexpr uint8_t kCountSaturated = 0xFFU;
+
+[[nodiscard]] constexpr uint8_t generation(uint16_t slot) {
+  return static_cast<uint8_t>(slot >> kGenerationShift);
+}
+[[nodiscard]] constexpr uint8_t count(uint16_t slot) {
+  return static_cast<uint8_t>(slot & kCountMask);
+}
+[[nodiscard]] constexpr uint16_t pack(uint8_t gen, uint8_t cnt) {
+  return static_cast<uint16_t>(
+      (static_cast<uint16_t>(gen) << kGenerationShift) | cnt);
+}
+
+struct Acquired {
+  uint8_t generation = 0;
+  bool counted = false;  // false = slot was saturated; release is a no-op
+};
+
+// Register a borrow: count+1 (seq_cst CAS), unless saturated.  Run BEFORE
+// the borrow escapes and before the wrap-intent/epoch revalidation — the
+// seq_cst RMW is the reader's half of the Dekker pairing with the
+// writer's intent-store-then-count-load (proof at
+// Volume::allocate_write_slot).
+template <typename AtomicU16>
+[[nodiscard]] Acquired acquire(AtomicU16 &slot) {
+  uint16_t cur = slot.load(std::memory_order_seq_cst);
+  for (;;) {
+    if (count(cur) == kCountSaturated) {
+      return {generation(cur), false};
+    }
+    uint16_t next = pack(generation(cur), static_cast<uint8_t>(count(cur) + 1));
+    if (slot.compare_exchange_weak(cur, next, std::memory_order_seq_cst,
+                                   std::memory_order_seq_cst)) {
+      return {generation(cur), true};
+    }
+  }
+}
+
+// Drop a counted borrow: count-1 iff the generation still matches (a
+// mismatch means a forced wrap reset the slot since the acquire — the
+// increment is gone, so the release must not touch the new epoch's count).
+template <typename AtomicU16>
+void release(AtomicU16 &slot, uint8_t gen) {
+  uint16_t cur = slot.load(std::memory_order_seq_cst);
+  for (;;) {
+    if (generation(cur) != gen || count(cur) == 0) {
+      return;
+    }
+    uint16_t next = pack(gen, static_cast<uint8_t>(count(cur) - 1));
+    if (slot.compare_exchange_weak(cur, next, std::memory_order_seq_cst,
+                                   std::memory_order_seq_cst)) {
+      return;
+    }
+  }
+}
+
+// Ceiling-forced wrap: invalidate all outstanding counts (generation+1,
+// count = 0) so leaked state cannot starve the stripe past one ceiling
+// episode.  No-op (generation preserved) when the count is already 0, so
+// generations only burn when there was live-or-leaked state to clear.
+// Returns true when a reset happened.
+template <typename AtomicU16>
+bool force_reset(AtomicU16 &slot) {
+  uint16_t cur = slot.load(std::memory_order_seq_cst);
+  for (;;) {
+    if (count(cur) == 0) {
+      return false;
+    }
+    uint16_t next = pack(static_cast<uint8_t>(generation(cur) + 1), 0);
+    if (slot.compare_exchange_weak(cur, next, std::memory_order_seq_cst,
+                                   std::memory_order_seq_cst)) {
+      return true;
+    }
+  }
+}
+
+}  // namespace borrow_slot
+
+/// Memory-mapped directory for cross-process cache sharing.
+///
+/// MmapDirectory stores directory entries directly in mmap'd memory,
+/// allowing multiple processes to share the same directory. It uses
+/// a seqlock pattern for lock-free reads with torn-read detection.
+///
+/// Memory Layout:
+/// ```
+/// ┌────────────────────────────────────────┐
+/// │ MmapDirectoryHeader (64 bytes)         │
+/// ├────────────────────────────────────────┤
+/// │ Version counters (4 bytes per bucket)  │
+/// ├────────────────────────────────────────┤
+/// │ Directory entries (10 bytes each)      │
+/// │   - 4 entries per bucket               │
+/// └────────────────────────────────────────┘
+/// ```
+///
+/// Thread/Process Safety:
+/// - Multiple readers can read concurrently (lock-free)
+/// - Writers use atomic version counters for synchronization
+/// - Torn reads are detected via version mismatch and retried
+class MmapDirectory {
+ public:
+  static constexpr size_t kEntriesPerBucket = 4;
+  static constexpr size_t kMaxReadRetries = 100;
+  /// Maximum spins waiting for a writer to release the seqlock (even version).
+  static constexpr size_t kMaxWriterWaitSpins = 1000;
+  static constexpr uint32_t kMagic = 0x4D444952;  // "MDIR"
+  static constexpr uint16_t kVersion = 1;
+
+  /// Header stored at the beginning of the mmap'd region
+  struct Header {
+    uint32_t magic;         // Magic number for validation
+    uint16_t version;       // Format version
+    uint16_t reserved;      // Padding
+    uint32_t num_buckets;   // Number of buckets
+    uint32_t entry_count;   // Current entry count (approximate)
+    uint8_t current_phase;  // GC phase (atomic access via std::atomic_ref)
+    uint8_t phase_lock;     // Cross-process CAS spinlock for phase toggle
+                            // (0=unlocked, 1=locked)
+    // write_lock takeover generation + owner, carved from the former
+    // pad1[6] (offsets 18-23; the bytes stay naturally aligned: gen at 18
+    // is 2-aligned, owner_pid at 20 is 4-aligned, shared_write_pos stays at
+    // 24).  Same layout-compat argument as every other carved field:
+    // init() has always zeroed this padding, open() never validated it, and
+    // older builds never read or wrote it — so version stays 1 and a
+    // skewed old-build peer degrades to today's presume-dead behavior on
+    // the write lock, never to corruption (it simply won't publish an owner
+    // or bump the generation).  See acquire_write_lock() for the protocol:
+    // a force-release bumps write_lock_gen (the sole "was I usurped" signal
+    // a usurped holder revalidates), write_lock_owner_pid carries the
+    // holder's PID so a waiter can PROVE it dead (kill(pid,0)) before ever
+    // force-releasing, instead of presuming death after a spin count.
+    // write_lock_gen is bumped on every write-lock force-release;
+    // write_lock_owner_pid is the current holder's PID (0 = none/unpublished).
+    uint16_t write_lock_gen;
+    uint32_t write_lock_owner_pid;
+    uint64_t shared_write_pos;  // Shared write position — an ABSOLUTE file
+                                // offset (set from stripe->write_pos; bounds
+                                // stripe->data_offset..stripe->offset+size),
+                                // NOT relative to the stripe.  The phase-ABA
+                                // positional guard compares absolute entry
+                                // offsets against it — do not "fix" these
+                                // semantics.  0 = uninitialized (use
+                                // data_offset)
+
+    uint8_t write_lock;  // Cross-process CAS spinlock for write-pos allocation
+                         // (0=unlocked, 1=locked)
+
+    // Wrap-intent flag, carved from the FIRST byte of the former
+    // pad2 (offset 33; same layout-compat argument as offsets 40/48/56:
+    // init() has always zeroed this region, open() never validates it,
+    // and older builds never read or write it outside init()).  Set to 1
+    // (seq_cst) by a writer BEFORE its lease-gate load and cleared after
+    // the wrap decision completes (defer, or toggle/reset/record done),
+    // all under write_lock.  Readers load it (seq_cst, BEFORE the epoch
+    // re-read) during borrow revalidation: the store-then-load shape on
+    // BOTH sides closes the Dekker window the lease load alone leaves
+    // open — proof at Volume::allocate_write_slot (volume.cpp).
+    uint8_t wrap_intent;
+
+    // Per-stripe outstanding-borrow slot, carved from the LAST
+    // 2 bytes of the former pad2 (offsets 34-35; pad2 is now fully spent).
+    // Packed {generation:8, count:8} — see the borrow_slot helpers below.
+    // count is the number of live disk-hit borrows (open ReadHandles) on
+    // this stripe across ALL processes, incremented (seq_cst CAS) before a
+    // borrow escapes and decremented on ReadHandle close/destruction.  The
+    // wrap gate defers a wrap only while count > 0 AND the lease at offset
+    // 56 is live — a promptly-closed read no longer blocks writers for the
+    // rest of its lease (the write-starvation fix).  generation is
+    // bumped (and count zeroed) by a ceiling-forced wrap so state leaked
+    // by a crashed borrow holder costs at most one lease_wrap_ceiling
+    // episode; stale releases are dropped by the generation check.
+    // Same layout-compat argument as the other carved fields: init() has
+    // always zeroed these bytes, open() never validates them, and older
+    // builds never read or write them outside init() — version stays 1.
+    // Skew caveat: an old-build reader process does not count its borrows,
+    // so during a rolling upgrade its borrows are protected only by the
+    // lease timestamp, as before this fix.
+    uint16_t stripe_borrow_slot;
+
+    // Lease-protocol STEP-3 (2026-07-07): cross-process per-stripe force-wrap
+    // deadline, carved from pad2 (offset 36).  steady-clock MILLISECONDS
+    // (truncated to uint32) of the instant a ceiling-forced wrap becomes
+    // reachable on this stripe (= deferral start + lease_wrap_ceiling);
+    // 0 = no wrap currently deferred.  Published seq_cst by the deferring
+    // writer so a READER process serving a zero-copy borrow can copy the
+    // aliased bytes out of the mmap BEFORE the force-wrap overwrites them
+    // (win-preserving copy-trigger).  Same layout-compat argument as the
+    // other carved fields: init() zeroes it, open() never validates it,
+    // old builds never touch it -> version stays 1; skew degrades to the
+    // conservative always-copy behavior, never to corruption.
+    uint32_t shared_wrap_deferred_deadline_ms;
+
+    // Wrap-cadence telemetry, carved out of the former trailing padding
+    // (offsets 40 and 48). Layout-compatible with version-1 headers written
+    // by older builds: init() has always zeroed this region, open() never
+    // validates it, and older builds never read or write these bytes — so
+    // 0 keeps its "no data yet" meaning in both skew directions. Caveat:
+    // an old-build writer process does not update these fields, so during
+    // a rolling upgrade the shared counters can undercount.
+    // Updated under write_lock; read lock-free via std::atomic_ref.
+    uint64_t shared_wrap_count;         // Write-buffer wraps on this stripe,
+                                        // across all processes
+    uint64_t shared_last_wrap_time_ns;  // steady-clock ns of the most recent
+                                        // wrap (CLOCK_MONOTONIC is
+                                        // boot-relative, so comparable across
+                                        // processes on one host).
+                                        // 0 = never wrapped.
+
+    // Read-lease slot, carved out of the LAST
+    // 8 bytes of the former trailing padding.  steady-clock ns expiry of
+    // the newest read lease on this stripe; 0 = no lease.  Same
+    // layout-compat argument as the wrap counters above: init() has always
+    // zeroed this region, open() never validates it, and older builds
+    // never read or write it outside init() — so version stays 1 and skew
+    // degrades to today's (unprotected) behavior, never worse.
+    // Readers stamp via seq_cst CAS-max (stamp_lease_expiry); writers load
+    // seq_cst before any wrap side effect (Dekker pairing, see volume.cpp).
+    //
+    // The header is FULLY SPENT — no padding remains anywhere: the former
+    // pad1 is carved into write_lock_gen (18) and write_lock_owner_pid (20),
+    // the former pad2 (33-39) into wrap_intent (33), stripe_borrow_slot
+    // (34-35) and shared_wrap_deferred_deadline_ms (36-39), and the former
+    // trailing padding into the wrap counters (40/48) and this lease (56).
+    // This note cannot drift: kFixedFieldsSize below sums every field and
+    // the static_assert beneath the struct pins the total to kHeaderSize,
+    // so any new field breaks the build until it forces a version bump and
+    // a migration story.
+    uint64_t stripe_lease_expiry_ns;
+
+    static constexpr size_t kFixedFieldsSize =
+        sizeof(uint32_t) + sizeof(uint16_t) + sizeof(uint16_t) +
+        sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint8_t) +
+        sizeof(uint8_t) + sizeof(uint16_t) + sizeof(uint32_t) +
+        sizeof(uint64_t) + sizeof(uint8_t) + sizeof(uint8_t) +
+        sizeof(uint16_t) + sizeof(uint32_t) + sizeof(uint64_t) +
+        sizeof(uint64_t) + sizeof(uint64_t);
+    static constexpr size_t kHeaderSize = 64;
+  };
+  static_assert(sizeof(Header) == 64, "Header must be 64 bytes");
+  static_assert(Header::kFixedFieldsSize == Header::kHeaderSize,
+                "Header layout accounting is stale; the header is fully "
+                "spent, so a new field means a version bump and a layout "
+                "decision");
+  static_assert(offsetof(Header, write_lock_gen) == 18,
+                "write_lock_gen must stay at offset 18 (on-disk format)");
+  static_assert(offsetof(Header, write_lock_owner_pid) == 20,
+                "write_lock_owner_pid must stay at offset 20 (on-disk format)");
+  static_assert(offsetof(Header, wrap_intent) == 33,
+                "wrap_intent must stay at offset 33 (on-disk format)");
+  static_assert(offsetof(Header, stripe_borrow_slot) == 34,
+                "stripe_borrow_slot must stay at offset 34 (on-disk format)");
+  static_assert(offsetof(Header, shared_wrap_deferred_deadline_ms) == 36,
+                "shared_wrap_deferred_deadline_ms must stay at offset 36 "
+                "(on-disk format)");
+  static_assert(offsetof(Header, shared_wrap_count) == 40,
+                "shared_wrap_count must stay at offset 40 (on-disk format)");
+  static_assert(offsetof(Header, shared_last_wrap_time_ns) == 48,
+                "shared_last_wrap_time_ns must stay at offset 48 "
+                "(on-disk format)");
+  static_assert(offsetof(Header, stripe_lease_expiry_ns) == 56,
+                "stripe_lease_expiry_ns must stay at offset 56 "
+                "(on-disk format)");
+  // Cross-process atomics require lock-free operations (no internal mutex).
+  static_assert(std::atomic_ref<uint8_t>::is_always_lock_free,
+                "phase_lock requires lock-free uint8_t atomics");
+  static_assert(std::atomic_ref<uint16_t>::is_always_lock_free,
+                "stripe_borrow_slot requires lock-free uint16_t atomics");
+  static_assert(std::atomic_ref<uint32_t>::is_always_lock_free,
+                "seqlock versions require lock-free uint32_t atomics");
+  static_assert(std::atomic_ref<uint64_t>::is_always_lock_free,
+                "shared_write_pos requires lock-free uint64_t atomics");
+
+  /// Calculate the total size needed for a directory with given bucket count
+  static size_t required_size(size_t num_buckets);
+
+  /// Initialize a new directory in the given memory region
+  /// Returns nullopt if region is too small or num_buckets would overflow
+  static std::optional<MmapDirectory> init(std::span<std::byte> region,
+                                           size_t num_buckets);
+
+  /// Open an existing directory from the given memory region
+  static std::optional<MmapDirectory> open(std::span<std::byte> region);
+
+  /// Probe for an entry matching the key
+  /// Returns nullopt if not found or if consistent read couldn't be achieved
+  [[nodiscard]] std::optional<DirEntry> probe(const CacheKey &key) const;
+
+  /// Iterate over all matching entries without allocation
+  /// Callback returns false to stop iteration
+  template <typename Callback>
+  void probe_each(const CacheKey &key, Callback &&callback) const;
+
+  /// Sentinels for insert()'s verified_offset parameter — shared semantics
+  /// with the in-memory directory (see the discussion on Directory).
+  static constexpr uint64_t kMatchAnyTag = Directory::kMatchAnyTag;
+  static constexpr uint64_t kNoVerifiedEntry = Directory::kNoVerifiedEntry;
+
+  /// Insert or update an entry
+  /// Returns true on success
+  /// verified_offset selects which same-tag entry (if any) may be updated
+  /// in place (a DirEntry holds no key material, so a tag match alone may
+  /// be a colliding foreign key); *collision_evicted reports a full-bucket
+  /// collider eviction, *bucket_full_evicted a full-bucket eviction of the
+  /// entry nearest the wrap cursor.  See the sentinels on
+  /// Directory.
+  bool insert(const CacheKey &key, uint64_t offset, uint64_t size,
+              uint64_t verified_offset = kMatchAnyTag,
+              bool *collision_evicted = nullptr,
+              bool *bucket_full_evicted = nullptr);
+
+  /// Remove an entry
+  /// Returns true if entry was found and removed
+  /// WARNING: matches on the 12-bit tag only (a DirEntry holds no key
+  /// material), so a colliding foreign key's entry can be removed.
+  /// Collision-safe removal must verify the stored first_key and use
+  /// remove_at() — see Volume::remove_sync.  No production call sites.
+  bool remove(const CacheKey &key);
+
+  /// Remove an entry matching both tag and offset (precise removal)
+  bool remove_at(const CacheKey &key, uint64_t target_offset);
+
+  /// Clear all entries
+  void clear();
+
+  /// Get approximate entry count
+  [[nodiscard]] size_t count() const;
+
+  /// Get total capacity (number of entries)
+  [[nodiscard]] size_t capacity() const;
+
+  /// Get number of buckets
+  [[nodiscard]] size_t bucket_count() const;
+
+  /// Get current GC phase
+  [[nodiscard]] bool current_phase() const;
+
+  /// Toggle GC phase
+  void toggle_phase();
+
+  /// Get shared write position (ABSOLUTE file offset, 0 = unset)
+  [[nodiscard]] uint64_t get_shared_write_pos() const;
+
+  /// Set shared write position (ABSOLUTE file offset)
+  void set_shared_write_pos(uint64_t pos);
+
+  /// Record one write-buffer wrap in the shared header (wrap-cadence
+  /// telemetry): increments shared_wrap_count and publishes now_ns as
+  /// shared_last_wrap_time_ns. Must be called with the write lock held
+  /// (the wrap decision itself happens under it).
+  void record_shared_wrap(uint64_t now_ns);
+
+  /// Total write-buffer wraps on this stripe, across all processes.
+  [[nodiscard]] uint64_t shared_wrap_count() const;
+
+  /// steady-clock ns of the most recent wrap on this stripe (any process);
+  /// 0 = never wrapped.
+  [[nodiscard]] uint64_t shared_last_wrap_time_ns() const;
+
+  /// Read-lease expiry (steady-clock ns, 0 = no lease), seq_cst load.
+  /// The writer-side lease gate uses this before any wrap side effect
+  /// (Dekker pairing with the reader's stamp).
+  [[nodiscard]] uint64_t lease_expiry_ns() const;
+
+  /// Stamp the read lease: CAS-max to new_expiry_ns, seq_cst, with the
+  /// write-avoidance guard — the CAS is skipped entirely when the current
+  /// expiry already covers skip_if_at_least_ns (= now + T - T/4).  Never
+  /// lowers the stored value (a bogus far-future value is handled by the
+  /// writer's staleness clamp instead).
+  void stamp_lease_expiry(uint64_t new_expiry_ns, uint64_t skip_if_at_least_ns);
+
+  /// Raw packed {generation, count} borrow slot, seq_cst load.
+  /// The writer-side wrap gate reads this (count > 0 = borrows outstanding)
+  /// after its intent store and before any wrap side effect.
+  [[nodiscard]] uint16_t borrow_slot_raw() const;
+
+  /// Register a live borrow on this stripe (seq_cst CAS; count+1 unless
+  /// saturated).  Must run BEFORE the borrow escapes and before the
+  /// intent/epoch revalidation — see borrow_slot::acquire.
+  [[nodiscard]] borrow_slot::Acquired borrow_acquire();
+
+  /// Drop a counted borrow (generation-checked decrement); no-op when a
+  /// forced wrap reset the slot since the matching acquire.
+  void borrow_release(uint8_t generation);
+
+  /// Ceiling-forced wrap: generation+1, count = 0 (no-op when count == 0).
+  /// Returns true when outstanding state was cleared.
+  bool borrow_force_reset();
+
+  /// Wrap epoch for the reader's stamp-then-revalidate protocol:
+  /// {shared_wrap_count, current_phase} loaded seq_cst.
+  [[nodiscard]] std::pair<uint64_t, bool> wrap_epoch() const;
+
+  /// Wrap-intent flag (seq_cst load).  True while a writer is
+  /// inside the wrap decision + publish window; readers must discard the
+  /// borrow and retry.
+  [[nodiscard]] bool wrap_intent() const;
+
+  /// Set/clear the wrap-intent flag (seq_cst store).  Writer-side only,
+  /// under the write lock: set BEFORE the lease-gate load, cleared once
+  /// the wrap decision completes (defer or publish).
+  void set_wrap_intent(bool active);
+
+  /// Lease-protocol STEP-3: the published cross-process force-wrap deadline
+  /// (steady-clock ms; 0 = no deferred wrap).  Set by the deferring
+  /// writer; read by a zero-copy embedder to copy-out before the force.
+  [[nodiscard]] uint32_t wrap_deferred_deadline_ms() const;
+  void set_wrap_deferred_deadline_ms(uint32_t deadline_ms);
+
+  /// Proof that a write-lock acquisition still owns the lock.  Returned by
+  /// acquire_write_lock(); passed to revalidate_write_lock()/
+  /// release_write_lock().  `generation` is the takeover counter observed at
+  /// acquire: a force-release by another process bumps it, so a holder whose
+  /// observed generation still matches has NOT been usurped.  The remaining
+  /// fields are process-local telemetry (never read from shared memory).
+  struct WriteLockToken {
+    // Takeover counter SAMPLED BEFORE the acquire CAS (ordering is
+    // load-bearing — see acquire_write_lock); a force-release bumps it.
+    uint16_t generation = 0;
+    // True once the lock is held.
+    bool acquired = false;
+    // True when this acquisition recovered the lock from a PROVEN-dead
+    // holder (routine crash recovery).
+    bool forced_release = false;
+    // True when this acquisition took over a holder it could NOT prove
+    // dead via the last-resort escalation — the alertable event (PID reuse
+    // or a live holder wedged for many seconds).
+    bool escalated_takeover = false;
+    // Number of liveness re-checks spent waiting on a still-live holder.
+    uint32_t live_waits = 0;
+  };
+
+  /// Acquire cross-process write lock for write-pos allocation.
+  /// Serializes the read-shared_write_pos → pwrite → update sequence
+  /// across processes to prevent overlapping writes.  The hot uncontended
+  /// path is one generation load + a single CAS.  On contention the waiter
+  /// never usurps a holder it cannot PROVE dead (kill(pid,0)); a genuinely
+  /// dead holder is force-released so a crash cannot deadlock the cache.
+  /// Returns a token the caller must feed to revalidate_write_lock() before
+  /// ANY shared side effect and to release_write_lock() when done —
+  /// discarding it leaks the lock until a waiter's escalation recovers it.
+  [[nodiscard]] WriteLockToken acquire_write_lock();
+
+  /// Non-blocking single-CAS acquire for the in-place header RMW sites.
+  /// NEVER spins, waits, or usurps: on contention returns {acquired=false}
+  /// and the caller applies its own policy (the hit path drops the delta —
+  /// best-effort by contract; the control path retries then reports Busy).
+  /// A blocking acquire on the hit path would park a request thread behind a
+  /// peer's pwrite+fsync.  It inherits acquire_write_lock's rare, self-healing
+  /// accepted-leak policy on a generation race (see the definition).
+  [[nodiscard]] WriteLockToken try_acquire_write_lock();
+
+  /// True iff this acquisition still holds the lock (no force-release has
+  /// bumped the generation since acquire).  A usurped holder MUST NOT
+  /// publish shared_write_pos or let its caller pwrite — doing so is the
+  /// overlapping-write corruption this guard closes.
+  [[nodiscard]] bool revalidate_write_lock(const WriteLockToken &token) const;
+
+  /// Ownership-checked release: a no-op if a force-release usurped us (the
+  /// lock now belongs to the usurper; storing 0 would free ITS critical
+  /// section and admit a third writer).  Deliberately the ONLY release —
+  /// an unconditional release would free whoever currently holds the lock.
+  void release_write_lock(const WriteLockToken &token);
+
+  /// TEST SEAM ONLY — never set in production.  When true, acquire_write_lock
+  /// reverts to the pre-fix "presume the holder dead after the spin budget"
+  /// behavior (no kill(2) liveness proof), so the multi-process regression
+  /// test can exhibit the old live-holder usurpation and prove the fix
+  /// removes it.
+  static inline std::atomic<bool> s_write_lock_presume_dead_for_test{false};
+
+  /// TEST SEAM ONLY — never set in production.  Overrides the last-resort
+  /// live-holder escalation budget (kMaxLiveWaitEscalations, ~4096 waits ≈
+  /// multi-second) when nonzero, so the F6-F test can force an
+  /// escalated_takeover against a deliberately stalled LIVE holder in
+  /// milliseconds and pin the bounded escalation-usurp residual (torn bytes
+  /// stay detectable; the usurped holder's commit is refused).  0 = use the
+  /// production budget.
+  static inline std::atomic<uint32_t> s_write_lock_max_live_waits_for_test{0};
+
+  /// Current seqlock version of the bucket this key hashes to.  Every
+  /// COMPLETED directory mutation advances it by exactly 2
+  /// (acquire_writer even->odd, release_writer odd->even), published with
+  /// release semantics and shared across processes — so a change since a
+  /// sampled value means "something in this bucket moved", whichever process
+  /// moved it.  A bare acquire load; no lock, no retry.  Returns 0 on an
+  /// invalid directory.
+  [[nodiscard]] uint32_t bucket_version(const CacheKey &key) const;
+
+  /// Publish "something reachable through this bucket changed" WITHOUT
+  /// changing a DirEntry.  Used only by the chain-repoint path, which
+  /// rewrites a predecessor DOCUMENT header and would otherwise leave the
+  /// bucket version untouched — invisible to a peer validating its RAM tier
+  /// against it.  Implemented as an empty acquire_writer/release_writer
+  /// bracket so it inherits the seqlock's fences, TSan annotations and
+  /// crashed-holder recovery, and advances the counter by exactly 2 like
+  /// every other mutation.  NEVER open-code this as a fetch_add: an odd
+  /// delta breaks the even/odd parity the seqlock depends on.
+  void touch_bucket(const CacheKey &key);
+
+  /// Full mapped byte range backing this directory (header + version
+  /// counters + entries).  Used for explicit flushes of the directory
+  /// region — see Volume::sync_directory().  Empty if invalid.
+  [[nodiscard]] std::span<std::byte> region() const;
+
+  /// Check if directory is valid
+  [[nodiscard]] bool is_valid() const { return _header != nullptr; }
+
+  // Non-copyable (doesn't own memory, but copying would be confusing)
+  MmapDirectory(const MmapDirectory &) = delete;
+  MmapDirectory &operator=(const MmapDirectory &) = delete;
+
+  // Movable
+  MmapDirectory(MmapDirectory &&other) noexcept;
+  MmapDirectory &operator=(MmapDirectory &&other) noexcept;
+
+  /// Default constructor (creates invalid directory)
+  MmapDirectory()
+      : _header(nullptr),
+        _versions(nullptr),
+        _entries(nullptr),
+        _num_buckets(0) {}
+
+ private:
+  MmapDirectory(Header *header, uint32_t *versions, DirEntry *entries,
+                size_t num_buckets);
+
+  /// Get version counter for a bucket (atomic load)
+  [[nodiscard]] uint32_t load_version(size_t bucket_idx) const;
+
+  // NOTE: there is deliberately NO single-step "increment_version" helper.
+  // A bucket version is a SEQLOCK counter: even = stable, odd = a writer
+  // holds the bucket.  The only legal way to advance it is the balanced
+  // acquire_writer/release_writer pair (+2, parity preserved).  A helper that
+  // added 1 would leave the bucket permanently "write in progress", spinning
+  // every subsequent writer and failing every reader's retry loop.  Callers
+  // that need to publish a change without touching a DirEntry use the public
+  // touch_bucket() above.
+
+  /// Acquire writer lock on a bucket (spins until CAS even→odd succeeds).
+  /// Returns the pre-lock (even) version for use in release.
+  uint32_t acquire_writer(size_t bucket_idx);
+
+  /// Release writer lock (increments odd→even).
+  void release_writer(size_t bucket_idx);
+
+  /// Acquire cross-process phase lock (CAS spinlock on header->phase_lock).
+  /// Prevents toggle_phase() from invalidating entries mid-insert.
+  void acquire_phase_lock();
+
+  /// Release cross-process phase lock.
+  void release_phase_lock();
+
+  /// Atomically increment entry count
+  void increment_count();
+
+  /// Atomically decrement entry count
+  void decrement_count();
+
+  Header *_header;
+  uint32_t *_versions;  // One per bucket (accessed via std::atomic_ref)
+  DirEntry *_entries;
+  size_t _num_buckets;
+};
+
+// Template implementation
+template <typename Callback>
+void MmapDirectory::probe_each(const CacheKey &key, Callback &&callback) const {
+  if (!_header) {
+    return;
+  }
+
+  uint32_t bucket_idx = key.bucket_hash() % _num_buckets;
+  uint16_t target_tag = key.tag();
+
+  // Retry loop for torn read detection
+  for (size_t retry = 0; retry < kMaxReadRetries; ++retry) {
+    // Capture the phase INSIDE the retry loop: a retry triggered by a
+    // concurrent toggle_phase() must rescan with the new phase, or
+    // entries stamped after the flip would be invisibly skipped
+    // (spurious miss).
+    bool cur_phase = current_phase();
+
+    // Wait for an even version before starting the scan.  An odd version
+    // means a writer currently holds the bucket lock — spinning here avoids
+    // wasting a full retry attempt on a guaranteed-inconsistent read.
+    uint32_t version_before = load_version(bucket_idx);
+    if ((version_before & 1) != 0) {
+      for (size_t spin = 0; spin < kMaxWriterWaitSpins; ++spin) {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+        _mm_pause();
+#elif defined(__x86_64__)
+        __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(_M_ARM64)
+        __asm__ volatile("yield" ::: "memory");
+#endif
+        version_before = load_version(bucket_idx);
+        if ((version_before & 1) == 0) break;
+      }
+      if ((version_before & 1) != 0) {
+        // Writer still active after spin limit — yield and retry
+        std::this_thread::yield();
+        continue;
+      }
+    }
+
+    // Memory barrier to ensure we read entries after version
+    std::atomic_thread_fence(std::memory_order_acquire);
+    CYCLONE_TSAN_ACQUIRE(&_versions[bucket_idx]);
+
+    const DirEntry *bucket = &_entries[bucket_idx * kEntriesPerBucket];
+    bool should_stop = false;
+
+    for (size_t i = 0; i < kEntriesPerBucket && !should_stop; ++i) {
+      DirEntry entry = bucket[i];  // Copy the entry
+
+      if (entry.is_empty()) {
+        continue;
+      }
+      // Skip stale entries from a previous GC phase
+      if (entry.phase() != cur_phase) {
+        continue;
+      }
+      if (entry.tag() == target_tag) {
+        // Memory barrier before reading version again
+        std::atomic_thread_fence(std::memory_order_acquire);
+
+        uint32_t version_after = load_version(bucket_idx);
+        if (version_before != version_after) {
+          // Version changed during read - retry
+          break;
+        }
+
+        if (!callback(entry)) {
+          should_stop = true;
+        }
+      }
+    }
+
+    if (should_stop) {
+      return;
+    }
+
+    // Check version one more time
+    std::atomic_thread_fence(std::memory_order_acquire);
+    uint32_t version_after = load_version(bucket_idx);
+    if (version_before == version_after) {
+      return;  // Consistent read achieved
+    }
+    // Version changed - retry
+  }
+}
+
+}  // namespace cyclone

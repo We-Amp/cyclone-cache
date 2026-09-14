@@ -1,0 +1,21 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "cyclone-cache",
+  "version-string": "0.1.0",
+  "description": "High-performance shared on-disk + RAM cache library",
+  "homepage": "https://github.com/We-Amp/cyclone-cache",
+  "license": "Apache-2.0",
+  "builtin-baseline": "7849750896c86bd7a4a02ed760812dba321a4a9b",
+  "dependencies": [
+    {
+      "name": "openssl",
+      "version>=": "3.6.3"
+    }
+  ],
+  "overrides": [
+    {
+      "name": "openssl",
+      "version": "3.6.3"
+    }
+  ]
+}

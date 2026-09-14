@@ -1,0 +1,28 @@
+# Apache RAT exclusions, read by tools/ci/rat.sh (the License audit CI job).
+#
+# One pattern per line. RAT matches each pattern against the BASE NAME of every
+# file and directory it visits (not the path); a matched directory is skipped
+# whole. Patterns are tried as a regular expression, an exact name and a
+# wildcard, so write globs in regex form (.*\.md, not *.md).
+#
+# Everything not listed here must carry the Apache-2.0 SPDX header. Add an
+# entry only for a file that has no comment syntax or no license-bearing
+# content of its own, and say why.
+
+# Git metadata. Listed here rather than passed as -e on the command line:
+# RAT 0.16 honours EITHER -e flags OR the -E file, never both, so a single
+# -e would silently disable this whole file.
+.git
+
+# Tool configuration: formatter/linter/git/audit settings, no content of their own.
+.clang-format
+.clang-tidy
+.gitignore
+.git-blame-ignore-revs
+.rat-excludes
+
+# Documentation (Markdown): covered by the repository LICENSE, no header convention.
+.*\.md
+
+# libFuzzer seed corpora (fuzz/corpus/*/): opaque binary test inputs.
+corpus

@@ -1,0 +1,47 @@
+# pre-commit installs BOTH the commit-time and push-time git hooks
+# (default_install_hook_types). `pre-commit install` wires them up in one step.
+default_install_hook_types: [pre-commit, pre-push]
+# Keep the standard hooks commit-only; the push gate is declared explicitly below.
+default_stages: [pre-commit]
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v20.1.8
+    hooks:
+      - id: clang-format
+        types_or: [c, c++]
+
+  - repo: local
+    hooks:
+      - id: license-headers
+        name: Check license headers
+        entry: "bash -c 'rc=0; for f in \"$@\"; do head -5 \"$f\" | grep -q \"SPDX-License-Identifier: Apache-2.0\" || { echo \"Missing Apache-2.0 SPDX header: $f\"; rc=1; }; if grep -q -i -E \"BUSL|Business Source\" \"$f\"; then echo \"BUSL residue: $f\"; rc=1; fi; done; exit $rc' --"
+        language: system
+        files: '\.(cpp|hpp|h)$'
+        exclude: ^(build|build-tsan|build-asan)/
+      - id: doc-version-literals
+        name: Doc version-literal drift (CLAUDE.md/AGENTS.md vs clang-format pin)
+        entry: tools/ci/check_doc_commands.sh
+        language: script
+        pass_filenames: false
+        files: '^(CLAUDE\.md|AGENTS\.md|\.pre-commit-config\.yaml)$'
+      # Push gate: re-checks clang-format on the files being pushed using the
+      # pinned clang-format 20.x (tools/format.sh resolves it — a local 20.x
+      # binary or the pinned pip wheel). Catches commits made with --no-verify
+      # or in a clone where `pre-commit install` was never run. Changed-files
+      # only, so it stays fast; needs no remote formatter box.
+      - id: clang-format-push-gate
+        name: clang-format 20.x push gate (tools/format.sh --check --changed)
+        entry: tools/format.sh
+        args: ['--check', '--changed']
+        language: script
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]

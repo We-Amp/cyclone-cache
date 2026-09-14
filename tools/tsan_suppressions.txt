@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2024-2026 We-Amp B.V.
+
+# TSan suppressions for Cyclone Cache
+#
+# See: https://github.com/google/sanitizers/wiki/ThreadSanitizerSuppressions
+
+# MmapDirectory::probe vs clear/insert — seqlock-protected access that
+# TSan cannot reason about (uses atomic seq + data fence pattern).
+race:cyclone::MmapDirectory::probe
+race:cyclone::MmapDirectory::clear
+race:cyclone::MmapDirectory::insert
+
+# In-memory Directory — same per-bucket seqlock pattern as MmapDirectory
+# (readers copy raw DirEntry words between version loads + acquire fences;
+# writers publish odd/even version transitions).  The reader side inlines
+# into probe/probe_each callers, so suppress on the writer-side mutators
+# (one matching frame in either stack suppresses the report) plus the
+# reader entry points.
+race:cyclone::Directory::probe
+race:cyclone::Directory::probe_each
+race:cyclone::Directory::insert
+race:cyclone::Directory::remove
+race:cyclone::Directory::remove_at
+
+
+# Intentional thread leak at shutdown (leak_thread_on_shutdown).
+# Leaked threads may race with destructors during process exit.
+# This is a deliberate trade-off to avoid UB from atexit ordering.
+thread:cyclone::AdaptiveThreadPool::spawn_worker
+race:cyclone::Stripe::~Stripe
+race:cyclone::Volume::close
+# The leaked worker thread accesses pool state (via captured `this`)
+# after the pool is destroyed during shutdown.
+race:cyclone::AdaptiveThreadPool::worker_loop
