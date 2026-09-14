@@ -1,0 +1,25 @@
+# Build directories
+build/
+build-*/
+cmake-build-*/
+
+# IDE/Editor files
+.cache/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Compiled files
+*.o
+*.a
+*.so
+*.dylib
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# local scratch artifacts (never committed)
+.artifacts-nobump/

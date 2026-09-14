@@ -1,0 +1,6 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2024-2026 We-Amp B.V.
+
+# Zig C++ compiler wrapper for x86_64-windows-gnu target
+exec zig c++ -target x86_64-windows-gnu -std=c++23 "$@"

@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2024-2026 We-Amp B.V.
+
+# LSan suppressions for Cyclone Cache
+#
+# See: https://github.com/google/sanitizers/wiki/AddressSanitizerLeakSanitizer
+
+# Intentional thread leak at shutdown (leak_thread_on_shutdown in thread_util.hpp).
+# A std::thread is heap-allocated and never joined to avoid UB from atexit
+# destruction ordering. The 8-byte leak is the std::thread object itself.
+leak:cyclone::leak_thread_on_shutdown

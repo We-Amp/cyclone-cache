@@ -1,0 +1,8 @@
+# Bulk formatting commits — skip with: git blame --ignore-revs-file .git-blame-ignore-revs
+# Or set permanently: git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# clang-format + clang-tidy initial fix pass (2026-04-01)
+3a988b752e8af17ebe6f4c497dbec26ec6d87a66
+
+# Relicense to Apache-2.0: license header sweep and audit headers (squash-merged 2026-09-05)
+92ca230205e18ea56386203bfc5978e0a8c2065a
