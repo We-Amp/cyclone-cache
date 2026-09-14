@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2024-2026 We-Amp B.V.
+
+name: CI
+
+# Minimal public CI (ADR-131): build + test on the three GitHub-hosted
+# platforms, plus the license-header gate. The exhaustive lanes (sanitizers,
+# TSan, lint, fuzzing, CVE scanning, nightly stress) stay on the private
+# fleet and are deliberately not part of this workflow.
+#
+# The build mirrors the private lanes: bundled SHA-256 (no OpenSSL/vcpkg
+# dependency) and Catch2 via FetchContent. Tests run as a single process
+# (the binary directly, not `ctest -j`): the Catch2 cases share a fixed
+# on-disk temp path, so parallel test processes race on file sharing.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCYCLONE_USE_BUNDLED_SHA256=ON
+      - name: Build
+        run: cmake --build build --config Release -j
+      - name: Test
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            ./build/Release/cyclone-tests.exe
+          else
+            ./build/cyclone-tests
+          fi
+
+  license-audit:
+    name: License audit (Apache RAT)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Apache RAT (fails on any unknown license)
+        env:
+          RAT_WORK_DIR: ${{ runner.temp }}/rat
+        run: bash tools/ci/rat.sh
+      - name: Upload RAT report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rat-report
+          path: ${{ runner.temp }}/rat/rat-report.txt
+          if-no-files-found: warn
