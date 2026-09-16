@@ -3,7 +3,7 @@
 
 name: CI
 
-# Minimal public CI (ADR-131): build + test on the three GitHub-hosted
+# Minimal public CI: build + test on the three GitHub-hosted
 # platforms, plus the license-header gate. The exhaustive lanes (sanitizers,
 # TSan, lint, fuzzing, CVE scanning, nightly stress) stay on the private
 # fleet and are deliberately not part of this workflow.
