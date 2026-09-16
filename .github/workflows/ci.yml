@@ -4,9 +4,11 @@
 name: CI
 
 # Minimal public CI: build + test on the three GitHub-hosted
-# platforms, plus the license-header gate. The exhaustive lanes (sanitizers,
-# TSan, lint, fuzzing, CVE scanning, nightly stress) stay on the private
-# fleet and are deliberately not part of this workflow.
+# platforms, plus the license-header gate and the public-tree hygiene gate
+# (tools/ci/check-public-hygiene.sh — keeps private-infrastructure and
+# private-process vocabulary out of the public tree). The exhaustive lanes
+# (sanitizers, TSan, lint, fuzzing, CVE scanning, nightly stress) stay on
+# the private fleet and are deliberately not part of this workflow.
 #
 # The build mirrors the private lanes: bundled SHA-256 (no OpenSSL/vcpkg
 # dependency) and Catch2 via FetchContent. Tests run as a single process
@@ -71,3 +73,12 @@ jobs:
           name: rat-report
           path: ${{ runner.temp }}/rat/rat-report.txt
           if-no-files-found: warn
+
+  public-hygiene:
+    name: Public-tree hygiene gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: Scan the tracked tree for non-public vocabulary
+        run: bash tools/ci/check-public-hygiene.sh

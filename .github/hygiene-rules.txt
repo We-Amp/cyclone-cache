@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2024-2026 We-Amp B.V.
+#
+# Public-tree hygiene rules, enforced by tools/ci/check-public-hygiene.sh
+# (the "Public-tree hygiene gate" CI job). This repository is public, so the
+# tracked tree must stay free of private-infrastructure and private-process
+# vocabulary. One rule per line:
+#
+#   <grep-flags><TAB><extended-regex pattern>
+#
+# Blank lines and lines starting with # are ignored. Flags are a subset of
+# grep's: E (extended regex, required) and i (case-insensitive).
+#
+# Rule classes (one rule per line below, in this order):
+#   decision-ids    internal decision-record references
+#   runner-labels   private CI runner-pool label scheme
+#   dev-repo slugs  pre-publication development repository names
+#   internal IDs    internal work-item / requirement identifiers
+#   fleet topology  private build-fleet host, machine and topology words
+#
+# The slug and topology rules use explicit non-word character classes rather
+# than \b, so a longer path segment (github.com/oschaaf/cyclone-foo) is not a
+# hit while a hyphenated compound (non-self-hosted) still is.
+E	ADR-[0-9]{3}([^0-9]|$)
+Ei	(linux|mac|macos|windows)-(x64|arm64)(-[a-z0-9]+)*-(pool|mps[0-9]+)([^a-z0-9-]|$)
+E	(^|[^A-Za-z0-9_/-])(oschaaf/modpagespeed-2|oschaaf/cyclone|mod_pagespeed_private)([^A-Za-z0-9_/-]|$)
+E	MPS2-[A-Z]+-[0-9]+
+Ei	(^|[^A-Za-z0-9_])(self-hosted|threadripper|duster|mpb-?16|weamp-web)([^A-Za-z0-9_]|$)
