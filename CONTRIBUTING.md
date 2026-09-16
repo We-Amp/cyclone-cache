@@ -13,16 +13,15 @@ Thank you for your interest in contributing to Cyclone Cache!
   - MSVC 2022 or later
 - OpenSSL development headers (or build with `-DCYCLONE_USE_BUNDLED_SHA256=ON`)
 
-CI pins LLVM 20 for build, lint, and sanitizers (`clang++-20`, `clang-tidy-20`,
-`clang-format-20`). To reproduce the lint gate locally you need LLVM 20
-specifically — see CLAUDE.md's "Linting (required CI gate)" section for the exact
-commands.
+The lint gate pins LLVM 20 (`clang++-20`, `clang-tidy-20`, `clang-format-20`).
+To reproduce it locally you need LLVM 20 specifically — see CLAUDE.md's
+"Linting (required gate)" section for the exact commands.
 
 ### Building
 
 ```bash
 # Clone and build
-git clone <repository-url>
+git clone https://github.com/We-Amp/cyclone-cache
 cd cyclone-cache
 cmake -B build
 cmake --build build

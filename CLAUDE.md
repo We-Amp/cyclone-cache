@@ -28,12 +28,12 @@ all paths to the resolved toplevel.
 - This `CLAUDE.md` / `AGENTS.md` pair follows the cross-repo AI-agent
   ergonomics standard shared by all We-Amp repositories.
 
-## PageSpeed 2.0 Integration
+## mod_pagespeed 2.1 Integration
 
-This is the Cyclone cache library, used as the storage layer for PageSpeed 2.0.
-It is built as a Bazel dependency (`@cyclone` in `MODULE.bazel`) via a custom
-BUILD file at `third_party/cyclone.BUILD`. **When working on PageSpeed 2.0, use
-Bazel (not CMake) to build and test.**
+This is the Cyclone cache library, used as the storage layer for mod_pagespeed
+2.1. It is built as a Bazel dependency (`@cyclone` in `MODULE.bazel`) via a
+custom BUILD file at `third_party/cyclone.BUILD`. **When working on
+mod_pagespeed 2.1, use Bazel (not CMake) to build and test.**
 
 ### How PageSpeed Uses Cyclone
 
@@ -125,9 +125,13 @@ need `VCPKG_ROOT`; the `*-zig` presets disable tests/examples/benchmarks.
 
 ## Reproduce CI locally
 
-CI runs on a self-hosted Linux runner; every job builds with LLVM 20 and
-`-DCYCLONE_USE_BUNDLED_SHA256=ON`. Match it exactly to avoid a remote
-round-trip. Build & test, as CI runs it:
+CI runs on GitHub-hosted runners only: a build-and-test matrix
+(`ubuntu-latest`, `windows-latest`, `macos-latest`) that configures with
+`cmake -B build -DCMAKE_BUILD_TYPE=Release -DCYCLONE_USE_BUNDLED_SHA256=ON`,
+builds, and runs the test binary, plus an Apache RAT license-audit job
+(`bash tools/ci/rat.sh`). The bundled-SHA256 build is hermetic: no OpenSSL or
+vcpkg dependency. The reference local build, with the LLVM 20 toolchain the
+project pins:
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release \
@@ -137,17 +141,20 @@ cmake --build build -j$(nproc)
 (cd build && ./cyclone-tests)
 ```
 
-## Linting (required CI gate — match exactly)
+Run the test binary directly rather than `ctest -j`: the Catch2 cases share a
+fixed on-disk temp path, so parallel test processes race on file sharing.
 
-The `lint` job is a hard-failing CI gate. CI requires LLVM 20 specifically
+## Linting (required gate — match exactly)
+
+Lint is a hard-failing contribution gate and requires LLVM 20 specifically
 (`clang-format-20` / `clang-tidy-20` / `run-clang-tidy-20`, installed from
-apt.llvm.org); other major versions produce CI-failing formatting even when
-locally green. Commands lifted byte-for-byte from CI's `lint` job.
+apt.llvm.org); other major versions produce gate-failing formatting even when
+locally green. The exact commands:
 
 clang-format check (and the `-i` fix variant):
 
 ```bash
-# Check (what CI runs):
+# Check (what the gate runs):
 find src include/cyclone tests benchmarks examples -type f \
   \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) \
   | xargs clang-format-20 --dry-run --Werror
@@ -159,13 +166,13 @@ find src include/cyclone tests benchmarks examples -type f \
 ```
 
 **One entry point — `tools/format.sh`.** Rather than invoking `clang-format`
-directly, use `tools/format.sh` (`--check` to verify like CI, `--changed` for a
-fast changed-files check). It resolves a clang-format **20.x** binary — a local
-`clang-format-20`, else a pinned `clang-format==20.1.8` pip wheel bootstrapped
-into a shared cache venv (byte-identical to the CI `clang-format-20`). If your
-`clang-format` is not **20.x**, do not format by hand — run `tools/format.sh`.
-`pre-commit install` also wires a **pre-push** gate (`clang-format-push-gate`)
-that runs this check on the files being pushed.
+directly, use `tools/format.sh` (`--check` to verify like the gate, `--changed`
+for a fast changed-files check). It resolves a clang-format **20.x** binary — a
+local `clang-format-20`, else a pinned `clang-format==20.1.8` pip wheel
+bootstrapped into a shared cache venv (byte-identical to a stock
+`clang-format-20`). If your `clang-format` is not **20.x**, do not format by
+hand — run `tools/format.sh`. `pre-commit install` also wires a **pre-push**
+gate (`clang-format-push-gate`) that runs this check on the files being pushed.
 
 clang-tidy (needs `build/compile_commands.json`, emitted by
 `CMAKE_EXPORT_COMPILE_COMMANDS=ON`, on by default in `CMakeLists.txt`):
@@ -176,9 +183,10 @@ run-clang-tidy-20 -p build "cyclone/(src|include/cyclone|tests|benchmarks)/.*\.(
 ```
 
 The leading `cyclone/` in the tidy regex is intentional: it matches the
-`cyclone/` source-tree directory segment in the absolute paths CMake writes into
-`compile_commands.json` (e.g. the runner's `…/_work/cyclone/cyclone/…` checkout).
-The `lint` job is a pure CMake build — no Bazel involved.
+`cyclone/` source-tree directory segment in the absolute paths CMake writes
+into `compile_commands.json` (e.g. a `…/cyclone/cyclone/…` checkout nested
+inside a parent directory of the same name). Lint is a pure CMake build — no
+Bazel involved.
 
 ## Project Structure
 
@@ -351,9 +359,10 @@ if (!result) {
 - Google-based style enforced by `.clang-format` (`BasedOnStyle: Google`,
   `ColumnLimit: 80`, `PointerAlignment: Left`, `Standard: Latest`), 2-space
   indent. `.clang-format` is the single source of truth.
-- 80 columns, not 120. Run `clang-format-20 -i` before committing — CI rejects
-  non-conforming code via `clang-format-20 --dry-run --Werror` (see the
-  Linting section below for the exact commands).
+- 80 columns, not 120. Run `clang-format-20 -i` before committing — the
+  private contribution gate rejects non-conforming code via
+  `clang-format-20 --dry-run --Werror` (see the Linting section above for the
+  exact commands).
 - Naming: classes `CamelCase`, functions/methods `snake_case`, member
   variables `_prefix`, constants `kCamelCase`.
 - Use `std::expected` for error handling, not exceptions
@@ -411,10 +420,10 @@ TEST_CASE("Description", "[tag1][tag2]")
 
 ### Running Sanitizer Tests
 
-These match CI's `tsan` and `asan` jobs. The suppressions files
-(`tools/{tsan,lsan}_suppressions.txt`) carry known false positives (seqlock
-directory access, intentional shutdown thread leak), so a local run must wire
-them in to match CI; without them you see noise CI does not.
+The suppressions files (`tools/{tsan,lsan}_suppressions.txt`) carry known false
+positives (seqlock directory access, intentional shutdown thread leak), so a
+sanitizer run must wire them in to stay signal-only; without them you see
+noise that the pinned configuration does not.
 
 ```bash
 # ASan + UBSan (memory errors, undefined behavior)
@@ -436,8 +445,8 @@ cmake --build build-tsan -j$(nproc)
 (cd build-tsan && TSAN_OPTIONS="suppressions=$PWD/../tools/tsan_suppressions.txt" ./cyclone-tests)
 ```
 
-`-fno-sanitize=vptr` matches CI (avoids spurious UBSan vptr reports). For a
-quick local ASan build without reproducing the exact CI flags, the one-flag
+`-fno-sanitize=vptr` avoids spurious UBSan vptr reports. For a quick local
+ASan build without reproducing the exact flags above, the one-flag
 `-DCYCLONE_ENABLE_ASAN=ON` (`CMakeLists.txt`) is simpler.
 
 ## Common Tasks

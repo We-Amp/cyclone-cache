@@ -8,6 +8,13 @@ Licensed under the Apache License, Version 2.0 (see LICENSE).
 The cache architecture is inspired by Apache Traffic Server's disk cache design.
 Apache Traffic Server is (c) The Apache Software Foundation, licensed under Apache-2.0.
 
+The default build links against OpenSSL for SHA-256 (a system package or a
+vcpkg-provided build; see vcpkg.json). OpenSSL is (c) The OpenSSL Project
+Authors, licensed under Apache-2.0 (https://www.openssl.org/source/license.html).
+OpenSSL is an external dependency, not vendored in this tree; the
+CYCLONE_USE_BUNDLED_SHA256=ON build configuration replaces it with the
+self-contained implementation in src/core/sha256.hpp.
+
 ~~
 
 Files: *
