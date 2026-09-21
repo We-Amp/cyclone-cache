@@ -43,7 +43,9 @@
 namespace cyclone {
 
 // Compact 10-byte directory entry matching ATS layout for proven efficiency.
-// Supports up to 512TB per stripe with 40-bit offset addressing.
+// The 40-bit offset is a BYTE offset into the stripe (see
+// `stripe->offset + dir_entry.offset()` in volume.cpp), so a stripe can
+// address up to 1 TiB.
 struct alignas(2) DirEntry {
   static constexpr size_t kSize = 10;
 

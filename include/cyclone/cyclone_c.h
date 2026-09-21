@@ -11,11 +11,23 @@
 extern "C" {
 #endif
 
+/* This header must compile as C11 as well as C++, so every type below is a
+ * typedef rather than a C++ alias declaration. */
+// NOLINTBEGIN(modernize-use-using)
+
 /* --------------------------------------------------------------------------
  * Error codes
  * -------------------------------------------------------------------------- */
 
-using CycloneError = enum : uint8_t {
+/*
+ * Error code.  Spelled as a fixed-width typedef plus an anonymous enum of
+ * constants rather than an enum type: C11 has no enum-base syntax, so a plain
+ * C `enum` would be int-sized while the C++ `enum : uint8_t` it replaces is
+ * one byte.  uint8_t is exactly one byte in both languages, so the ABI is
+ * identical either side of the boundary.
+ */
+typedef uint8_t CycloneError;
+enum {
   CYCLONE_OK = 0,    /* Success */
   CYCLONE_NOT_FOUND, /* Entry not found (also used by exists() for "does not
                         exist") */
@@ -49,7 +61,8 @@ using CycloneError = enum : uint8_t {
  * separate keyspaces: the same key written to both tiers refers to two
  * independent entries.
  */
-using CycloneTier = enum : uint8_t {
+typedef uint8_t CycloneTier;
+enum {
   CYCLONE_TIER_DEFAULT = 0, /* Hash-routed default (payload) volume — the
                                behavior of the tier-less functions */
   CYCLONE_TIER_SMALL = 1    /* Dedicated small-object volume, isolated from
@@ -63,14 +76,14 @@ using CycloneTier = enum : uint8_t {
  * Opaque handles
  * -------------------------------------------------------------------------- */
 
-using CycloneCacheHandle = struct CycloneCacheHandle;
-using CycloneReadHandle = struct CycloneReadHandle;
+typedef struct CycloneCacheHandle CycloneCacheHandle;
+typedef struct CycloneReadHandle CycloneReadHandle;
 
 /* --------------------------------------------------------------------------
  * Configuration
  * -------------------------------------------------------------------------- */
 
-using CycloneCacheConfig = struct {
+typedef struct {
   const char *cache_path;
   uint64_t cache_size_bytes;
   uint64_t ram_cache_size_bytes; /* In-memory (RAM) tier size in bytes, copied
@@ -183,13 +196,13 @@ using CycloneCacheConfig = struct {
      BUCKET, so unrelated writes to the same bucket also invalidate.
 
      Same trailing-field ABI note as small_tier_percent above. */
-};
+} CycloneCacheConfig;
 
 /* --------------------------------------------------------------------------
  * Statistics
  * -------------------------------------------------------------------------- */
 
-using CycloneCacheStats = struct {
+typedef struct {
   uint64_t ram_cache_hits;
   uint64_t ram_cache_misses;
   uint64_t disk_cache_hits;
@@ -338,7 +351,7 @@ using CycloneCacheStats = struct {
    *     saving, but the same crowding signal. */
   uint64_t ram_coherence_rejections;
   uint64_t ram_coherence_put_rejections;
-};
+} CycloneCacheStats;
 
 /* --------------------------------------------------------------------------
  * Thread Safety
@@ -443,8 +456,8 @@ int cyclone_cache_cross_process_ram_coherence_active(CycloneCacheHandle *cache);
  *   data/data_len: fetched value (NULL/0 on failure)
  *   err:        CYCLONE_OK on success, error code on failure
  */
-using CycloneMissDoneCallback = void (*)(void *, const char *, size_t,
-                                         CycloneError);
+typedef void (*CycloneMissDoneCallback)(void *, const char *, size_t,
+                                        CycloneError);
 
 /*
  * Miss handler: called by the cache when a read misses and no fetch is
@@ -455,8 +468,8 @@ using CycloneMissDoneCallback = void (*)(void *, const char *, size_t,
  *   done_cb:            completion callback the handler MUST call exactly once
  *   done_user_data:     opaque pointer to pass back to done_cb
  */
-using CycloneMissHandler = void (*)(const char *, size_t, void *,
-                                    CycloneMissDoneCallback, void *);
+typedef void (*CycloneMissHandler)(const char *, size_t, void *,
+                                   CycloneMissDoneCallback, void *);
 
 /*
  * Register a miss handler. When set, cyclone_cache_read_async() will invoke
@@ -476,8 +489,7 @@ CycloneError cyclone_cache_set_miss_handler(CycloneCacheHandle *cache,
  * IMPORTANT: The data pointer is only valid for the duration of this callback.
  * If you need to retain the data, copy it before returning from the callback.
  */
-using CycloneReadCallback = void (*)(void *, const char *, size_t,
-                                     CycloneError);
+typedef void (*CycloneReadCallback)(void *, const char *, size_t, CycloneError);
 
 /*
  * Async read that uses the miss handler on cache miss.
@@ -502,6 +514,8 @@ CycloneError cyclone_cache_read_async(CycloneCacheHandle *cache,
  */
 CycloneError cyclone_cache_drain_pending(CycloneCacheHandle *cache,
                                          uint32_t timeout_ms);
+
+// NOLINTEND(modernize-use-using)
 
 #ifdef __cplusplus
 } /* extern "C" */

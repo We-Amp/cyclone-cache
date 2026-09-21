@@ -2,7 +2,9 @@
 # Copyright (c) 2024-2026 We-Amp B.V.
 
 cmake_minimum_required(VERSION 3.20)
-project(cyclone-cache VERSION 0.1.0 LANGUAGES CXX)
+# C is enabled only for the C-ABI header compile guard in tests/c_api; the
+# library itself is C++ only.
+project(cyclone-cache VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -181,7 +183,20 @@ if(CYCLONE_BUILD_TESTS)
     tests/integration/test_write_handle_volume_lifetime.cpp
     tests/integration/test_reset_gate_spawn.cpp
   )
-  target_link_libraries(cyclone-tests PRIVATE cyclone-cache Catch2::Catch2WithMain)
+  # Compile guard: cyclone_c.h is the C ABI header, so it must stay valid C11
+  # (it once used C++ alias declarations and did not compile as C).  Built as
+  # an OBJECT library so the C standard is scoped to this one TU, and linked
+  # into cyclone-tests so a broken header fails the ordinary test build.
+  add_library(cyclone-c-header-check OBJECT tests/c_api/c_header_compiles.c)
+  set_target_properties(cyclone-c-header-check PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED ON
+    C_EXTENSIONS OFF)
+  target_include_directories(cyclone-c-header-check
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+  target_link_libraries(cyclone-tests PRIVATE cyclone-cache Catch2::Catch2WithMain
+                                              cyclone-c-header-check)
   target_include_directories(cyclone-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
                                                    ${CMAKE_CURRENT_SOURCE_DIR}/tests)
   catch_discover_tests(cyclone-tests)
