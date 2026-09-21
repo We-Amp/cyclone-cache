@@ -1,653 +1,735 @@
 # Cyclone Cache
 
-A modern C++23 disk cache library inspired by Apache Traffic Server's proven cache design. Cyclone Cache provides high-performance caching with scan-resistant eviction, memory-mapped I/O, and a flexible plugin system.
+[![CI](https://github.com/We-Amp/cyclone-cache/actions/workflows/ci.yml/badge.svg)](https://github.com/We-Amp/cyclone-cache/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![C++23](https://img.shields.io/badge/C%2B%2B-23-00599C.svg)](#requirements)
+[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)](#building)
 
-## Features
+**A lock-free, memory-mapped, multi-process disk cache for C++23 — and a
+C ABI for everything else.** Cyclone is the persistent storage engine behind
+mod_pagespeed 2.1, built on the on-disk design of Apache Traffic Server: a
+circular write log per stripe, a 10-byte directory entry, phase-bit eviction,
+and a scan-resistant CLFUS RAM tier. Reads take no lock. Many processes can
+share one cache file. Large values are served as zero-copy views into the
+mapped file.
 
-- **Scan-Resistant Caching**: CLFUS (Clock LRU Frequency Size) algorithm prevents streaming workloads from evicting hot data
-- **Memory-Mapped I/O**: Fast reads with OS-assisted paging and zero-copy potential
-- **Compact Directory**: 10-byte entries supporting up to 512TB per stripe
-- **Plugin System**: Extensible architecture for custom key generation, variant selection, and freshness checking
-- **HTTP Support**: Built-in plugin for RFC 7234 content negotiation (Vary headers, Accept matching, freshness calculation)
-- **Cross-Platform**: Supports Linux, macOS, and Windows
-- **Modern C++**: Uses C++23 features including `std::expected`, coroutines, and `std::span`
+It is a general-purpose blob store for anything keyed by a hash — HTTP
+responses and their content-negotiated variants, rendered pages, transcoded
+images, or the [KV-cache tensors of an LLM prefix](#kv-cache-for-llm-inference).
 
-## Requirements
+**Status:** v0.1.0, pre-release. On-disk format v7. The API is not yet frozen;
+pin a commit when you depend on it. All numbers below are from one machine
+(Apple M5 / macOS 27); expect different absolutes on Linux/NVMe.
 
-- CMake 3.20 or later
-- C++23 compatible compiler (GCC 13+, Clang 16+, MSVC 2022+)
-- OpenSSL (for SHA-256 hashing)
+## Cyclone in numbers
 
-## Building
+Measured on this repository at the current commit — Apple M5 (10 cores),
+macOS 27, Release build, bundled SHA-256, single thread unless stated. Every
+number below is reproducible with the commands in
+[Reproducing the numbers](#reproducing-the-numbers).
 
-```bash
-# Configure
-cmake -B build
+| Number | What it means |
+|---:|---|
+| **0.33 µs** | p50 for a warm hit served from the mapped file (4 KB object) — **2.5 M reads/s** on one thread |
+| **17.6 M reads/s** | 4 threads hammering the mmap tier (512 B objects), 3.3× one thread; 22 M/s at 16 threads |
+| **10 µs** | p50 for a 4 KB write, 14.6 µs p99 — **96 K writes/s**, no per-write fsync |
+| **~0.5 GB/s** | sustained single-thread write *and* first-read bandwidth at 64 KB–1 MB object sizes |
+| **0.4 µs** | to acquire a zero-copy view of a 1 MB object once it has been verified — cost is independent of object size |
+| **0** | stripe locks on the read path — per-bucket seqlocks, CRC32 and read leases instead |
+| **10 bytes** | per directory entry; 132-byte document header; 1 TiB addressable per stripe |
+| **N processes** | may open the same cache file; each owns `stripe % N` for writes, all read everything |
+| **64** | content variants ("alternates") per key — compressed, transcoded, quantized… |
+| **639** | Catch2 test cases, 209 K assertions, plus libFuzzer harnesses; CI on Linux, macOS, Windows |
 
-# Build
-cmake --build build
+## Architecture
 
-# Run tests
-ctest --test-dir build
+One `Cache` façade owns the cross-cutting services and a set of volumes. Each
+volume is one file on disk, divided into stripes; each stripe is an
+independent append-only log with its own directory.
 
-# Run benchmarks
-./build/cache_benchmark 100 1000 4096  # 100MB cache, 1000 entries, 4KB each
+```mermaid
+flowchart TD
+    App["Your application"] --> API
+    subgraph API["API"]
+        direction LR
+        CAPI["C ABI · cyclone_c.h"] --> CPP["C++ API · Cache"]
+    end
+    API --> Services
+    subgraph Services["Cache services"]
+        direction LR
+        RAM["RAM tier<br/>CLFUS / LRU, ≤64 segments"] ~~~ PLUG["PluginManager<br/>HTTP Vary, custom selectors"] ~~~ OPT["OptimizationEngine<br/>background alternates"] ~~~ HIT["HitTracker<br/>4096 stripes"] ~~~ SYNC["DirectorySyncer<br/>periodic fsync"]
+    end
+    Services --> Vol
+    subgraph Vol["Volumes · one file each, 64-byte header"]
+        direction LR
+        subgraph S0["Stripe 0"]
+            direction LR
+            D0["Directory<br/>seqlock buckets, 10-byte entries"] ~~~ W0["Data area<br/>circular log of documents"]
+        end
+        S0 ~~~ S1["Stripe 1"] ~~~ SN["Stripe N-1"] ~~~ SM["Volume.small<br/>optional small-object tier"]
+    end
+    Peers["Peer processes<br/>share the file, own stripe % N for writes"] -.-> Vol
+    Vol -->|"mmap / MapViewOfFile"| Disk[("Disk")]
 ```
 
-`CMakePresets.json` provides per-platform presets (run `cmake --list-presets`):
+The read hot path never takes a lock. A hit is a directory probe under a
+seqlock, a few guards, and a span into the mapped file:
 
-```bash
-cmake --preset macos-arm64 && cmake --build --preset macos-arm64 && ctest --preset macos-arm64
+```mermaid
+flowchart LR
+    A["RAM tier<br/>probe"] -->|miss| B["Directory probe<br/>per-bucket seqlock"]
+    B --> C["Guards<br/>position · CRC32 · full key"]
+    C --> D["Borrow region<br/>stamp lease"]
+    D --> G{"Wrap intent or<br/>epoch moved?"}
+    G -->|no| H["Serve<br/>zero-copy span"]
+    G -->|yes| B
+    A -->|hit| H
 ```
 
-Windows/vcpkg presets need `VCPKG_ROOT`; the `*-zig` cross-compile presets
-disable tests, examples, and benchmarks.
+Writers take exactly one stripe lock — the stripe's mutex in `commit_write` —
+and publish a directory entry only after the document bytes are durable, so a
+crash can never leave an entry pointing at torn data. Eviction is O(1):
+when a stripe's log wraps, a single phase bit flips and every entry from the
+previous lap becomes stale. Details, with file:line anchors, live in
+[doc/architecture.md](doc/architecture.md) and
+[doc/multi-process.md](doc/multi-process.md).
 
-### Build Options
+## Why Cyclone
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `CYCLONE_BUILD_TESTS` | ON | Build unit and integration tests |
-| `CYCLONE_BUILD_HTTP_PLUGIN` | ON | Build HTTP alternate selection plugin |
-| `CYCLONE_BUILD_EXAMPLES` | ON | Build example programs |
-| `CYCLONE_BUILD_BENCHMARKS` | ON | Build benchmark programs |
-| `CYCLONE_ENABLE_ASAN` | OFF | Enable AddressSanitizer |
-| `CYCLONE_USE_BUNDLED_SHA256` | OFF | Use bundled SHA-256 instead of OpenSSL — ON in CI for a hermetic build, and required on machines without OpenSSL dev headers |
+- **Lock-free reads that scale.** Readers touch only per-thread sharded
+  state (read anchors, borrow shards, hit counters, RAM-cache segments) —
+  see the [numbers](#cyclone-in-numbers).
+- **Zero-copy.** `ReadHandle::mapped_view()` aliases the mapped file;
+  `content_file_offset()` feeds `sendfile`. A lease/borrow protocol keeps a
+  writer from wrapping over bytes a reader is still holding.
+- **Multi-process by design.** Put the directory in the file
+  (`MultiProcessConfig`), give each process an index, and worker processes
+  share one cache with seqlock + CRC32 torn-read detection — no daemon, no
+  IPC.
+- **Crash-safe by ordering, not by fsync.** Data is durable before the
+  directory entry is published; with the mmap directory the periodic
+  `DirectorySyncer` bounds the loss window, and `sync_on_write` is opt-in.
+- **Scan-resistant RAM tier.** CLFUS (Clock LRU Frequency Size) admits on the
+  second touch and ranks by `(hits + 1) / (size + 256)`, so a crawler pass
+  cannot flush your hot set.
+- **Variants under one key.** Up to 64 alternates per key (Brotli, gzip,
+  WebP, AVIF, JPEG XL, custom IDs) with a built-in RFC 7234 HTTP selector
+  and a background engine that generates alternates after the write.
+- **Small-object tier.** Carve off a percentage of a volume so payload churn
+  can never evict your manifests and metadata.
+- **Portable.** Linux, macOS, Windows; CMake presets for x64/arm64/universal
+  and Zig cross-builds; hermetic build with a bundled SHA-256.
+- **`std::expected` everywhere.** No exceptions; coroutine `Task<T>` API
+  alongside the `_sync` calls.
 
-## Quick Start
+## Quick start
 
 ```cpp
 #include "cyclone/cache.hpp"
 #include "cyclone/key.hpp"
 
+#include <span>
+#include <string>
+
 using namespace cyclone;
 
 int main() {
-    // Create cache with default configuration
-    CacheConfig config;
-    auto cache_result = Cache::create(config);
-    if (!cache_result) {
-        return 1;
-    }
-    auto& cache = *cache_result;
+  CacheConfig config;
+  config.set_ram_cache_size(64_MB);        // 0 disables the RAM tier
 
-    // Add a storage volume
-    VolumeConfig vol_config;
-    vol_config.path = "/var/cache/myapp/cache.dat";
-    vol_config.size = 1024 * 1024 * 1024;  // 1GB
-    cache->add_volume(vol_config);
-    cache->start();
+  auto created = Cache::create(config);
+  if (!created) return 1;
+  Cache& cache = *created.value();
 
-    // Write to cache
-    CacheKey key("http://example.com/page.html");
-    std::string content = "Hello, World!";
-    std::vector<std::byte> data(content.size());
-    std::memcpy(data.data(), content.data(), content.size());
+  // One file, 1 GB; stripes are sized automatically.
+  if (!cache.add_volume("/var/cache/myapp/cache.dat", 1_GB)) return 1;
+  if (!cache.start()) return 1;
 
-    auto write_handle = cache->write_sync(key, data.size());
-    if (write_handle) {
-        write_handle->write_sync(std::span<const std::byte>(data));
-        write_handle->close_sync();
-    }
+  CacheKey key = CacheKey::from_url("https://example.com/page.html");
 
-    // Read from cache
-    auto read_handle = cache->read_sync(key);
-    if (read_handle) {
-        auto cached_content = read_handle->content();
-        // Use cached_content...
-    }
+  std::string body = "Hello, World!";
+  auto bytes = std::as_bytes(std::span{body});
+  if (auto w = cache.write_sync(key, bytes.size())) {
+    w->write_sync(bytes);
+    w->close_sync();                       // publishes the directory entry
+  }
 
-    cache->stop();
-    return 0;
+  if (auto r = cache.read_sync(key)) {
+    std::span<const std::byte> content = r->content();   // zero-copy on a disk hit
+    // ... use content before r goes out of scope
+  }
+
+  cache.stop();                            // close all handles first
 }
 ```
 
-## API Overview
+[examples/basic_usage.cpp](examples/basic_usage.cpp) is the same flow with
+headers, stats, and the coroutine API (`Task<T>::sync_wait()`).
 
-### Cache
+## Building
 
-The main entry point for all cache operations.
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DCYCLONE_USE_BUNDLED_SHA256=ON
+cmake --build build -j
+./build/cyclone-tests                 # run the test binary directly (see note)
+./build/cyclone-tests "[security]"    # one tag; --list-tags shows them all
+```
+
+On Windows the binary is `build\Release\cyclone-tests.exe`.
+
+Run the test binary directly rather than `ctest -j`: the Catch2 cases share a
+fixed on-disk temp path, so parallel test *processes* race on it.
+
+`CMakePresets.json` carries per-platform presets — `linux-x64`,
+`linux-arm64`, `macos-arm64`, `macos-x64`, `macos-universal`, `windows-x64`,
+`windows-arm64` (each with a `-release` variant), `*-zig` cross-compile
+presets, and `dev` / `asan` / `tsan` / `ci-release` for contributors:
+
+```bash
+cmake --preset macos-arm64 && cmake --build --preset macos-arm64
+```
+
+Windows/vcpkg presets need `VCPKG_ROOT`; the `*-zig` presets disable tests,
+examples, and benchmarks.
+
+### Requirements
+
+- CMake 3.20+ and a C++23 compiler (CI builds with each GitHub runner's
+  default toolchain: GCC on Ubuntu, Apple Clang on macOS, MSVC on Windows;
+  LLVM 20 is the formatting/lint toolchain, see [CONTRIBUTING.md](CONTRIBUTING.md))
+- OpenSSL **or** `-DCYCLONE_USE_BUNDLED_SHA256=ON` (hermetic, what CI uses)
+- Catch2 3 for tests (found via `find_package`, else fetched at configure)
+
+### Build options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `CYCLONE_BUILD_TESTS` | ON | Build the `cyclone-tests` Catch2 binary |
+| `CYCLONE_BUILD_HTTP_PLUGIN` | ON | Build the RFC 7234 alternate-selection plugin (defines `CYCLONE_HTTP_PLUGIN` for consumers) |
+| `CYCLONE_BUILD_EXAMPLES` | ON | Build `examples/` |
+| `CYCLONE_BUILD_BENCHMARKS` | ON | Build `cache_benchmark`, `performance_baseline`, `concurrent_read_bench` |
+| `CYCLONE_BUILD_FUZZERS` | OFF | Build the libFuzzer harnesses in `fuzz/` (Clang only) |
+| `CYCLONE_ENABLE_ASAN` | OFF | AddressSanitizer for a quick local check |
+| `CYCLONE_USE_BUNDLED_SHA256` | OFF | Bundled SHA-256 instead of OpenSSL; ON in CI, required where OpenSSL headers are absent |
+
+### Consuming
+
+There is no tagged release yet — pin a commit:
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(cyclone-cache
+  GIT_REPOSITORY https://github.com/We-Amp/cyclone-cache.git
+  GIT_TAG        <commit>)
+set(CYCLONE_BUILD_TESTS OFF)
+set(CYCLONE_USE_BUNDLED_SHA256 ON)
+FetchContent_MakeAvailable(cyclone-cache)
+target_link_libraries(myapp PRIVATE cyclone-cache)
+```
+
+`cmake --install` also exports `cyclone::cyclone-cache` for
+`find_package(cyclone-cache)`.
+
+## KV cache for LLM inference
+
+Cyclone was built as an HTTP object cache, but the primitives it ships are the
+ones an **LLM KV-cache offload / prefix-caching tier** needs: a whole-file
+`MAP_SHARED` mapping, reads that hand back a `std::span` aliasing the page
+cache without copying, several processes sharing one cache file with lock-free
+cross-process reads, and a lease protocol that keeps a borrowed region intact
+while you stream it to the device. Persist the key/value tensors of a prompt
+prefix to node-local NVMe, and the next request that shares the prefix loads
+them instead of recomputing them.
+
+- **Zero-copy loads.** On a disk hit `content()` aliases the mapped volume —
+  acquiring a view costs ~0.4 µs whether the value is 4 KB or 1 MB, and
+  nothing is copied into your address space on the way to the GPU.
+- **Safe aliasing under eviction.** The borrow + lease pins the region while
+  your handle is open; `renew_lease_strict()` and `ns_until_forced_wrap()`
+  tell you exactly when to de-alias.
+- **One cache, many workers.** Tensor-parallel ranks or replicas on one node
+  share a single file: each owns a slice of stripes for writes, all read
+  everything with no locks.
+- **Restart-warm.** With the mmap directory (multi-process mode) the index
+  lives in the file: a worker restart or redeploy does not cold-start the
+  prefix cache.
+- **Variants per prefix.** Up to 64 alternates per key, IDs 128–255 reserved
+  for your own scheme — fp16 / fp8 / int4 copies of the same prefix, chosen
+  at read time.
+- **Bring your own hash.** `CacheKey::from_digest()` takes a raw 32-byte
+  digest, so a rolling hash over token blocks is the key; prefix chaining
+  policy stays in your connector.
+
+```cpp
+// prefix_digest: your 32-byte hash over the token prefix (full or chunked)
+CacheKey key = CacheKey::from_digest(prefix_digest);
+
+if (auto w = cache.write_sync(key, kv_blob.size())) {   // store
+  w->set_header(layout_meta);       // dtype, layers, seq_len, page layout…
+  w->write_sync(kv_blob);
+  w->close_sync();
+}
+
+if (auto r = cache.read_sync(key)) {                    // load, zero-copy
+  std::span<const std::byte> kv = r->content();        // aliases the mmap'd pages
+  copy_to_device(kv.data(), kv.size());                 // while the handle is open
+}
+```
+
+Sizing for KV blobs: raise `max_object_size` (default 64 MB; `0` removes the
+bound; the format tops out just under 4 GiB) and set `stripe_size` larger than
+your largest value — a document must fit in one stripe, and one that cannot is
+refused with `NoSpace`. Set `ram_cache_size = 0`
+and let the OS page cache be the RAM tier; consider
+`verify_checksum_on_read = false` for multi-hundred-MB values, where the CRC
+pass dominates the first read. Cyclone is a node-local tier behind a KV
+connector — it is not a distributed store, has no GPU-direct or RDMA path, and
+ships no Python bindings today. Write bandwidth is ~0.5 GB/s per thread.
+
+## Concepts
+
+**Keys** are SHA-256 digests: `CacheKey{"any string"}`,
+`CacheKey::from_url(url, host)`, or `CacheKey::from_digest(bytes)` when you
+already have a hash. `segment_hash()` picks the stripe, `bucket_hash()` the
+bucket, and a 12-bit `tag()` is what the directory stores — the full key is
+re-verified against the document header on every hit, so a tag collision is a
+clean miss, never a wrong answer.
+
+**Stripes** are the unit of everything: one directory, one circular write log,
+one writer lock, one owner process. A volume gets about `size / 32 MB` stripes
+automatically (rounded, clamped to 1–16); explicit `stripe_size` values are
+floored at 128 MB.
+
+**Persistence.** The data area is always on disk, but the *directory* is
+in-memory unless you enable the mmap directory (`multi_process_config.enabled`,
+usable with a single process too). Without it a cache starts empty on every
+open. With it, the index lives in the file and survives restarts; the
+`DirectorySyncer` (`directory_sync_interval`, default 30 s) bounds what a
+crash can lose — entries published since the last sync, and an in-place
+overwrite that was not yet synced may serve its prior value.
+
+**Object size.** A write above `max_object_size` (default 64 MB, `0` =
+unbounded) fails with `ObjectTooLarge`; a document that cannot fit in one
+stripe's data area, or exceeds the format's ~4 GiB record limit, fails with
+`NoSpace`. Nothing is truncated silently.
+
+**The RAM tier** (CLFUS or LRU, sharded into up to 64 *segments* — RAM-cache
+shards, unrelated to stripes) is populated on the alternate read path for
+objects up to 32 KB. A plain `read_sync` reads from it but never repopulates
+it, and is otherwise served straight from the mapped file — which is what
+every "hit" in the [numbers](#cyclone-in-numbers) measures.
+
+**Eviction is FIFO by wraparound.** When a stripe's write cursor reaches the
+end it wraps, flips the stripe's phase bit, and every entry from the previous
+lap is instantly stale. Nothing is scanned. Pair this with the small-object
+tier when some entries must outlive payload churn.
+
+**Alternates** are variants stored under one key in a singly linked chain:
+`write_alternate_sync(key, AlternateId::Brotli, len)`, then
+`read_alternate_sync(key, selector, ctx)` to pick the best one for a request.
+`AlternateId::Custom` and above are yours.
+
+**Tiers.** `Tier::kSmall` routes an operation to the sidecar `<path>.small`
+volume created by `CacheConfig::small_tier_percent`. The two tiers are separate
+keyspaces and the small tier has no RAM cache. Both volumes need at least one
+128 MB stripe (≈256 MB total single-process, `(N + 1) × 128 MB` with N
+processes); below that the tier is silently disabled — check
+`Cache::small_tier_active()`.
+
+**Read leases.** A disk hit borrows its region and stamps a lease
+(`read_lease_duration`, default 5 s). A writer that needs to wrap over a
+borrowed region defers instead, up to `lease_wrap_ceiling` (60 s) per episode.
+Close handles promptly; renew long holds with `renew_lease_strict()` and poll
+`ns_until_forced_wrap()` when you alias `mapped_view()` for a long time.
+
+**Multi-process.** With `multi_process_config.enabled`, the directory lives in
+the cache file as a shared `MmapDirectory`. Process *i* of *N* writes only the
+stripes where `stripe % N == i` (`CacheError::NotOwned` otherwise) and reads
+all of them; readers detect torn documents by CRC32 and retry. Enable
+`cross_process_ram_coherence` to have a RAM-tier hit re-validated against the
+shared directory's bucket version, so a peer's purge is never served stale.
+The file must live on a filesystem with working byte-range locks (not NFS or
+overlayfs); `CacheStats::volumes_with_degraded_reset_gate` tells you if it
+does not.
+
+## API overview
+
+Everything fallible returns `std::expected<T, CacheError>`; every operation
+takes an optional trailing `Tier` (default `Tier::kDefault`).
 
 ```cpp
 class Cache {
-    // Creation
-    static std::expected<std::unique_ptr<Cache>, CacheError> create(const CacheConfig& config);
+  static std::expected<std::unique_ptr<Cache>, CacheError> create(const CacheConfig&);
 
-    // Volume management
-    std::expected<void, CacheError> add_volume(const VolumeConfig& config);
-    std::expected<void, CacheError> start();
-    void stop();
+  std::expected<void, CacheError> add_volume(const std::string& path, size_t size);
+  std::expected<void, CacheError> add_volume(const VolumeConfig&);
+  std::expected<void, CacheError> start();
+  void stop();
 
-    // Synchronous operations
-    std::expected<ReadHandle, CacheError> read_sync(const CacheKey& key);
-    std::expected<WriteHandle, CacheError> write_sync(const CacheKey& key, uint64_t content_length);
-    std::expected<void, CacheError> remove_sync(const CacheKey& key);
-    std::expected<bool, CacheError> exists_sync(const CacheKey& key);
+  // Synchronous
+  std::expected<ReadHandle,  CacheError> read_sync  (const CacheKey&, Tier = Tier::kDefault);
+  std::expected<WriteHandle, CacheError> write_sync (const CacheKey&, uint64_t content_length, Tier = Tier::kDefault);
+  std::expected<void, CacheError>        remove_sync(const CacheKey&, Tier = Tier::kDefault);
+  std::expected<bool, CacheError>        exists_sync(const CacheKey&, Tier = Tier::kDefault);
 
-    // Asynchronous operations (coroutines)
-    Task<std::expected<ReadHandle, CacheError>> open_read(const CacheKey& key);
-    Task<std::expected<WriteHandle, CacheError>> open_write(const CacheKey& key, uint64_t content_length);
-    Task<std::expected<void, CacheError>> remove(const CacheKey& key);
+  // Coroutines — drive with Task<T>::sync_wait() or your own executor
+  Task<std::expected<ReadHandle,   CacheError>> open_read  (const CacheKey&, Tier = Tier::kDefault);
+  Task<std::expected<WriteHandle,  CacheError>> open_write (const CacheKey&, uint64_t content_length, Tier = Tier::kDefault);
+  Task<std::expected<UpdateHandle, CacheError>> open_update(const CacheKey&);   // in-place header rewrite
+  Task<std::expected<void, CacheError>>         remove     (const CacheKey&, Tier = Tier::kDefault);
+  Task<std::expected<bool, CacheError>>         exists     (const CacheKey&, Tier = Tier::kDefault);
 
-    // Alternate chain operations (for content variants like compressed versions)
-    std::expected<std::vector<AlternateInfo>, CacheError> list_alternates_sync(const CacheKey& key);
-    std::expected<WriteHandle, CacheError> write_alternate_sync(const CacheKey& key, AlternateId id, uint64_t length);
-    std::expected<ReadHandle, CacheError> read_alternate_sync(const CacheKey& key, const StorageAlternateSelector& sel, const AlternateSelectionContext& ctx);
-    std::expected<void, CacheError> remove_alternate_sync(const CacheKey& key, AlternateId id);
+  // Alternates (content variants under one key, max 64)
+  std::expected<std::vector<AlternateInfo>, CacheError> list_alternates_sync(const CacheKey&, Tier = Tier::kDefault);
+  std::expected<WriteHandle, CacheError> write_alternate_sync (const CacheKey&, AlternateId, uint64_t content_length, Tier = Tier::kDefault);
+  std::expected<ReadHandle,  CacheError> read_alternate_sync  (const CacheKey&, const StorageAlternateSelector&, const AlternateSelectionContext&, Tier = Tier::kDefault);
+  std::expected<void, CacheError>        remove_alternate_sync(const CacheKey&, AlternateId, Tier = Tier::kDefault);
 
-    // Statistics
-    CacheStats stats() const;
+  // Introspection
+  CacheStats stats() const;                         // hits, misses, evictions, wrap and lease telemetry, …
+  uint64_t total_capacity() const;  uint64_t bytes_used() const;
+  std::vector<VolumeFileInfo> volume_files() const; // on-disk names are fingerprinted
+  bool small_tier_active() const;
+  bool cross_process_ram_coherence_active() const;
+
+  PluginManager& plugin_manager();
+  OptimizationEngine* optimization_engine();
 };
 ```
-
-### CacheKey
-
-Cache keys are SHA-256 hashes that can be created from strings or URLs.
 
 ```cpp
 class CacheKey {
-    explicit CacheKey(std::string_view s);
-    static CacheKey from_url(std::string_view url, std::string_view hostname = {});
-
-    uint32_t segment_hash() const;  // For stripe selection
-    uint32_t bucket_hash() const;   // For bucket selection
-    uint16_t tag() const;           // 12-bit collision tag
+  static constexpr size_t kDigestSize = 32;                 // SHA-256
+  explicit CacheKey(std::string_view s);
+  explicit CacheKey(std::span<const std::byte> data);
+  static CacheKey from_url(std::string_view url, std::string_view hostname = {});
+  static CacheKey from_digest(std::span<const std::byte, kDigestSize>);
+  static CacheKey from_hex(std::string_view);
+  std::span<const std::byte, kDigestSize> digest() const noexcept;
+  std::string to_hex() const;
+  uint32_t segment_hash() const;  uint32_t bucket_hash() const;  uint16_t tag() const;
 };
 ```
-
-### ReadHandle / WriteHandle
-
-Handles for reading and writing cached content.
 
 ```cpp
 class ReadHandle {
-    std::span<const std::byte> header() const;
-    std::span<const std::byte> content() const;
-    uint64_t content_length() const;
-    bool is_ram_cache_hit() const;
-    std::optional<std::span<const std::byte>> mapped_view() const;
+  std::span<const std::byte> header() const;
+  std::span<const std::byte> content() const;                // aliases the mmap on a disk hit
+  std::optional<std::span<const std::byte>> mapped_view() const;  // whole document; its 132-byte header is volatile
+  uint64_t content_file_offset() const;                      // for sendfile; kNoFileOffset if not eligible
+  uint64_t content_length() const;
+  bool is_ram_cache_hit() const;
+
+  Task<std::expected<size_t, CacheError>> read(std::span<std::byte> buffer);
+  Task<std::expected<std::vector<std::byte>, CacheError>> read_all();
+
+  bool renew_lease();                     // long holds: call at a cadence <= 3/4 of read_lease_duration
+  LeaseRenewal renew_lease_strict();      // kOk | kCopyNow | kTorn | kLeasesOff
+  uint64_t ns_until_forced_wrap() const;  // headroom before a deferred wrap proceeds
+  void close() noexcept;
 };
 
-class WriteHandle {
-    void set_header(std::span<const std::byte> header);
-    std::expected<size_t, CacheError> write_sync(std::span<const std::byte> data);
-    std::expected<void, CacheError> close_sync();
-    void abort();
+class WriteHandle {                        // RAII: an unclosed handle aborts
+  void set_header(std::span<const std::byte>);
+  std::expected<size_t, CacheError> write_sync(std::span<const std::byte>);
+  Task<std::expected<size_t, CacheError>> write(std::span<const std::byte>);
+  std::expected<void, CacheError> close_sync();   // makes the entry visible
+  Task<std::expected<void, CacheError>> close();
+  void abort() noexcept;
 };
 ```
 
-### Configuration
+Destroy every handle before `Cache::stop()`, and do not hold a disk-hit
+`ReadHandle` across writes to the same cache — it pins its stripe against
+wraps.
+
+### Errors
+
+```cpp
+enum class CacheError : std::uint8_t {
+  Success = 0, NotFound, Exists, NoSpace, IoError, Corrupted, InvalidKey,
+  InvalidArgument, NotInitialized, AlreadyOpen, Closed, Busy, Timeout,
+  PluginError, InternalError,
+  TooManyAlternates, AlternateNotFound, ChainCorrupted,   // alternate chains
+  IncompatibleVersion,                                    // on-disk format
+  OptimizationQueueFull, OptimizationCancelled, TransformFailed,
+  NotOwned, InvalidConfiguration,                         // multi-process
+  ResetRefusedLivePeer, ObjectTooLarge
+};
+```
+
+`CacheError` is registered with `std::is_error_code_enum`, so it converts to
+`std::error_code` (`make_error_code(err).message()`).
+
+## Configuration
+
+The fields you will actually set; see
+[include/cyclone/config.hpp](include/cyclone/config.hpp) for the rest.
 
 ```cpp
 struct CacheConfig {
-    size_t ram_cache_size = 256 * 1024 * 1024;  // 256MB default
-    RamCacheType ram_cache_type = RamCacheType::CLFUS;
-    uint32_t small_tier_percent = 0;  // 0 = small-object tier disabled
-
-    // Validate every RAM-cache hit against the shared directory's bucket
-    // version, so a peer process's re-record or purge is not served from
-    // this process's RAM tier.  Per-process declaration, needs no peer
-    // agreement; inert without multi-process mode and a RAM tier.  See
-    // doc/multi-process.md.
-    bool cross_process_ram_coherence = false;
-
-    // Lease-based region pinning (borrow-scoped since the write-starvation fix): a
-    // disk-hit read registers a per-stripe borrow (released when its
-    // ReadHandle closes) and stamps a per-stripe lease of this duration;
-    // a wrap over the borrowed region is deferred (and the fill dropped)
-    // only while a borrow is outstanding AND the lease holds — closing
-    // the handle returns write capacity immediately.  0 disables.
-    // Renew long holds via ReadHandle::renew_lease() at a cadence
-    // <= 3T/4; holds past lease_wrap_ceiling are unprotected.
-    std::chrono::milliseconds read_lease_duration{5000};
-    std::chrono::milliseconds lease_wrap_ceiling{60000};
+  size_t       ram_cache_size = 256_MB;           // 0 = no RAM tier
+  RamCacheType ram_cache_type = RamCacheType::CLFUS;  // or LRU
+  size_t       max_object_size = 64_MB;           // larger writes fail with ObjectTooLarge; 0 = unbounded
+  bool         enable_checksum = true;            // CRC32 per document
+  bool         verify_checksum_on_read = true;    // first read of each offset verifies it
+  uint32_t     small_tier_percent = 0;            // 1..50 enables the small-object tier
+  bool         cross_process_ram_coherence = false;
+  std::chrono::milliseconds directory_sync_interval{30000};  // multi-process durability cadence
+  std::chrono::milliseconds read_lease_duration{5000};       // 0 disables leases
+  std::chrono::milliseconds lease_wrap_ceiling{60000};
+  MultiProcessConfig multi_process_config;        // enabled, process_index, total_processes
+  OptimizationConfig optimization_config;         // background alternate generation
+  // fluent setters: set_ram_cache_size(), set_small_tier_percent(),
+  // set_multi_process(index, total), set_directory_sync_interval(), …
 };
 
 struct VolumeConfig {
-    std::string path;
-    size_t size = 0;  // 0 = use file size
-    size_t stripe_size = 0;  // 0 = auto (32MB granularity, up to 16 stripes);
-                             // explicit values have a 128MB minimum
+  std::string path;
+  size_t size = 0;             // 0 = use the existing file's size
+  size_t stripe_size = 0;      // 0 = auto (32 MB granularity, ≤16 stripes); explicit ≥128 MB
+  bool   sync_on_write = false;
+  bool   auto_reset_on_incompatible = true;   // false ⇒ IncompatibleVersion instead of a reset
 };
 ```
 
-### Small-Object Tier
-
-Cyclone's eviction is FIFO-by-wraparound: when a stripe wraps, everything in
-its previous phase is evicted. Small, long-lived entries (metadata,
-manifests) sharing a volume with large-payload churn are wiped on every wrap.
-The small-object tier gives them a hard physical guarantee instead of a
-policy: a separate small volume that only explicitly tagged operations route
-to, so payload churn *cannot* evict them.
+Multi-process, two workers sharing one file:
 
 ```cpp
 CacheConfig config;
-config.set_small_tier_percent(10);  // carve 10% out of the volume below
-
-auto cache = Cache::create(config);
-cache->add_volume("/var/cache/app.cache", 10_GB);  // default gets 9GB,
-                                                   // small tier gets 1GB at
-                                                   // /var/cache/app.cache.small
-cache->start();
-
-// Tag small-object operations explicitly; untagged calls are unchanged.
-cache->write_sync(key, len, Tier::kSmall);
-cache->read_sync(key, Tier::kSmall);
+config.set_multi_process(/*process_index=*/worker_id, /*total_processes=*/2)
+      .set_cross_process_ram_coherence(true);
 ```
 
-Behavior and sizing rules:
+## Plugins
 
-- `small_tier_percent` is clamped to **[1, 50]**; the carve-out comes off the
-  first added volume's configured size. The small volume lives in a sidecar
-  file at **`<path>.small`** — provision and back it up alongside the main
-  file.
-- The small volume is floored at one **128 MB** stripe (plus header). In
-  multi-process mode the floor grows to **`total_processes` × 128 MB** so
-  every process owns at least one writable small-tier stripe.
-- If the configured total cannot host both tiers' floors, the tier is
-  **silently disabled** — check `cache->small_tier_active()` (C:
-  `cyclone_cache_small_tier_active()`) after `add_volume()` if you require
-  it. As a rule of thumb the total must be at least ~256 MB single-process,
-  `(total_processes + 1)` × 128 MB multi-process.
-- The two tiers are separate keyspaces: the same key names two independent
-  entries, and reads only see the tier they were issued against. When the
-  tier is disabled, `Tier::kSmall` falls back to default routing, so callers
-  may pass the tier unconditionally.
-- Enabling the feature on an existing cache keeps the old volume's data as
-  the default tier; small-tier reads start cold once. (Multi-process caches
-  reset on any geometry change — see [doc/multi-process.md](doc/multi-process.md).)
-- Small-tier reads bypass the RAM cache (served via mmap / OS page cache);
-  hit tracking is also default-tier-only.
-- `total_capacity()` / `bytes_used()` include the carve-out;
-  `cyclone_cache_read_async()` remains default-tier-only.
+A `CachePlugin` can generate keys, choose among alternates, judge freshness,
+and rank eviction. Two rough edges to know about: the HTTP plugin's factory
+and the `OptimizationEngine` class are not yet declared in public headers
+(forward-declare the factory; include `optimization/optimization_engine.hpp`
+from `src/`).
 
-## RAM Cache Algorithms
-
-### CLFUS (Clock LRU Frequency Size)
-
-The default algorithm, designed for scan resistance:
-
-- First access records key in a "seen filter" but doesn't cache
-- Second access admits to cache
-- Eviction uses value function: `(hits + 1) / (size + 256)`
-- History list tracks recently evicted entries for smarter re-admission
-
-### LRU (Least Recently Used)
-
-Simple LRU for predictable behavior:
+The built-in HTTP plugin implements `Vary` matching, `Accept*` quality values,
+and RFC 7234 freshness:
 
 ```cpp
-CacheConfig config;
-config.ram_cache_type = RamCacheType::LRU;
+namespace cyclone { std::shared_ptr<CachePlugin> create_http_alternate_plugin(); }
+
+cache.plugin_manager().set_alternate_selector(cyclone::create_http_alternate_plugin());
 ```
 
-## Plugin System
-
-Cyclone Cache supports plugins for customizing cache behavior.
-
-### Creating a Plugin
+An `OptimizationPlugin` produces new alternates in the background after a
+write — compress with Brotli once a document is hot, transcode an image, and
+so on — on an adaptive thread pool that backs off under system load:
 
 ```cpp
-class MyPlugin : public CachePlugin {
-public:
-    PluginInfo info() const override {
-        return {"my-plugin", "1.0.0", 100};  // name, version, plugin_id
-    }
+class BrotliPlugin : public OptimizationPlugin {
+  PluginInfo info() const override { return {"brotli", "1.0.0", 42}; }
 
-    CacheKey generate_key(const KeyContext& ctx) override {
-        // Custom key generation
-        return CacheKey::from_url(ctx.url, ctx.hostname);
-    }
+  OptimizationPlan plan_optimization(const CacheKey&, std::span<const std::byte> header,
+                                     uint64_t content_length, AlternateId written,
+                                     uint32_t hit_count) override {
+    OptimizationPlan plan;
+    if (written == AlternateId::Original && hit_count >= 5)
+      plan.add(AlternateId::Brotli, /*priority=*/10, /*deferrable=*/true, content_length * 2);
+    return plan;
+  }
 
-    std::optional<size_t> select_variant(
-        const VariantCollection& variants,
-        const LookupContext& ctx) override {
-        // Select best variant for request
-        if (variants.empty()) return std::nullopt;
-        return 0;  // Return first variant
-    }
-
-    FreshnessResult check_freshness(
-        const CacheVariant& variant,
-        const FreshnessContext& ctx) override {
-        // Check if cached entry is still valid
-        return FreshnessResult::Fresh;
-    }
-};
-```
-
-### Registering a Plugin
-
-```cpp
-auto plugin = std::make_shared<MyPlugin>();
-cache->plugin_manager().register_plugin(plugin);
-cache->plugin_manager().set_alternate_selector(plugin);
-```
-
-### HTTP Alternate Plugin
-
-Built-in plugin for HTTP content negotiation:
-
-```cpp
-#ifdef CYCLONE_HTTP_PLUGIN
-// Enable HTTP-aware caching
-auto http_plugin = cyclone::create_http_alternate_plugin();
-cache->plugin_manager().set_alternate_selector(http_plugin);
-#endif
-```
-
-Features:
-- Vary header matching
-- Accept/Accept-Encoding/Accept-Language quality calculation
-- Cache-Control freshness (max-age, must-revalidate)
-- RFC 7234 age calculation
-
-### Background Optimization System
-
-Cyclone Cache includes a background optimization system that allows plugins to automatically
-generate optimized alternates (e.g., Brotli-compressed versions) after content is written.
-
-```cpp
-class MyCompressionPlugin : public OptimizationPlugin {
-public:
-    PluginInfo info() const override {
-        return {"my-compressor", "1.0.0", 42};
-    }
-
-    OptimizationPlan plan_optimization(
-        const CacheKey& key,
-        std::span<const std::byte> header,
-        uint64_t content_length,
-        AlternateId written_alternate,
-        uint32_t hit_count) override
-    {
-        OptimizationPlan plan;
-        // Only optimize original content above a certain hit count
-        if (written_alternate == AlternateId::Original && hit_count >= 5) {
-            plan.add(AlternateId::Brotli, 10, true, content_length * 2);
-        }
-        return plan;
-    }
-
-    std::expected<TransformResult, CacheError> transform(
-        AlternateId target,
-        const OptimizationContext& ctx) override
-    {
-        // Check for cancellation periodically
-        if (ctx.is_cancelled()) {
-            return std::unexpected(CacheError::OptimizationCancelled);
-        }
-
-        // Perform compression...
-        TransformResult result;
-        result.alternate_id = target;
-        result.content = compress(ctx.source_content());
-        return result;
-    }
+  std::expected<TransformResult, CacheError> transform(AlternateId target,
+                                                       const OptimizationContext& ctx) override {
+    if (ctx.is_cancelled()) return std::unexpected(CacheError::OptimizationCancelled);
+    return TransformResult{.content = compress(ctx.source_content()), .alternate_id = target};
+  }
 };
 
-// Register the plugin
-auto plugin = std::make_shared<MyCompressionPlugin>();
-cache->optimization_engine()->register_plugin(plugin);
+config.optimization_config.set_enabled(true).set_max_threads(4)
+      .set_min_hits_before_optimize(5).set_load_high_watermark(0.8);
+cache.optimization_engine()->register_plugin(std::make_shared<BrotliPlugin>());
 ```
 
-Configuration options:
+See [doc/plugin-development.md](doc/plugin-development.md).
 
-```cpp
-CacheConfig config;
-config.optimization_config
-    .set_enabled(true)
-    .set_min_threads(1)
-    .set_max_threads(4)  // 0 = auto (hardware_concurrency / 2)
-    .set_min_hits_before_optimize(5)
-    .set_load_high_watermark(0.8)  // Pause when system load exceeds this
-    .set_load_low_watermark(0.5);  // Resume when load drops below this
-```
+## C ABI
 
-Features:
-- Adaptive thread pool with autoscaling based on queue depth
-- Priority queue with deduplication
-- Load-aware throttling (pauses during high system load)
-- Cancellation support for graceful shutdown
-- Memory usage tracking and limits
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                      Cache API                          │
-├─────────────────────────────────────────────────────────┤
-│                   Plugin Manager                         │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────┐  │
-│  │ Key Gen     │  │ Variant Sel │  │ Freshness Check │  │
-│  └─────────────┘  └─────────────┘  └─────────────────┘  │
-├─────────────────────────────────────────────────────────┤
-│                     RAM Cache                            │
-│  ┌─────────────────────┐  ┌─────────────────────────┐   │
-│  │       CLFUS         │  │         LRU             │   │
-│  └─────────────────────┘  └─────────────────────────┘   │
-├─────────────────────────────────────────────────────────┤
-│                      Volumes                             │
-│  ┌─────────────────────────────────────────────────┐    │
-│  │  Stripe 0   │  Stripe 1   │  Stripe 2   │  ...  │    │
-│  │ ┌─────────┐ │ ┌─────────┐ │ ┌─────────┐ │       │    │
-│  │ │Directory│ │ │Directory│ │ │Directory│ │       │    │
-│  │ └─────────┘ │ └─────────┘ │ └─────────┘ │       │    │
-│  │ ┌─────────┐ │ ┌─────────┐ │ ┌─────────┐ │       │    │
-│  │ │  Data   │ │ │  Data   │ │ │  Data   │ │       │    │
-│  │ └─────────┘ │ └─────────┘ │ └─────────┘ │       │    │
-│  └─────────────────────────────────────────────────┘    │
-├─────────────────────────────────────────────────────────┤
-│                    Mapped File I/O                       │
-│  ┌─────────────────────┐  ┌─────────────────────────┐   │
-│  │   POSIX (mmap)      │  │   Win32 (MapViewOfFile) │   │
-│  └─────────────────────┘  └─────────────────────────┘   │
-└─────────────────────────────────────────────────────────┘
-```
-
-### Directory Entry Layout (10 bytes)
-
-```
-Word 0 (16 bits): offset[0:15]
-Word 1 (16 bits): offset[16:23] | big[2] | size[6]
-Word 2 (16 bits): tag[12] | phase[1] | head[1] | pinned[1] | reserved[1]
-Word 3 (16 bits): next pointer (bucket chain)
-Word 4 (16 bits): offset[24:39]
-```
-
-- 40-bit offset supports up to 512TB per stripe
-- 12-bit tag for collision detection
-- 6-bit size with 2-bit multiplier for approximate sizing
-
-### Document Format (132-byte header, v5)
-
-```
-┌────────────────────────────────────────┐
-│ magic (4) | len (4) | total_len (8)    │
-├────────────────────────────────────────┤
-│ first_key (32 bytes - SHA-256)         │
-├────────────────────────────────────────┤
-│ fragment_key (32 bytes - SHA-256)      │
-├────────────────────────────────────────┤
-│ header_len | type | ver | flags        │
-│ sync_serial | write_serial             │
-│ pin_until | checksum | frag_offset     │
-│ hit_count | next_alternate_offset (8)  │
-│ alternate_id | reserved | last_access  │
-├────────────────────────────────────────┤
-│ Header data (variable)                 │
-├────────────────────────────────────────┤
-│ Content data (variable)                │
-└────────────────────────────────────────┘
-```
-
-## Performance
-
-Benchmark results on Apple M-series (50MB cache, 500 entries, 2KB each):
-
-| Operation | Throughput | Latency |
-|-----------|------------|---------|
-| Key generation (SHA-256) | 2-3M ops/sec | 0.3-0.5 us |
-| Write | 7-10K ops/sec | 92-130 us |
-| Read (sequential) | 60-180K ops/sec | 5-17 us |
-| Read (random) | 80-160K ops/sec | 6-12 us |
-| Exists check | 1.5-4M ops/sec | 0.25-0.7 us |
-| Read miss | 1.5-3M ops/sec | 0.35-0.7 us |
-
-*Ranges reflect variance due to OS page cache effects. Write latency depends on `sync_on_write` configuration.*
-
-## Error Handling
-
-All operations return `std::expected<T, CacheError>`:
-
-```cpp
-enum class CacheError {
-    None,
-    NotFound,
-    AlreadyExists,
-    NotInitialized,
-    AlreadyOpen,
-    Closed,
-    IoError,
-    InvalidArgument,
-    OutOfSpace,
-    Corrupted,
-    InternalError
-};
-```
-
-Example error handling:
-
-```cpp
-auto result = cache->read_sync(key);
-if (!result) {
-    switch (result.error()) {
-        case CacheError::NotFound:
-            // Handle cache miss
-            break;
-        case CacheError::IoError:
-            // Handle I/O error
-            break;
-        default:
-            // Handle other errors
-            break;
-    }
-}
-```
-
-## C API
-
-Cyclone Cache provides a C ABI wrapper for integration with C code or languages with C FFI (Python, Rust, Go, etc.).
-
-### Basic Usage
+`cyclone_c.h` exposes the cache with `extern "C"` linkage for FFI from
+Python, Rust, Go, Nginx modules, and friends, including an async read with a
+miss handler that coalesces concurrent misses for the same key into one
+origin fetch. Two caveats: the header itself currently needs a C++ compiler
+(it uses `using` aliases — bindings that call the ABI directly, such as
+ctypes or cffi, are unaffected), and C reads copy into a handle-owned buffer
+rather than aliasing the mapping.
 
 ```c
 #include "cyclone/cyclone_c.h"
 
-// Create cache
 CycloneCacheConfig config = {
     .cache_path = "/var/cache/myapp.cache",
-    .cache_size_bytes = 100 * 1024 * 1024,  // 100MB
-    .ram_cache_size_bytes = 10 * 1024 * 1024,  // 10MB
+    .cache_size_bytes = 1024ull * 1024 * 1024,
+    .ram_cache_size_bytes = 64ull * 1024 * 1024,   /* 0 = RAM tier off */
     .enable_checksum = 1,
-    .num_segments = 4
-    // NOTE: .small_tier_percent needs a total of ~256MB+ (see "Small-Object
-    // Tier" above) — at this example's 100MB the tier would silently disable;
-    // check cyclone_cache_small_tier_active() after create when using it.
+    .enable_mmap_directory = 1,                    /* share the directory across processes */
 };
+CycloneCacheHandle* cache = NULL;
+if (cyclone_cache_create(&config, &cache) != CYCLONE_OK) return 1;
 
-CycloneCacheHandle *cache = NULL;
-CycloneError err = cyclone_cache_create(&config, &cache);
+cyclone_cache_write(cache, key, key_len, data, data_len);
 
-// Write
-const char *key = "my-key";
-const char *data = "Hello, World!";
-cyclone_cache_write(cache, key, strlen(key), data, strlen(data));
-
-// Read
-CycloneReadHandle *rh = NULL;
-if (cyclone_cache_read(cache, key, strlen(key), &rh) == CYCLONE_OK) {
-    const char *read_data;
-    size_t read_len;
-    cyclone_cache_read_data(rh, &read_data, &read_len);
-    // Use read_data...
-    cyclone_cache_read_close(rh);
+CycloneReadHandle* rh = NULL;
+if (cyclone_cache_read(cache, key, key_len, &rh) == CYCLONE_OK) {
+  const char* p; size_t n;
+  cyclone_cache_read_data(rh, &p, &n);             /* valid until read_close */
+  cyclone_cache_read_close(rh);
 }
 
-// Cleanup
+/* Miss handler: one origin fetch per in-flight key, however many readers pile on. */
+static void on_miss(const char* key, size_t key_len, void* ud,
+                    CycloneMissDoneCallback done, void* done_ud) {
+  /* fetch from origin, then: */ done(done_ud, body, body_len, CYCLONE_OK);
+}
+static void on_read(void* ud, const char* data, size_t len, CycloneError err) {
+  /* runs when the entry is served — from cache or from on_miss */
+}
+cyclone_cache_set_miss_handler(cache, on_miss, NULL);
+cyclone_cache_read_async(cache, key, key_len, on_read, NULL);
+
+cyclone_cache_drain_pending(cache, 5000);          /* before destroy */
 cyclone_cache_destroy(cache);
 ```
 
-### Async Read with Miss Callback (Request Coalescing)
+The full surface (`*_tier` variants, `cyclone_cache_stats`,
+`cyclone_cache_exists`, `cyclone_cache_delete`, small-tier and coherence
+probes) is documented in [include/cyclone/cyclone_c.h](include/cyclone/cyclone_c.h).
 
-The C API supports async reads with a miss callback hook. When multiple concurrent reads request the same missing key, only one fetch is triggered and all waiters receive the result.
+## On-disk format
 
-```c
-// Miss handler - called when cache misses
-void my_miss_handler(const char *key, size_t key_len, void *user_data,
-                     CycloneMissDoneCallback done_cb, void *done_ud) {
-    // Fetch data from origin (e.g., HTTP request)
-    const char *fetched = "fetched data";
-    done_cb(done_ud, fetched, strlen(fetched), CYCLONE_OK);
-}
+Format major **v7**. Each volume file starts with a 64-byte `VolumeHeader`
+(magic `CYLN`, format version, creation time, size); a major-version mismatch
+resets the volume (or fails with `IncompatibleVersion` when
+`auto_reset_on_incompatible = false`), a minor mismatch is compatible. File
+names are fingerprinted with the format version and geometry
+(`cache-7-<hash>.dat`), so an upgrade starts a fresh file and leaves the old
+one on disk until `gc_superseded_on_start` (POSIX only) or you delete it.
 
-// Register handler
-cyclone_cache_set_miss_handler(cache, my_miss_handler, NULL);
+Directory entry — 10 bytes, no key material:
 
-// Async read callback
-void my_read_cb(void *user_data, const char *data, size_t len, CycloneError err) {
-    if (err == CYCLONE_OK) {
-        // Use data...
-    }
-}
-
-// Async read - will call miss handler on cache miss
-cyclone_cache_read_async(cache, key, strlen(key), my_read_cb, NULL);
+```
+w0  offset[0:15]
+w1  offset[16:23] | big[2] | size[6]         approximate size = (size+1) × 512 << big
+w2  tag[12] | phase[1] | head[1] | pinned[1] | reserved[1]
+w3  next                                     bucket chain, 4 entries per bucket
+w4  offset[24:39]                            40-bit byte offset → 1 TiB per stripe
 ```
 
-See `include/cyclone/cyclone_c.h` for the complete C API.
+Document — 132-byte header, then header bytes, then content:
 
-## Thread Safety
+```
+magic · len · total_len
+first_key      (32 B, SHA-256 of the key)
+fragment_key   (32 B)
+header_len · type · version · flags · sync_serial · write_serial
+pin_until · checksum (CRC32) · frag_offset · hit_count
+next_alternate_offset (8 B) · last_access · alternate_id · reserved
+```
 
-- Cache operations are thread-safe
-- **Reads are lock-free**: readers take no stripe lock in any mode. Correctness
-  comes from per-bucket seqlock directories, commit ordering (data durable
-  before the directory entry is published), CRC validation, and lease-based
-  region pinning that keeps a borrowed mmap region from being
-  wrapped out from under a reader
-- Writes take the stripe mutex exclusively in `commit_write` — the only stripe
-  lock in the system
-- RAM cache (CLFUS) is segmented (up to 64 segments) so concurrent readers
-  don't contend on one mutex
+## Performance
 
-See [doc/architecture.md](doc/architecture.md#concurrency-model) and
-[doc/multi-process.md](doc/multi-process.md) for the full model.
+All figures: Apple M5 (10 cores), macOS 27, `-DCMAKE_BUILD_TYPE=Release
+-DCYCLONE_USE_BUNDLED_SHA256=ON`, cache file on the internal SSD, default
+`CacheConfig`. The RAM tier is not populated by `read_sync`, so every "hit"
+below is served from the memory-mapped disk tier.
 
-## Security
+### Single-thread latency, 4 KB objects (`performance_baseline`)
 
-Cyclone Cache includes hardening against malicious or corrupted cache data:
+512 MB volume, 5 000 entries.
 
-- **Bounds checking**: Deserialization validates counts and lengths before allocation
-- **Cycle detection**: Directory chain traversal limited to prevent infinite loops
-- **Overflow protection**: Size calculations checked for integer overflow
-- **RAII cleanup**: WriteHandle destructor aborts incomplete writes
-- **Checksum validation**: Optional CRC32 for content integrity
+| Operation | ops/s | p50 | p99 | p99.9 |
+|-----------|------:|----:|----:|------:|
+| Key generation (SHA-256) | 2.7–4.9 M | 0.2–0.3 µs | 0.5 µs | 0.5 µs |
+| Write, 4 KB | 96 K | 10.1 µs | 14.6 µs | 25 µs |
+| Read, first touch (page-in + CRC32) | 131 K | 7.3 µs | 10.3 µs | 13.8 µs |
+| Read, warm (random) | **2.5 M** | **0.33 µs** | 0.58 µs | 0.75 µs |
+| Exists | 4.4 M | 0.21 µs | 0.29 µs | 0.42 µs |
+| Miss | 3.5 M | 0.29 µs | 0.33 µs | 0.42 µs |
+| Mixed 70 % read / 20 % exists / 10 % write | 1.2 M | 0.38 µs | 3.8 µs | 7.0 µs |
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for security testing guidelines.
+### Object-size sweep (`performance_baseline --content-size …`)
+
+| Object | Write ops/s (MB/s) | First read ops/s (MB/s) | Warm read p50 |
+|-------:|-------------------:|------------------------:|--------------:|
+| 4 KB | 95.7 K (374) | 131 K (512) | 0.33 µs |
+| 64 KB | 8.6 K (534) | 9.1 K (567) | 0.33 µs |
+| 1 MB | 526 (526) | 559 (559) | 0.38 µs |
+
+First reads are bounded by the table-driven CRC32 over the content; a warm
+read re-runs no CRC32 and copies nothing, so its cost does not grow with the
+object.
+
+### Read scaling (`concurrent_read_bench`, 512 B objects, RAM tier off)
+
+| Threads | reads/s | vs 1 thread |
+|--------:|--------:|------------:|
+| 1 | 5.3 M | 1.0× |
+| 2 | 9.4 M | 1.8× |
+| 4 | 17.6 M | 3.3× |
+| 8 | 18.6 M | 3.5× |
+| 16 | 22.1 M | 4.2× |
+
+The M5 has 4 performance and 6 efficiency cores; scaling is near-linear across
+the performance cores and flattens as work lands on efficiency cores.
+
+### Reproducing the numbers
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DCYCLONE_USE_BUNDLED_SHA256=ON && cmake --build build -j
+./build/performance_baseline --cache-size 512  --entries 5000 --content-size 4096
+./build/performance_baseline --cache-size 1024 --entries 2000 --content-size 65536
+./build/performance_baseline --cache-size 2048 --entries 500  --content-size 1048576
+./build/concurrent_read_bench 20000 512 2 0 512 ramoff
+./build/cache_benchmark 512 5000 4096
+```
+
+## Thread safety and concurrency invariants
+
+- Readers take no stripe lock in any mode. Correctness comes from per-bucket
+  seqlocks (readers retry, never block), commit ordering, CRC32, full-key
+  re-verification, a positional guard against phase-bit ABA, and read leases.
+- Writers hold the stripe mutex only inside `commit_write`.
+- Everything a reader touches is sharded per thread: 64 read anchors per
+  volume, 64 borrow shards per stripe, 64 read counters, a 16-shard teardown
+  gate, 4096 hit-tracker stripes, up to 64 CLFUS segments.
+- Multi-process: only the owner writes a stripe; per-write fsync is never
+  forced — durability is the periodic `DirectorySyncer`.
+
+Each invariant is pinned by a test — `tests/integration/test_lockfree_read_races.cpp`,
+`test_power_loss.cpp`, `test_wrap_phase_aba.cpp`, `test_tag_collision.cpp`,
+`tests/unit/multi_process_test.cpp` — and documented in
+[doc/architecture.md](doc/architecture.md#concurrency-model).
+
+## Security and robustness
+
+Cache files are untrusted input. Deserialization validates every count and
+length before allocating (`kMaxSectionCount`, `kMaxSectionSize`), chain
+traversal is depth-bounded (`kMaxChainDepth`, `kMaxChainTraversalDepth`), size
+arithmetic is overflow-checked, and `fuzz/` carries libFuzzer harnesses for
+document parsing, volume open, and the C API (`-DCYCLONE_BUILD_FUZZERS=ON`).
+`asan` and `tsan` presets are in `CMakePresets.json`; point
+`LSAN_OPTIONS`/`TSAN_OPTIONS` at the suppressions in `tools/` when running
+them. See [SECURITY.md](SECURITY.md) for
+reporting.
 
 ## Documentation
 
-- [Architecture Guide](doc/architecture.md) - Internal design and data structures
-- [API Reference](doc/api-reference.md) - Complete API documentation
-- [Plugin Development](doc/plugin-development.md) - Creating custom plugins
-- [Contributing](CONTRIBUTING.md) - Development guidelines
+- [doc/architecture.md](doc/architecture.md) — internals, glossary, concurrency model
+- [doc/multi-process.md](doc/multi-process.md) — the cross-process model in depth
+- [doc/api-reference.md](doc/api-reference.md) — complete API reference
+- [doc/plugin-development.md](doc/plugin-development.md) — writing plugins
+- [CONTRIBUTING.md](CONTRIBUTING.md) — toolchain, formatting gate, sanitizers
+- [CHANGELOG.md](CHANGELOG.md)
 
 ## License
 
-Licensed under the Apache License 2.0. See [LICENSE](LICENSE) for details.
+Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
-## Acknowledgments
-
-Inspired by [Apache Traffic Server](https://trafficserver.apache.org/)'s cache implementation, particularly:
-- 10-byte directory entry format
-- CLFUS scan-resistant algorithm
+Cyclone's on-disk layout, 10-byte directory entry, and CLFUS algorithm follow
+the design of the [Apache Traffic Server](https://trafficserver.apache.org/)
+cache.
