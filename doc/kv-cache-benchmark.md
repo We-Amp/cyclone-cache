@@ -186,7 +186,18 @@ document builder → serialized record) and CRCs it before a single
    advise `WILLNEED`/`SEQUENTIAL` per large read (`MappedFile` has the
    hooks, unused). Unproven here; measure on Linux with a quiesced page
    cache before and after.
-4. Only then: a zero-copy C read entry point and a Python binding, which is
+4. **Make the zero-copy read pay off end to end.** `view` mode shows the
+   zero-copy path itself is the cheapest per-get of any store here (≈1.5 µs
+   for a 2 MiB block, LMDB the only peer in the same class), but a KV
+   connector only benefits if the device transfer can source from the
+   mapping: register the mapped pages (`cudaHostRegister`, Metal
+   `newBufferWithBytesNoCopy`) instead of staging through a pinned buffer,
+   or go further and feed `ReadHandle::content_file_offset()` — the
+   existing sendfile hook — to GPUDirect Storage (`cuFileRead`) so a block
+   moves NVMe→GPU with no host copy at all. Both need a device-side
+   benchmark (Metal on Apple silicon first, CUDA/GDS on Linux) before the
+   claim is made.
+5. Only then: a zero-copy C read entry point and a Python binding, which is
    what a vLLM/SGLang connector would call.
 
 ### Corrections to the first run
