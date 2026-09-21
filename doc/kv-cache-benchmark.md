@@ -207,6 +207,33 @@ document builder → serialized record) and CRCs it before a single
 5. Only then: a zero-copy C read entry point and a Python binding, which is
    what a vLLM/SGLang connector would call.
 
+### Corrections to the first run
+
+Two methodology faults were found in the first sweep by review and
+retraction is the honest fix:
+
+- The peer harness wiped each block size's data only *before* that size
+  ran, so 2–6 GiB of earlier sizes stayed resident and squeezed the 16 GiB
+  page cache during the larger-block runs; `kv_bench` deletes its volume
+  per size, so Cyclone never paid that. Peer warm reads were depressed up to
+  100× (LMDB `view` 4 k → 513 k gets/s) and the first draft claimed a 5–20×
+  Cyclone read advantage that does not exist. Fixed in the harness; every
+  number above is from the corrected sweep.
+- The first headline table put a `view`-mode multi-process row under
+  `copy`-mode rows, inflating the multi-process story ~10×. Phase 5 now
+  runs both modes and only `copy` is compared.
+
+### Caveats
+
+- One laptop, one SSD, APFS, 16 GiB RAM, 10 s per point, single run. Treat
+  differences under ~20 % as noise; the multi-× differences are not.
+- The peers measure a `std::string` allocation and a SHA-256 inside their
+  warm-phase sample (≈1 µs); Cyclone hashes outside it. Irrelevant at
+  100 µs+ latencies, slightly flatters Cyclone at the µs scale.
+- No Linux/NVMe numbers yet; that is the deployment target and the next
+  run, ideally with `echo 3 > drop_caches` between phases so first-touch
+  becomes a real measurement.
+
 ## Device transfer: does zero-copy pay off? (Metal, Apple silicon)
 
 Item 4 above asks whether the zero-copy read pays off *end to end* — a KV
@@ -355,33 +382,6 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DCYCLONE_USE_BUNDLED_SHA256=ON
 cmake --build build -j
 ./build/kv_gpu_metal --block-size 2097152 --seconds 10
 ```
-
-### Corrections to the first run
-
-Two methodology faults were found in the first sweep by review and
-retraction is the honest fix:
-
-- The peer harness wiped each block size's data only *before* that size
-  ran, so 2–6 GiB of earlier sizes stayed resident and squeezed the 16 GiB
-  page cache during the larger-block runs; `kv_bench` deletes its volume
-  per size, so Cyclone never paid that. Peer warm reads were depressed up to
-  100× (LMDB `view` 4 k → 513 k gets/s) and the first draft claimed a 5–20×
-  Cyclone read advantage that does not exist. Fixed in the harness; every
-  number above is from the corrected sweep.
-- The first headline table put a `view`-mode multi-process row under
-  `copy`-mode rows, inflating the multi-process story ~10×. Phase 5 now
-  runs both modes and only `copy` is compared.
-
-### Caveats
-
-- One laptop, one SSD, APFS, 16 GiB RAM, 10 s per point, single run. Treat
-  differences under ~20 % as noise; the multi-× differences are not.
-- The peers measure a `std::string` allocation and a SHA-256 inside their
-  warm-phase sample (≈1 µs); Cyclone hashes outside it. Irrelevant at
-  100 µs+ latencies, slightly flatters Cyclone at the µs scale.
-- No Linux/NVMe numbers yet; that is the deployment target and the next
-  run, ideally with `echo 3 > drop_caches` between phases so first-touch
-  becomes a real measurement.
 
 ## Reproducing
 
