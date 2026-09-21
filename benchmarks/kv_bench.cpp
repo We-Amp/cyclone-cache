@@ -94,6 +94,7 @@
 #include "cyclone/config.hpp"
 #include "cyclone/error.hpp"
 #include "cyclone/key.hpp"
+#include "kv_workload.hpp"
 
 #ifndef _WIN32
 #include <sys/types.h>
@@ -102,18 +103,14 @@
 #endif
 
 using namespace cyclone;
+using namespace cyclone::kv_workload;
 
 namespace {
 
 constexpr const char *kStoreName = "cyclone";
 constexpr const char *kStoreVersion = "0.1.0";
 
-constexpr size_t kPageSize = 4096;
-constexpr size_t kMetaSize = 64;  // spec: 64-byte header = the digest twice
 constexpr size_t kCapacityBytes = size_t{8} * 1024 * 1024 * 1024;  // 8 GiB
-constexpr size_t kDatasetBudget = size_t{4} * 1024 * 1024 * 1024;  // 4 GiB
-constexpr size_t kMaxBlocks = 4096;
-constexpr double kZipfTheta = 0.99;
 constexpr double kWarmupSeconds = 2.0;
 constexpr uint32_t kReaderProcesses = 4;
 constexpr const char *kVolumeStem = "cyclone_kv_bench";
@@ -122,118 +119,8 @@ constexpr const char *kVolumeStem = "cyclone_kv_bench";
 std::atomic<uint64_t> g_sink{0};
 
 // ---------------------------------------------------------------------------
-// Value generator: xorshift64* seeded with the block index (spec).
-//
-// SPEC RESOLUTION: "seed = i" is degenerate for i = 0 (xorshift64* is stuck at
-// zero), so a zero seed -- and only a zero seed -- is replaced by the golden
-// ratio constant below.  Every other block is exactly "seed = i".
-// ---------------------------------------------------------------------------
-constexpr uint64_t kZeroSeedSubstitute = 0x9E3779B97F4A7C15ULL;
-
-inline uint64_t xorshift64star(uint64_t &state) {
-  state ^= state >> 12;
-  state ^= state << 25;
-  state ^= state >> 27;
-  return state * 0x2545F4914F6CD1DBULL;
-}
-
-inline uint64_t seed_state(uint64_t seed) {
-  return seed == 0 ? kZeroSeedSubstitute : seed;
-}
-
-void fill_block(std::span<std::byte> out, uint64_t seed) {
-  uint64_t state = seed_state(seed);
-  size_t off = 0;
-  while (off + sizeof(uint64_t) <= out.size()) {
-    const uint64_t word = xorshift64star(state);
-    std::memcpy(out.data() + off, &word, sizeof(word));
-    off += sizeof(word);
-  }
-  if (off < out.size()) {
-    const uint64_t word = xorshift64star(state);
-    std::memcpy(out.data() + off, &word, out.size() - off);
-  }
-}
-
-// First 8 bytes of block `seed`, for a cheap content spot-check.
-uint64_t first_word_of_block(uint64_t seed) {
-  uint64_t state = seed_state(seed);
-  return xorshift64star(state);
-}
-
-// ---------------------------------------------------------------------------
-// Zipf generator: Gray et al. (as used by YCSB), theta = 0.99.
-// The uniform source is the same xorshift64* engine (seed = 42 + thread id) so
-// a peer harness can reproduce the exact access sequence.
-// ---------------------------------------------------------------------------
-class ZipfGenerator {
- public:
-  ZipfGenerator(size_t n, double theta, uint64_t seed)
-      : _n(n), _theta(theta), _state(seed_state(seed)) {
-    _zetan = zeta(n, theta);
-    const double zeta2 = zeta(2, theta);
-    _alpha = 1.0 / (1.0 - theta);
-    _eta = (1.0 - std::pow(2.0 / static_cast<double>(n), 1.0 - theta)) /
-           (1.0 - zeta2 / _zetan);
-  }
-
-  size_t next() {
-    const double u = uniform();
-    const double uz = u * _zetan;
-    if (uz < 1.0) return 0;
-    if (uz < 1.0 + std::pow(0.5, _theta)) return 1;
-    const auto idx = static_cast<size_t>(
-        static_cast<double>(_n) * std::pow(_eta * u - _eta + 1.0, _alpha));
-    return idx < _n ? idx : _n - 1;
-  }
-
- private:
-  static double zeta(size_t n, double theta) {
-    double sum = 0.0;
-    for (size_t i = 1; i <= n; ++i) {
-      sum += 1.0 / std::pow(static_cast<double>(i), theta);
-    }
-    return sum;
-  }
-
-  double uniform() {
-    // 53 random bits mapped into [0, 1).
-    return static_cast<double>(xorshift64star(_state) >> 11) *
-           (1.0 / 9007199254740992.0);
-  }
-
-  size_t _n;
-  double _theta;
-  uint64_t _state;
-  double _zetan = 0.0;
-  double _alpha = 0.0;
-  double _eta = 0.0;
-};
-
-// ---------------------------------------------------------------------------
 // Measurement bookkeeping
 // ---------------------------------------------------------------------------
-struct Percentiles {
-  double p50 = 0.0;
-  double p99 = 0.0;
-  double p999 = 0.0;
-};
-
-Percentiles compute_percentiles(std::vector<double> &latencies_us) {
-  Percentiles p;
-  if (latencies_us.empty()) return p;
-  std::sort(latencies_us.begin(), latencies_us.end());
-  auto pick = [&](double q) {
-    const auto idx =
-        static_cast<size_t>(q * static_cast<double>(latencies_us.size() - 1));
-    return latencies_us[idx];
-  };
-  p.p50 = pick(0.50);
-  p.p99 = pick(0.99);
-  p.p999 = pick(0.999);
-  return p;
-}
-
 struct Record {
   std::string phase;
   std::string mode;  // empty => omitted
@@ -407,10 +294,6 @@ void drop_caches(const Options &opts) {
     std::cerr << "        drop-caches command returned " << rc << "\n";
 }
 
-size_t dataset_blocks(size_t block_size) {
-  return std::min(kMaxBlocks, kDatasetBudget / block_size);
-}
-
 // A document must fit one stripe's DATA AREA, and keys hash-route to stripes,
 // so a stripe also has to absorb the hash-bin variance of the dataset without
 // wrapping (a wrap is an eviction, and phases 1-3 must not evict).  The auto
@@ -500,22 +383,6 @@ std::unique_ptr<Cache> open_store(const Options &opts, size_t block_size) {
 // ---------------------------------------------------------------------------
 // Read work
 // ---------------------------------------------------------------------------
-uint64_t touch_pages(std::span<const std::byte> data) {
-  uint64_t sink = 0;
-  for (size_t off = 0; off < data.size(); off += kPageSize) {
-    sink += static_cast<uint64_t>(std::to_integer<uint8_t>(data[off]));
-  }
-  return sink;
-}
-
-uint64_t copy_out(std::span<const std::byte> data,
-                  std::vector<std::byte> &buffer) {
-  const size_t len = std::min(data.size(), buffer.size());
-  std::memcpy(buffer.data(), data.data(), len);
-  return len == 0 ? 0
-                  : static_cast<uint64_t>(std::to_integer<uint8_t>(buffer[0]));
-}
-
 struct RunResult {
   uint64_t ops = 0;
   uint64_t misses = 0;
@@ -586,28 +453,6 @@ RunResult run_zipf_reader(Cache &cache, const std::vector<CacheKey> &keys,
 // ---------------------------------------------------------------------------
 // Phases
 // ---------------------------------------------------------------------------
-struct Dataset {
-  std::vector<CacheKey> keys;
-  std::vector<std::array<std::byte, kMetaSize>> metadata;
-};
-
-// Key = SHA-256("prefix-<i>").  CacheKey's string constructor IS that SHA-256,
-// so the digest it produces is byte-identical to what a peer harness hashes;
-// it is routed through from_digest() to make the contract explicit.
-Dataset build_dataset(size_t n) {
-  Dataset ds;
-  ds.keys.reserve(n);
-  ds.metadata.resize(n);
-  for (size_t i = 0; i < n; ++i) {
-    const CacheKey hashed("prefix-" + std::to_string(i));
-    const auto digest = hashed.digest();
-    ds.keys.push_back(CacheKey::from_digest(digest));
-    std::memcpy(ds.metadata[i].data(), digest.data(), CacheKey::kDigestSize);
-    std::memcpy(ds.metadata[i].data() + CacheKey::kDigestSize, digest.data(),
-                CacheKey::kDigestSize);
-  }
-  return ds;
-}
 
 // Reference vectors shared with the peer harness (its README carries the
 // same table), so two implementations of the spec can prove they generate

@@ -190,15 +190,171 @@ document builder → serialized record) and CRCs it before a single
    zero-copy path itself is the cheapest per-get of any store here (≈1.5 µs
    for a 2 MiB block, LMDB the only peer in the same class), but a KV
    connector only benefits if the device transfer can source from the
-   mapping: register the mapped pages (`cudaHostRegister`, Metal
-   `newBufferWithBytesNoCopy`) instead of staging through a pinned buffer,
-   or go further and feed `ReadHandle::content_file_offset()` — the
-   existing sendfile hook — to GPUDirect Storage (`cuFileRead`) so a block
-   moves NVMe→GPU with no host copy at all. Both need a device-side
-   benchmark (Metal on Apple silicon first, CUDA/GDS on Linux) before the
-   claim is made.
+   mapping. **Measured on Apple silicon** (see "Device transfer" below):
+   Metal wraps Cyclone's file-backed `MAP_SHARED` mapping with
+   `newBufferWithBytesNoCopy` without copying it, and wrapping the volume
+   mapping **once** — each read then being an offset into it — runs
+   **1.9× faster than staging** through a pinned buffer (44.4 vs 23.6 GB/s,
+   batched), while wrapping per block is a wash. The API needed for the
+   winning form already exists (`content()`,
+   `ReadHandle::content_file_offset()`, `Cache::volume_files()`); what is
+   missing is an entry point that hands an embedder the mapping identity
+   directly instead of making it reconstruct one. Still open: the Linux
+   half — `cudaHostRegister` on the mapped pages, and feeding
+   `content_file_offset()` — the existing sendfile hook — to GPUDirect
+   Storage (`cuFileRead`) so a block moves NVMe→GPU with no host copy at
+   all. That claim still needs a CUDA/GDS benchmark.
 5. Only then: a zero-copy C read entry point and a Python binding, which is
    what a vLLM/SGLang connector would call.
+
+## Device transfer: does zero-copy pay off? (Metal, Apple silicon)
+
+Item 4 above asks whether the zero-copy read pays off *end to end* — a KV
+connector only benefits if the device transfer can source from the mapping
+instead of staging through a pinned buffer. `benchmarks/kv_gpu_metal.mm`
+answers the Apple half of that question with a measurement. For a block that
+is already in the store, it times how fast it reaches GPU-private memory
+(`MTLStorageModePrivate`) along five paths — a per-block
+`newBufferWithBytesNoCopy` wrap (`zerocopy`), a single wrap of the store's
+whole mapping blitted by offset (`zerocopy-persistent`), a `memcpy` into a
+persistent shared buffer then a blit (`staged`), the copy alone (`memcpy`),
+and two fixed-cost probes (an empty command buffer, and a 4 KiB blit).
+Batched variants put 16 blocks in one command buffer and report per-block
+amortized. The same three stores are compared, and the blocks come from
+`benchmarks/kv_workload.hpp`, so they are bit-identical to `kv_bench`'s.
+
+### Acceptance: Metal wraps a file-backed `MAP_SHARED` mapping, no copy
+
+This was the open question, and the answer is yes — no fallback was needed.
+Every surface was accepted, `buffer.contents` came back **equal to the
+mapping base** (so Metal is aliasing the pages, not copying them), and every
+blit finished `MTLCommandBufferStatusCompleted`:
+
+```
+mmap(MAP_SHARED, PROT_READ|PROT_WRITE) : accepted; contents == mapping base
+mmap(MAP_SHARED, PROT_READ)            : accepted; contents == mapping base
+A1 content() page-aligned range        : accepted; contents == mapping base
+A2 mapped_view() page-aligned range    : accepted; contents == mapping base
+A3 own mmap at content_file_offset()   : accepted; contents == mapping base
+```
+
+A read-**only** (`PROT_READ`) file mapping is accepted too, which is not
+obvious — `MTLResourceStorageModeShared` is nominally CPU-writable. So A2 and
+A3 were never needed; they stay in the benchmark as a regression check,
+because acceptance is a macOS/driver property that could change.
+
+Two mechanics matter. The wrapped pointer must be page-aligned, and on Apple
+silicon a page is **16 KiB**, not 4 KiB (the benchmark takes it from
+`getpagesize()`). And `content()` starts 4356 bytes into a page — it sits
+behind the 132-byte document header inside the volume — so the wrap is taken
+at the page-aligned address below it and the blit uses
+`sourceOffset: content - pagebase`, which is 4-byte aligned as the blit
+encoder requires.
+
+### Results, 2 MiB blocks
+
+Apple M5 (10 core), 16 GiB, macOS 27.0 (26A428), Metal device "Apple M5",
+unified memory, `maxBufferLength` 8.9 GiB, page size 16384. N = 512, 10 s per
+path, otherwise-idle machine. Raw lines:
+[`metal-gpu-2mib.jsonl`](kv-cache-benchmark/metal-gpu-2mib.jsonl).
+
+| store | path | batch | blocks/s | GB/s | p50 µs | p99 µs | correct |
+|---|---|---:|---:|---:|---:|---:|---|
+| metal | submit-only-0B | 1 | 72252 | 0.00 | 13.8 | 19.0 | ok |
+| metal | blit-4KiB | 1 | 6433 | 0.03 | 173.7 | 227.3 | ok |
+| cyclone | zerocopy | 1 | 4457 | 9.35 | 217.6 | 266.0 | ok |
+| cyclone | zerocopy-persistent | 1 | 4548 | 9.54 | 214.4 | 251.9 | ok |
+| cyclone | staged | 1 | 4940 | 10.36 | 203.5 | 239.8 | ok |
+| cyclone | memcpy | 1 | 33595 | 70.45 | 29.2 | 37.2 | ok |
+| cyclone | zerocopy | 16 | 13688 | 28.71 | 70.3 | 109.6 | ok |
+| **cyclone** | **zerocopy-persistent** | **16** | **21171** | **44.40** | **46.3** | **87.0** | **ok** |
+| cyclone | staged | 16 | 11247 | 23.59 | 87.8 | 123.8 | ok |
+| lmdb | zerocopy | 1 | 4726 | 9.91 | 206.8 | 332.9 | ok |
+| lmdb | zerocopy-persistent | 1 | 4568 | 9.58 | 213.9 | 252.0 | ok |
+| lmdb | staged | 1 | 4928 | 10.33 | 203.6 | 286.3 | ok |
+| lmdb | memcpy | 1 | 33768 | 70.82 | 29.4 | 35.8 | ok |
+| lmdb | zerocopy | 16 | 8680 | 18.20 | 114.7 | 162.1 | ok |
+| lmdb | zerocopy-persistent | 16 | 20510 | 43.01 | 47.7 | 92.1 | ok |
+| lmdb | staged | 16 | 11317 | 23.73 | 87.1 | 123.6 | ok |
+| filedir-pread | staged | 1 | 3443 | 7.22 | 289.3 | 412.7 | ok |
+| filedir-pread | memcpy | 1 | 10353 | 21.71 | 97.6 | 124.9 | ok |
+| filedir-pread | staged | 16 | 5098 | 10.69 | 198.0 | 238.7 | ok |
+
+### What it says
+
+**1. A single-block GPU transfer is entirely submission-bound — so batch.**
+An empty command buffer costs 13.8 µs p50 to commit and wait; a command
+buffer with a blit encoder moving **4 KiB** costs 173.7 µs. That ~160 µs is
+the blit-encoder round trip and is independent of the byte count: a 2 MiB
+single-block transfer is 203–218 µs, barely more than the 4 KiB one. At
+batch 1 nothing else is visible — zero-copy, staged and persistent-wrap all
+land between 203 and 218 µs, inside the noise of Metal submission. Saving a
+29 µs memcpy is irrelevant when the submission costs 170 µs. Anyone doing
+one-block-per-command-buffer transfers is measuring Metal, not their storage
+tier.
+
+**2. Wrapping per block is a wash.** Batched 16-per-command-buffer, the
+per-block `newBufferWithBytesNoCopy` path is a win for Cyclone (28.7 vs
+23.6 GB/s staged) and a *loss* for LMDB (18.2 vs 23.7). Making a 2 MiB range
+GPU-addressable costs roughly what memcpying it costs, and the cost is
+variable — it depends on how the driver finds and wires the underlying
+pages, which is why two stores making identical Metal calls disagree.
+Wrapping a borrowed span per read is not where zero-copy pays off.
+
+**3. Wrapping the mapping *once* is — 1.9×.** Both zero-copy stores keep
+every block inside one `MAP_SHARED` region (Cyclone in the volume file
+mapping, 7.56 GiB of it wrapped here; LMDB in its map, 1.01 GiB). Wrap that
+region once into a single `MTLBuffer` and each block becomes a
+`sourceOffset` into it. At batch 16 Cyclone reaches **44.40 GB/s**, p50
+**46.3 µs**/block, against 23.59 GB/s staged — **1.88× throughput, 1.9×
+lower latency**. LMDB gets 43.01 GB/s, the same 1.8×. `filedir-pread`, which
+has no borrowed-buffer API at all, reaches only 10.69 GB/s — **4.2×
+behind**. That is the real answer: Cyclone's zero-copy read pays off for GPU
+transfer, but in the form "the cache file is one persistent GPU-visible
+mapping and a read hands you an offset into it", not "wrap whatever span the
+read returned". The `ReadHandle` API already supports the useful form —
+`content()` gives the pointer, `content_file_offset()` the offset, and
+`Cache::volume_files()` the file — so an embedder can build the persistent
+wrapper itself. Note `maxBufferLength` is 8.9 GiB here: an 8 GiB volume fits
+one wrapper, a larger cache needs the mapping split into several wrapped
+windows.
+
+### Caveat: unified memory
+
+`MTLStorageModePrivate` on Apple silicon is **still system DRAM**. It is not
+a discrete VRAM aperture and there is no PCIe bus in the path. What is
+measured is a real DMA-engine copy between two regions of the same physical
+memory, plus the driver work to make the source range GPU-addressable —
+which is exactly the cost `newBufferWithBytesNoCopy` pays per block on the
+`zerocopy` path and once on `zerocopy-persistent`. That is the honest cost of
+"get these bytes into a resource the GPU owns and the CPU cannot touch",
+which is what an offload tier must do before a kernel reads them. It is
+**not** a host-to-device upload measurement and must not be compared to a
+discrete-GPU PCIe figure. On a discrete GPU the staged path would
+additionally pay a real bus transfer, widening the gap in favour of any path
+that avoids a host copy — so the 1.9× here is the conservative end. In the
+other direction: because memory is unified, an application that can let the
+GPU read the cache pages *in place* (a shared-storage-mode buffer used
+directly by the kernel, no blit at all) skips this measurement entirely. The
+benchmark deliberately measures the transfer-to-private case, because that is
+what a consumer wanting an isolated, GPU-owned copy has to do.
+
+One deviation from the rest of this document: LMDB is opened with
+`MDB_NOTLS` here. Without it LMDB pins a read-only transaction to a thread
+slot and a batch of 16 simultaneous borrows from one thread cannot be opened
+at all. It changes reader-slot bookkeeping only, not durability.
+
+### Running it
+
+The target is Apple-only and built by the ordinary benchmark configure;
+LMDB is optional (without it the `lmdb` rows are absent and the header
+prints `lmdb: not built`).
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DCYCLONE_USE_BUNDLED_SHA256=ON
+cmake --build build -j
+./build/kv_gpu_metal --block-size 2097152 --seconds 10
+```
 
 ### Corrections to the first run
 

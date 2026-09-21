@@ -231,6 +231,48 @@ if(CYCLONE_BUILD_BENCHMARKS)
 
   add_executable(kv_bench benchmarks/kv_bench.cpp)
   target_link_libraries(kv_bench PRIVATE cyclone-cache)
+
+  # Apple-only: the Metal GPU-transfer experiment (ObjC++).  EVERYTHING it
+  # needs -- including enable_language(OBJCXX), which would otherwise probe for
+  # an Objective-C++ compiler on every platform -- lives inside this guard, so
+  # Linux and Windows configures are bit-for-bit unaffected.
+  if(APPLE)
+    enable_language(OBJCXX)
+    find_library(METAL_FRAMEWORK Metal)
+    find_library(FOUNDATION_FRAMEWORK Foundation)
+    if(METAL_FRAMEWORK AND FOUNDATION_FRAMEWORK)
+      add_executable(kv_gpu_metal benchmarks/kv_gpu_metal.mm)
+      set_target_properties(kv_gpu_metal PROPERTIES
+        OBJCXX_STANDARD 23
+        OBJCXX_STANDARD_REQUIRED ON)
+      target_compile_options(kv_gpu_metal PRIVATE -fobjc-arc)
+      target_link_libraries(kv_gpu_metal PRIVATE
+        cyclone-cache
+        ${METAL_FRAMEWORK}
+        ${FOUNDATION_FRAMEWORK})
+
+      # LMDB is the optional second zero-copy store to compare against; the
+      # benchmark prints "lmdb: not built" and skips those rows without it.
+      find_path(LMDB_INCLUDE_DIR lmdb.h
+        HINTS /opt/homebrew/opt/lmdb/include /usr/local/opt/lmdb/include)
+      find_library(LMDB_LIBRARY NAMES lmdb
+        HINTS /opt/homebrew/opt/lmdb/lib /usr/local/opt/lmdb/lib)
+      if(LMDB_INCLUDE_DIR AND LMDB_LIBRARY)
+        message(STATUS "kv_gpu_metal: LMDB ${LMDB_LIBRARY}")
+        target_compile_definitions(kv_gpu_metal PRIVATE
+          CYCLONE_KV_GPU_HAVE_LMDB)
+        target_include_directories(kv_gpu_metal SYSTEM PRIVATE
+          ${LMDB_INCLUDE_DIR})
+        target_link_libraries(kv_gpu_metal PRIVATE ${LMDB_LIBRARY})
+      else()
+        message(STATUS
+          "kv_gpu_metal: LMDB not found - the lmdb comparison rows are absent")
+      endif()
+    else()
+      message(STATUS
+        "kv_gpu_metal: Metal/Foundation not found - target not built")
+    endif()
+  endif()
 endif()
 
 if(CYCLONE_BUILD_FUZZERS)
