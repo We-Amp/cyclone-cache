@@ -252,7 +252,13 @@ MachineInfo collect_machine_info(const std::string &dir) {
       "awk -F: '/model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null");
   info.cores = run_command("nproc 2>/dev/null");
   info.os = run_command("uname -sr");
-  info.filesystem = run_command("stat -f -c %T '" + dir + "' 2>/dev/null");
+  // findmnt names ext4 correctly; stat -f cannot tell ext2/3/4 apart
+  // (they share a superblock magic).
+  info.filesystem =
+      run_command("findmnt -n -o FSTYPE --target '" + dir + "' 2>/dev/null");
+  if (info.filesystem == "unknown" || info.filesystem.empty()) {
+    info.filesystem = run_command("stat -f -c %T '" + dir + "' 2>/dev/null");
+  }
 #endif
   info.commit = run_command("git rev-parse --short HEAD 2>/dev/null");
   if (info.cores == "unknown") {
@@ -765,6 +771,9 @@ bool run_multiprocess(const Options &opts, const Dataset &ds, size_t block_size,
   out->processes = reported;
   out->ops_per_s = static_cast<double>(ops) / span;
   out->gb_per_s = gb_per_s(bytes, span);
+  out->hit_fraction = (ops + misses) > 0 ? static_cast<double>(ops) /
+                                               static_cast<double>(ops + misses)
+                                         : 0.0;
   return true;
 }
 #endif  // !_WIN32
