@@ -76,6 +76,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -391,7 +392,20 @@ struct Options {
   bool skip_multiprocess = false;
   std::string output;
   std::string path;
+  std::string drop_caches_cmd;  // run before phases 2 and 4 (e.g. Linux
+                                // "sync; echo 3 > /proc/sys/vm/drop_caches")
 };
+
+// Optional page-cache drop between phases so first-touch and restart read
+// from the device instead of the page cache.  Needs privileges the harness
+// does not have itself; the command is the operator's.
+void drop_caches(const Options &opts) {
+  if (opts.drop_caches_cmd.empty()) return;
+  std::cerr << "        dropping caches: " << opts.drop_caches_cmd << "\n";
+  const int rc = std::system(opts.drop_caches_cmd.c_str());
+  if (rc != 0)
+    std::cerr << "        drop-caches command returned " << rc << "\n";
+}
 
 size_t dataset_blocks(size_t block_size) {
   return std::min(kMaxBlocks, kDatasetBudget / block_size);
@@ -931,6 +945,9 @@ void print_usage(const char *argv0) {
          "and exit\n"
       << "  --output FILE         Write the JSON lines to FILE\n"
       << "  --path DIR            Directory for the volume file\n"
+      << "  --drop-caches-cmd CMD Shell command run before phases 2 and 4\n"
+      << "                        (e.g. \"sync; echo 3 > /proc/sys/vm/"
+         "drop_caches\")\n"
       << "  --help, -h            Show this help\n";
 }
 
@@ -972,6 +989,8 @@ int main(int argc, char *argv[]) {
       opts.output = argv[++i];
     } else if (arg == "--path" && i + 1 < argc) {
       opts.path = argv[++i];
+    } else if (arg == "--drop-caches-cmd" && i + 1 < argc) {
+      opts.drop_caches_cmd = argv[++i];
     } else if (arg == "--help" || arg == "-h") {
       print_usage(argv[0]);
       return 0;
@@ -1110,6 +1129,7 @@ int main(int argc, char *argv[]) {
     }
 
     std::cerr << "  [2/5] get_first_touch\n";
+    drop_caches(opts);
     record(
         run_sequential_get(*cache, ds, block_size, "get_first_touch", false));
 
@@ -1126,6 +1146,7 @@ int main(int argc, char *argv[]) {
     std::cerr << "  [4/5] restart\n";
     cache->stop();
     cache.reset();
+    drop_caches(opts);
     cache = open_store(opts, block_size);
     if (!cache) {
       exit_code = 1;
