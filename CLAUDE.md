@@ -156,12 +156,12 @@ clang-format check (and the `-i` fix variant):
 ```bash
 # Check (what the gate runs):
 find src include/cyclone tests benchmarks examples -type f \
-  \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) \
+  \( -name '*.c' -o -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) \
   | xargs clang-format-20 --dry-run --Werror
 
 # Fix in place:
 find src include/cyclone tests benchmarks examples -type f \
-  \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) \
+  \( -name '*.c' -o -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) \
   | xargs clang-format-20 -i
 ```
 
@@ -494,7 +494,8 @@ SHA-256, single thread except where noted, 4 KB objects;
 from the mapped file (OS page cache), not the RAM cache; first-touch reads pay
 page-in plus CRC32 verification and are checksum-bound.
 
-Read scaling (`concurrent_read_bench 20000 512 2 0 512 ramoff`):
+Read scaling (`concurrent_read_bench 20000 512 2 0 512 ramoff` — 512 B objects,
+RAM tier off; a different harness, not comparable to the table above):
 
 | Threads | Reads/sec |
 |---------|-----------|

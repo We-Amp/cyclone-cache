@@ -95,12 +95,12 @@ EOF
 #     pre-commit parity gate's tracked-C/C++ set, which adds fuzz/) ---
 all_scope_files() {
   find src include/cyclone tests benchmarks examples fuzz -type f \
-    \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) 2>/dev/null | sort
+    \( -name '*.c' -o -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) 2>/dev/null | sort
 }
 in_scope() {
   case "$1" in
     src/*|include/cyclone/*|tests/*|benchmarks/*|examples/*|fuzz/*)
-      case "$1" in *.cpp|*.hpp|*.h) return 0 ;; esac ;;
+      case "$1" in *.c|*.cpp|*.hpp|*.h) return 0 ;; esac ;;
   esac
   return 1
 }

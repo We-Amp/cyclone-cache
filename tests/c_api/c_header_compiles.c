@@ -17,12 +17,11 @@
 /*
  * The error and tier types must stay one byte wide so the C and C++ ABIs
  * agree, and their constants must be usable in constant expressions.
- * Negative-width array typedefs are the C11-portable static assertion.
  */
-typedef char cyclone_error_is_one_byte[sizeof(CycloneError) == 1 ? 1 : -1];
-typedef char cyclone_tier_is_one_byte[sizeof(CycloneTier) == 1 ? 1 : -1];
-typedef char cyclone_ok_is_zero[CYCLONE_OK == 0 ? 1 : -1];
-typedef char cyclone_tier_default_is_zero[CYCLONE_TIER_DEFAULT == 0 ? 1 : -1];
+_Static_assert(sizeof(CycloneError) == 1, "CycloneError must be one byte");
+_Static_assert(sizeof(CycloneTier) == 1, "CycloneTier must be one byte");
+_Static_assert(CYCLONE_OK == 0, "CYCLONE_OK must be zero");
+_Static_assert(CYCLONE_TIER_DEFAULT == 0, "CYCLONE_TIER_DEFAULT must be zero");
 
 /* The callback typedefs must be assignable from a matching C function. */
 static void cyclone_c_on_read(void *user_data, const char *data,
@@ -42,6 +41,8 @@ CycloneError cyclone_c_header_compiles(void) {
   CycloneCacheHandle *cache = NULL; /* opaque handle, incomplete type */
   CycloneReadHandle *read_handle = NULL;
   CycloneReadCallback read_cb = cyclone_c_on_read;
+  CycloneMissDoneCallback miss_done_cb = cyclone_c_on_read;
+  CycloneMissHandler miss_handler = NULL;
   CycloneTier tier = CYCLONE_TIER_SMALL;
 
   memset(&config, 0, sizeof(config));
@@ -50,7 +51,8 @@ CycloneError cyclone_c_header_compiles(void) {
   config.cache_size_bytes = 1;
   config.max_object_size = UINT64_MAX;
 
-  if (cache != NULL || read_handle != NULL || read_cb == NULL) {
+  if (cache != NULL || read_handle != NULL || read_cb == NULL ||
+      miss_done_cb == NULL || miss_handler != NULL) {
     return CYCLONE_INTERNAL_ERROR;
   }
   if (tier != CYCLONE_TIER_SMALL || stats.ram_cache_hits != 0) {

@@ -24,7 +24,9 @@ extern "C" {
  * constants rather than an enum type: C11 has no enum-base syntax, so a plain
  * C `enum` would be int-sized while the C++ `enum : uint8_t` it replaces is
  * one byte.  uint8_t is exactly one byte in both languages, so the ABI is
- * identical either side of the boundary.
+ * identical either side of the boundary.  Two consequences for C++ callers:
+ * it is not a distinct type (any integer converts to it without a cast), and
+ * streaming it prints a character -- log it as static_cast<unsigned>(err).
  */
 typedef uint8_t CycloneError;
 enum {
