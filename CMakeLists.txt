@@ -228,6 +228,9 @@ if(CYCLONE_BUILD_BENCHMARKS)
 
   add_executable(concurrent_read_bench benchmarks/concurrent_read_bench.cpp)
   target_link_libraries(concurrent_read_bench PRIVATE cyclone-cache)
+
+  add_executable(kv_bench benchmarks/kv_bench.cpp)
+  target_link_libraries(kv_bench PRIVATE cyclone-cache)
 endif()
 
 if(CYCLONE_BUILD_FUZZERS)
