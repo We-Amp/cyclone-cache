@@ -24,5 +24,9 @@
 # Documentation (Markdown): covered by the repository LICENSE, no header convention.
 .*\.md
 
+# Benchmark result data (doc/kv-cache-benchmark/*.jsonl): JSON has no comment
+# syntax; measurements, not authored content.
+.*\.jsonl
+
 # libFuzzer seed corpora (fuzz/corpus/*/): opaque binary test inputs.
 corpus
