@@ -156,12 +156,14 @@ clang-format check (and the `-i` fix variant):
 ```bash
 # Check (what the gate runs):
 find src include/cyclone tests benchmarks examples -type f \
-  \( -name '*.c' -o -name '*.cpp' -o -name '*.hpp' -o -name '*.h' -o -name '*.mm' \) \
+  \( -name '*.c' -o -name '*.cpp' -o -name '*.hpp' -o -name '*.h' -o -name '*.mm' \
+     -o -name '*.cu' \) \
   | xargs clang-format-20 --dry-run --Werror
 
 # Fix in place:
 find src include/cyclone tests benchmarks examples -type f \
-  \( -name '*.c' -o -name '*.cpp' -o -name '*.hpp' -o -name '*.h' -o -name '*.mm' \) \
+  \( -name '*.c' -o -name '*.cpp' -o -name '*.hpp' -o -name '*.h' -o -name '*.mm' \
+     -o -name '*.cu' \) \
   | xargs clang-format-20 -i
 ```
 

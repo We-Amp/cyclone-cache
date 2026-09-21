@@ -16,6 +16,7 @@ option(CYCLONE_BUILD_TESTS "Build tests" ON)
 option(CYCLONE_BUILD_HTTP_PLUGIN "Build HTTP alternate plugin" ON)
 option(CYCLONE_BUILD_EXAMPLES "Build examples" ON)
 option(CYCLONE_BUILD_BENCHMARKS "Build benchmarks" ON)
+option(CYCLONE_BUILD_CUDA_BENCHMARKS "Build the CUDA KV transfer benchmark" OFF)
 option(CYCLONE_ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(CYCLONE_USE_BUNDLED_SHA256 "Use bundled SHA-256 instead of OpenSSL (for cross-compilation)" OFF)
 
@@ -271,6 +272,65 @@ if(CYCLONE_BUILD_BENCHMARKS)
     else()
       message(STATUS
         "kv_gpu_metal: Metal/Foundation not found - target not built")
+    endif()
+  endif()
+
+  # Opt-in: the CUDA GPU-transfer experiment, the discrete-GPU counterpart of
+  # kv_gpu_metal.  OFF by default and EVERYTHING it needs -- including
+  # enable_language(CUDA) and find_package(CUDAToolkit), both of which would
+  # otherwise probe for nvcc on machines that have none -- lives inside this
+  # guard, so an ordinary configure is bit-for-bit unaffected.
+  #
+  # The target is deliberately two translation units.  Cyclone's public
+  # headers are C++23 (std::expected) and nvcc 12.4 stops at C++20, so the
+  # store logic is compiled as C++23 by the host compiler in
+  # kv_gpu_cuda_host.cpp and only the CUDA runtime calls go through nvcc in
+  # kv_gpu_cuda.cu, behind the plain-C seam in kv_gpu_cuda.h.  Pass
+  # -DCMAKE_CUDA_HOST_COMPILER=g++-13 (CUDA 12.4 accepts GCC <= 13) and
+  # -DCMAKE_CUDA_ARCHITECTURES=<sm> for the device in the machine.
+  if(CYCLONE_BUILD_CUDA_BENCHMARKS)
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+      # Pascal: the GTX 1050 the experiment was first run on.
+      set(CMAKE_CUDA_ARCHITECTURES 61)
+    endif()
+    if(CMAKE_CUDA_HOST_COMPILER)
+      message(STATUS
+        "kv_gpu_cuda: nvcc host compiler ${CMAKE_CUDA_HOST_COMPILER}")
+    endif()
+    message(STATUS
+      "kv_gpu_cuda: CUDA ${CUDAToolkit_VERSION}, architectures "
+      "${CMAKE_CUDA_ARCHITECTURES}")
+
+    add_executable(kv_gpu_cuda
+      benchmarks/kv_gpu_cuda.cu
+      benchmarks/kv_gpu_cuda_host.cpp)
+    set_target_properties(kv_gpu_cuda PROPERTIES
+      CUDA_STANDARD 20
+      CUDA_STANDARD_REQUIRED ON
+      CXX_STANDARD 23
+      CXX_STANDARD_REQUIRED ON)
+    target_link_libraries(kv_gpu_cuda PRIVATE cyclone-cache CUDA::cudart)
+
+    # LMDB is the optional second zero-copy store to compare against; the
+    # benchmark prints "lmdb: not built" and skips those rows without it.
+    find_path(LMDB_INCLUDE_DIR lmdb.h
+      HINTS /opt/homebrew/opt/lmdb/include /usr/local/opt/lmdb/include)
+    find_library(LMDB_LIBRARY NAMES lmdb
+      HINTS /opt/homebrew/opt/lmdb/lib /usr/local/opt/lmdb/lib)
+    if(LMDB_INCLUDE_DIR AND LMDB_LIBRARY)
+      message(STATUS "kv_gpu_cuda: LMDB ${LMDB_LIBRARY}")
+      # The definition is only meaningful to the host TU; the .cu never sees
+      # a store.
+      set_source_files_properties(benchmarks/kv_gpu_cuda_host.cpp PROPERTIES
+        COMPILE_DEFINITIONS CYCLONE_KV_GPU_HAVE_LMDB)
+      target_include_directories(kv_gpu_cuda SYSTEM PRIVATE
+        ${LMDB_INCLUDE_DIR})
+      target_link_libraries(kv_gpu_cuda PRIVATE ${LMDB_LIBRARY})
+    else()
+      message(STATUS
+        "kv_gpu_cuda: LMDB not found - the lmdb comparison rows are absent")
     endif()
   endif()
 endif()

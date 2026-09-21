@@ -196,10 +196,14 @@ document builder → serialized record) and CRCs it before a single
    path is the cheapest per-get of any store here (≈1.5 µs for a 2 MiB
    block; LMDB the only peer in the same class), and the Metal section
    below shows the payoff: wrap the volume mapping once and blit by
-   `content_file_offset()` for 1.9× over a staged copy. CUDA on a discrete
-   GPU (registration vs pinned staging) and GPUDirect Storage
-   (`cuFileRead` at `content_file_offset()`, NVMe→GPU with no host copy)
-   are the next measurements.
+   `content_file_offset()` for 1.9× over a staged copy. The API for the
+   winning form exists (`content()`, `content_file_offset()`,
+   `volume_files()`); what is missing is an entry point that hands an
+   embedder the mapping identity directly. The discrete-GPU half is
+   `benchmarks/kv_gpu_cuda.cu` (registration vs pinned staging over PCIe,
+   see [Device transfer: CUDA](#device-transfer-cuda-gtx-1050-pcie));
+   GPUDirect Storage (`cuFileRead` at `content_file_offset()`, NVMe→GPU
+   with no host copy) needs a data-center GPU.
 5. Only then: a zero-copy C read entry point and a Python binding, which is
    what a vLLM/SGLang connector would call.
 
@@ -426,6 +430,101 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DCYCLONE_USE_BUNDLED_SHA256=ON
 cmake --build build -j
 ./build/kv_gpu_metal --block-size 2097152 --seconds 10
 ```
+
+## Device transfer: CUDA (GTX 1050, PCIe)
+
+The Metal section above answers the Apple half of item 4 on unified memory,
+where there is no bus at all. `benchmarks/kv_gpu_cuda.cu` (plus its C++23
+host half, `benchmarks/kv_gpu_cuda_host.cpp`) asks the same question where
+there *is* one: a discrete GPU behind PCIe, on which the staged path really
+does pay a host copy that a mapping-sourced transfer does not. Same workload
+(`benchmarks/kv_workload.hpp`, so the blocks are bit-identical to
+`kv_bench`'s and the Metal run's), same Cyclone tuning, same N = 512 blocks
+of 2 MiB, same "already in the store, read once, every page touched before
+any timing" discipline.
+
+The paths, all landing the same bytes in the same `cudaMalloc` buffer:
+
+| path | what it does |
+|---|---|
+| `pageable` | `cudaMemcpy(H2D)` straight from `content()`. The naive path: the driver stages it through its own internal pinned buffers, synchronously, so it cannot batch. |
+| `zerocopy` | `cudaHostRegister` the page-aligned range containing `content()`, `cudaMemcpyAsync`, sync, `cudaHostUnregister` — per block. "Pin whatever span the read returned." |
+| `zerocopy-persistent` | `cudaHostRegister` the store's whole mapping **once**; a block is then nothing but its borrowed pointer. The decisive variant. |
+| `staged` | `memcpy` into a `cudaMallocHost` buffer, then `cudaMemcpyAsync`. The conventional path. |
+| `memcpy` | the host copy alone, no GPU — `kv_bench`'s `copy` access mode, as a reference cost. |
+
+Three references involve no store at all: `submit-only-0B` (a 0-byte
+`cudaMemcpyAsync` plus `cudaStreamSynchronize`), `h2d-4KiB`, and
+`pinned-ceiling` — a full block out of the pinned buffer, which is the PCIe
+host-to-device bandwidth ceiling the machine can reach at all and which no
+store-backed row can beat. `zerocopy`, `zerocopy-persistent` and `staged`
+also run batched: 16 `cudaMemcpyAsync` on one stream, one
+`cudaStreamSynchronize`, reported per-block amortized.
+
+The load-bearing unknown is the same one Metal answered with "yes": whether
+`cudaHostRegister` will page-lock a file-backed `MAP_SHARED` mapping at all.
+If it refuses, both zero-copy paths are simply unavailable to an embedder and
+the answer for CUDA is "stage it". The benchmark therefore probes every
+surface at startup — an own `MAP_SHARED` mapping read-write and read-only,
+each with `cudaHostRegisterDefault` and `cudaHostRegisterReadOnly`, a private
+anonymous mapping as the control, and Cyclone's `content()`, `mapped_view()`
+and own-mmap-at-`content_file_offset()` surfaces — and prints the exact
+`cudaGetErrorString` for each. Acceptance alone is not enough: each probe
+also transfers and compares the device bytes against the source.
+
+### Machine
+
+Intel Core i7-8750H (6 cores / 12 threads), 23 GiB RAM, Samsung 970 PRO NVMe
+root, **NVIDIA GeForce GTX 1050 Mobile** (GP107M, Pascal, `sm_61`, 4 GiB),
+Ubuntu 22.04.5, kernel 5.15.0-191. Driver 550.163.01 and CUDA toolkit 12.4
+from the NVIDIA `ubuntu2204` apt repository; `nvcc` builds the `.cu` with
+`-ccbin g++-13` (CUDA 12.4 accepts GCC ≤ 13) while the host half is built as
+C++23 by `clang++-20`. It is an Optimus hybrid laptop: `nvidia-prime` had it
+in `intel` mode, which installs a `blacklist nvidia` / `alias nvidia off`
+modprobe drop-in and stops the driver loading no matter how well it built —
+`prime-select on-demand` is what makes the GPU usable for compute. Because
+`cudaHostRegister` page-locks multi-GiB ranges of the cache mapping, the
+`memlock` rlimit has to be raised (a drop-in under
+`/etc/security/limits.d/`); the default ~3 GiB is smaller than the span an
+8 GiB Cyclone volume occupies, and the benchmark falls back to 1 GiB
+registration windows and reports the fallback when a single registration is
+refused.
+
+### Status
+
+**Not yet measured.** The driver and toolkit installed cleanly (DKMS built
+`nvidia/550.163.01` for 5.15.0-191, `nvcc` 12.4 present, `nouveau`
+blacklisted), but the machine did not come back from the reboot that the
+driver switch requires and needs physical attention. The benchmark, its
+CMake wiring and the gate scope for `.cu` are in the tree; the acceptance
+result, the results table and the PCIe ceiling reference go here when the
+box is back.
+
+### Running it
+
+The target is opt-in — `CYCLONE_BUILD_CUDA_BENCHMARKS` is `OFF` by default
+and everything it needs, `enable_language(CUDA)` and
+`find_package(CUDAToolkit)` included, is inside that guard, so an ordinary
+configure never probes for `nvcc`. LMDB is optional exactly as for the Metal
+target.
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CXX_COMPILER=clang++-20 \
+  -DCYCLONE_USE_BUNDLED_SHA256=ON \
+  -DCYCLONE_BUILD_CUDA_BENCHMARKS=ON \
+  -DCMAKE_CUDA_HOST_COMPILER=g++-13 \
+  -DCMAKE_CUDA_ARCHITECTURES=61
+cmake --build build -j
+./build/kv_gpu_cuda --block-size 2097152 --seconds 10 --path /fast/ssd/kvdata
+```
+
+Cyclone's public headers are C++23 (`std::expected`) and nvcc 12.4 stops at
+C++20, so the target is deliberately two translation units: everything that
+touches Cyclone, LMDB or the workload is compiled as C++23 by the host
+compiler in `kv_gpu_cuda_host.cpp`, and only the CUDA runtime calls go
+through nvcc in `kv_gpu_cuda.cu`, behind the plain-C seam in
+`kv_gpu_cuda.h`.
 
 ## Reproducing
 

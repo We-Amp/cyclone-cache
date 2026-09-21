@@ -24,7 +24,7 @@ repos:
         name: Check license headers
         entry: "bash -c 'rc=0; for f in \"$@\"; do head -5 \"$f\" | grep -q \"SPDX-License-Identifier: Apache-2.0\" || { echo \"Missing Apache-2.0 SPDX header: $f\"; rc=1; }; if grep -q -i -E \"BUSL|Business Source\" \"$f\"; then echo \"BUSL residue: $f\"; rc=1; fi; done; exit $rc' --"
         language: system
-        files: '\.(c|cpp|hpp|h|mm)$'
+        files: '\.(c|cpp|hpp|h|mm|cu)$'
         exclude: ^(build|build-tsan|build-asan)/
       - id: doc-version-literals
         name: Doc version-literal drift (CLAUDE.md/AGENTS.md vs clang-format pin)
