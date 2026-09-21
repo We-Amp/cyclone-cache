@@ -16,7 +16,8 @@
 //   2. get_first_touch   single reader, sequential, touches every 4 KiB page
 //   3. get_warm          Zipf(0.99), T in {1,4,8}, modes view + copy
 //   4. restart           clean close + reopen, read all N once (view)
-//   5. multiprocess_read fork 4 reader processes, each phase-3 view at T=1
+//   5. multiprocess_read fork 4 reader processes, each phase-3 at T=1, view
+//      and copy
 //
 // Cyclone tuning, and why:
 //   max_object_size = 0        blocks run to 32 MiB; the 64 MiB default would
@@ -824,7 +825,7 @@ struct ChildReport {
 // Phase 5.  See the file header for why the children open their own Cache on
 // the same volume with the parent's configuration.
 bool run_multiprocess(const Options &opts, const Dataset &ds, size_t block_size,
-                      double seconds, Record *out) {
+                      Mode mode, double seconds, Record *out) {
   int fds[2] = {-1, -1};
   if (::pipe(fds) != 0) {
     std::cerr << "  pipe() failed; skipping the multi-process phase\n";
@@ -847,9 +848,9 @@ bool run_multiprocess(const Options &opts, const Dataset &ds, size_t block_size,
         ::close(fds[0]);
         auto cache = open_store(opts, block_size);
         if (cache) {
-          RunResult res =
-              run_zipf_reader(*cache, ds.keys, Mode::kView, block_size, c,
-                              kWarmupSeconds, seconds, false);
+          RunResult res = run_zipf_reader(*cache, ds.keys, mode, block_size, c,
+                                          std::min(kWarmupSeconds, seconds),
+                                          seconds, false);
           ChildReport rep{res.ops, res.bytes, res.misses, res.seconds};
           rc = (::write(fds[1], &rep, sizeof(rep)) == sizeof(rep)) ? 0 : 2;
           cache->stop();
@@ -898,7 +899,7 @@ bool run_multiprocess(const Options &opts, const Dataset &ds, size_t block_size,
   }
 
   out->phase = "multiprocess_read";
-  out->mode = "view";
+  out->mode = mode_name(mode);
   out->block_size = block_size;
   out->n = ds.keys.size();
   out->threads = reported;  // process count, so reports key on it
@@ -1147,9 +1148,12 @@ int main(int argc, char *argv[]) {
 #else
       std::cerr << "  [5/5] multiprocess_read (" << kReaderProcesses
                 << " processes)\n";
-      Record mp;
-      if (run_multiprocess(opts, ds, block_size, opts.seconds, &mp)) {
-        record(std::move(mp));
+      for (Mode mode : {Mode::kView, Mode::kCopy}) {
+        std::cerr << "        mode=" << mode_name(mode) << "\n";
+        Record mp;
+        if (run_multiprocess(opts, ds, block_size, mode, opts.seconds, &mp)) {
+          record(std::move(mp));
+        }
       }
 #endif
     }
