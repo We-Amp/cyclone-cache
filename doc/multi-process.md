@@ -81,7 +81,8 @@ Cache File Layout (multi-process mode):
 │ Stripe 0:                              │
 │   ├─ MmapDirectory Header (64 bytes)   │
 │   ├─ Version Counters (4B per bucket)  │
-│   ├─ Directory Entries (40B per bucket)│
+│   ├─ Directory Entries (4 entries ×    │
+│   │   10B = 40B per bucket)            │
 │   └─ Data Area                         │
 ├────────────────────────────────────────┤
 │ Stripe 1: ...                          │

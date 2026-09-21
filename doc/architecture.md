@@ -16,9 +16,9 @@ as a C++ API and a C ABI.
 |------|---------|----------------|
 | **Stripe (= Segment)** | The cache partitioning unit. The C API `num_segments` (`cyclone_c.h`) and `CacheKey::segment_hash()` (`key.hpp`) refer to the SAME stripes this doc describes — there is exactly ONE partitioning dimension. `stripe_index = key.segment_hash() % num_stripes`. | `key.hpp`, `cyclone_c.h`, "Volumes and Stripes" |
 | **Volume** | A single cache file on disk, divided into stripes for parallel access. | `src/core/volume.hpp`, "Volumes and Stripes" |
-| **VolumeHeader** | 64-byte header at offset 0; magic `0x43594C4E` ("CYLN") + format major/minor. Format major is **v5**. | `src/core/volume.hpp` (`VolumeHeader`) |
-| **Directory entry** | Compact 10-byte key→offset record. Bitfields: `tag` (12-bit collision tag), `phase` (1-bit phase GC), `head` (1-bit, first fragment), `pinned` (1-bit, do-not-evict), 40-bit `offset` (512 TB/stripe), `next` (bucket chain). Carries **no key material**. | `src/core/directory.hpp` (`DirEntry`) |
-| **Document / fragment** | On-disk record (132-byte header, format major **v5**). A large value spans fragments; the `head`-flagged entry is the first. | `src/core/document.hpp` (`Document`) |
+| **VolumeHeader** | 64-byte header at offset 0; magic `0x43594C4E` ("CYLN") + format major/minor. Format major is **v7**. | `src/core/volume.hpp` (`VolumeHeader`) |
+| **Directory entry** | Compact 10-byte key→offset record. Bitfields: `tag` (12-bit collision tag), `phase` (1-bit phase GC), `head` (1-bit, first fragment), `pinned` (1-bit, reserved for do-not-evict — not enforced by eviction today), 40-bit `offset` (byte offset within the stripe; 1 TiB/stripe), `next` (bucket chain). Carries **no key material**. | `src/core/directory.hpp` (`DirEntry`) |
+| **Document / fragment** | On-disk record (132-byte header, format major **v7**). The format reserves `FirstFrag`/`MiddleFrag`/`LastFrag` types, but the implementation writes only `SingleFrag` documents today — a document must fit in one stripe's data area (write fails with `NoSpace` otherwise) and under `max_object_size` (`ObjectTooLarge`). | `src/core/document.hpp` (`Document`) |
 | **bucket_hash / tag** | Within a stripe, `bucket_hash()` selects the directory bucket; `tag()` is the 12-bit collision tag. | `key.hpp` |
 | **Alternate / AlternateId** | A content variant under one key (Original, Brotli, Gzip, WebP, AVIF, JpegXL, Custom…). `AlternateId` normalizes UA capabilities into discrete classes. | `alternate.hpp` |
 | **Alternate chain** | Singly-linked list of alternates via `next_alternate_offset`. Directory points to the **head** (newest); **tail** is typically Original (oldest). Max 64 per key. | "Alternate Chains" |
@@ -115,8 +115,9 @@ Why many small stripes matter (the comment above `kMinStripeSize`, `volume.hpp`)
 block *all* writes. Stripe offsets are 8-byte aligned — misaligned `seq_cst`
 atomics in an mmap directory SIGBUS on arm64 — enforced by page-flooring.
 
-The v5 header persists the authoritative `stripe_count` (`VolumeHeader::stripe_count`), so a
-volume always re-opens with the geometry it was created with.
+The volume header persists the authoritative `stripe_count` (`VolumeHeader::stripe_count`,
+a field introduced in format v5), so a volume always re-opens with the geometry
+it was created with.
 
 ### Directory
 
@@ -136,10 +137,11 @@ Word 3: next[16]  (bucket chain pointer)
 Word 4: offset[24:39]
 ```
 
-- **offset** (40 bits) — byte offset within stripe (512 TB).
+- **offset** (40 bits) — byte offset within stripe (1 TiB/stripe addressable).
 - **big/size** (2 + 6 bits) — encoded size.
 - **tag** (12 bits) — collision tag (4096 values).
-- **phase / head / pinned** (1 bit each) — GC phase, first fragment, do-not-evict.
+- **phase / head / pinned** (1 bit each) — GC phase, first fragment; `pinned`
+  is reserved for do-not-evict but not currently consulted by eviction.
 - **next** (16 bits) — chain to the next entry in the bucket.
 
 Entries are grouped into **buckets of 4** (`bucket_index = bucket_hash() % num_buckets`);
@@ -155,20 +157,25 @@ overwritten.
 
 ### Document Format
 
-Each cached entry is a document with a 132-byte header (**v5** format,
+Each cached entry is a document with a 132-byte header (**v7** format,
 `document.hpp` (`Document`)). `Document::kVersionMajor` and
-`VolumeHeader::kFormatVersionMajor` are kept in lockstep at 5.
+`VolumeHeader::kFormatVersionMajor` are kept in lockstep at 7. The format
+reserves `FirstFrag`/`MiddleFrag`/`LastFrag` document types for spanning a
+large value across fragments, but the implementation writes only
+`SingleFrag` documents today (both write sites hardcode `Document::Type::SingleFrag`,
+`src/core/volume.cpp`); a document must fit in one stripe's data area (`NoSpace`
+otherwise) and under `max_object_size` (`ObjectTooLarge`).
 
 ```
 Document Header (132 bytes)
-├─ magic        uint32_t  0x5F129B13
+├─ magic        uint32_t  0x5F129B14
 ├─ len          uint32_t  fragment length (header + data)
 ├─ total_len    uint64_t  total document size
 ├─ first_key    32 bytes  SHA-256 of the primary key
 ├─ frag_key     32 bytes  SHA-256 of this fragment
 ├─ header_len   uint32_t  metadata header size
-├─ doc_type     uint8_t   Single / First / Middle / Last fragment
-├─ ver_major    uint8_t   format version (5)
+├─ doc_type     uint8_t   Single / First / Middle / Last fragment (SingleFrag only, in practice)
+├─ ver_major    uint8_t   format version (7)
 ├─ ver_minor    uint8_t   format version
 ├─ flags        uint8_t   document flags
 ├─ sync_serial  uint32_t
@@ -184,14 +191,17 @@ Document Header (132 bytes)
 └─ Content Data (variable)
 ```
 
-**Format version history** (a pre-v5 volume auto-resets on open when
-`auto_reset_on_incompatible`, default true, `config.hpp`):
+**Format version history** (a volume with a mismatched major version
+auto-resets on open when `auto_reset_on_incompatible`, default true,
+`config.hpp`; see `doc/multi-process.md` for the full migration story):
 
 | Version | Change |
 |---------|--------|
 | v3 | mmap directory (multi-process) |
 | v4 | auto-derived stripe count |
 | v5 | finer stripe granularity + persisted, authoritative `stripe_count` |
+| v6 | `hit_count` / `next_alternate_offset` / `last_access` laid out naturally aligned, so the in-place header RMW sites can store them atomically |
+| v7 | alternate chains are depth-bounded at write time; the bump leaves pre-bound (over-deep, possibly cyclic) chains behind rather than repairing them |
 
 ### Alternate Chains
 
