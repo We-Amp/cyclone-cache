@@ -81,6 +81,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <span>
 #include <sstream>
 #include <string>
@@ -131,7 +132,7 @@ inline uint64_t xorshift64star(uint64_t &state) {
   state ^= state >> 12;
   state ^= state << 25;
   state ^= state >> 27;
-  return state * 0x2545F4914F6CDD1DULL;
+  return state * 0x2545F4914F6CD1DBULL;
 }
 
 inline uint64_t seed_state(uint64_t seed) {
@@ -522,6 +523,7 @@ RunResult run_zipf_reader(Cache &cache, const std::vector<CacheKey> &keys,
     copy_buffer.assign(block_size, std::byte{0});
   }
   uint64_t sink = 0;
+  if (record_latency) result.latencies_us.reserve(size_t{1} << 20);
 
   auto one_op = [&](bool record) {
     const CacheKey &key = keys[zipf.next()];
@@ -592,7 +594,34 @@ Dataset build_dataset(size_t n) {
   return ds;
 }
 
-Record run_put(Cache &cache, const Dataset &ds, size_t block_size) {
+// Reference vectors shared with the peer harness (its README carries the
+// same table), so two implementations of the spec can prove they generate
+// the identical workload: keys, block bytes and the Zipf access sequence.
+void print_reference_vectors() {
+  const Dataset ds = build_dataset(3);
+  for (size_t i = 0; i < 3; ++i) {
+    std::cout << "key prefix-" << i << " = " << ds.keys[i].to_hex() << "\n";
+  }
+  std::array<std::byte, 16> head{};
+  for (size_t i = 0; i < 3; ++i) {
+    fill_block(head, i);
+    std::cout << "value[" << i << "][0..15] =";
+    for (auto b : head) {
+      std::cout << ' ' << std::hex << std::setw(2) << std::setfill('0')
+                << std::to_integer<unsigned>(b);
+    }
+    std::cout << std::dec << "\n";
+  }
+  for (uint32_t seed : {42U, 43U}) {
+    ZipfGenerator zipf(2048, kZipfTheta, seed);
+    std::cout << "zipf(n=2048, seed " << seed << ") =";
+    for (int i = 0; i < 10; ++i) std::cout << ' ' << zipf.next();
+    std::cout << "\n";
+  }
+}
+
+std::optional<Record> run_put(Cache &cache, const Dataset &ds,
+                              size_t block_size) {
   using clock = std::chrono::steady_clock;
   const size_t n = ds.keys.size();
   std::vector<std::byte> block(block_size);
@@ -638,13 +667,46 @@ Record run_put(Cache &cache, const Dataset &ds, size_t block_size) {
   r.has_latency = true;
   r.latency = compute_percentiles(latencies);
   if (ok != n) {
-    std::cerr << "  WARNING: only " << ok << " of " << n << " puts succeeded\n";
+    std::cerr << "  ERROR: only " << ok << " of " << n
+              << " puts succeeded; results for this size are invalid\n";
+    return std::nullopt;
   }
   return r;
 }
 
 // Sequential single-threaded view-mode read of every key, used by both the
 // first-touch phase and the restart phase.
+// Untimed self-check: the first `count` blocks round-trip byte-exactly
+// (header and first value word), so a broken generator or a wrap is caught
+// before any timed phase runs.  Mirrors the peer harness's content check.
+bool verify_blocks(Cache &cache, const Dataset &ds, size_t block_size,
+                   size_t count) {
+  for (size_t i = 0; i < std::min(count, ds.keys.size()); ++i) {
+    auto rh = cache.read_sync(ds.keys[i]);
+    if (!rh.has_value()) {
+      std::cerr << "  content verify: block " << i << " missing\n";
+      return false;
+    }
+    const auto content = rh->content();
+    const auto header = rh->header();
+    uint64_t word = 0;
+    if (content.size() == block_size) {
+      std::memcpy(&word, content.data(), sizeof(word));
+    }
+    const bool ok =
+        content.size() == block_size && word == first_word_of_block(i) &&
+        header.size() == kMetaSize &&
+        std::memcmp(header.data(), ds.metadata[i].data(), kMetaSize) == 0;
+    rh->close();
+    if (!ok) {
+      std::cerr << "  content verify: block " << i << " MISMATCH\n";
+      return false;
+    }
+  }
+  std::cerr << "  content verify: ok\n";
+  return true;
+}
+
 Record run_sequential_get(Cache &cache, const Dataset &ds, size_t block_size,
                           const std::string &phase, bool verify_content) {
   using clock = std::chrono::steady_clock;
@@ -714,8 +776,9 @@ Record run_get_warm(Cache &cache, const Dataset &ds, size_t block_size,
   workers.reserve(threads);
   for (uint32_t t = 0; t < threads; ++t) {
     workers.emplace_back([&, t]() {
-      results[t] = run_zipf_reader(cache, ds.keys, mode, block_size, t,
-                                   kWarmupSeconds, seconds, true);
+      results[t] =
+          run_zipf_reader(cache, ds.keys, mode, block_size, t,
+                          std::min(kWarmupSeconds, seconds), seconds, true);
     });
   }
   for (auto &w : workers) w.join();
@@ -805,14 +868,14 @@ bool run_multiprocess(const Options &opts, const Dataset &ds, size_t block_size,
   uint64_t ops = 0;
   uint64_t bytes = 0;
   uint64_t misses = 0;
-  double span = 0.0;
+  double elapsed_sum = 0.0;
   uint32_t reported = 0;
   ChildReport rep{};
   while (::read(fds[0], &rep, sizeof(rep)) == sizeof(rep)) {
     ops += rep.ops;
     bytes += rep.bytes;
     misses += rep.misses;
-    span = std::max(span, rep.seconds);
+    elapsed_sum += rep.seconds;
     ++reported;
   }
   ::close(fds[0]);
@@ -824,10 +887,12 @@ bool run_multiprocess(const Options &opts, const Dataset &ds, size_t block_size,
                 << ")\n";
     }
   }
-  if (reported == 0 || span <= 0.0) {
+  if (reported == 0 || elapsed_sum <= 0.0) {
     std::cerr << "  no child reported; skipping the multi-process phase\n";
     return false;
   }
+  // Aggregate = sum(ops) / mean(child elapsed), matching the peer harness.
+  const double span = elapsed_sum / reported;
   if (misses > 0) {
     std::cerr << "  WARNING: " << misses << " misses across reader processes\n";
   }
@@ -836,7 +901,7 @@ bool run_multiprocess(const Options &opts, const Dataset &ds, size_t block_size,
   out->mode = "view";
   out->block_size = block_size;
   out->n = ds.keys.size();
-  out->threads = 1;
+  out->threads = reported;  // process count, so reports key on it
   out->processes = reported;
   out->ops_per_s = static_cast<double>(ops) / span;
   out->gb_per_s = gb_per_s(bytes, span);
@@ -861,6 +926,8 @@ void print_usage(const char *argv0) {
       << "                        multi-process mode; restart loses the "
          "index)\n"
       << "  --skip-multiprocess   Skip phase 5\n"
+      << "  --print-vectors       Print cross-harness reference vectors "
+         "and exit\n"
       << "  --output FILE         Write the JSON lines to FILE\n"
       << "  --path DIR            Directory for the volume file\n"
       << "  --help, -h            Show this help\n";
@@ -897,6 +964,9 @@ int main(int argc, char *argv[]) {
       opts.no_mmap_dir = true;
     } else if (arg == "--skip-multiprocess") {
       opts.skip_multiprocess = true;
+    } else if (arg == "--print-vectors") {
+      print_reference_vectors();
+      return 0;
     } else if (arg == "--output" && i + 1 < argc) {
       opts.output = argv[++i];
     } else if (arg == "--path" && i + 1 < argc) {
@@ -980,7 +1050,7 @@ int main(int argc, char *argv[]) {
             << kWarmupSeconds << "s warm-up)\n\n";
 
   *json_out << "{\"store\":\"" << kStoreName
-            << "\",\"phase\":\"machine_info\",\"cpu\":\"" << machine.cpu
+            << "\",\"phase\":\"machine\",\"cpu\":\"" << machine.cpu
             << "\",\"cores\":\"" << machine.cores << "\",\"os\":\""
             << machine.os << "\",\"filesystem\":\"" << machine.filesystem
             << "\",\"version\":\"" << kStoreVersion << "\",\"commit\":\""
@@ -1027,10 +1097,20 @@ int main(int argc, char *argv[]) {
     };
 
     std::cerr << "  [1/5] put\n";
-    record(run_put(*cache, ds, block_size));
+    auto put = run_put(*cache, ds, block_size);
+    if (!put) {
+      exit_code = 1;
+      break;
+    }
+    record(*put);
+    if (!verify_blocks(*cache, ds, block_size, 2)) {  // untimed self-check
+      exit_code = 1;
+      break;
+    }
 
     std::cerr << "  [2/5] get_first_touch\n";
-    record(run_sequential_get(*cache, ds, block_size, "get_first_touch", true));
+    record(
+        run_sequential_get(*cache, ds, block_size, "get_first_touch", false));
 
     std::cerr << "  [3/5] get_warm (Zipf theta=" << kZipfTheta << ")\n";
     for (Mode mode : {Mode::kView, Mode::kCopy}) {
