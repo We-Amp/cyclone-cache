@@ -81,7 +81,7 @@ Cyclone Cache is a high-performance C++23 disk cache library inspired by Apache 
 - Language: C++23 (requires GCC 13+, Clang 16+, or MSVC 2022+)
 - Build System: CMake 3.20+
 - Testing: Catch2
-- Dependencies: OpenSSL (for SHA-256)
+- Dependencies: OpenSSL, or the bundled SHA-256 (`CYCLONE_USE_BUNDLED_SHA256`)
 
 ## Build Commands
 
@@ -156,12 +156,12 @@ clang-format check (and the `-i` fix variant):
 ```bash
 # Check (what the gate runs):
 find src include/cyclone tests benchmarks examples -type f \
-  \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) \
+  \( -name '*.c' -o -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) \
   | xargs clang-format-20 --dry-run --Werror
 
 # Fix in place:
 find src include/cyclone tests benchmarks examples -type f \
-  \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) \
+  \( -name '*.c' -o -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) \
   | xargs clang-format-20 -i
 ```
 
@@ -477,16 +477,31 @@ Run specific test with verbose output:
 
 ## Performance Baselines
 
-Current performance (Apple M-series, optimized build):
+Current performance (Apple M5, 10 cores, macOS 27, Release build, bundled
+SHA-256, single thread except where noted, 4 KB objects;
+`performance_baseline --cache-size 512 --entries 5000 --content-size 4096`):
 
 | Operation | Throughput | Notes |
 |-----------|------------|-------|
-| Key generation | 2-3M ops/sec | SHA-256 hashing |
-| Write (2KB) | 7-10K ops/sec | Includes fsync (configurable) |
-| Read (sequential) | 60-180K ops/sec | Varies with OS cache |
-| Read (random) | 80-160K ops/sec | Memory-mapped I/O |
-| Exists check | 1.5-4M ops/sec | Directory lookup only |
-| Cache miss | 1.5-3M ops/sec | Fast path |
+| Key generation | 2.7-4.9M ops/sec | SHA-256 hashing, 0.2-0.3 µs |
+| Write (4KB) | 96K ops/sec | p50 10.1 µs, p99 14.6 µs |
+| Read (first-touch) | 131K ops/sec | p50 7.3 µs — page-in + CRC32 |
+| Read (warm, random) | 2.5M ops/sec | p50 0.33 µs |
+| Exists check | 4.4M ops/sec | 0.21 µs; directory lookup only |
+| Cache miss | 3.5M ops/sec | 0.29 µs; fast path |
+
+`read_sync` never populates the RAM tier, so the "warm" reads above are served
+from the mapped file (OS page cache), not the RAM cache; first-touch reads pay
+page-in plus CRC32 verification and are checksum-bound.
+
+Read scaling (`concurrent_read_bench 20000 512 2 0 512 ramoff` — 512 B objects,
+RAM tier off; a different harness, not comparable to the table above):
+
+| Threads | Reads/sec |
+|---------|-----------|
+| 1 | 5.3M/s |
+| 4 | 17.6M/s |
+| 16 | 22.1M/s |
 
 ## Resources
 

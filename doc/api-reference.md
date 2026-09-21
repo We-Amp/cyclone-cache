@@ -977,8 +977,14 @@ the full mapping, and the field comments in `cyclone_c.h`.
 
 ### Error Codes
 
+`CycloneError` is a one-byte `uint8_t` typedef (not an `enum` type) so that
+its width is identical in C and C++; the codes are an anonymous enum. Values
+are append-only for ABI stability. Note that as a `uint8_t` it streams as a
+character in C++ — log it as `static_cast<unsigned>(err)`.
+
 ```c
-typedef enum {
+typedef uint8_t CycloneError;
+enum {
     CYCLONE_OK = 0,
     CYCLONE_NOT_FOUND,
     CYCLONE_EXISTS,
@@ -988,8 +994,16 @@ typedef enum {
     CYCLONE_INVALID_KEY,
     CYCLONE_INVALID_ARGUMENT,
     CYCLONE_NOT_INITIALIZED,
-    CYCLONE_INTERNAL_ERROR
-} CycloneError;
+    CYCLONE_INTERNAL_ERROR,
+    CYCLONE_RESET_REFUSED_LIVE_PEER,  /* a live peer holds the cache */
+    CYCLONE_OBJECT_TOO_LARGE          /* write exceeds max_object_size */
+};
+
+typedef uint8_t CycloneTier;
+enum {
+    CYCLONE_TIER_DEFAULT = 0,  /* hash-routed payload volume */
+    CYCLONE_TIER_SMALL = 1     /* small-object sidecar volume, when enabled */
+};
 ```
 
 ### Core Functions

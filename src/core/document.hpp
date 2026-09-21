@@ -14,7 +14,7 @@
 
 namespace cyclone {
 
-// Document header format (128 bytes fixed header, followed by variable data)
+// Document header format (132-byte fixed header, followed by variable data)
 struct Document {
   static constexpr uint32_t kMagic = 0x5F129B14;
   static constexpr uint8_t kVersionMajor =
