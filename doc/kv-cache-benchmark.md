@@ -154,8 +154,8 @@ and CRC-on-first-read come as a package. With verification off
 > the i7-8750H (slice-by-16), and the restart phase in this same
 > configuration moved from 0.558 to 8.54 GB/s. Every number in the tables
 > below predates that change. The checksum has since moved again, to
-> CRC-32C at on-disk format v8 (34 GB/s on the M5) — see the follow-up under
-> fix-list item 2.
+> CRC-32C at on-disk format v8 (34.9 GB/s on the M5) — see the follow-up
+> under fix-list item 2.
 
 **Multi-process readers scale worse than threads, for the same reason.**
 Four Cyclone reader processes reach 46 GB/s in copy mode, 0.65× a single
@@ -221,10 +221,11 @@ document builder → serialized record) and CRCs it before a single
    `crc32` instruction computes CRC-32**C**, a different polynomial. That
    was the open decision, and it has been taken: the document checksum *is*
    CRC-32C from format major v8 (reflected `0x82F63B78`, init/xorout
-   `0xFFFFFFFF`), which has hardware instructions on x86-64 (SSE4.2
-   `crc32q`) *and* ARMv8 (`crc32cx`). Existing cache files are discarded —
-   the format major is part of the fingerprinted filename, so consumers take
-   a cold cache, never a misparse. The files are now
+   `0xFFFFFFFF`), which has a hardware path on x86-64 (SSE4.2 `crc32q`) as
+   well as on ARMv8 (`crc32cx`). Existing cache files are abandoned (not
+   deleted) on open — the format major is part of the fingerprinted
+   filename, so consumers take a cold cache, never a misparse, and the
+   superseded v7 file stays on disk until it is reclaimed. The files are now
    `src/core/crc32c.{hpp,cpp}`, `tests/unit/test_crc32c.cpp` and
    `./build-rel/crc32c_bench`. Both hardware paths run three interleaved CRC
    registers (8192- then 256-byte blocks, recombined through
@@ -233,7 +234,10 @@ document builder → serialized record) and CRCs it before a single
 
    | 2 MiB buffer | byte-wise | slice-by-16 | hw, 1 stream | hw, 3-way |
    |---|---:|---:|---:|---:|
-   | Apple M5 (clang, Release) | 0.61 GB/s | 3.28 GB/s | 12.02 GB/s | **34.03 GB/s** |
+   | Apple M5 (clang, Release) | 0.61 GB/s | 3.37 GB/s | 12.19 GB/s | **34.93 GB/s** |
+
+   (Best of five `crc32c_bench --seconds 1` runs on an otherwise idle
+   machine.)
 
    > **TODO (lead):** the i7-8750H `crc32c_bench` row and the Linux
    > `kv_bench` restart/first-touch numbers for v8 are not measured yet —

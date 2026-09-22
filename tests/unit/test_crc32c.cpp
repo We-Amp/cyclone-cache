@@ -178,6 +178,20 @@ TEST_CASE("CRC-32C incremental equals one-shot", "[crc32c][document]") {
     uint32_t state = crc32c_update(0, all.first(split));
     state = crc32c_update(state, all.subspan(split));
     REQUIRE(state == expected);
+
+    // Not just whatever dispatch picked: each implementation must carry the
+    // running state across a chunk boundary on its own.
+    uint32_t portable = crc32c_update_portable(0, all.first(split));
+    portable = crc32c_update_portable(portable, all.subspan(split));
+    REQUIRE(portable == expected);
+
+    uint32_t hw = crc32c_update_hardware(0, all.first(split));
+    hw = crc32c_update_hardware(hw, all.subspan(split));
+    REQUIRE(hw == expected);
+
+    uint32_t hw1 = crc32c_update_hardware_1way(0, all.first(split));
+    hw1 = crc32c_update_hardware_1way(hw1, all.subspan(split));
+    REQUIRE(hw1 == expected);
   }
 
   // Random split points, so the chunk boundaries do not all land on the

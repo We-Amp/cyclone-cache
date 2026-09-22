@@ -20,12 +20,16 @@
 //     from __builtin_cpu_supports("sse4.2").  MSVC needs neither: its
 //     intrinsics are always available, and the runtime probe is __cpuid leaf
 //     1, ECX bit 20.
-//   * ARMv8: the `crc32cb/crc32cw/crc32cx` instruction group.  Two flavours,
-//     as before: when the toolchain already targets a CPU with the extension
-//     (__ARM_FEATURE_CRC32 -- every Apple silicon build, Windows on ARM, any
-//     -march=armv8-a+crc build) we use the <arm_acle.h> intrinsics directly;
-//     on a baseline armv8-a Linux build the ACLE header does not expose them,
-//     so the instructions are emitted with inline asm under
+//   * ARMv8: the `crc32cb/crc32cw/crc32cx` instruction group.  Three
+//     flavours.  A GCC/Clang toolchain that already targets a CPU with the
+//     extension (__ARM_FEATURE_CRC32 -- every Apple silicon build, any
+//     -march=armv8-a+crc build) gets the <arm_acle.h> intrinsics directly.
+//     MSVC on ARM64 defines neither that macro nor ships <arm_acle.h>, but
+//     spells the same intrinsics __crc32cb/__crc32cw/__crc32cd in <intrin.h>,
+//     and Windows on ARM mandates ARMv8.1, so that target is unconditional
+//     too -- without this branch windows-arm64 would silently fall back to
+//     the table path.  On a baseline armv8-a Linux build the ACLE header does
+//     not expose them, so the instructions are emitted with inline asm under
 //     `.arch_extension crc` (the trick the kernel and zlib-ng use) and the
 //     path is selected from AT_HWCAP & HWCAP_CRC32.  Either way everything
 //     stays in one translation unit built with the project's stock flags.
@@ -55,6 +59,9 @@
 #if defined(CYCLONE_CRC32C_ARM)
 #if defined(__ARM_FEATURE_CRC32)
 #include <arm_acle.h>
+#define CYCLONE_CRC32C_ARM_ALWAYS 1
+#elif defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
 #define CYCLONE_CRC32C_ARM_ALWAYS 1
 #elif defined(__linux__) && defined(__GNUC__)
 #include <sys/auxv.h>
@@ -104,12 +111,15 @@ constexpr SliceTables make_slice_tables() {
 
 constexpr SliceTables kSlice = make_slice_tables();
 
-constexpr uint32_t bswap32(uint32_t v) noexcept {
+// Reached only on a big-endian host.  [[maybe_unused]] keeps the
+// little-endian builds (every CI target) free of
+// -Wunneeded-internal-declaration under a consumer's -Werror.
+[[maybe_unused]] constexpr uint32_t bswap32(uint32_t v) noexcept {
   return ((v & 0x000000FFU) << 24) | ((v & 0x0000FF00U) << 8) |
          ((v >> 8) & 0x0000FF00U) | ((v >> 24) & 0x000000FFU);
 }
 
-constexpr uint64_t bswap64(uint64_t v) noexcept {
+[[maybe_unused]] constexpr uint64_t bswap64(uint64_t v) noexcept {
   return (static_cast<uint64_t>(bswap32(static_cast<uint32_t>(v))) << 32) |
          bswap32(static_cast<uint32_t>(v >> 32));
 }
@@ -233,6 +243,10 @@ constexpr size_t kShort = kCrc32cShortBlock;
 
 constexpr ShiftTable kShiftLong = make_shift_table(kLong);
 constexpr ShiftTable kShiftShort = make_shift_table(kShort);
+// Both fit inside clang's default constexpr step budget with ~5x headroom.
+// If a compiler ever refuses (MSVC has the tightest limit), derive kShiftLong
+// from kShiftShort instead of exponentiating again: kLong is kShort * 32, so
+// it is five more squarings of the same operator.
 
 inline uint32_t shift_crc(const ShiftTable& t, uint32_t crc) noexcept {
   return t[0][crc & 0xFFU] ^ t[1][(crc >> 8) & 0xFFU] ^
@@ -380,6 +394,9 @@ CYCLONE_CRC32C_SSE42_TARGET uint32_t sse42_3way_impl(uint32_t crc,
 inline uint32_t hw_crc32cb(uint32_t crc, uint8_t v) noexcept {
   return __crc32cb(crc, v);
 }
+inline uint32_t hw_crc32cw(uint32_t crc, uint32_t v) noexcept {
+  return __crc32cw(crc, v);
+}
 inline uint32_t hw_crc32cd(uint32_t crc, uint64_t v) noexcept {
   return __crc32cd(crc, v);
 }
@@ -390,6 +407,10 @@ inline uint32_t hw_crc32cb(uint32_t crc, uint8_t v) noexcept {
   __asm__(".arch_extension crc\ncrc32cb %w0, %w0, %w1"
           : "+r"(crc)
           : "r"(static_cast<uint32_t>(v)));
+  return crc;
+}
+inline uint32_t hw_crc32cw(uint32_t crc, uint32_t v) noexcept {
+  __asm__(".arch_extension crc\ncrc32cw %w0, %w0, %w1" : "+r"(crc) : "r"(v));
   return crc;
 }
 inline uint32_t hw_crc32cd(uint32_t crc, uint64_t v) noexcept {
@@ -403,6 +424,11 @@ uint32_t arm_tail(uint32_t crc, const uint8_t* p, size_t len) noexcept {
     crc = hw_crc32cd(crc, load_le64(p));
     p += 8;
     len -= 8;
+  }
+  if (len >= 4) {
+    crc = hw_crc32cw(crc, load_le32(p));
+    p += 4;
+    len -= 4;
   }
   while (len != 0) {
     crc = hw_crc32cb(crc, *p++);
@@ -482,8 +508,8 @@ bool hardware_usable() noexcept {
 }
 
 // The interleaved variant is what dispatch picks on both architectures.  On
-// an Apple M5 it is 2.4-2.8x the single-chain path (12.0 -> 34.0 GB/s over
-// 2 MiB, 12.5 -> 28.9 GB/s over 4 KiB), and it is never slower: an input
+// an Apple M5 it is 2.4-2.9x the single-chain path (12.2 -> 34.9 GB/s over
+// 2 MiB, 12.4 -> 29.2 GB/s over 4 KiB), and it is never slower: an input
 // below 3*kShort takes the same single-chain tail either way.  Compare the
 // two with `crc32c_bench`, which times both rows.
 Crc32cImpl hardware_impl() noexcept {
@@ -513,9 +539,23 @@ Crc32cImpl select_impl() noexcept {
   return &slice_by_16_impl;
 }
 
-// Resolved once, before main(); the hot loop below sees a plain indirect call
-// and no feature branches.
-const Crc32cImpl kCrc32cImpl = select_impl();
+// Resolved once, on first use.  Deliberately a function-local static rather
+// than a namespace-scope one: a namespace-scope Crc32cImpl would be
+// DYNAMICALLY initialised, so a downstream static initialiser that checksums a
+// document before this translation unit's initialiser ran would call through a
+// null pointer.  The thread-safe-statics guard is one predictable load against
+// the CRC work that follows, and the hot loop still sees no feature branches.
+Crc32cImpl dispatch() noexcept {
+  static const Crc32cImpl impl = select_impl();
+  return impl;
+}
+
+// Same treatment for the probe: hardware_usable() wraps a getauxval() on
+// baseline aarch64 Linux, and the answer cannot change during the process.
+bool have_hardware() noexcept {
+  static const bool usable = hardware_usable();
+  return usable;
+}
 
 inline uint32_t run(Crc32cImpl impl, uint32_t state,
                     std::span<const std::byte> data) noexcept {
@@ -528,7 +568,7 @@ inline uint32_t run(Crc32cImpl impl, uint32_t state,
 
 uint32_t crc32c_update(uint32_t state,
                        std::span<const std::byte> data) noexcept {
-  return run(kCrc32cImpl, state, data);
+  return run(dispatch(), state, data);
 }
 
 uint32_t crc32c(std::span<const std::byte> data) noexcept {
@@ -542,26 +582,28 @@ uint32_t crc32c_update_portable(uint32_t state,
 
 uint32_t crc32c_update_hardware(uint32_t state,
                                 std::span<const std::byte> data) noexcept {
-  return run(hardware_usable() ? hardware_impl() : &slice_by_16_impl, state,
+  return run(have_hardware() ? hardware_impl() : &slice_by_16_impl, state,
              data);
 }
 
 uint32_t crc32c_update_hardware_1way(uint32_t state,
                                      std::span<const std::byte> data) noexcept {
-  return run(hardware_usable() ? hardware_impl_1way() : &slice_by_16_impl,
-             state, data);
+  return run(have_hardware() ? hardware_impl_1way() : &slice_by_16_impl, state,
+             data);
 }
 
-bool crc32c_has_hardware() noexcept { return hardware_usable(); }
+bool crc32c_has_hardware() noexcept { return have_hardware(); }
 
 const char* crc32c_impl_name() noexcept {
-  if (kCrc32cImpl == &slice_by_16_impl) {
+  if (dispatch() == &slice_by_16_impl) {
     return "slice-by-16";
   }
 #if defined(CYCLONE_CRC32C_X86)
   return "sse4.2-crc32c";
-#else
+#elif defined(CYCLONE_CRC32C_ARM_HW)
   return "armv8-crc32c";
+#else
+  return "slice-by-16";
 #endif
 }
 

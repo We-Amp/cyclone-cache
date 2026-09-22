@@ -200,29 +200,35 @@ is part of the on-disk format and is frozen: reflected polynomial
 
 CRC-32C replaced CRC-32/ISO-HDLC at format v8 for one reason: it is the
 polynomial *both* mainstream server architectures implement in hardware —
-x86-64 SSE4.2 (`crc32q`) and ARMv8 (`crc32cx`) — where ISO-HDLC has
-instructions only on ARMv8, leaving x86 on the table path.
+it has a hardware path on x86-64 (SSE4.2 `crc32q`) as well as on ARMv8
+(`crc32cx`), where ISO-HDLC has instructions only on ARMv8, leaving x86 on
+the table path. The x86-64 path is not yet measured; see the TODO in
+[kv-cache-benchmark.md](kv-cache-benchmark.md).
 
-Implementations, all bit-identical, selected once through a function pointer
-resolved before `main()` (no per-call feature branches):
+Implementations, all bit-identical, selected once on first use through a
+function pointer (no per-call feature branches):
 
 | Path | When | Apple M5, 2 MiB |
 |------|------|----------------:|
 | byte-at-a-time table | reference only (the tests' oracle) | 0.61 GB/s |
-| slice-by-16 tables (portable) | everywhere else | 3.28 GB/s |
+| slice-by-16 tables (portable) | everywhere else | 3.37 GB/s |
 | x86-64 SSE4.2 `crc32q`, 3-way interleaved | `__builtin_cpu_supports("sse4.2")` (`__cpuid` leaf 1 ECX bit 20 on MSVC); the one function carries `target("sse4.2")` so the project's stock flags are unchanged | n/a |
-| ARMv8 `crc32cb/w/x`, 3-way interleaved | `__ARM_FEATURE_CRC32`, or `AT_HWCAP & HWCAP_CRC32` on Linux aarch64 | 34.0 GB/s |
+| ARMv8 `crc32cb/w/x`, 3-way interleaved | `__ARM_FEATURE_CRC32`, MSVC ARM64, or `AT_HWCAP & HWCAP_CRC32` on Linux aarch64 | 34.9 GB/s |
+
+Best of five `crc32c_bench --seconds 1` runs on an otherwise idle machine;
+a run sharing the machine with a build loses a few percent. The portable
+path is the same slice-by-16 structure as the v7 ISO-HDLC one — the
+polynomial does not change its cost, so its rate is unchanged within that
+noise (3.37 here against 3.44 measured for ISO-HDLC), and the ≈2.8 GB/s
+previously measured on an i7-8750H still applies there.
 
 Both hardware paths run **three** independent CRC registers over three
 adjacent blocks (8192 bytes, then 256) and stitch them back together with
 compile-time-generated GF(2) "advance over N zero bytes" operators: the
 `crc32` instruction has ~3 cycles of latency at one per cycle, so a single
 dependent chain leaves two thirds of the issue slots idle. On an M5 that is
-12.0 → 34.0 GB/s over 2 MiB. `crc32c_bench` times both, and
-`crc32c_update_hardware_1way()` exists so the comparison stays honest. The
-portable path is the same slice-by-16 structure as before — the polynomial
-does not change its cost, so the ≈2.8 GB/s previously measured on an
-i7-8750H still applies there.
+12.2 → 34.9 GB/s over 2 MiB. `crc32c_bench` times both, and
+`crc32c_update_hardware_1way()` exists so the comparison stays honest.
 
 This matters because the CRC-validation cache is per-process: the first
 read of an offset, every read after a restart, and every read in a second
