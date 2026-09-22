@@ -17,7 +17,7 @@ It is a general-purpose blob store for anything keyed by a hash — HTTP
 responses and their content-negotiated variants, rendered pages, transcoded
 images, or the [KV-cache tensors of an LLM prefix](#kv-cache-for-llm-inference).
 
-**Status:** v0.1.0, pre-release. On-disk format v7. The API is not yet frozen;
+**Status:** v0.1.0, pre-release. On-disk format v8. The API is not yet frozen;
 pin a commit when you depend on it. All numbers below are from one machine
 (Apple M5 / macOS 27); expect different absolutes on Linux/NVMe.
 
@@ -603,12 +603,12 @@ probes) is documented in [include/cyclone/cyclone_c.h](include/cyclone/cyclone_c
 
 ## On-disk format
 
-Format major **v7**. Each volume file starts with a 64-byte `VolumeHeader`
+Format major **v8**. Each volume file starts with a 64-byte `VolumeHeader`
 (magic `CYLN`, format version, creation time, size); a major-version mismatch
 resets the volume (or fails with `IncompatibleVersion` when
 `auto_reset_on_incompatible = false`), a minor mismatch is compatible. File
 names are fingerprinted with the format version and geometry
-(`cache-7-<hash>.dat`), so an upgrade starts a fresh file and leaves the old
+(`cache-8-<hash>.dat`), so an upgrade starts a fresh file and leaves the old
 one on disk until `gc_superseded_on_start` (POSIX only) or you delete it.
 
 Directory entry — 10 bytes, no key material:
@@ -628,7 +628,7 @@ magic · len · total_len
 first_key      (32 B, SHA-256 of the key)
 fragment_key   (32 B)
 header_len · type · version · flags · sync_serial · write_serial
-pin_until · checksum (CRC32) · frag_offset · hit_count
+pin_until · checksum (CRC-32C) · frag_offset · hit_count
 next_alternate_offset (8 B) · last_access · alternate_id · reserved
 ```
 
@@ -661,9 +661,10 @@ below is served from the memory-mapped disk tier.
 | 64 KB | 8.6 K (534) | 9.1 K (567) | 0.33 µs |
 | 1 MB | 526 (526) | 559 (559) | 0.38 µs |
 
-First reads are bounded by the table-driven CRC32 over the content; a warm
-read re-runs no CRC32 and copies nothing, so its cost does not grow with the
-object.
+First reads pay page-in plus a CRC-32C over the content (hardware
+`crc32c*`/`crc32q` where the CPU has it, a slice-by-16 table otherwise); a
+warm read re-runs no CRC and copies nothing, so its cost does not grow with
+the object.
 
 ### Read scaling (`concurrent_read_bench`, 512 B objects, RAM tier off)
 
