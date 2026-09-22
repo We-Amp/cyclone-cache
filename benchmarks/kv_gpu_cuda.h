@@ -15,6 +15,10 @@
 
 #pragma once
 
+// This seam is compiled by two different toolchains (nvcc + its host
+// compiler for the .cu, clang for the C++23 host TU), so it stays plain C:
+// typedefs and <stddef.h>, not alias declarations and <cstddef>.
+// NOLINTBEGIN(modernize-use-using, modernize-deprecated-headers)
 #include <stddef.h>
 
 #ifdef __cplusplus
@@ -77,3 +81,4 @@ int cygpu_memcpy_d2h(void *dst, size_t src_off, size_t len);
 #ifdef __cplusplus
 }  // extern "C"
 #endif
+// NOLINTEND(modernize-use-using, modernize-deprecated-headers)
