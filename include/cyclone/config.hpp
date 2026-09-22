@@ -244,6 +244,33 @@ struct CacheConfig {
   bool enable_compression = false;
   int io_queue_depth = 64;
 
+  // Readahead threshold for the disk read path (0 = disabled).
+  //
+  // The volume mapping is opened MADV_RANDOM, which is right for small HTTP
+  // objects (no readahead pollution) but turns a cold read of a large
+  // document into one serial page fault per page.  When a document on the
+  // disk hit path is at least this many bytes, the read issues a readahead
+  // hint over exactly that document's byte range BEFORE the CRC
+  // verification first touches it, so the kernel fetches the range with a
+  // few large asynchronous I/Os instead of ~len/page_size serial ones.  The
+  // advice is a best-effort hint: it takes no lock, reads no shared state,
+  // and every error is ignored.  The open-time MADV_RANDOM is deliberately
+  // left in place, so objects below the threshold keep their
+  // fault-per-page, no-readahead behaviour.
+  //
+  // WHICH kernel call is platform-dependent, because MADV_WILLNEED is
+  // portable in spelling but not in cost:
+  //   Linux    madvise(MADV_WILLNEED) over the mapping, in 512 KiB chunks.
+  //   macOS    fcntl(F_RDADVISE) over the FILE range.  Darwin's
+  //            MADV_WILLNEED is synchronous and serialises on the shared VM
+  //            object, so with four processes reading one volume it costs
+  //            most of the multi-process read throughput; F_RDADVISE is the
+  //            native asynchronous readahead and is ~30x cheaper under that
+  //            contention.  The default is therefore safe on macOS too.
+  //   Windows  PrefetchVirtualMemory over the mapping.
+  // See doc/architecture.md ("Readahead policy") for the measurements.
+  size_t readahead_min_bytes = 256_KB;
+
   // Hit tracking
   std::chrono::milliseconds hit_flush_interval{
       1000};  // How often to flush hit counts to disk
@@ -445,6 +472,10 @@ struct CacheConfig {
     verify_checksum_on_read = verify;
     return *this;
   }
+  CacheConfig &set_readahead_min_bytes(size_t bytes) {
+    readahead_min_bytes = bytes;
+    return *this;
+  }
   CacheConfig &set_directory_sync_interval(std::chrono::milliseconds val) {
     directory_sync_interval = val;
     return *this;
@@ -507,6 +538,12 @@ struct VolumeConfig {
   // is skipped (write-side checksums are still computed).  Safe to disable when
   // using persistent mmap with a single writer (no torn reads possible).
   bool verify_checksum_on_read = true;
+
+  // Issue a readahead hint over a document's own byte range on the disk read
+  // path when the document is at least this large (0 = disabled).  Normally
+  // set from CacheConfig::readahead_min_bytes; see its documentation there
+  // for the mechanism and why the open-time MADV_RANDOM stays.
+  size_t readahead_min_bytes = 256_KB;
 
   // Version compatibility behavior
   // If true (default): automatically reset/purge cache on version mismatch

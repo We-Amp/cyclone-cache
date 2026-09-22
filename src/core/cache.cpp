@@ -428,6 +428,9 @@ std::expected<void, CacheError> Cache::add_volume_locked(
       vol_config.path, vol_config.size, vol_config.stripe_size,
       _impl->config.multi_process_config.enabled);
   vol_config.verify_checksum_on_read = _impl->config.verify_checksum_on_read;
+  // Large-document readahead threshold: configured on CacheConfig, applied
+  // by the volume's disk read path (see VolumeConfig::readahead_min_bytes).
+  vol_config.readahead_min_bytes = _impl->config.readahead_min_bytes;
   // Lease-pinning knobs are configured on CacheConfig.
   vol_config.read_lease_duration = _impl->config.read_lease_duration;
   vol_config.lease_wrap_ceiling = _impl->config.lease_wrap_ceiling;
@@ -1012,6 +1015,7 @@ CacheStats Cache::stats() const {
     result.evictions += vs.evictions;
     result.directory_syncs += vs.directory_syncs;
     result.fsyncs += vs.fsyncs;
+    result.readahead_hints_issued += vs.readahead_hints_issued;
 
     // Wrap-cadence telemetry: sum wrap counts; take the minimum interval
     // across volumes; last_* comes from the most recently wrapped volume.

@@ -64,6 +64,12 @@ struct CacheStats {
   // init/removal).  Convoy instrument.
   uint64_t fsyncs = 0;
 
+  // Large-document readahead hints issued on the disk read path, summed
+  // across all volumes (see CacheConfig::readahead_min_bytes).  Counts the
+  // hints that got past the per-document re-advise filter, so it is a
+  // measure of kernel calls made rather than of large reads served.
+  uint64_t readahead_hints_issued = 0;
+
   // Wrap-cadence telemetry: how often the circular write buffer wraps back
   // to the start of a stripe's data area (aggregated across all volumes).
   // Sizing instrument for the eviction-vs-reader race.
