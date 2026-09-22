@@ -92,10 +92,10 @@ TEST_CASE("DocumentBuilder with different types", "[document]") {
 TEST_CASE("Document header size is 132 bytes", "[document][alternate]") {
   REQUIRE(Document::kHeaderSize == 132);
   // Deliberate tripwire: a version bump is a cross-release decision (cold
-  // cache for every consumer), never an incidental edit.  Version 7 leaves
-  // pre-depth-bound alternate chains behind; it must stay in lockstep with
+  // cache for every consumer), never an incidental edit.  Version 8 switches
+  // the document checksum to CRC-32C; it must stay in lockstep with
   // VolumeHeader::kFormatVersionMajor.
-  REQUIRE(Document::kVersionMajor == 7);
+  REQUIRE(Document::kVersionMajor == 8);
 }
 
 TEST_CASE("Document alternate chain fields default values",

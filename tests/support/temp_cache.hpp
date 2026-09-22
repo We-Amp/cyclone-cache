@@ -4,7 +4,7 @@
 // Shared RAII temp-directory helper for cache tests.
 //
 // Motivation: Cache::add_volume() structural-fingerprints the volume filename
-// ("cyclone.dat" -> "cyclone-7-<16hex>.dat", plus a ".small" sibling) inside
+// ("cyclone.dat" -> "cyclone-8-<16hex>.dat", plus a ".small" sibling) inside
 // add_volume_locked(), so the file the library actually creates does NOT match
 // the raw path a test passed in. Tests that cleaned up with std::remove(raw)
 // therefore left the fingerprinted files behind, and on persistent-/tmp CI

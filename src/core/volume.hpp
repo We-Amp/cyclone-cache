@@ -105,7 +105,18 @@ struct VolumeHeader {
   //   on disk until it is reclaimed (CacheConfig::gc_superseded_on_start, or a
   //   manual delete -- required BEFORE start on a space-constrained cache
   //   directory, and on Windows, where the GC is compiled out).
-  static constexpr uint16_t kFormatVersionMajor = 7;
+  // Version 8: the document checksum is CRC-32C (Castagnoli) instead of
+  //   CRC-32/ISO-HDLC -- CRC-32C has hardware instructions on x86-64 (SSE4.2)
+  //   as well as ARMv8, and the checksum is re-verified on every cold read.
+  //   Again not a layout bump: no byte moved, but every pre-v8 document's
+  //   stored checksum is computed over a different polynomial and would fail
+  //   verification.  The format major separates the rings, so a v8 binary
+  //   resolves to a different fingerprinted filename and starts cold rather
+  //   than rejecting document after document.  Same consumer consequences as
+  //   the v7 bump: COLD CACHE on upgrade, and the superseded v7 file stays on
+  //   disk until it is reclaimed (CacheConfig::gc_superseded_on_start, or a
+  //   manual delete).
+  static constexpr uint16_t kFormatVersionMajor = 8;
   static constexpr uint16_t kFormatVersionMinor = 0;
 
   uint32_t magic = kMagic;
