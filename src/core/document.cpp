@@ -8,21 +8,23 @@
 #include <cstring>
 #include <limits>
 
-#include "crc32.hpp"
+#include "crc32c.hpp"
 
 namespace cyclone {
 
-// The document checksum is the CRC-32/ISO-HDLC over header_data + content
-// (everything after the 132-byte on-disk header).  The polynomial, init,
-// reflection and xorout live in crc32.hpp and are part of the on-disk format
-// -- see the convention block there before touching any of it.
+// The document checksum is the CRC-32C (Castagnoli) over header_data +
+// content (everything after the 132-byte on-disk header).  The polynomial,
+// init, reflection and xorout live in crc32c.hpp and are part of the on-disk
+// format -- see the convention block there before touching any of it, and
+// note that changing it requires a kVersionMajor bump (v8 is the CRC-32C
+// one; v7 and earlier carried CRC-32/ISO-HDLC).
 
 uint32_t Document::compute_checksum(std::span<const std::byte> data) {
-  return crc32(data);
+  return crc32c(data);
 }
 
 bool Document::verify_checksum(std::span<const std::byte> content) const {
-  return checksum == crc32(content);
+  return checksum == crc32c(content);
 }
 
 // Field descriptor for table-driven serialization.

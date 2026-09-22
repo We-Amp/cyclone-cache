@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2024-2026 We-Amp B.V.
 //
-// Micro-benchmark for the document checksum (src/core/crc32.*).
+// Micro-benchmark for the document checksum (src/core/crc32c.*).
 //
 // Every first read of a document, and every read after a restart or from a
 // second process, re-verifies the whole payload, so this number is a hard
 // ceiling on cold read bandwidth.  Usage:
 //
-//   ./build-rel/crc32_bench [--seconds 0.3]
+//   ./build-rel/crc32c_bench [--seconds 0.3]
 
 #include <algorithm>
 #include <array>
@@ -22,18 +22,18 @@
 #include <string>
 #include <vector>
 
-#include "core/crc32.hpp"
+#include "core/crc32c.hpp"
 
 namespace {
 
 using Clock = std::chrono::steady_clock;
 
-// The byte-at-a-time table CRC32 Cyclone shipped before slice-by-16, kept here
-// as the "before" row so the speedup is measured on one machine at one time.
+// Byte-at-a-time table CRC-32C: the slowest correct implementation, kept as
+// the "before" row and as the cross-check every other row must match.
 constexpr uint32_t make_crc_table_entry(uint32_t n) {
   uint32_t c = n;
   for (int k = 0; k < 8; k++) {
-    c = ((c & 1) != 0u) ? (0xedb88320 ^ (c >> 1)) : (c >> 1);
+    c = ((c & 1) != 0u) ? (0x82f63b78 ^ (c >> 1)) : (c >> 1);
   }
   return c;
 }
@@ -48,7 +48,7 @@ constexpr std::array<uint32_t, 256> make_crc_table() {
 
 constexpr auto kCrcTable = make_crc_table();
 
-uint32_t crc32_bytewise(uint32_t state, std::span<const std::byte> data) {
+uint32_t crc32c_bytewise(uint32_t state, std::span<const std::byte> data) {
   uint32_t crc = ~state;
   for (std::byte b : data) {
     crc = kCrcTable[(crc ^ static_cast<uint8_t>(b)) & 0xFF] ^ (crc >> 8);
@@ -59,19 +59,24 @@ uint32_t crc32_bytewise(uint32_t state, std::span<const std::byte> data) {
 using Fn = uint32_t (*)(uint32_t, std::span<const std::byte>);
 
 uint32_t call_portable(uint32_t s, std::span<const std::byte> d) {
-  return cyclone::crc32_update_portable(s, d);
+  return cyclone::crc32c_update_portable(s, d);
+}
+
+uint32_t call_hardware_1way(uint32_t s, std::span<const std::byte> d) {
+  return cyclone::crc32c_update_hardware_1way(s, d);
 }
 
 uint32_t call_hardware(uint32_t s, std::span<const std::byte> d) {
-  return cyclone::crc32_update_hardware(s, d);
+  return cyclone::crc32c_update_hardware(s, d);
 }
 
 uint32_t call_dispatch(uint32_t s, std::span<const std::byte> d) {
-  return cyclone::crc32_update(s, d);
+  return cyclone::crc32c_update(s, d);
 }
 
 struct Impl {
   const char* name;
+  const char* streams;
   Fn fn;
 };
 
@@ -115,20 +120,25 @@ int main(int argc, char** argv) {
     }
   }
 
+  const bool has_hw = cyclone::crc32c_has_hardware();
   std::vector<Impl> impls;
-  impls.push_back({"bytewise (old)", &crc32_bytewise});
-  impls.push_back({"slice-by-16", &call_portable});
-  if (cyclone::crc32_has_hardware()) {
-    impls.push_back({"armv8-crc32", &call_hardware});
+  impls.push_back({"bytewise", "1", &crc32c_bytewise});
+  impls.push_back({"slice-by-16", "1", &call_portable});
+  if (has_hw) {
+    const char* hw = cyclone::crc32c_impl_name();
+    impls.push_back({hw, "1", &call_hardware_1way});
+    impls.push_back({hw, "3-way", &call_hardware});
   }
-  impls.push_back({"dispatch", &call_dispatch});
+  impls.push_back({"dispatch", has_hw ? "3-way" : "1", &call_dispatch});
 
-  const size_t sizes[] = {4096, 64 * 1024, 2 * 1024 * 1024};
+  const size_t sizes[] = {size_t{4096}, size_t{64} * 1024,
+                          size_t{2} * 1024 * 1024};
 
-  std::printf("crc32 micro-benchmark  (dispatch selected: %s)\n\n",
-              cyclone::crc32_impl_name());
-  std::printf("%-16s %12s %12s %12s\n", "impl", "4 KiB", "64 KiB", "2 MiB");
-  std::printf("%-16s %12s %12s %12s\n", "", "GB/s", "GB/s", "GB/s");
+  std::printf("crc32c micro-benchmark  (dispatch selected: %s)\n\n",
+              cyclone::crc32c_impl_name());
+  std::printf("%-16s %-12s %12s %12s %12s\n", "impl", "streams", "4 KiB",
+              "64 KiB", "2 MiB");
+  std::printf("%-16s %-12s %12s %12s %12s\n", "", "", "GB/s", "GB/s", "GB/s");
 
   std::mt19937 rng(12345);
   std::vector<std::byte> buf(sizes[2]);
@@ -137,7 +147,7 @@ int main(int argc, char** argv) {
   }
 
   // Sanity: every implementation must agree before any number is printed.
-  const uint32_t want = crc32_bytewise(0, buf);
+  const uint32_t want = crc32c_bytewise(0, buf);
   for (const auto& impl : impls) {
     if (impl.fn(0, buf) != want) {
       std::fprintf(stderr, "MISMATCH in %s\n", impl.name);
@@ -147,7 +157,7 @@ int main(int argc, char** argv) {
 
   uint32_t sink = 0;
   for (const auto& impl : impls) {
-    std::printf("%-16s", impl.name);
+    std::printf("%-16s %-12s", impl.name, impl.streams);
     for (size_t size : sizes) {
       const double gbps = run(
           impl.fn, std::span<const std::byte>(buf).first(size), seconds, &sink);
