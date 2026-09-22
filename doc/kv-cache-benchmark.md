@@ -149,6 +149,12 @@ index persistent also forces `verify_checksum_on_read`, so restart-warmth
 and CRC-on-first-read come as a package. With verification off
 (`cyclone-noverify`) first-touch runs at 37 GB/s.
 
+> **Update — fixed.** The table routine is gone; see fix-list item 2. The
+> checksum now runs at 12.2 GB/s on the M5 (ARMv8 `crc32`) and 2.8 GB/s on
+> the i7-8750H (slice-by-16), and the restart phase in this same
+> configuration moved from 0.558 to 8.54 GB/s. Every number in the tables
+> below predates that change.
+
 **Multi-process readers scale worse than threads, for the same reason.**
 Four Cyclone reader processes reach 46 GB/s in copy mode, 0.65× a single
 thread, where four threads reach 1.1× and LMDB's four processes 1.2× (78
@@ -272,6 +278,40 @@ document builder → serialized record) and CRCs it before a single
    could live beside the mmap directory so a restart and every peer process
    inherit it. Covers the restart floor and the multi-process sub-scaling
    on both platforms.
+2. **Fast CRC32** — ✅ **done** (`src/core/crc32.{hpp,cpp}`). The byte-wise
+   table routine was replaced by slice-by-16 tables plus an ARMv8
+   `crc32b/w/x` path, selected once through a function pointer. The on-disk
+   convention is untouched (reflected `0xEDB88320`, init/xorout
+   `0xFFFFFFFF`), so existing cache files keep verifying. Measured with
+   `./build-rel/crc32_bench`, 2 MiB buffer:
+
+   | | byte-wise (was) | slice-by-16 | ARMv8 crc32 |
+   |---|---:|---:|---:|
+   | Apple M5 (clang, Release) | 0.61 GB/s | 3.44 GB/s | **12.21 GB/s** |
+   | i7-8750H (clang-20, Release) | 0.50 GB/s | **2.83 GB/s** | n/a |
+
+   Both machines print the same checksum for the same buffer, and the unit
+   test pins every path against a verbatim copy of the old byte-wise
+   routine (`tests/unit/test_crc32.cpp`).
+
+   End to end on the M5 (`kv_bench --block-size 2097152 --seconds 5
+   --threads 1 --skip-multiprocess`, warm page cache): restart
+   **0.558 → 8.54 GB/s** (15×), first touch 0.566 → 8.72 GB/s, put
+   0.421 → 1.38 GB/s. `performance_baseline --content-size 4096`
+   first-touch read **137 k → 1.12 M ops/s**. The restart floor is now the
+   page-cache/copy rate, not the checksum.
+
+   Note on x86-64: SSE4.2's `crc32` instruction is CRC-32**C**
+   (Castagnoli), a *different* polynomial — using it would change the
+   on-disk format and invalidate every existing cache file, so x86-64 runs
+   the portable table path. If the format is ever revved, the options are
+   adopting CRC-32C outright or adding a PCLMULQDQ folding path for the
+   current polynomial (>20 GB/s, no format change).
+
+   Still open from this item: a way for the *verified state* to outlive the
+   process — the CRC-validation cache could live beside the mmap directory
+   so a restart and every peer process inherit it, removing the
+   re-verification entirely rather than making it cheap.
 3. **A `WriteHandle::reserve(n)` that hands back the destination span** so
    the caller writes or DMAs straight into the record, collapsing three
    copies to one; then revisit puts against file-per-block (4× today).

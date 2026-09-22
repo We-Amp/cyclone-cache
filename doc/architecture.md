@@ -191,6 +191,33 @@ Document Header (132 bytes)
 └─ Content Data (variable)
 ```
 
+**Document checksum.** `checksum` is a CRC-32/ISO-HDLC (the "IEEE"/zlib
+CRC32) over header_data + content — everything after the 132-byte header.
+The convention is part of the on-disk format and is frozen: reflected
+polynomial `0xEDB88320`, init `0xFFFFFFFF`, reflected in and out, final XOR
+`0xFFFFFFFF`, so `crc32("123456789") == 0xCBF43926`. It lives in
+`src/core/crc32.{hpp,cpp}`, behind `crc32()` / `crc32_update()`.
+
+Three implementations, all bit-identical, selected once through a function
+pointer resolved before `main()` (no per-call feature branches):
+
+| Path | When | Apple M5 | i7-8750H |
+|------|------|---------:|---------:|
+| byte-at-a-time table (former code) | — | 0.61 GB/s | 0.50 GB/s |
+| slice-by-16 tables (portable) | everywhere else | 3.44 GB/s | 2.83 GB/s |
+| ARMv8 `crc32b/w/x` (`<arm_acle.h>`) | `__ARM_FEATURE_CRC32`, or `AT_HWCAP & HWCAP_CRC32` on Linux aarch64 | 12.21 GB/s | — |
+
+x86-64 deliberately has no hardware path: SSE4.2's `crc32` instruction
+computes CRC-32**C** (Castagnoli), a different checksum, and adopting it
+would invalidate every existing cache file. If the format is ever revved,
+the options are CRC-32C (SSE4.2 + ARMv8 `crc32c*`) or a PCLMULQDQ folding
+path for this polynomial.
+
+This matters because the CRC-validation cache is per-process: the first
+read of an offset, every read after a restart, and every read in a second
+process re-verify the whole payload, so the CRC rate is the ceiling on cold
+read bandwidth. See [kv-cache-benchmark.md](kv-cache-benchmark.md).
+
 **Format version history** (a volume with a mismatched major version
 auto-resets on open when `auto_reset_on_incompatible`, default true,
 `config.hpp`; see `doc/multi-process.md` for the full migration story):
