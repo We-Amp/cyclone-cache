@@ -199,9 +199,13 @@ document builder → serialized record) and CRCs it before a single
    `content_file_offset()` for 1.9× over a staged copy. The API for the
    winning form exists (`content()`, `content_file_offset()`,
    `volume_files()`); what is missing is an entry point that hands an
-   embedder the mapping identity directly. The discrete-GPU half is
-   `benchmarks/kv_gpu_cuda.cu` (registration vs pinned staging over PCIe,
-   see [Device transfer: CUDA](#device-transfer-cuda-gtx-1050-pcie));
+   embedder the mapping identity directly. The discrete-GPU half now agrees
+   and more strongly: over PCIe 3.0 ×16 on a GTX 1050,
+   `cudaHostRegister` accepts the volume mapping whole (7.56 GiB in one
+   call) and transferring from it reaches **12.79 GB/s — 99.8% of the
+   12.82 GB/s pinned-buffer bus ceiling — against 5.51 GB/s staged, 2.3×**,
+   while registering *per block* is a 21% **loss** against staging (see
+   [Device transfer: CUDA](#device-transfer-cuda-gtx-1050-pcie)).
    GPUDirect Storage (`cuFileRead` at `content_file_offset()`, NVMe→GPU
    with no host copy) needs a data-center GPU.
 5. Only then: a zero-copy C read entry point and a Python binding, which is
@@ -433,6 +437,14 @@ cmake --build build -j
 
 ## Device transfer: CUDA (GTX 1050, PCIe)
 
+**In one line:** `cudaHostRegister` does accept Cyclone's file-backed
+`MAP_SHARED` volume mapping — 7.56 GiB in a single call — and transferring
+2 MiB blocks straight out of it reaches **12.79 GB/s, 99.8% of this
+machine's 12.82 GB/s pinned-buffer PCIe ceiling, 2.32× the staged path**;
+registering *per block* instead is a **21% loss** against staging and 1.33×
+worse than not trying at all. The Metal 1.9× was the conservative end, as
+predicted.
+
 The Metal section above answers the Apple half of item 4 on unified memory,
 where there is no bus at all. `benchmarks/kv_gpu_cuda.cu` (plus its C++23
 host half, `benchmarks/kv_gpu_cuda_host.cpp`) asks the same question where
@@ -448,7 +460,7 @@ The paths, all landing the same bytes in the same `cudaMalloc` buffer:
 | path | what it does |
 |---|---|
 | `pageable` | `cudaMemcpy(H2D)` straight from `content()`. The naive path: the driver stages it through its own internal pinned buffers, synchronously, so it cannot batch. |
-| `zerocopy` | `cudaHostRegister` the page-aligned range containing `content()`, `cudaMemcpyAsync`, sync, `cudaHostUnregister` — per block. "Pin whatever span the read returned." |
+| `zerocopy` | `cudaHostRegister` the page-aligned range containing `content()`, `cudaMemcpyAsync`, sync, `cudaHostUnregister` — once per batch, for each block read. "Pin whatever span the read returned." Batched, the spans are coalesced first, because packed records make them overlap (see the acceptance notes). |
 | `zerocopy-persistent` | `cudaHostRegister` the store's whole mapping **once**; a block is then nothing but its borrowed pointer. The decisive variant. |
 | `staged` | `memcpy` into a `cudaMallocHost` buffer, then `cudaMemcpyAsync`. The conventional path. |
 | `memcpy` | the host copy alone, no GPU — `kv_bench`'s `copy` access mode, as a reference cost. |
@@ -474,31 +486,206 @@ also transfers and compares the device bytes against the source.
 
 ### Machine
 
-Intel Core i7-8750H (6 cores / 12 threads), 23 GiB RAM, Samsung 970 PRO NVMe
-root, **NVIDIA GeForce GTX 1050 Mobile** (GP107M, Pascal, `sm_61`, 4 GiB),
-Ubuntu 22.04.5, kernel 5.15.0-191. Driver 550.163.01 and CUDA toolkit 12.4
-from the NVIDIA `ubuntu2204` apt repository; `nvcc` builds the `.cu` with
-`-ccbin g++-13` (CUDA 12.4 accepts GCC ≤ 13) while the host half is built as
-C++23 by `clang++-20`. It is an Optimus hybrid laptop: `nvidia-prime` had it
-in `intel` mode, which installs a `blacklist nvidia` / `alias nvidia off`
-modprobe drop-in and stops the driver loading no matter how well it built —
-`prime-select on-demand` is what makes the GPU usable for compute. Because
-`cudaHostRegister` page-locks multi-GiB ranges of the cache mapping, the
-`memlock` rlimit has to be raised (a drop-in under
+Intel Core i7-8750H (6 cores / 12 threads, 2.20 GHz), 23 GiB RAM, Samsung
+970 PRO NVMe root, **NVIDIA GeForce GTX 1050** (GP107M, Pascal, `sm_61`,
+compute capability 6.1, 5 SMs, 3.9 GiB), on **PCIe 3.0 ×16** (link reported
+at gen 3 / width 16, both current and max), Ubuntu 22.04.5, kernel
+5.15.0-191. Driver 550.163.01 and CUDA toolkit 12.4 from the NVIDIA
+`ubuntu2204` apt repository; `nvcc` builds the `.cu` with `-ccbin g++-13`
+(CUDA 12.4 accepts GCC ≤ 13) while the host half is built as C++23 by
+`clang++-20`. Host page size 4096. It is an Optimus hybrid laptop:
+`nvidia-prime` had it in `intel` mode, which installs a `blacklist nvidia` /
+`alias nvidia off` modprobe drop-in and stops the driver loading no matter
+how well it built — `prime-select on-demand` is what makes the GPU usable
+for compute.
+
+Because `cudaHostRegister` page-locks multi-GiB ranges of the cache mapping,
+the `memlock` rlimit has to be raised (a drop-in under
 `/etc/security/limits.d/`); the default ~3 GiB is smaller than the span an
-8 GiB Cyclone volume occupies, and the benchmark falls back to 1 GiB
-registration windows and reports the fallback when a single registration is
-refused.
+8 GiB Cyclone volume occupies. With `memlock` unlimited the **single
+registration succeeded** — 7.56 GiB of Cyclone's mapping in **one** window,
+in 4.9 s — so the 1 GiB window fallback was never exercised in these runs. It
+stays in the benchmark, and reports itself when it fires, because the rlimit
+is a machine property and not every host will allow the whole span.
 
-### Status
+One build note that is not about the GPU: CMake only knows a CUDA language
+dialect it has a flag for, and `CUDA20` arrived in CMake 3.25 — Ubuntu 22.04
+ships 3.22, where asking for it fails the *generate* step outright. The
+`.cu` is deliberately plain (runtime calls, `memset`/`strncpy`), so
+`CMakeLists.txt` requests C++20 only where CMake knows the flag and falls
+back to C++17 otherwise, announcing which it took.
 
-**Not yet measured.** The driver and toolkit installed cleanly (DKMS built
-`nvidia/550.163.01` for 5.15.0-191, `nvcc` 12.4 present, `nouveau`
-blacklisted), but the machine did not come back from the reboot that the
-driver switch requires and needs physical attention. The benchmark, its
-CMake wiring and the gate scope for `.cu` are in the tree; the acceptance
-result, the results table and the PCIe ceiling reference go here when the
-box is back.
+### Acceptance: CUDA page-locks a file-backed `MAP_SHARED` mapping — with the right flag
+
+The answer is **yes**, with one condition that costs an embedder nothing to
+meet but fails confusingly if missed: the *protection* of the mapping, not
+its file backing, is what decides the flag. A read-write `MAP_SHARED` file
+mapping is taken by plain `cudaHostRegisterDefault`; a **`PROT_READ`** one is
+refused by it with `invalid argument`, and needs
+`cudaHostRegisterReadOnly`. Verbatim, at 2 MiB:
+
+```
+mmap(MAP_SHARED, RW)  RegisterDefault  : accepted; transfer completed; device bytes == source
+mmap(MAP_SHARED, RW)  RegisterReadOnly : accepted; transfer completed; device bytes == source
+mmap(MAP_SHARED, RO)  RegisterDefault  : REFUSED: cudaHostRegister -> invalid argument
+mmap(MAP_SHARED, RO)  RegisterReadOnly : accepted; transfer completed; device bytes == source
+MAP_PRIVATE|ANONYMOUS (control)        : accepted; transfer completed; device bytes == source
+
+A1 content() page-aligned range      : accepted; transfer completed; device bytes == source
+   (content ptr % page = 260)
+A2 mapped_view() page-aligned range  : accepted; transfer completed; device bytes == source
+   (document view 2097348 B incl. its header)
+A3 own mmap(PROT_READ) Default       : REFUSED: cudaHostRegister -> invalid argument
+A3 own mmap(PROT_READ) ReadOnly      : accepted; transfer completed; device bytes == source
+```
+
+Acceptance alone was not taken as the answer: every probe also ran a
+`cudaMemcpyAsync` out of the registered range and compared the device bytes
+against the source, and all of them matched.
+
+So all three Cyclone surfaces work. A1 and A2 are read-write (Cyclone maps
+its volume `PROT_READ|PROT_WRITE`) and go through on `Default`; A3 — the
+GPUDirect-shaped surface, a consumer's own `mmap(MAP_SHARED, PROT_READ)` at
+`content_file_offset()` — needs `ReadOnly`, and so does **LMDB's** map, which
+is why LMDB's rows exist at all. `content()` sits 260 bytes into a page (the
+132-byte document header, plus the record's place in the stripe), so the
+registration is taken at the page below it and the copy sources from
+`content()` itself.
+
+The persistent registration that the decisive path needs was accepted whole:
+**7.56 GiB of Cyclone's mapping in a single `cudaHostRegister`**, with
+`cudaHostRegisterDefault`, in 4.9 s — no windowing. LMDB's 1.00 GiB map was
+taken in one `ReadOnly` registration in 0.1 s.
+
+One mechanic worth recording, because the naive shape of the per-block path
+is simply broken. Records are packed back to back, so two blocks of one
+16-block batch routinely share a page. CUDA refuses a range overlapping one
+already pinned — and, less obviously, a `cudaMemcpyAsync` whose source
+*straddles the end* of a registration returns `invalid argument` even though
+every byte is resident. The `zerocopy` path therefore sorts and coalesces the
+batch's page-aligned spans before registering any of them, which is what an
+embedder pinning borrowed spans would have to do too. It also registers
+everything before enqueuing any copy and unregisters only after the
+synchronize: unregistering host memory the DMA engine is still reading is a
+use-after-free.
+
+### Results, 2 MiB blocks
+
+N = 512, 10 s per path, otherwise-idle machine, `--path` on the NVMe. Raw
+lines: [`cuda-gtx1050-2mib.jsonl`](kv-cache-benchmark/cuda-gtx1050-2mib.jsonl).
+
+| store | path | batch | blocks/s | GB/s | p50 µs | p99 µs | correct |
+|---|---|---:|---:|---:|---:|---:|---|
+| cuda | submit-only-0B | 1 | 2027874 | 0.00 | 0.5 | 0.5 | ok |
+| cuda | h2d-4KiB | 1 | 254471 | 1.04 | 3.8 | 4.2 | ok |
+| cuda | pinned-ceiling | 1 | 6078 | 12.75 | 164.0 | 190.2 | ok |
+| **cuda** | **pinned-ceiling** | **16** | **6112** | **12.82** | **162.9** | **167.3** | **ok** |
+| cyclone | pageable | 1 | 2774 | 5.82 | 372.1 | 416.1 | ok |
+| cyclone | zerocopy | 1 | 2272 | 4.77 | 434.9 | 484.0 | ok |
+| cyclone | zerocopy | 16 | 2079 | 4.36 | 407.8 | 1167.3 | ok |
+| cyclone | zerocopy-persistent | 1 | 5949 | 12.48 | 165.9 | 193.9 | ok |
+| **cyclone** | **zerocopy-persistent** | **16** | **6098** | **12.79** | **162.5** | **168.6** | **ok** |
+| cyclone | staged | 1 | 2428 | 5.09 | 421.3 | 491.4 | ok |
+| cyclone | staged | 16 | 2626 | 5.51 | 394.5 | 401.4 | ok |
+| cyclone | memcpy | 1 | 5156 | 10.81 | 204.1 | 246.7 | ok |
+| lmdb | pageable | 1 | 2752 | 5.77 | 372.7 | 410.9 | ok |
+| lmdb | zerocopy | 1 | 2230 | 4.68 | 443.2 | 508.2 | ok |
+| lmdb | zerocopy | 16 | 2561 | 5.37 | 346.7 | 622.7 | ok |
+| lmdb | zerocopy-persistent | 1 | 5997 | 12.58 | 165.4 | 191.8 | ok |
+| lmdb | zerocopy-persistent | 16 | 6107 | 12.81 | 163.8 | 169.0 | ok |
+| lmdb | staged | 1 | 2434 | 5.10 | 421.3 | 465.3 | ok |
+| lmdb | staged | 16 | 2600 | 5.45 | 394.3 | 420.8 | ok |
+| lmdb | memcpy | 1 | 5085 | 10.66 | 204.0 | 247.3 | ok |
+| filedir-pread | staged | 1 | 1964 | 4.12 | 510.8 | 559.5 | ok |
+| filedir-pread | staged | 16 | 2399 | 5.03 | 424.7 | 433.6 | ok |
+| filedir-pread | memcpy | 1 | 4984 | 10.45 | 206.9 | 223.6 | ok |
+
+**The ceiling reference.** `pinned-ceiling` — a 2 MiB `cudaMemcpyAsync` out of
+a `cudaMallocHost` buffer, no store in the path — reaches **12.82 GB/s**.
+PCIe 3.0 ×16 is 15.75 GB/s of raw lane rate after 128b/130b encoding, so
+12.82 GB/s is ~81% of it, which is what a gen-3 ×16 link delivers once TLP
+headers and the DMA engine are accounted for. Nothing store-backed can beat
+it, and it is the denominator below:
+
+| path (batch 16) | GB/s | % of the 12.82 GB/s pinned ceiling |
+|---|---:|---:|
+| cyclone `zerocopy-persistent` | 12.79 | **99.8%** |
+| lmdb `zerocopy-persistent` | 12.81 | 99.9% |
+| cyclone `pageable` (batch 1) | 5.82 | 45.4% |
+| cyclone `staged` | 5.51 | 43.0% |
+| lmdb `staged` | 5.45 | 42.5% |
+| filedir-pread `staged` | 5.03 | 39.2% |
+| cyclone `zerocopy` | 4.36 | 34.0% |
+
+### What it says
+
+**1. CUDA submission is nearly free, so this is a bandwidth story, not a
+submission story — the opposite of Metal.** A 0-byte `cudaMemcpyAsync` plus
+`cudaStreamSynchronize` costs **0.46 µs**; Metal's empty command buffer cost
+13.8 µs, thirty times more. A 4 KiB transfer costs 3.8 µs against Metal's
+173.7 µs. The consequence is that **batching barely matters here**: the
+ceiling moves 12.75 → 12.82 GB/s from batch 1 to batch 16, and
+`zerocopy-persistent` 12.48 → 12.79. On Metal the headline advice was "batch
+or you are measuring the submission"; on CUDA a single 2 MiB transfer already
+runs at 98% of what sixteen batched ones do. Everything that separates the
+rows below is the **host copy**, not the enqueue.
+
+**2. Registering per block is a loss — and a bigger one than doing nothing
+clever at all.** Cyclone's `zerocopy` reaches 4.36 GB/s batched, against 5.51
+staged: **0.79×, a 21% loss**. It is also slower than `pageable` (5.82 GB/s),
+the naive `cudaMemcpy` straight from `content()` that lets the driver stage
+through its own internal buffers — so pinning the borrowed span per read is
+worse than not trying, by 1.33×. The p99 tells the same story louder: 1167 µs
+against 401 µs staged, because `cudaHostRegister`/`cudaHostUnregister` walk
+and wire page tables on every block and that work is spiky. LMDB agrees
+(5.37 vs 5.45, a wash at best). Making 2 MiB of host memory DMA-able costs
+about what copying it costs, on both platforms — this is the one conclusion
+Metal and CUDA reach identically.
+
+**3. Registering the mapping *once* is the win — 2.3×, and it lands on the
+bus ceiling.** Page-lock Cyclone's whole volume mapping once and a block
+becomes nothing but its borrowed pointer: **12.79 GB/s at batch 16, p50
+162.5 µs**, against **5.51 GB/s / 394.5 µs** staged — **2.32× throughput,
+2.43× lower latency** — and **99.8% of the 12.82 GB/s pinned-buffer PCIe
+ceiling**. The staged path cannot get there and the reason is arithmetic, not
+tuning: the host `memcpy` alone runs at 10.81 GB/s, so staging serializes a
+10.81 GB/s copy with a 12.82 GB/s bus and lands at 1/(1/10.81 + 1/12.82) =
+5.87 GB/s — within noise of the 5.51 measured. Removing the copy removes the
+whole of that. `filedir-pread`, which has no borrowed-buffer API and *must*
+stage, reaches 5.03 GB/s: Cyclone's persistent form is **2.54× ahead** of it.
+LMDB reaches the same ceiling (12.81 GB/s), which is the honest framing — this
+is a property of *any* store that keeps every value inside one registrable
+mapping, and Cyclone and LMDB are the two here that do.
+
+That is the discrete-GPU confirmation of the Metal result, and it is
+stronger: on unified memory the persistent wrap won 1.9× against a copy
+between two regions of the same DRAM, while over a real bus it wins 2.3× and
+saturates the link. The API for the winning form already exists — `content()`
+for the pointer, `content_file_offset()` for the offset, `volume_files()` for
+the file — so an embedder can build the persistent registration today. What
+is missing is the same thing Metal wanted: an entry point that hands over the
+mapping identity directly, instead of making the caller infer the span from
+the pointers reads happen to return.
+
+**8 MiB, partial.** An 8 MiB sweep was attempted and abandoned, but its
+Cyclone half completed before the box ran out of room and says the same
+thing: ceiling 13.07 GB/s, `zerocopy-persistent` **12.82 GB/s (98.1% of it)**
+against **5.60 GB/s** staged — **2.29×** — while per-block `zerocopy`
+collapses to 2.15 GB/s, a **61% loss** against staging rather than 2 MiB's
+21%, because the registration cost scales with the span while the copy it
+saves does not. The run was stopped during the LMDB phase: at 8 MiB the three
+stores hold ~12 GiB of blocks and the registered volume mapping another
+7.75 GiB, which does not fit this machine's 23 GiB, and what it was measuring
+by then was page reclaim. There is no `.jsonl` for it for that reason. The
+2 MiB configuration above (1 GiB per store) sits comfortably in RAM and is
+the one to cite.
+
+Two practical notes for anyone doing this. The mapping must be registered
+with `cudaHostRegisterReadOnly` if it is `PROT_READ` — including the
+GPUDirect-shaped A3 surface — and page-locking multi-GiB spans needs
+`memlock` raised; the benchmark degrades to 1 GiB windows and says so when a
+single registration is refused, which is functionally identical for the
+transfer.
 
 ### Running it
 
@@ -514,10 +701,16 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release \
   -DCYCLONE_USE_BUNDLED_SHA256=ON \
   -DCYCLONE_BUILD_CUDA_BENCHMARKS=ON \
   -DCMAKE_CUDA_HOST_COMPILER=g++-13 \
-  -DCMAKE_CUDA_ARCHITECTURES=61
-cmake --build build -j
+  -DCMAKE_CUDA_ARCHITECTURES=61 \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
+cmake --build build -j --target kv_gpu_cuda
 ./build/kv_gpu_cuda --block-size 2097152 --seconds 10 --path /fast/ssd/kvdata
 ```
+
+`-DCMAKE_CUDA_COMPILER` is only needed when the toolkit's `nvcc` is not on
+`PATH`, which is the default for the NVIDIA apt packages (they install under
+`/usr/local/cuda`). `-DCMAKE_CUDA_ARCHITECTURES` must match the device —
+`61` is Pascal; `nvidia-smi --query-gpu=compute_cap --format=csv` prints it.
 
 Cyclone's public headers are C++23 (`std::expected`) and nvcc 12.4 stops at
 C++20, so the target is deliberately two translation units: everything that

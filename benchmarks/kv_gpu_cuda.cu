@@ -137,6 +137,10 @@ int cygpu_host_unregister(const void *base) {
   return static_cast<int>(cudaHostUnregister(const_cast<void *>(base)));
 }
 
+int cygpu_error_already_registered(void) {
+  return static_cast<int>(cudaErrorHostMemoryAlreadyRegistered);
+}
+
 int cygpu_memcpy_h2d_sync(const void *src, size_t dst_off, size_t len) {
   if (!device_range_ok(dst_off, len)) {
     return static_cast<int>(cudaErrorInvalidValue);

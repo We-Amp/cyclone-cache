@@ -303,11 +303,26 @@ if(CYCLONE_BUILD_BENCHMARKS)
       "kv_gpu_cuda: CUDA ${CUDAToolkit_VERSION}, architectures "
       "${CMAKE_CUDA_ARCHITECTURES}")
 
+    # CMake can only request a CUDA dialect it has a flag for, and CUDA20
+    # arrived in CMake 3.25 -- Ubuntu 22.04 ships 3.22, where asking for it
+    # fails the generate step outright ("does not know the compile flags to
+    # use to enable it").  The .cu is deliberately plain (runtime calls,
+    # memset/strncpy), so it compiles as C++17 just as well; ask for 20 only
+    # where CMake actually knows the flag.
+    if(DEFINED CMAKE_CUDA20_STANDARD_COMPILE_OPTION)
+      set(CYCLONE_CUDA_STD 20)
+    else()
+      set(CYCLONE_CUDA_STD 17)
+      message(STATUS
+        "kv_gpu_cuda: CMake ${CMAKE_VERSION} has no CUDA20 dialect - "
+        "building the .cu as C++17")
+    endif()
+
     add_executable(kv_gpu_cuda
       benchmarks/kv_gpu_cuda.cu
       benchmarks/kv_gpu_cuda_host.cpp)
     set_target_properties(kv_gpu_cuda PROPERTIES
-      CUDA_STANDARD 20
+      CUDA_STANDARD ${CYCLONE_CUDA_STD}
       CUDA_STANDARD_REQUIRED ON
       CXX_STANDARD 23
       CXX_STANDARD_REQUIRED ON)

@@ -19,7 +19,11 @@
 //                        pinned buffers, synchronously.
 //   zerocopy             cudaHostRegister the page-aligned range containing
 //                        content(), cudaMemcpyAsync, sync, cudaHostUnregister
-//                        -- per block.  "Pin whatever span the read returned."
+//                        -- for each block of the batch.  "Pin whatever span
+//                        the read returned."  Batched, the spans are sorted
+//                        and coalesced first: records are packed back to back
+//                        so they overlap, and CUDA refuses an overlapping
+//                        registration (see unit_zerocopy).
 //   zerocopy-persistent  cudaHostRegister the store's WHOLE mapping ONCE, then
 //                        per block just cudaMemcpyAsync from the borrowed
 //                        pointer (which now lands inside a registered range,
@@ -81,6 +85,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "cyclone/cache.hpp"
@@ -140,6 +145,40 @@ uintptr_t page_base(uintptr_t p) {
 }
 
 std::string cuda_err(int rc) { return cygpu_error_string(rc); }
+
+// Why the last measured unit gave up.  A path that fails mid-run reports a
+// bare "transfer failed" otherwise, and the whole point of the experiment is
+// which CUDA call refuses what -- so the units record the exact
+// cudaGetErrorString here and run_path() puts it in the row's note.
+std::string g_unit_error;
+
+// What cudaHostRegister was asked for, and what it made of it.
+enum class RegOutcome { kDefault, kReadOnly, kAlreadyRegistered, kRefused };
+
+// cudaHostRegisterDefault is refused ("invalid argument") on a PROT_READ file
+// mapping -- which is exactly what LMDB's map is, and what a consumer mapping
+// a Cyclone volume file for reading would create.  cudaHostRegisterReadOnly
+// takes those.  So: try Default (what a read-write mapping wants), fall back
+// to ReadOnly, and report an overlap with an existing registration as its own
+// outcome, because the range is page-locked either way and refusing to
+// measure it would be wrong.
+RegOutcome host_register_any(const void *base, size_t len, std::string *err) {
+  const int rc = cygpu_host_register(base, len, 0);
+  if (rc == 0) return RegOutcome::kDefault;
+  if (rc == cygpu_error_already_registered()) {
+    return RegOutcome::kAlreadyRegistered;
+  }
+  const int rc_ro = cygpu_host_register(base, len, 1);
+  if (rc_ro == 0) return RegOutcome::kReadOnly;
+  if (rc_ro == cygpu_error_already_registered()) {
+    return RegOutcome::kAlreadyRegistered;
+  }
+  if (err != nullptr) {
+    *err = "RegisterDefault -> " + cuda_err(rc) + "; RegisterReadOnly -> " +
+           cuda_err(rc_ro);
+  }
+  return RegOutcome::kRefused;
+}
 
 // ------------------------------------------------------------ machine info
 
@@ -535,12 +574,14 @@ RunOut run_path(size_t n, size_t bs, size_t batch, double seconds,
   RunOut out;
   const double warmup = std::min(kWarmupSeconds, seconds);
   size_t i = 0;
+  g_unit_error.clear();
 
   auto t0 = Clock::now();
   while (secs_since(t0) < warmup) {
     if (!unit(i, batch)) {
       out.supported = false;
-      out.note = "transfer failed during warm-up";
+      out.note = "failed during warm-up" +
+                 (g_unit_error.empty() ? std::string() : ": " + g_unit_error);
       return out;
     }
     i = (i + batch) % n;
@@ -555,7 +596,8 @@ RunOut run_path(size_t n, size_t bs, size_t batch, double seconds,
     const auto a = Clock::now();
     if (!unit(i, batch)) {
       out.supported = false;
-      out.note = "transfer failed during measurement";
+      out.note = "failed during measurement" +
+                 (g_unit_error.empty() ? std::string() : ": " + g_unit_error);
       return out;
     }
     const auto b = Clock::now();
@@ -796,12 +838,18 @@ void probe_cyclone_surfaces(CycloneStore *cyc, size_t bs,
       void *m = ::mmap(nullptr, mlen, PROT_READ, MAP_SHARED, fd,
                        static_cast<off_t>(abase));
       if (m != MAP_FAILED) {
-        const auto r = probe_register(m, mlen, aoff, bs, false, readback);
+        // Both flags: a PROT_READ mapping is exactly the case
+        // cudaHostRegisterDefault refuses, so reporting only Default would
+        // read as "CUDA cannot take this surface" when it can.
+        auto r = probe_register(m, mlen, aoff, bs, false, readback);
         std::printf(
-            "    A3 own mmap(MAP_SHARED, PROT_READ)   : %s\n"
+            "    A3 own mmap(PROT_READ) Default       : %s\n"
             "       (volume file %s, content_file_offset %llu)\n",
             r.detail.c_str(), cyc->volume_file().c_str(),
             static_cast<unsigned long long>(fo));
+        r = probe_register(m, mlen, aoff, bs, true, readback);
+        std::printf("    A3 own mmap(PROT_READ) ReadOnly      : %s\n",
+                    r.detail.c_str());
         ::munmap(m, mlen);
       }
       ::close(fd);
@@ -827,15 +875,15 @@ class SpanRegistration {
  public:
   ~SpanRegistration() { release(); }
 
-  bool acquire(uintptr_t base, size_t len, bool read_only) {
+  bool acquire(uintptr_t base, size_t len) {
     _base = base;
     _len = len;
-    if (try_windows(len, read_only)) {
+    if (try_windows(len)) {
       _windows = 1;
       return true;
     }
     const std::string whole = _error;
-    if (try_windows(kRegisterWindow, read_only)) {
+    if (try_windows(kRegisterWindow)) {
       _windows = (len + kRegisterWindow - 1) / kRegisterWindow;
       _error = "single " + std::to_string(len >> 30) + " GiB registration " +
                whole + "; fell back to 1 GiB windows";
@@ -855,18 +903,31 @@ class SpanRegistration {
   }
   [[nodiscard]] size_t windows() const { return _windows; }
   [[nodiscard]] const std::string &error() const { return _error; }
+  // Which cudaHostRegister flag the mapping was actually taken with -- the
+  // read-only fallback is the whole reason LMDB's map can be registered.
+  [[nodiscard]] const char *flag() const { return _flag; }
 
  private:
-  bool try_windows(size_t window, bool read_only) {
+  bool try_windows(size_t window) {
     release();
     for (size_t off = 0; off < _len; off += window) {
       const size_t n = std::min(window, _len - off);
       auto *p = reinterpret_cast<void *>(_base + off);
-      const int rc = cygpu_host_register(p, n, read_only ? 1 : 0);
-      if (rc != 0) {
-        _error = "-> " + cuda_err(rc);
-        release();
-        return false;
+      std::string err;
+      switch (host_register_any(p, n, &err)) {
+        case RegOutcome::kDefault:
+          _flag = "cudaHostRegisterDefault";
+          break;
+        case RegOutcome::kReadOnly:
+          _flag = "cudaHostRegisterReadOnly";
+          break;
+        case RegOutcome::kAlreadyRegistered:
+          _flag = "already registered";
+          continue;  // nothing of ours to unregister
+        case RegOutcome::kRefused:
+          _error = "-> " + err;
+          release();
+          return false;
       }
       _registered.push_back(p);
     }
@@ -877,6 +938,7 @@ class SpanRegistration {
   uintptr_t _base = 0;
   size_t _len = 0;
   size_t _windows = 0;
+  const char *_flag = "?";
   std::vector<void *> _registered;
   std::string _error;
 };
@@ -1090,50 +1152,105 @@ void run_store(GpuStore *store, const Dataset &ds, size_t bs, double seconds,
       const uint8_t *d = nullptr;
       size_t l = 0;
       if (!store->acquire(k, (start + k) % n, d, l) || l != bs) {
+        g_unit_error = "store read failed";
         store->release(k);
         return false;
       }
       const int rc = cygpu_memcpy_h2d_sync(d, k * bs, l);
       store->release(k);
-      if (rc != 0) return false;
+      if (rc != 0) {
+        g_unit_error = "cudaMemcpy -> " + cuda_err(rc);
+        return false;
+      }
     }
     return true;
   };
 
-  // B: register the page-aligned range containing the block, transfer,
-  // unregister -- per block.
+  // B: register the page-aligned range containing each block, transfer,
+  // unregister -- once per batch.
+  //
+  // Two mechanics the naive shape gets wrong, both found by running it.
+  // Records are packed back to back, so two blocks of one batch routinely
+  // share a page: CUDA refuses a range overlapping one already pinned, and a
+  // copy whose source straddles the END of a registration comes back
+  // "invalid argument" even though every byte is resident.  So the spans are
+  // sorted and coalesced first, which is what an embedder pinning borrowed
+  // spans would have to do anyway.  And ALL registration happens before any
+  // copy is enqueued, unregistration only after the sync -- unregistering
+  // host memory the DMA engine is still reading would be a use-after-free.
+  std::vector<std::pair<const uint8_t *, size_t>> zc_blocks;
+  std::vector<std::pair<uintptr_t, uintptr_t>> zc_spans;
+  std::vector<std::pair<uintptr_t, uintptr_t>> zc_merged;
+  std::vector<void *> zc_regs;
+  zc_blocks.reserve(kBatchBlocks);
+  zc_spans.reserve(kBatchBlocks);
+  zc_merged.reserve(kBatchBlocks);
+  zc_regs.reserve(kBatchBlocks);
   UnitFn unit_zerocopy = [&](size_t start, size_t count) {
+    zc_blocks.clear();
+    zc_spans.clear();
+    zc_merged.clear();
+    zc_regs.clear();
     bool ok = true;
-    std::vector<void *> regs;
-    regs.reserve(count);
     size_t got = 0;
     for (size_t k = 0; k < count; ++k) {
       const uint8_t *d = nullptr;
       size_t l = 0;
       if (!store->acquire(k, (start + k) % n, d, l) || l != bs) {
+        g_unit_error = "store read failed";
         store->release(k);
         ok = false;
-        break;
-      }
-      const uintptr_t ptr = reinterpret_cast<uintptr_t>(d);
-      const uintptr_t base = page_base(ptr);
-      const size_t off = static_cast<size_t>(ptr - base);
-      auto *rbase = reinterpret_cast<void *>(base);
-      if (cygpu_host_register(rbase, round_up(off + l, g_page_size), 0) != 0) {
-        store->release(k);
-        ok = false;
-        break;
-      }
-      regs.push_back(rbase);
-      if (cygpu_memcpy_h2d_async(d, k * bs, l) != 0) {
-        ok = false;
-        got = k + 1;
         break;
       }
       got = k + 1;
+      zc_blocks.emplace_back(d, l);
+      const uintptr_t ptr = reinterpret_cast<uintptr_t>(d);
+      const uintptr_t base = page_base(ptr);
+      const size_t off = static_cast<size_t>(ptr - base);
+      zc_spans.emplace_back(base, base + round_up(off + l, g_page_size));
     }
-    if (cygpu_stream_sync() != 0) ok = false;
-    for (auto *r : regs) cygpu_host_unregister(r);
+
+    if (ok) {
+      std::sort(zc_spans.begin(), zc_spans.end());
+      for (const auto &s : zc_spans) {
+        if (!zc_merged.empty() && s.first <= zc_merged.back().second) {
+          zc_merged.back().second = std::max(zc_merged.back().second, s.second);
+        } else {
+          zc_merged.push_back(s);
+        }
+      }
+      for (const auto &s : zc_merged) {
+        auto *p = reinterpret_cast<void *>(s.first);
+        std::string err;
+        const auto outcome = host_register_any(p, s.second - s.first, &err);
+        if (outcome == RegOutcome::kRefused) {
+          g_unit_error = "cudaHostRegister on the borrowed span: " + err;
+          ok = false;
+          break;
+        }
+        // Registered by something else (the store's own mapping, say): the
+        // bytes are page-locked either way, but do not unregister a range
+        // this batch did not take.
+        if (outcome != RegOutcome::kAlreadyRegistered) zc_regs.push_back(p);
+      }
+    }
+
+    if (ok) {
+      for (size_t k = 0; k < zc_blocks.size(); ++k) {
+        const int rc = cygpu_memcpy_h2d_async(zc_blocks[k].first, k * bs,
+                                              zc_blocks[k].second);
+        if (rc != 0) {
+          g_unit_error = "cudaMemcpyAsync -> " + cuda_err(rc);
+          ok = false;
+          break;
+        }
+      }
+    }
+    if (const int rc = cygpu_stream_sync(); rc != 0) {
+      g_unit_error = "cudaStreamSynchronize -> " + cuda_err(rc);
+      ok = false;
+    }
+    for (auto *r : zc_regs) cygpu_host_unregister(r);
     for (size_t k = 0; k < got; ++k) store->release(k);
     return ok;
   };
@@ -1151,18 +1268,28 @@ void run_store(GpuStore *store, const Dataset &ds, size_t bs, double seconds,
       const uint8_t *d = nullptr;
       size_t l = 0;
       if (!store->acquire(k, (start + k) % n, d, l) || l != bs) {
+        g_unit_error = "store read failed";
         store->release(k);
         ok = false;
         break;
       }
       got = k + 1;
-      if (!span.contains(reinterpret_cast<uintptr_t>(d), l) ||
-          cygpu_memcpy_h2d_async(d, k * bs, l) != 0) {
+      if (!span.contains(reinterpret_cast<uintptr_t>(d), l)) {
+        g_unit_error = "borrowed pointer fell outside the registered span";
+        ok = false;
+        break;
+      }
+      const int rc = cygpu_memcpy_h2d_async(d, k * bs, l);
+      if (rc != 0) {
+        g_unit_error = "cudaMemcpyAsync -> " + cuda_err(rc);
         ok = false;
         break;
       }
     }
-    if (cygpu_stream_sync() != 0) ok = false;
+    if (const int rc = cygpu_stream_sync(); rc != 0) {
+      g_unit_error = "cudaStreamSynchronize -> " + cuda_err(rc);
+      ok = false;
+    }
     for (size_t k = 0; k < got; ++k) store->release(k);
     return ok;
   };
@@ -1173,25 +1300,34 @@ void run_store(GpuStore *store, const Dataset &ds, size_t bs, double seconds,
     size_t got = 0;
     for (size_t k = 0; k < count; ++k) {
       if (!store->read_into((start + k) % n, pinned + k * bs, bs)) {
+        g_unit_error = "store read failed";
         ok = false;
         break;
       }
       got = k + 1;
     }
     for (size_t k = 0; k < got; ++k) {
-      if (cygpu_memcpy_h2d_async(pinned + k * bs, k * bs, bs) != 0) {
+      const int rc = cygpu_memcpy_h2d_async(pinned + k * bs, k * bs, bs);
+      if (rc != 0) {
+        g_unit_error = "cudaMemcpyAsync -> " + cuda_err(rc);
         ok = false;
         break;
       }
     }
-    if (cygpu_stream_sync() != 0) ok = false;
+    if (const int rc = cygpu_stream_sync(); rc != 0) {
+      g_unit_error = "cudaStreamSynchronize -> " + cuda_err(rc);
+      ok = false;
+    }
     return ok;
   };
 
   // E: the host copy alone, no GPU at all.
   UnitFn unit_memcpy = [&](size_t start, size_t count) {
     for (size_t k = 0; k < count; ++k) {
-      if (!store->read_into((start + k) % n, heap->data(), bs)) return false;
+      if (!store->read_into((start + k) % n, heap->data(), bs)) {
+        g_unit_error = "store read failed";
+        return false;
+      }
     }
     return true;
   };
@@ -1222,12 +1358,12 @@ void run_store(GpuStore *store, const Dataset &ds, size_t bs, double seconds,
     const uintptr_t sbase = page_base(lo);
     const size_t slen = round_up(static_cast<size_t>(hi - sbase), g_page_size);
     const auto t_reg = Clock::now();
-    if (span.acquire(sbase, slen, false)) {
+    if (span.acquire(sbase, slen)) {
       std::printf(
-          "  persistent registration: accepted (%.2f GiB of the store's "
-          "mapping, %zu window(s), %.1f s)%s%s\n",
-          static_cast<double>(slen) / (1024.0 * 1024 * 1024), span.windows(),
-          secs_since(t_reg), span.error().empty() ? "" : " -- ",
+          "  persistent registration: accepted with %s (%.2f GiB of the "
+          "store's mapping, %zu window(s), %.1f s)%s%s\n",
+          span.flag(), static_cast<double>(slen) / (1024.0 * 1024 * 1024),
+          span.windows(), secs_since(t_reg), span.error().empty() ? "" : " -- ",
           span.error().c_str());
       for (size_t batch : {size_t{1}, kBatchBlocks}) {
         rows.push_back({sname, "zerocopy-persistent", batch, bs,

@@ -58,6 +58,12 @@ void *cygpu_pinned_ptr(void);
 int cygpu_host_register(const void *base, size_t len, int read_only);
 int cygpu_host_unregister(const void *base);
 
+// cudaErrorHostMemoryAlreadyRegistered as an int, so the host side can tell
+// "this range overlaps one that is already pinned" (benign: the bytes are
+// page-locked either way) from a real refusal without including
+// cuda_runtime.h.
+int cygpu_error_already_registered(void);
+
 // Transfers into the device buffer at `dst_off`.  `..._sync` is a blocking
 // cudaMemcpy (the naive pageable path); `..._async` enqueues on the stream
 // and the caller calls cygpu_stream_sync() once per batch.
