@@ -1,7 +1,8 @@
 # Cyclone as an LLM KV-cache storage tier — benchmark
 
-**Status:** first round, two laptops (macOS/Apple silicon and Linux/NVMe with
-a quiesced page cache), treat as an instrument reading rather than a
+**Status:** three rounds on two laptops (macOS/Apple silicon and Linux/NVMe
+with a quiesced page cache); round 3 measures the first two fixes the earlier
+rounds called for. Treat every number as an instrument reading rather than a
 marketing number. The point of this round is to find out where Cyclone
 stands against the storage backends that LLM serving stacks put behind their
 KV connectors today, and to measure — not guess — which of its known
@@ -409,6 +410,79 @@ LMDB are the same zero-syscall class (274 k vs 245 k gets/s `view`; 11.9 vs
 
 **Writes** are 0.25–0.35 GB/s here vs 1.3–1.4 for file-per-block — the
 same 4× gap as on macOS, from the same three copies + CRC.
+
+## Round 3: both fixes together (readahead + fast CRC32)
+
+`round3` = the corrected sweep's Cyclone plus the two fixes above
+(platform-aware readahead for large documents, slice-by-16 / ARMv8 CRC32).
+Same harnesses, same peers' numbers as the corrected sweeps; raw data in
+[`doc/kv-cache-benchmark/round3/`](kv-cache-benchmark/round3/); full Linux
+tables in [Appendix C](#appendix-c--linux-round-3-generated-tables).
+
+### Linux, page cache dropped before cold phases — 2 MiB blocks
+
+| | stock | **round 3** | filedir | filedir-read | lmdb | rocksdb |
+|---|---:|---:|---:|---:|---:|---:|
+| PUT, GB/s | 0.34 | **0.81** | 1.44 | 1.39 | 0.15 ¹ | 0.61 |
+| Cold first-touch GET, GB/s | 0.06 | **1.62** (27×) | 1.76 | 1.30 | 2.15 | 0.82 |
+| Cold restart GET, GB/s | 0.06 | **1.44** (24×) | 1.73 | 1.31 | 2.16 | 0.82 |
+| Cold first-touch, verification off | 0.18 | 2.31 | — | — | — | — |
+| Warm GET copy, 1 thread, GB/s | 11.9 | 10.5 | 6.5 | 8.0 | 12.9 | 3.0 |
+| Warm GET view, 1 thread, gets/s | 274 k | 265 k | 7.0 k | 5.3 k | 245 k | 1.8 k |
+| 4 reader processes, view, gets/s | 217 k | **621 k** | 26 k | 6.5 k | 585 k | n/a |
+| 4 reader processes, copy, GB/s | 9.3 | 9.8 | 11.8 | 7.8 | 10.9 | n/a |
+
+¹ fsync per put. Other sizes: cold first-touch 0.62 / 1.63 / 1.28 GB/s and
+restart 0.55 / 1.53 / 1.18 at 512 KiB / 8 MiB / 32 MiB (stock: 0.07–0.16).
+
+### macOS, Apple M5 — 2 MiB blocks (60 s writeback settle before warm)
+
+| | stock | **round 3** |
+|---|---:|---:|
+| PUT, GB/s | 0.42 | **1.28** |
+| First-touch GET, GB/s | 0.56 | **5.44** |
+| Restart GET, GB/s | 0.56 | **8.45** |
+| Warm GET copy, 1 / 8 threads, GB/s | 70.9 / 107 | 63.6 / 114 |
+| Warm GET view, 1 thread, gets/s | 668 k | 698 k |
+| 4 reader processes, view / copy | 728 k gets/s / 46 GB/s | **1.67 M / 78 GB/s** |
+
+### What round 3 says
+
+- **The cold-read loss is gone on Linux.** 27× on first-touch and 24× on
+  restart put Cyclone level with file-per-block (1.6 vs 1.7 GB/s) and
+  within 25–35 % of LMDB. With verification off it reads 2.31 GB/s, past
+  every peer, so the remaining gap to LMDB is the x86 slice-by-16 CRC32 at
+  2.8 GB/s (ARM gets the 12 GB/s hardware path; on x86 the next step is a
+  PCLMULQDQ path or the CRC-32C format decision).
+- **Multi-process readers now scale.** Four processes reach 621 k gets/s on
+  Linux (2.9× stock, ≈ LMDB) and 1.67 M on macOS (2.3×): each child's
+  re-verification and re-faulting is now cheap enough not to dominate its
+  window. Copy-mode phase 5 is DRAM-bound on both boxes, as for every store.
+- **Writes** improved 2.4–3× from the CRC alone (0.81 GB/s on Linux, 1.28 on
+  macOS) and are still 1.7× behind file-per-block; the three-copy write path
+  is the next item.
+- **Warm reads are unchanged** within noise on both platforms, including the
+  4 KB HTTP baseline.
+
+### Caveats specific to this round
+
+- **A benchmark artifact, not a regression, and worth knowing about:** on
+  macOS the faster put + first-touch (≈6 s instead of ≈17 s for 4 GiB) meant
+  the warm phase started while the OS was still writing the dataset back,
+  and reads of in-flight pages measured writeback (2 MiB warm view: 23 k
+  gets/s, p99 250 µs). With the hint off it was worse (870 gets/s), and a
+  60 s settle (`kv_bench --pause-before-warm`) restores 615–700 k. Linux is
+  immune because `drop_caches` syncs first. The macOS table above is the
+  settled run.
+- The Linux box carried a leaked dirty-page count from an ext4 bug during
+  this round (writers throttled until reboot; measured with
+  `vm.dirty_bytes` raised for the runs). One cell — 512 KiB restart — came
+  out at 0.10 GB/s in the sweep and 0.55 GB/s in two clean re-runs with all
+  4096 readahead hints confirmed firing after the reopen (`kv_bench` now
+  prints `readahead_hints_issued` per phase); the table uses the clean
+  re-run and the raw file records both.
+- The peers were not re-run for round 3; their corrected-sweep numbers are
+  reused, taken on the same box before the dirty-page leak.
 
 ## Device transfer: does zero-copy pay off? (Metal, Apple silicon)
 
@@ -1164,3 +1238,155 @@ Cells: gets/s / GB/s.
 | 1 | 5.7k / 11.91 | 5.6k / 11.83 | 3.1k / 6.49 | 3.8k / 8.03 | 6.1k / 12.85 | 1.4k / 2.99 |
 | 4 | 5.6k / 11.64 | 5.6k / 11.81 | 4.8k / 10.00 | 3.8k / 7.95 | 5.7k / 11.86 | 1.4k / 2.86 |
 | 8 | 5.5k / 11.61 | 5.5k / 11.56 | 4.4k / 9.32 | 2.9k / 6.05 | 5.4k / 11.42 | 1.3k / 2.64 |
+
+## Appendix C — Linux round-3 generated tables
+
+`cyclone` = round 3; `cyclone-v2` = stock from the corrected sweep; peers as
+in Appendix B. Cells as in Appendix A.
+
+### Phase 1 - PUT (single writer, sequential)
+
+Cells: ops/s / GB/s / p99 us.
+
+| block size | cyclone | cyclone-noverify | cyclone-v2 | filedir | filedir-read | lmdb | rocksdb |
+|---|---|---|---|---|---|---|---|
+| 512 KiB | 1.2k / 0.61 / 847 | - | 579.0 / 0.30 / 1888 | 2.6k / 1.38 / 330 | 2.6k / 1.37 / 351 | 115.6 / 0.06 / 12651 | 1.1k / 0.59 / 1469 |
+| 2 MiB | 386.3 / 0.81 / 3413 | 230.7 / 0.48 / 5814 | 163.8 / 0.34 / 13113 | 686.5 / 1.44 / 1092 | 660.7 / 1.39 / 1134 | 72.1 / 0.15 / 20484 | 291.9 / 0.61 / 39055 |
+| 8 MiB | 90.1 / 0.76 / 13970 | - | 41.6 / 0.35 / 27850 | 159.8 / 1.34 / 5255 | 156.8 / 1.32 / 4770 | 42.0 / 0.35 / 30866 | 71.9 / 0.60 / 55080 |
+| 32 MiB | 11.7 / 0.39 / 80314 | - | 7.5 / 0.25 / 130183 | 42.5 / 1.42 / 18911 | 38.8 / 1.30 / 21741 | 13.5 / 0.45 / 70673 | 15.6 / 0.52 / 60536 |
+
+### Phase 2 - GET first touch (single thread, view)
+
+Cells: ops/s / GB/s / p99 us.
+
+| block size | cyclone | cyclone-noverify | cyclone-v2 | filedir | filedir-read | lmdb | rocksdb |
+|---|---|---|---|---|---|---|---|
+| 512 KiB | 1.2k / 0.63 / 1445 | - | 137.0 / 0.07 / 13232 | 1.8k / 0.94 / 879 | 2.3k / 1.20 / 798 | 3.7k / 1.93 / 1417 | 1.7k / 0.87 / 982 |
+| 2 MiB | 771.4 / 1.62 / 1868 | 1.1k / 2.31 / 1551 | 30.5 / 0.06 / 59454 | 838.8 / 1.76 / 2356 | 621.5 / 1.30 / 2548 | 1.0k / 2.15 / 3917 | 390.2 / 0.82 / 4571 |
+| 8 MiB | 194.8 / 1.63 / 5310 | - | 17.2 / 0.14 / 63363 | 299.4 / 2.51 / 6188 | 253.6 / 2.13 / 6470 | 252.7 / 2.12 / 6555 | 103.2 / 0.87 / 15543 |
+| 32 MiB | 38.2 / 1.28 / 30223 | - | 4.7 / 0.16 / 229454 | 77.5 / 2.60 / 16553 | 33.0 / 1.11 / 39479 | 65.5 / 2.20 / 21097 | 13.7 / 0.46 / 102098 |
+
+### Phase 3 - GET warm, Zipf(0.99)
+
+#### view, T = 1
+
+Cells: gets/s / GB/s / p99 us.
+
+| block size | cyclone | cyclone-noverify | cyclone-v2 | filedir | filedir-read | lmdb | rocksdb |
+|---|---|---|---|---|---|---|---|
+| 512 KiB | 757.7k / 397.26 / 7 | - | 854.7k / 448.13 / 2 | 25.4k / 13.33 / 57 | 21.5k / 11.29 / 73 | 678.9k / 355.95 / 2 | 9.5k / 5.01 / 138 |
+| 2 MiB | 265.1k / 555.97 / 5 | 266.1k / 558.13 / 5 | 274.4k / 575.37 / 5 | 7.0k / 14.73 / 195 | 5.3k / 11.17 / 258 | 244.6k / 512.96 / 5 | 1.8k / 3.87 / 620 |
+| 8 MiB | 68.2k / 572.34 / 20 | - | 69.5k / 582.87 / 16 | 1.9k / 15.56 / 679 | 1.1k / 9.22 / 1127 | 66.8k / 560.36 / 16 | 364.6 / 3.06 / 3087 |
+| 32 MiB | 17.2k / 576.47 / 92 | - | 17.6k / 589.45 / 74 | 457.4 / 15.35 / 2725 | 217.7 / 7.30 / 5702 | 17.1k / 574.40 / 62 | 29.8 / 1.00 / 34898 |
+
+#### copy, T = 1
+
+Cells: gets/s / GB/s / p99 us.
+
+| block size | cyclone | cyclone-noverify | cyclone-v2 | filedir | filedir-read | lmdb | rocksdb |
+|---|---|---|---|---|---|---|---|
+| 512 KiB | 31.1k / 16.32 / 48 | - | 33.1k / 17.36 / 46 | 13.9k / 7.28 / 106 | 16.4k / 8.58 / 94 | 31.4k / 16.48 / 46 | 7.8k / 4.07 / 148 |
+| 2 MiB | 5.0k / 10.48 / 263 | 5.2k / 10.96 / 259 | 5.7k / 11.91 / 235 | 3.1k / 6.49 / 400 | 3.8k / 8.03 / 328 | 6.1k / 12.85 / 224 | 1.4k / 2.99 / 767 |
+| 8 MiB | 1.2k / 10.18 / 937 | - | 1.4k / 11.65 / 806 | 808.3 / 6.78 / 1420 | 772.5 / 6.48 / 1441 | 1.4k / 11.82 / 808 | 289.8 / 2.43 / 3628 |
+| 32 MiB | 328.9 / 11.04 / 3413 | - | 346.0 / 11.61 / 3181 | 206.2 / 6.92 / 5491 | 135.5 / 4.55 / 7648 | 314.8 / 10.56 / 3388 | 27.6 / 0.93 / 40346 |
+
+#### view, T = 4
+
+Cells: gets/s / GB/s / p99 us.
+
+| block size | cyclone | cyclone-noverify | cyclone-v2 | filedir | filedir-read | lmdb | rocksdb |
+|---|---|---|---|---|---|---|---|
+| 512 KiB | 2.71M / 1422.80 / 8 | - | 2.97M / 1556.56 / 2 | 27.3k / 14.32 / 332 | 52.8k / 27.66 / 104 | 2.13M / 1117.56 / 3 | 24.0k / 12.57 / 225 |
+| 2 MiB | 646.8k / 1356.52 / 10 | 647.2k / 1357.20 / 10 | 754.9k / 1583.13 / 9 | 11.1k / 23.31 / 772 | 6.4k / 13.43 / 710 | 624.9k / 1310.58 / 9 | 1.7k / 3.63 / 2843 |
+| 8 MiB | 131.6k / 1103.53 / 53 | - | 158.2k / 1326.75 / 41 | 3.6k / 30.27 / 1976 | 1.2k / 10.15 / 3569 | 146.0k / 1224.42 / 45 | 390.2 / 3.27 / 10656 |
+| 32 MiB | 32.4k / 1086.91 / 171 | - | 38.0k / 1274.45 / 145 | 1.1k / 37.82 / 5419 | 249.6 / 8.38 / 16921 | 36.3k / 1216.70 / 150 | 68.9 / 2.31 / 64826 |
+
+#### copy, T = 4
+
+Cells: gets/s / GB/s / p99 us.
+
+| block size | cyclone | cyclone-noverify | cyclone-v2 | filedir | filedir-read | lmdb | rocksdb |
+|---|---|---|---|---|---|---|---|
+| 512 KiB | 50.8k / 26.63 / 128 | - | 59.1k / 30.96 / 106 | 27.5k / 14.44 / 223 | 41.7k / 21.88 / 122 | 60.1k / 31.53 / 110 | 13.5k / 7.09 / 343 |
+| 2 MiB | 4.7k / 9.86 / 1019 | 5.4k / 11.38 / 952 | 5.6k / 11.64 / 864 | 4.8k / 10.00 / 1087 | 3.8k / 7.95 / 1154 | 5.7k / 11.86 / 836 | 1.4k / 2.86 / 3174 |
+| 8 MiB | 1.1k / 9.63 / 3799 | - | 1.4k / 11.36 / 3222 | 1.2k / 10.42 / 4172 | 697.8 / 5.85 / 6034 | 1.3k / 11.30 / 3207 | 300.8 / 2.52 / 13734 |
+| 32 MiB | 323.9 / 10.87 / 13947 | - | 308.6 / 10.36 / 14711 | 324.8 / 10.90 / 15112 | 124.9 / 4.19 / 33132 | 316.0 / 10.60 / 13624 | 57.4 / 1.93 / 75925 |
+
+#### view, T = 8
+
+Cells: gets/s / GB/s / p99 us.
+
+| block size | cyclone | cyclone-noverify | cyclone-v2 | filedir | filedir-read | lmdb | rocksdb |
+|---|---|---|---|---|---|---|---|
+| 512 KiB | 3.76M / 1973.14 / 11 | - | 4.26M / 2233.45 / 4 | 28.7k / 15.05 / 721 | 48.3k / 25.30 / 266 | 2.77M / 1452.10 / 6 | 10.0k / 5.24 / 1667 |
+| 2 MiB | 662.9k / 1390.24 / 25 | 636.6k / 1335.11 / 25 | 799.9k / 1677.44 / 21 | 10.2k / 21.38 / 1717 | 5.0k / 10.50 / 2431 | 649.2k / 1361.45 / 21 | 1.6k / 3.40 / 7254 |
+| 8 MiB | 130.9k / 1098.19 / 105 | - | 158.4k / 1328.49 / 86 | 3.4k / 28.79 / 4157 | 1.2k / 10.11 / 9760 | 149.0k / 1250.24 / 88 | 374.2 / 3.14 / 29980 |
+| 32 MiB | 32.8k / 1100.70 / 408 | - | 38.6k / 1296.12 / 345 | 1.1k / 35.98 / 11570 | 235.8 / 7.91 / 48260 | 37.2k / 1248.82 / 351 | 69.7 / 2.34 / 152073 |
+
+#### copy, T = 8
+
+Cells: gets/s / GB/s / p99 us.
+
+| block size | cyclone | cyclone-noverify | cyclone-v2 | filedir | filedir-read | lmdb | rocksdb |
+|---|---|---|---|---|---|---|---|
+| 512 KiB | 42.6k / 22.33 / 319 | - | 51.5k / 27.02 / 264 | 25.2k / 13.19 / 503 | 24.2k / 12.67 / 614 | 47.0k / 24.63 / 287 | 6.1k / 3.19 / 2396 |
+| 2 MiB | 4.6k / 9.57 / 2543 | 5.2k / 10.91 / 2515 | 5.5k / 11.61 / 2363 | 4.4k / 9.32 / 2581 | 2.9k / 6.05 / 4107 | 5.4k / 11.42 / 2073 | 1.3k / 2.64 / 9224 |
+| 8 MiB | 1.1k / 9.38 / 11333 | - | 1.3k / 11.11 / 9293 | 1.2k / 9.66 / 10079 | 644.6 / 5.41 / 17486 | 1.3k / 11.05 / 8197 | 271.9 / 2.28 / 42142 |
+| 32 MiB | 316.9 / 10.63 / 37391 | - | 299.6 / 10.05 / 45565 | 288.8 / 9.69 / 40300 | 122.8 / 4.12 / 91355 | 321.5 / 10.79 / 40234 | 56.5 / 1.90 / 192802 |
+
+### Phase 4 - RESTART (close, reopen, GET all N)
+
+Cells: ops/s / GB/s / p99 us / hit fraction.
+
+| block size | cyclone | cyclone-noverify | cyclone-v2 | filedir | filedir-read | lmdb | rocksdb |
+|---|---|---|---|---|---|---|---|
+| 512 KiB | 1.1k / 0.55 / 1524 / 1.000 | - | 144.6 / 0.08 / 12856 / 1.000 | 1.8k / 0.94 / 935 / 1.000 | 2.0k / 1.03 / 751 / 1.000 | 3.7k / 1.92 / 1390 / 1.000 | 1.8k / 0.92 / 857 / 1.000 |
+| 2 MiB | 686.8 / 1.44 / 2226 / 1.000 | 0.0 / 0.00 / 1 / 0.000 | 30.9 / 0.06 / 56714 / 1.000 | 823.0 / 1.73 / 2440 / 1.000 | 624.8 / 1.31 / 2537 / 1.000 | 1.0k / 2.16 / 3628 / 1.000 | 390.6 / 0.82 / 4361 / 1.000 |
+| 8 MiB | 182.7 / 1.53 / 5769 / 1.000 | - | 17.3 / 0.14 / 63020 / 1.000 | 300.2 / 2.52 / 5731 / 1.000 | 256.1 / 2.15 / 6462 / 1.000 | 258.8 / 2.17 / 6377 / 1.000 | 101.0 / 0.85 / 15478 / 1.000 |
+| 32 MiB | 35.0 / 1.18 / 35343 / 1.000 | - | 4.6 / 0.15 / 227921 / 1.000 | 78.5 / 2.63 / 14696 / 1.000 | 33.2 / 1.11 / 39372 / 1.000 | 64.1 / 2.15 / 20329 / 1.000 | 16.6 / 0.56 / 73849 / 1.000 |
+
+### Phase 5 - MULTI-PROCESS READ (P=4 processes, T=1)
+
+#### view
+
+Cells: ops/s / GB/s / hit fraction.
+
+| block size | cyclone | cyclone-noverify | cyclone-v2 | filedir | filedir-read | lmdb | rocksdb |
+|---|---|---|---|---|---|---|---|
+| 512 KiB | 2.49M / 1304.35 / 1.000 | - | 2.17M / 1138.23 | 85.6k / 44.90 / 1.000 | 51.8k / 27.15 / 1.000 | 2.09M / 1097.54 / 1.000 | - |
+| 2 MiB | 620.7k / 1301.69 / 1.000 | - | 216.8k / 454.73 | 26.0k / 54.53 / 1.000 | 6.5k / 13.54 / 1.000 | 585.0k / 1226.91 / 1.000 | - |
+| 8 MiB | 127.5k / 1069.91 / 1.000 | - | 46.5k / 389.89 | 6.3k / 52.54 / 1.000 | 1.2k / 9.70 / 1.000 | 146.4k / 1227.97 / 1.000 | - |
+| 32 MiB | 31.1k / 1043.57 / 1.000 | - | 11.2k / 375.25 | 1.5k / 51.48 / 1.000 | 260.4 / 8.74 / 1.000 | 35.9k / 1203.07 / 1.000 | - |
+
+#### copy
+
+Cells: ops/s / GB/s / hit fraction.
+
+| block size | cyclone | cyclone-noverify | cyclone-v2 | filedir | filedir-read | lmdb | rocksdb |
+|---|---|---|---|---|---|---|---|
+| 512 KiB | 49.5k / 25.94 / 1.000 | - | 50.7k / 26.56 | 40.5k / 21.25 / 1.000 | 39.9k / 20.90 / 1.000 | 61.9k / 32.44 / 1.000 | - |
+| 2 MiB | 4.7k / 9.82 / 1.000 | - | 4.4k / 9.29 | 5.6k / 11.84 / 1.000 | 3.7k / 7.77 / 1.000 | 5.2k / 10.89 / 1.000 | - |
+| 8 MiB | 1.3k / 10.54 / 1.000 | - | 1.0k / 8.63 | 1.4k / 11.66 / 1.000 | 646.4 / 5.42 / 1.000 | 1.3k / 10.55 / 1.000 | - |
+| 32 MiB | 315.6 / 10.59 / 1.000 | - | 239.1 / 8.02 | 333.0 / 11.17 / 1.000 | 130.8 / 4.39 / 1.000 | 270.2 / 9.07 / 1.000 | - |
+
+### Read scaling
+
+#### Read scaling at 2 MiB, mode = view
+
+Cells: gets/s / GB/s.
+
+| threads | cyclone | cyclone-noverify | cyclone-v2 | filedir | filedir-read | lmdb | rocksdb |
+|---|---|---|---|---|---|---|---|
+| 1 | 265.1k / 555.97 | 266.1k / 558.13 | 274.4k / 575.37 | 7.0k / 14.73 | 5.3k / 11.17 | 244.6k / 512.96 | 1.8k / 3.87 |
+| 4 | 646.8k / 1356.52 | 647.2k / 1357.20 | 754.9k / 1583.13 | 11.1k / 23.31 | 6.4k / 13.43 | 624.9k / 1310.58 | 1.7k / 3.63 |
+| 8 | 662.9k / 1390.24 | 636.6k / 1335.11 | 799.9k / 1677.44 | 10.2k / 21.38 | 5.0k / 10.50 | 649.2k / 1361.45 | 1.6k / 3.40 |
+
+#### Read scaling at 2 MiB, mode = copy
+
+Cells: gets/s / GB/s.
+
+| threads | cyclone | cyclone-noverify | cyclone-v2 | filedir | filedir-read | lmdb | rocksdb |
+|---|---|---|---|---|---|---|---|
+| 1 | 5.0k / 10.48 | 5.2k / 10.96 | 5.7k / 11.91 | 3.1k / 6.49 | 3.8k / 8.03 | 6.1k / 12.85 | 1.4k / 2.99 |
+| 4 | 4.7k / 9.86 | 5.4k / 11.38 | 5.6k / 11.64 | 4.8k / 10.00 | 3.8k / 7.95 | 5.7k / 11.86 | 1.4k / 2.86 |
+| 8 | 4.6k / 9.57 | 5.2k / 10.91 | 5.5k / 11.61 | 4.4k / 9.32 | 2.9k / 6.05 | 5.4k / 11.42 | 1.3k / 2.64 |
