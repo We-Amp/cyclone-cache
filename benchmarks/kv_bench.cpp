@@ -999,6 +999,14 @@ int main(int argc, char *argv[]) {
       break;
     }
 
+    // Diagnostic: readahead hints reaching the kernel per phase (cumulative
+    // CacheStats::readahead_hints_issued), so a phase whose hints silently
+    // stop firing is visible without a profiler.
+    auto hints_note = [&](const char *phase) {
+      std::cerr << "        readahead hints issued so far: "
+                << cache->stats().readahead_hints_issued << " (" << phase
+                << ")\n";
+    };
     auto record = [&](Record r) {
       r.verify_checksum = verify;
       r.mmap_directory = mmap_dir;
@@ -1021,6 +1029,7 @@ int main(int argc, char *argv[]) {
     std::cerr << "  [2/5] get_first_touch\n";
     drop_caches(opts);
     record(run_sequential_get(*cache, ds, block_size, "get_first_touch"));
+    hints_note("after get_first_touch");
 
     std::cerr << "  [3/5] get_warm (Zipf theta=" << kZipfTheta << ")\n";
     for (Mode mode : {Mode::kView, Mode::kCopy}) {
@@ -1042,6 +1051,7 @@ int main(int argc, char *argv[]) {
       break;
     }
     record(run_sequential_get(*cache, ds, block_size, "restart"));
+    hints_note("after restart");
 
     if (opts.skip_multiprocess) {
       std::cerr << "  [5/5] multiprocess_read: skipped "
