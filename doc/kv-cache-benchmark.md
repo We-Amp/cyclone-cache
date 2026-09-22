@@ -153,7 +153,9 @@ and CRC-on-first-read come as a package. With verification off
 > checksum now runs at 12.2 GB/s on the M5 (ARMv8 `crc32`) and 2.8 GB/s on
 > the i7-8750H (slice-by-16), and the restart phase in this same
 > configuration moved from 0.558 to 8.54 GB/s. Every number in the tables
-> below predates that change.
+> below predates that change. The checksum has since moved again, to
+> CRC-32C at on-disk format v8 (34 GB/s on the M5) — see the follow-up under
+> fix-list item 2.
 
 **Multi-process readers scale worse than threads, for the same reason.**
 Four Cyclone reader processes reach 46 GB/s in copy mode, 0.65× a single
@@ -190,7 +192,8 @@ document builder → serialized record) and CRCs it before a single
    the hooks, unused — and keep `MADV_RANDOM` for small objects. Measured
    on Linux with a quiesced cache; expect this alone to close most of the
    10–25× gap.
-2. **Fast CRC32** — ✅ **done** (`src/core/crc32.{hpp,cpp}`). The byte-wise
+2. **Fast CRC32** — ✅ **done** (then `src/core/crc32.{hpp,cpp}`; renamed
+   to `crc32c.{hpp,cpp}` by the follow-up below). The byte-wise
    table routine was replaced by slice-by-16 tables plus an ARMv8
    `crc32b/w/x` path, selected once through a function pointer. The on-disk
    convention is untouched (reflected `0xEDB88320`, init/xorout
@@ -204,7 +207,7 @@ document builder → serialized record) and CRCs it before a single
 
    Both machines print the same checksum for the same buffer, and the unit
    test pins every path against a verbatim copy of the old byte-wise
-   routine (`tests/unit/test_crc32.cpp`).
+   routine (then `tests/unit/test_crc32.cpp`).
 
    End to end on the M5 (`kv_bench --block-size 2097152 --seconds 5
    --threads 1 --skip-multiprocess`, warm page cache): restart
@@ -213,12 +216,29 @@ document builder → serialized record) and CRCs it before a single
    first-touch read **137 k → 1.12 M ops/s**. The restart floor is now the
    page-cache/copy rate, not the checksum.
 
-   Note on x86-64: SSE4.2's `crc32` instruction is CRC-32**C**
-   (Castagnoli), a *different* polynomial — using it would change the
-   on-disk format and invalidate every existing cache file, so x86-64 runs
-   the portable table path. If the format is ever revved, the options are
-   adopting CRC-32C outright or adding a PCLMULQDQ folding path for the
-   current polynomial (>20 GB/s, no format change).
+   Follow-up — **CRC-32C, on-disk format v8** (✅ done). The note this item
+   used to carry said x86-64 had to stay on the table path because SSE4.2's
+   `crc32` instruction computes CRC-32**C**, a different polynomial. That
+   was the open decision, and it has been taken: the document checksum *is*
+   CRC-32C from format major v8 (reflected `0x82F63B78`, init/xorout
+   `0xFFFFFFFF`), which has hardware instructions on x86-64 (SSE4.2
+   `crc32q`) *and* ARMv8 (`crc32cx`). Existing cache files are discarded —
+   the format major is part of the fingerprinted filename, so consumers take
+   a cold cache, never a misparse. The files are now
+   `src/core/crc32c.{hpp,cpp}`, `tests/unit/test_crc32c.cpp` and
+   `./build-rel/crc32c_bench`. Both hardware paths run three interleaved CRC
+   registers (8192- then 256-byte blocks, recombined through
+   compile-time-generated GF(2) zero-shift operators), because the
+   instruction is latency- not throughput-bound:
+
+   | 2 MiB buffer | byte-wise | slice-by-16 | hw, 1 stream | hw, 3-way |
+   |---|---:|---:|---:|---:|
+   | Apple M5 (clang, Release) | 0.61 GB/s | 3.28 GB/s | 12.02 GB/s | **34.03 GB/s** |
+
+   > **TODO (lead):** the i7-8750H `crc32c_bench` row and the Linux
+   > `kv_bench` restart/first-touch numbers for v8 are not measured yet —
+   > the Linux host was unreachable when this landed. Fill in the x86-64
+   > SSE4.2 column and the end-to-end sweep here.
 
    Still open from this item: a way for the *verified state* to outlive the
    process — the CRC-validation cache could live beside the mmap directory
