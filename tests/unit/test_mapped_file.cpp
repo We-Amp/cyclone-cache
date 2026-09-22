@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <system_error>
 
 #include "../../src/io/mapped_file.hpp"
 
@@ -168,5 +169,49 @@ TEST_CASE("MappedFile advise methods", "[mapped_file]") {
 
   mf->unmap_region(*region);
   mf->close();
+  remove_temp_file(path);
+}
+
+TEST_CASE("MappedFile advise_readahead addresses the file, not the mapping",
+          "[mapped_file]") {
+  // advise_readahead() is the file-offset readahead hint (Darwin's
+  // fcntl(F_RDADVISE)), as opposed to advise_willneed()'s address-range
+  // advice.  Two properties are contractual for Volume's read path: it
+  // needs no mapping at all, and supports_advise_readahead() agrees with
+  // what the call actually does -- that predicate, and not an error code,
+  // is what makes the caller fall back to advise_willneed().
+  auto path = create_temp_file(8192);
+  auto mf = MappedFile::create();
+
+  auto open_result = mf->open(path.string(), MappedFile::OpenMode::ReadOnly);
+  REQUIRE(open_result.has_value());
+
+  const bool supported = mf->supports_advise_readahead();
+  const auto ec = mf->advise_readahead(0, 8192);
+  if (supported) {
+    REQUIRE_FALSE(ec);
+  } else {
+    REQUIRE(ec == std::errc::not_supported);
+  }
+
+  // A zero-length hint is a no-op, never a failure, and a hint that runs
+  // off the end of the file is still only a hint.
+  const auto zero_ec = mf->advise_readahead(0, 0);
+  REQUIRE((!zero_ec || zero_ec == std::errc::not_supported));
+  (void)mf->advise_readahead(4096, 1 << 20);
+
+  // The mapping is unaffected by any of it.
+  auto region = mf->map_region(0, 8192, MappedFile::MapMode::ReadOnly);
+  REQUIRE(region.has_value());
+  REQUIRE((*region)[0] == std::byte{'X'});
+  mf->unmap_region(*region);
+
+  mf->close();
+  // On a closed file it reports an error rather than touching a stale
+  // descriptor; either way it must not be treated as success by a caller.
+  const auto closed_ec = mf->advise_readahead(0, 4096);
+  if (supported) {
+    REQUIRE(closed_ec == std::errc::bad_file_descriptor);
+  }
   remove_temp_file(path);
 }

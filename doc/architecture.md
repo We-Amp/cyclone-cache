@@ -284,6 +284,97 @@ so read handles (via read anchors) keep the mapping alive.
 - **Reads** map the page-aligned region containing the document and return a span; the OS page cache makes a hot hit zero-copy.
 - **Writes** use `pwrite` (clear durability semantics, no torn-write risk), never mmap stores.
 
+**Readahead policy.** The whole-volume mapping is advised `MADV_RANDOM` (plus
+`MADV_HUGEPAGE`) once at open. That is the right default for 4 KB HTTP
+objects — no readahead pollution, no wasted I/O around a random hit — but it
+also suppresses readahead for large documents, so a cold multi-megabyte read
+degenerates into one serial page fault per page (≈512 of them for a 2 MiB
+document on a 4 KiB-page Linux box). The disk read path
+therefore layers a *per-document* hint on top of that blanket advice: once a
+candidate's full key has been re-verified and its byte range is known, but
+before the CRC pass makes the first content touch, `Volume::read_sync` and the
+selected-alternate read path issue a readahead hint over exactly that
+document's range when it is at least `CacheConfig::readahead_min_bytes`
+(default 256 KiB, 0 = off). The open-time `MADV_RANDOM` is deliberately left
+in place, so anything below the threshold keeps its old fault-per-page
+behaviour.
+
+**Which kernel call, and why it is per platform.** `MADV_WILLNEED` is
+portable in spelling but not in cost, so `Volume::maybe_advise_readahead`
+picks by platform. It first calls `MappedFile::advise_readahead(file_offset,
+length)`, the *file*-range hint, and falls back to
+`MappedFile::advise_willneed(span)`, the *address*-range hint, only where
+that reports `std::errc::not_supported`:
+
+| Platform | Call | Why |
+|---|---|---|
+| Linux | `madvise(MADV_WILLNEED)`, 512 KiB chunks | Queues a few large asynchronous reads and returns; honoured on a file mapping despite `MADV_RANDOM` |
+| Darwin | `fcntl(F_RDADVISE)` on the volume fd | Darwin's `MADV_WILLNEED` is synchronous and serialises across processes (below) |
+| Windows | `PrefetchVirtualMemory` | Address-range equivalent of the Linux call |
+
+Darwin is the exception that forced the split. Its `madvise(MADV_WILLNEED)`
+is not Linux's queue-and-return: it walks and populates the range under the
+shared VM object's lock, so it costs far more per call *and* serialises
+across every process mapping the same volume. Probed directly on an M5 — one
+2 MiB range of a `MAP_SHARED` read-write mapping whose pages are in the
+buffer cache but not yet in the caller's page tables — `MADV_WILLNEED` in
+512 KiB chunks took **50 µs** with one process and **305 µs** with four
+concurrent ones, against **5 µs / 10 µs** for `fcntl(F_RDADVISE)` doing the
+same job. Against the four-reader `multiprocess_read` phase of `kv_bench`
+that difference is the whole ballgame: the madvise hint cost macOS 85 % of
+its multi-process read throughput and 30 % of its `restart` throughput,
+while `F_RDADVISE` lands inside noise of no hint at all and still buys the
+cold-read win. Apple Silicon's 16 KiB base page and Darwin's own clustered
+pagein are why the *upside* is smaller there than on Linux in the first
+place: a cold 2 MiB read is ~128 faults, not ~512.
+
+Two details are load-bearing on the Linux side. The advice is issued in
+512 KiB chunks, because Linux clamps one `MADV_WILLNEED` to
+`max(bdi->io_pages, ra_pages)` pages (`force_page_cache_ra()`): a single call
+over a 2 MiB document covers only its first ~1.25 MB and the rest still
+faults in a page at a time. And the Volume advises a given document
+placement at most once every `kReadaheadReadviseSeconds` (2 s), through a
+lossy direct-mapped filter (`_readahead_cache`, same shape as the
+CRC-validation cache) — on a warm re-read the pages are already resident but
+the call still walks the whole range, which unfiltered cost more than the
+read itself (warm `view` throughput fell from 261 k to 68 k gets/s for 2 MiB
+blocks before the filter went in). The filter matters more, not less, on
+Darwin, where four readers re-advising one volume is four times the traffic
+through a serialising call.
+
+The filter *decays* rather than remembering forever, because a KV tier is
+normally larger than RAM: "advised once, evicted from the page cache, read
+cold again" is the common case, and a permanent filter would drop the
+readahead exactly where it is worth most. Each slot therefore packs a 40-bit
+placement discriminator (offset *and* length, so a reused offset holding a
+different document re-advises) with a 24-bit steady-clock second, compared
+modularly so the epoch and the ~194-day truncation wrap are both harmless.
+The interval only has to be long enough that a hot key cannot pay for a
+`madvise()` per read: at 275 k gets/s on one key, 2 s caps it at one hint per
+~550 k reads. A collision, a torn pairing or a lost update costs one
+redundant or one skipped hint and nothing else, so the filter is never
+consulted for correctness and needs no synchronisation — the warm path is a
+single relaxed load, and the store happens only when a hint is issued.
+`CacheStats::readahead_hints_issued` counts the hints that actually reached
+the kernel, which makes the filter observable.
+
+Apart from that one relaxed load/store the hint takes no lock, reads no
+shared state and never dereferences the region, so it sits outside the
+borrow/lease window and participates in none of the reader protocols; every
+error is discarded, because a failed hint only costs the previous behaviour.
+`std::errc::not_supported` from `advise_readahead()` is the one answer that
+is *not* discarded — it is how the platform says "use the address-range
+call instead".
+
+Measured effect on a cold 2 MiB read (Linux, NVMe): 0.140 → 0.427 GB/s with
+CRC verification on, 0.179 → 2.327 GB/s with it off — after which the cold
+path is bounded by the software CRC32, not by I/O. `MADV_POPULATE_READ` was
+measured on top of this and did not help. On macOS the same phases go
+0.248 → 0.474 GB/s (first touch) and stay level on `restart`, with the
+four-process read phase inside noise; see
+[doc/kv-cache-benchmark.md](kv-cache-benchmark.md) for both platforms'
+tables.
+
 ### Plugin System
 
 Plugins (`plugin/plugin.hpp` (`CachePlugin`)) customize alternate selection, key
