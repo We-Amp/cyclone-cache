@@ -8,42 +8,14 @@
 #include <cstring>
 #include <limits>
 
+#include "crc32.hpp"
+
 namespace cyclone {
 
-namespace {
-
-// CRC32 lookup table (IEEE polynomial)
-constexpr uint32_t make_crc_table_entry(uint32_t n) {
-  uint32_t c = n;
-  for (int k = 0; k < 8; k++) {
-    if ((c & 1) != 0u) {
-      c = 0xedb88320 ^ (c >> 1);
-    } else {
-      c = c >> 1;
-    }
-  }
-  return c;
-}
-
-constexpr std::array<uint32_t, 256> make_crc_table() {
-  std::array<uint32_t, 256> table{};
-  for (uint32_t n = 0; n < 256; n++) {
-    table[n] = make_crc_table_entry(n);
-  }
-  return table;
-}
-
-constexpr auto kCrcTable = make_crc_table();
-
-uint32_t crc32(std::span<const std::byte> data) {
-  uint32_t crc = 0xFFFFFFFF;
-  for (std::byte b : data) {
-    crc = kCrcTable[(crc ^ static_cast<uint8_t>(b)) & 0xFF] ^ (crc >> 8);
-  }
-  return crc ^ 0xFFFFFFFF;
-}
-
-}  // namespace
+// The document checksum is the CRC-32/ISO-HDLC over header_data + content
+// (everything after the 132-byte on-disk header).  The polynomial, init,
+// reflection and xorout live in crc32.hpp and are part of the on-disk format
+// -- see the convention block there before touching any of it.
 
 uint32_t Document::compute_checksum(std::span<const std::byte> data) {
   return crc32(data);

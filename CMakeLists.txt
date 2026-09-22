@@ -64,6 +64,7 @@ add_library(cyclone-cache
   src/core/directory.cpp
   src/core/mmap_directory.cpp
   src/core/document.cpp
+  src/core/crc32.cpp
   src/core/write_buffer.cpp
   src/core/hit_tracker.cpp
   src/ram_cache/clfus.cpp
@@ -135,6 +136,7 @@ if(CYCLONE_BUILD_TESTS)
     tests/unit/test_key.cpp
     tests/unit/test_directory.cpp
     tests/unit/test_document.cpp
+    tests/unit/test_crc32.cpp
     tests/unit/test_alternate.cpp
     tests/unit/test_hit_tracker.cpp
     tests/unit/test_clfus.cpp
@@ -232,6 +234,10 @@ if(CYCLONE_BUILD_BENCHMARKS)
 
   add_executable(kv_bench benchmarks/kv_bench.cpp)
   target_link_libraries(kv_bench PRIVATE cyclone-cache)
+
+  add_executable(crc32_bench benchmarks/crc32_bench.cpp)
+  target_link_libraries(crc32_bench PRIVATE cyclone-cache)
+  target_include_directories(crc32_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
   # Apple-only: the Metal GPU-transfer experiment (ObjC++).  EVERYTHING it
   # needs -- including enable_language(OBJCXX), which would otherwise probe for
