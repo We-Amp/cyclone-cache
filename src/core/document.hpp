@@ -18,7 +18,7 @@ namespace cyclone {
 struct Document {
   static constexpr uint32_t kMagic = 0x5F129B14;
   static constexpr uint8_t kVersionMajor =
-      7;  // Version 6: hit_count/next_alternate_offset/last_access laid out
+      8;  // Version 6: hit_count/next_alternate_offset/last_access laid out
           // naturally aligned so the in-place header RMW sites can store them
           // via std::atomic_ref (kept in lockstep with
           // VolumeHeader::kFormatVersionMajor; pre-v6 volumes auto-reset)
@@ -28,6 +28,10 @@ struct Document {
           // VolumeHeader::kFormatVersionMajor is not ceremony: DocumentReader
           // gates on this field, so any stray v6 document a v7 binary reaches
           // reads as a MISS instead of a misparse.
+          // Version 8: the checksum below is CRC-32C (was CRC-32/ISO-HDLC).
+          // Pre-v8 documents would fail verification, and the fingerprinted
+          // filename (which mixes the format major) makes them invisible
+          // anyway -- consumers take a cold cache, never a misparse.
   static constexpr uint8_t kVersionMinor = 0;
 
   // Maximum alternates per cache key (bounds chain traversal).  Alias of the
@@ -74,7 +78,7 @@ struct Document {
   uint32_t sync_serial = 0;
   uint32_t write_serial = 0;
   uint32_t pin_until = 0;  // Unix timestamp
-  uint32_t checksum = 0;   // CRC32
+  uint32_t checksum = 0;   // CRC-32C (v8+); CRC-32/ISO-HDLC before v8
 
   uint32_t frag_offset = 0;  // Offset within total document
   uint32_t hit_count = 0;    // Persistent hit counter (was: reserved)

@@ -472,27 +472,29 @@ TEST_CASE("volume_files reports configured and actual on-disk paths",
 // the documented serialization: u16 LE format major, u8 mmap flag, u64 LE
 // {num_stripes, base_stripe_size, stripe_remainder}.)
 //
-// These values moved once, for the 6 -> 7 bump that leaves pre-depth-bound
-// alternate chains behind.  They were re-derived from the serialization above
-// rather than copied from the binary's output -- the re-derivation was checked
-// by reproducing the previous v6 hashes (7ddd9504877110d7 / a43f01449dc2105d)
-// with the format major set back to 6.
+// These values have moved twice: for the 6 -> 7 bump that leaves
+// pre-depth-bound alternate chains behind, and for the 7 -> 8 bump that
+// switches the document checksum to CRC-32C.  Each time they were re-derived
+// from the serialization above rather than copied from the binary's output --
+// the re-derivation is checked by reproducing the superseded hashes with the
+// format major set back (v6: 7ddd9504877110d7 / a43f01449dc2105d, v7:
+// 0d9cd9759862d3ec / f9973954149ff08a).
 TEST_CASE("fingerprint golden values pin the naming contract",
           "[fingerprint]") {
   // Auto stripes: 256 MiB, mmap on -> geometry {8, 33550336, 32704}.
   REQUIRE(fingerprint_cache_path("cyclone.dat", 256 * kMB, 0,
                                  /*mmap_directory=*/true) ==
-          "cyclone-7-0d9cd9759862d3ec.dat");
+          "cyclone-8-93cd38a16f167c85.dat");
   // Explicit stripes: 512 MiB + header, 128 MiB stripes, mmap off ->
   // geometry {4, 134217728, 0}.
   REQUIRE(fingerprint_cache_path(
               "cyclone.dat", 512 * kMB + VolumeHeader::kSize, 128 * kMB,
-              /*mmap_directory=*/false) == "cyclone-7-f9973954149ff08a.dat");
+              /*mmap_directory=*/false) == "cyclone-8-0614fc7c16097113.dat");
   // The .small sibling keeps its full "cyclone.dat" stem as the base.
   REQUIRE(fingerprint_cache_path("cyclone.dat.small",
                                  512 * kMB + VolumeHeader::kSize, 128 * kMB,
                                  /*mmap_directory=*/false) ==
-          "cyclone.dat-7-f9973954149ff08a.small");
+          "cyclone.dat-8-0614fc7c16097113.small");
   // Below the header floor (adopt-existing-file mode, size resolved at
   // open()): the path is returned UNCHANGED -- never a garbage-geometry hash.
   REQUIRE(fingerprint_cache_path("cyclone.dat", 0, 0,
