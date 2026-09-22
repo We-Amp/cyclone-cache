@@ -42,6 +42,25 @@ class MappedFile {
   virtual std::error_code advise_willneed(std::span<std::byte> region) = 0;
   virtual std::error_code advise_dontneed(std::span<std::byte> region) = 0;
 
+  // Best-effort readahead over a FILE byte range, addressed through the
+  // descriptor rather than through the mapping.  This exists because the
+  // only asynchronous readahead Darwin offers is fcntl(F_RDADVISE), which
+  // takes a file offset; its madvise(MADV_WILLNEED) is synchronous and
+  // serialises on the shared VM object, which makes it unusable as a hint
+  // (see Volume::maybe_advise_readahead).  Returns std::errc::not_supported
+  // where the platform has no such call; see supports_advise_readahead()
+  // for the way a caller is meant to ask.
+  virtual std::error_code advise_readahead(uint64_t file_offset,
+                                           size_t length) = 0;
+
+  // Whether advise_readahead() is implemented on this platform at all.
+  // This is a STATIC property of the build, deliberately not inferred from
+  // an advise_readahead() error: a runtime ENOTSUP from the underlying call
+  // (an exotic filesystem, say) must not silently reroute a caller onto
+  // advise_willneed(), which on Darwin is the path that costs multi-process
+  // read throughput.
+  [[nodiscard]] virtual bool supports_advise_readahead() const noexcept = 0;
+
   [[nodiscard]] virtual uint64_t file_size() const = 0;
 
   // Return the base address of the persistent whole-file mapping, or nullptr

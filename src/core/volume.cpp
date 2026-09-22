@@ -19,6 +19,8 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <span>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -2189,6 +2191,82 @@ std::expected<void, CacheError> Volume::init_stripes() {
   return {};
 }
 
+void Volume::maybe_advise_readahead(uint64_t doc_offset,
+                                    std::span<std::byte> region) noexcept {
+  // 0 disables the hint entirely; below the threshold small objects keep the
+  // open-time MADV_RANDOM behaviour (no readahead pollution).
+  const size_t threshold = _config.readahead_min_bytes;
+  if (threshold == 0 || region.size() < threshold) {
+    return;
+  }
+  if (!_mapped_file) {
+    return;
+  }
+  // Re-advise filter: at most one hint per document placement per
+  // kReadaheadReadviseSeconds (see _readahead_cache).  A warm re-read must
+  // not pay for a range walk it cannot benefit from, but a placement that
+  // has since been evicted from the page cache must get its hint back --
+  // on a cache larger than RAM that is the common case, not the exception.
+  const uint64_t disc = readahead_discriminator(doc_offset, region.size());
+  const uint32_t tick = readahead_tick();
+  auto& slot = (*_readahead_cache)[readahead_cache_index(doc_offset)];
+  const uint64_t stored = slot.load(std::memory_order_relaxed);
+  if ((stored >> kReadaheadTickBits) == disc) {
+    // Modular difference: correct across the tick wrap, and ticks only ever
+    // move forward, so a stale slot reads as "old" and re-advises.
+    const uint32_t stored_tick =
+        static_cast<uint32_t>(stored) & kReadaheadTickMask;
+    const uint32_t age = (tick - stored_tick) & kReadaheadTickMask;
+    if (age < kReadaheadReadviseSeconds) {
+      return;
+    }
+  }
+  slot.store((disc << kReadaheadTickBits) | tick, std::memory_order_relaxed);
+  // Best-effort hint over exactly this document's byte range.  WHICH call
+  // is a platform decision, because the two families behave very
+  // differently (measured; see doc/architecture.md):
+  //
+  //   Linux/Windows — advise the ADDRESS range of the mapping.
+  //     MADV_WILLNEED is honoured on a file mapping even though the mapping
+  //     carries MADV_RANDOM: the kernel queues a few large asynchronous
+  //     reads and returns, so the CRC pass below walks already-in-flight or
+  //     resident pages instead of taking one serial major fault per 4 KB
+  //     page.  Windows uses PrefetchVirtualMemory, same shape.
+  //
+  //   Darwin — advise the FILE range through the descriptor.
+  //     Darwin's madvise(MADV_WILLNEED) is NOT the asynchronous queue-and-
+  //     return of Linux: it walks and populates the range under the shared
+  //     VM object's lock, so it both costs far more per call and serialises
+  //     across every process mapping the same volume.  Probed on an M5 over
+  //     a 2 MiB range of a MAP_SHARED read-write mapping: 50 us with one
+  //     process, 305 us with four concurrent ones, against 5 us / 10 us for
+  //     fcntl(F_RDADVISE) doing the same job.  F_RDADVISE is the native
+  //     asynchronous readahead and is what advise_readahead() issues, so
+  //     Darwin takes that path and never the madvise one.
+  //
+  // supports_advise_readahead() is a static property of the build, not an
+  // error code: a runtime failure of F_RDADVISE must NOT reroute Darwin
+  // onto the madvise path, which is the expensive one there.  Errors from
+  // either call are discarded — a failed hint only costs the old
+  // behaviour.
+  if (_mapped_file->supports_advise_readahead()) {
+    (void)_mapped_file->advise_readahead(doc_offset, region.size());
+  } else {
+    (void)_mapped_file->advise_willneed(region);
+  }
+  _readahead_hints.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint32_t Volume::readahead_tick() noexcept {
+  // Seconds off the steady clock.  Only modular differences are ever
+  // compared, so the arbitrary epoch and the ~194-day truncation wrap are
+  // both harmless -- see the slot layout in volume.hpp.
+  auto secs = std::chrono::duration_cast<std::chrono::seconds>(
+                  std::chrono::steady_clock::now().time_since_epoch())
+                  .count();
+  return static_cast<uint32_t>(secs) & kReadaheadTickMask;
+}
+
 Stripe* Volume::select_stripe(const CacheKey& key) {
   if (_stripes.empty()) {
     return nullptr;
@@ -2370,6 +2448,21 @@ std::expected<ReadHandle, CacheError> Volume::read_sync(const CacheKey& key) {
         _mapped_file->unmap_region(*mapped);
         return true;  // Continue to next candidate
       }
+
+      // Large-document readahead.  The key matched, so this IS the document
+      // the caller asked for and its exact byte range is known — but
+      // nothing has touched its content yet (is_valid()/first_key() read
+      // header fields only).  Issue the hint HERE, before the CRC pass
+      // below makes the first content touch, so a cold 2 MiB document
+      // costs a few large asynchronous reads instead of ~512 serial page
+      // faults.  Pure address-range hint: no lock, no shared state, no
+      // dereference — it is outside the borrow/lease window by design and
+      // does not participate in the reader protocols (see
+      // maybe_advise_readahead).  Advise exactly the document, never the
+      // slack a coarse approx_size mapping may carry past its end.
+      maybe_advise_readahead(
+          doc_offset, mapped->first(std::min<size_t>(mapped->size(),
+                                                     reader.document().len)));
 
       // Verify checksum to detect corruption or torn reads.
       // Skip if this {offset, checksum} pair was already verified.  NOTE:
@@ -3369,6 +3462,7 @@ VolumeStats Volume::stats() const {
   result.evictions = _evictions.load();
   result.directory_syncs = _directory_syncs.load();
   result.fsyncs = _fsyncs.load();
+  result.readahead_hints_issued = _readahead_hints.load();
 
   // Wrap-cadence telemetry. Count: process-local counter (non-mmap
   // stripes) plus the shared per-stripe counters (mmap stripes), so in
@@ -4803,6 +4897,15 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
         checksum_failed = true;
         return false;
       }
+
+      // Large-document readahead for the selected alternate — same
+      // placement rule as read_sync(): the key has been re-verified, the
+      // byte range is known, and the CRC pass below is the first content
+      // touch.  See maybe_advise_readahead().
+      maybe_advise_readahead(
+          selected_offset,
+          selected_mapped->first(std::min<size_t>(
+              selected_mapped->size(), selected_reader.document().len)));
 
       // Verify checksum of selected alternate.
       // Skip if this {offset, checksum} pair was already verified.

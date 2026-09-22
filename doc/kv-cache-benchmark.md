@@ -182,14 +182,97 @@ document builder → serialized record) and CRCs it before a single
 
 ### What to change, in order
 
-1. **Readahead for large reads.** The blanket `MADV_RANDOM` on the whole
-   mapping (right for 4 KB HTTP objects) turns a cold 2 MiB read into ≈512
+1. **Readahead for large reads — DONE, 3.7× cold (13× with CRC out of the
+   way), with a per-platform hint.** The blanket `MADV_RANDOM` on the whole
+   mapping (right for 4 KB HTTP objects) turned a cold 2 MiB read into ≈512
    serial NVMe faults: 0.06 GB/s on Linux against 1.7–2.2 for the peers.
-   Advise `MADV_WILLNEED`/`MADV_SEQUENTIAL` (or `readahead()`) for the
-   document's range on the cold path before touching it — `MappedFile` has
-   the hooks, unused — and keep `MADV_RANDOM` for small objects. Measured
-   on Linux with a quiesced cache; expect this alone to close most of the
-   10–25× gap.
+   The disk read path now advises exactly the document's byte range, after
+   the full-key re-verification and before the CRC pass makes the first
+   content touch, for documents ≥ `CacheConfig::readahead_min_bytes`
+   (default 256 KiB, 0 = off). `MADV_RANDOM` stays, so small objects are
+   untouched. Two details carry most of the win: on Linux the advice is
+   issued in 512 KiB chunks, because the kernel clamps a single
+   `MADV_WILLNEED` to `max(bdi->io_pages, ra_pages)` pages and so silently
+   covers only the first ~1.25 MB of a 2 MiB range; and each document
+   placement is advised at most once every 2 s (a lossy direct-mapped
+   filter with a per-slot timestamp), because on a warm re-read the advice
+   walk costs more than the read — unfiltered it took warm `view` from
+   261 k to 68 k gets/s. The filter decays rather than remembering forever:
+   a KV tier is normally larger than RAM, so a block that was advised,
+   evicted and read cold again is the common case and must get its hint
+   back. `CacheStats::readahead_hints_issued` counts the hints that reach
+   the kernel.
+
+   **`MADV_WILLNEED` is not portable in cost — the macOS finding.** The
+   first version of this used `madvise(MADV_WILLNEED)` everywhere, which is
+   right on Linux and wrong on Darwin. Darwin's `MADV_WILLNEED` is not a
+   queue-and-return: it walks and populates the range under the shared VM
+   object's lock, so it is expensive per call *and* serialises across every
+   process mapping the volume. A standalone probe on an M5 — one 2 MiB
+   range of a `MAP_SHARED` read-write mapping whose pages are in the buffer
+   cache but not yet in the caller's page tables — measured
+   `MADV_WILLNEED` in 512 KiB chunks at **50 µs** with one process and
+   **305 µs** with four concurrent ones, against **5 µs / 10 µs** for
+   `fcntl(F_RDADVISE)`, Darwin's native asynchronous readahead. Against
+   phase 5 (four reader processes) that is the whole story: the madvise
+   hint cost macOS **86 %** of `multiprocess_read view`, **85 %** of
+   `copy`, and **29 %** of `restart`. The read path therefore picks by
+   platform — `F_RDADVISE` on the volume fd on Darwin,
+   `madvise(MADV_WILLNEED)` on Linux, `PrefetchVirtualMemory` on Windows —
+   via `MappedFile::supports_advise_readahead()`. With `F_RDADVISE` every
+   macOS phase is back inside noise of no hint at all, and the cold-read
+   win survives where the page cache is genuinely cold.
+
+   Linux, 2 MiB blocks, 1 thread, `--seconds 5`, caches dropped before the
+   cold phases; median of three runs:
+
+   | phase | before | after | |
+   |---|---:|---:|---:|
+   | `get_first_touch` | 57.4 gets/s, 0.120 GB/s, p99 24.2 ms | 212.9 gets/s, 0.446 GB/s, p99 5.3 ms | **3.7×** |
+   | `restart` | 57.9 gets/s, 0.121 GB/s, p99 24.3 ms | 209.5 gets/s, 0.439 GB/s, p99 5.5 ms | **3.6×** |
+   | `get_first_touch`, `--no-verify` | 85.5 gets/s, 0.179 GB/s, p99 18.5 ms | 1109.7 gets/s, 2.327 GB/s, p99 1.5 ms | **13.0×** |
+   | `put` | 132.0 puts/s, 0.277 GB/s | 131.7 puts/s, 0.276 GB/s | — |
+   | `get_warm` view | 271.6 k gets/s, p99 4.8 µs | 265.5 k gets/s, p99 5.0 µs | 98 % |
+   | `get_warm` copy | 5350 gets/s, 11.22 GB/s | 4990 gets/s, 10.47 GB/s | 93 % |
+   | `multiprocess_read` view | 8379 gets/s, 17.57 GB/s | 8287 gets/s, 17.38 GB/s | 99 % |
+   | `multiprocess_read` copy | 3508 gets/s, 7.36 GB/s | 3588 gets/s, 7.52 GB/s | 102 % |
+
+   Four children re-advising is 4× the hint traffic, so phase 5 is the case
+   that had to be checked: on Linux it is unchanged, because the 2 s
+   re-advise filter caps the traffic and `MADV_WILLNEED` returns without
+   blocking anyone else.
+
+   macOS (M5, 16 GB, APFS/NVMe), same command, median of three runs. No
+   `drop_caches` equivalent exists, so the "cold" phases here run against a
+   partly warm page cache and sit on the 0.55 GB/s software-CRC32 ceiling
+   rather than on I/O — which is exactly why the *cost* of the hint is what
+   this table is for:
+
+   | phase | stock | `MADV_WILLNEED` | `F_RDADVISE` |
+   |---|---:|---:|---:|
+   | `put` | 198.0 puts/s, 0.415 GB/s | 198.7, 0.417 | 205.6, 0.431 |
+   | `get_first_touch` | 277.6 gets/s, 0.582 GB/s | 240.4, 0.504 (87 %) | 284.4, 0.597 (**102 %**) |
+   | `restart` | 280.4 gets/s, 0.588 GB/s | 200.3, 0.420 (71 %) | 280.7, 0.589 (**100 %**) |
+   | `get_warm` view | 685.7 k gets/s | 679.5 k (99 %) | 684.4 k (100 %) |
+   | `get_warm` copy | 33.9 k gets/s, 71.09 GB/s | 33.7 k, 70.64 (99 %) | 33.3 k, 69.81 (98 %) |
+   | `multiprocess_read` view | 15502 gets/s, 32.51 GB/s | 2094, 4.39 (**14 %**) | 14743, 30.92 (95 %) |
+   | `multiprocess_read` copy | 10526 gets/s, 22.07 GB/s | 1596, 3.35 (**15 %**) | 10329, 21.66 (98 %) |
+
+   The one run in the set that started with a genuinely cold page cache is
+   the only macOS sample where readahead has anything to do: there stock
+   managed 118.4 gets/s (0.248 GB/s) on `get_first_touch` and `F_RDADVISE`
+   225.9 (0.474 GB/s). Apple Silicon's 16 KiB base page and Darwin's own
+   clustered pagein are why the upside is smaller than on Linux to begin
+   with — a cold 2 MiB read is ~128 faults there, not ~512.
+
+   The `--no-verify` row is the honest ceiling of the I/O fix: **2.33 GB/s,
+   past LMDB (2.15) and file-per-block (1.76)**. With verification on, the
+   cold path is now bounded by the 0.55 GB/s software CRC32, which is item
+   2 below — readahead has taken the I/O out of the picture and handed the
+   remaining gap to the checksum. `MADV_POPULATE_READ` (Linux ≥ 5.14) was
+   measured on top of the chunked `WILLNEED` and did not help (2.25 vs 2.33
+   GB/s), so it is not used: `WILLNEED` already queues the large reads, and
+   populating the PTEs up front only moves the per-page work.
 2. **Fast CRC32** — ✅ **done** (`src/core/crc32.{hpp,cpp}`). The byte-wise
    table routine was replaced by slice-by-16 tables plus an ARMv8
    `crc32b/w/x` path, selected once through a function pointer. The on-disk
@@ -313,6 +396,12 @@ run could only hint at (there the page cache was never cold) and it is now
 the top item in the fix list. It also explains why four Cyclone reader
 processes fall below one thread on both platforms: each process re-faults
 and re-verifies from scratch.
+
+> **Fixed since this run.** The table above is the pre-fix measurement and
+> is kept as the baseline. Per-document `MADV_WILLNEED` on the cold read
+> path (fix-list item 1, now landed) takes cold first-touch to 0.449 GB/s
+> with CRC on and 2.327 GB/s with it off — past LMDB. See item 1 below for
+> the full before/after.
 
 **Warm reads confirm the macOS picture on cheaper hardware.** Cyclone and
 LMDB are the same zero-syscall class (274 k vs 245 k gets/s `view`; 11.9 vs
