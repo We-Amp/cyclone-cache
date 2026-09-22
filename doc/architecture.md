@@ -208,19 +208,21 @@ the table path. The x86-64 path is not yet measured; see the TODO in
 Implementations, all bit-identical, selected once on first use through a
 function pointer (no per-call feature branches):
 
-| Path | When | Apple M5, 2 MiB |
-|------|------|----------------:|
-| byte-at-a-time table | reference only (the tests' oracle) | 0.61 GB/s |
-| slice-by-16 tables (portable) | everywhere else | 3.37 GB/s |
-| x86-64 SSE4.2 `crc32q`, 3-way interleaved | `__builtin_cpu_supports("sse4.2")` (`__cpuid` leaf 1 ECX bit 20 on MSVC); the one function carries `target("sse4.2")` so the project's stock flags are unchanged | n/a |
-| ARMv8 `crc32cb/w/x`, 3-way interleaved | `__ARM_FEATURE_CRC32`, MSVC ARM64, or `AT_HWCAP & HWCAP_CRC32` on Linux aarch64 | 34.9 GB/s |
+| Path | When | Apple M5, 2 MiB | i7-8750H, 2 MiB |
+|------|------|----------------:|----------------:|
+| byte-at-a-time table | reference only (the tests' oracle) | 0.61 GB/s | 0.50 GB/s |
+| slice-by-16 tables (portable) | everywhere else | 3.37 GB/s | 2.82 GB/s |
+| x86-64 SSE4.2 `crc32q`, 3-way interleaved | `__builtin_cpu_supports("sse4.2")` (`__cpuid` leaf 1 ECX bit 20 on MSVC); the one function carries `target("sse4.2")` so the project's stock flags are unchanged | — | 26.51 GB/s |
+| ARMv8 `crc32cb/w/x`, 3-way interleaved | `__ARM_FEATURE_CRC32`, MSVC ARM64, or `AT_HWCAP & HWCAP_CRC32` on Linux aarch64 | 34.9 GB/s | — |
 
-Best of five `crc32c_bench --seconds 1` runs on an otherwise idle machine;
-a run sharing the machine with a build loses a few percent. The portable
-path is the same slice-by-16 structure as the v7 ISO-HDLC one — the
-polynomial does not change its cost, so its rate is unchanged within that
-noise (3.37 here against 3.44 measured for ISO-HDLC), and the ≈2.8 GB/s
-previously measured on an i7-8750H still applies there.
+Best of five `crc32c_bench --seconds 1` runs on an otherwise idle machine
+(clang on both; g++-13 reaches 19.3 GB/s on the same i7 loop); a run
+sharing the machine with a build loses a few percent. The portable path is
+the same slice-by-16 structure as the v7 ISO-HDLC one — the polynomial does
+not change its cost, so its rate is unchanged within that noise (3.37 here
+against 3.44 measured for ISO-HDLC on the M5, 2.82 against 2.83 on the i7).
+Single-stream hardware rates are 12.2 GB/s (M5) and 10.4 GB/s (i7); the
+3-way interleave is what lifts both to the figures in the table.
 
 Both hardware paths run **three** independent CRC registers over three
 adjacent blocks (8192 bytes, then 256) and stitch them back together with

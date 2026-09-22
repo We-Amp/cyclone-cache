@@ -34,8 +34,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   ARMv8 (`crc32cx`), and the checksum is re-verified on every cold read, so
   it was the cold-read bandwidth ceiling on x86. Both hardware paths run a
   3-way interleave: 34.9 GB/s over 2 MiB on an Apple M5, up from 12.2 GB/s
-  single-stream and 3.4 GB/s for the portable table path (the x86-64 path is
-  not yet measured). Dispatch is resolved once, on first use.
+  single-stream and 3.4 GB/s for the portable table path; 26.5 GB/s on an
+  i7-8750H, up from 2.8 GB/s. On Linux that takes the 2 MiB cold read from
+  1.6 to 2.2 GB/s, level with LMDB (`doc/kv-cache-benchmark.md`). Dispatch
+  is resolved once, on first use.
   **Existing cache files are abandoned (not deleted) on open.** The format
   major is mixed into the fingerprinted volume filename, so a v8 binary
   resolves to a different file and starts cold rather than failing to verify
