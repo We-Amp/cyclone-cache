@@ -2134,11 +2134,13 @@ void Volume::configure_frontier(Stripe& stripe) const {
     const FrontierGeometry g = retention_geometry(data_area);
     stripe.chunks = g.chunks;
     stripe.chunk_size = g.chunk_size;
-    return;
+  } else {
+    // Flush mode: one chunk spanning the whole data area.
+    stripe.chunks = 1;
+    stripe.chunk_size = data_area;
   }
-  // Flush mode: one chunk spanning the whole data area.
-  stripe.chunks = 1;
-  stripe.chunk_size = data_area;
+  stripe.gen_div = FastDivU64(uint64_t{stripe.chunks} + 1);
+  stripe.chunk_div = FastDivU64(stripe.chunk_size);
 }
 
 std::expected<void, CacheError> Volume::init_stripes(bool exclusive) {
@@ -2985,7 +2987,7 @@ void Volume::stamp_read_lease(Stripe* stripe) const {
   }
 }
 
-BorrowToken Volume::acquire_borrow(Stripe* stripe, uint32_t chunk) {
+BorrowToken Volume::acquire_borrow(Stripe* stripe, uint32_t chunk) const {
   if (_lease_t_ns == 0 || stripe == nullptr) {
     return {};  // Leases disabled: the wrap gate is off, nothing to count.
   }
@@ -3104,10 +3106,10 @@ StripeSnapshot Volume::snapshot(const Stripe* stripe) const {
   reader_seam(ReaderSeam::kSnapshotGen);
 #endif
   const uint64_t n = stripe->chunks;
-  snap.pass = snap.gen / (n + 1);
+  snap.pass = stripe->pass_of(snap.gen);
   // Clamp, never repair: a corrupt or foreign G with f > N reads as a
   // fully exposed pass.
-  snap.frontier = std::min<uint64_t>(snap.gen % (n + 1), n);
+  snap.frontier = std::min<uint64_t>(snap.gen - (snap.pass * (n + 1)), n);
   snap.phase = (snap.pass & 1U) != 0;
   snap.cursor_rel = stripe->current_write_cursor() - stripe->offset;
   snap.frontier_rel = stripe->frontier_rel_of(snap.frontier);

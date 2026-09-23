@@ -1255,9 +1255,10 @@ TEST_CASE("MmapDirectory layout: the retention region fits the old slack",
   // 16384 buckets is the production directory (kDirectoryEntriesPerSegment).
   // The retention region (G + 64 x u32 = 264 bytes) sits after the entries
   // and must not move the page-rounded data offset (177 pages).
-  REQUIRE(MmapDirectory::required_size(16 * 1024) == 721224);
-  REQUIRE((MmapDirectory::required_size(16 * 1024) + 4095) / 4096 == 177);
-  REQUIRE(MmapDirectory::retention_offset(16 * 1024) % 8 == 0);
+  REQUIRE(MmapDirectory::required_size(size_t{16} * 1024) == 721224);
+  REQUIRE((MmapDirectory::required_size(size_t{16} * 1024) + 4095) / 4096 ==
+          177);
+  REQUIRE(MmapDirectory::retention_offset(size_t{16} * 1024) % 8 == 0);
 }
 
 TEST_CASE("MmapDirectory recognises a foreign-version directory",

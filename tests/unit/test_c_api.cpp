@@ -14,6 +14,7 @@
 #include <thread>
 #include <vector>
 
+#include "cyclone/config.hpp"
 #include "cyclone/cyclone_c.h"
 #include "support/temp_cache.hpp"
 
@@ -653,6 +654,37 @@ TEST_CASE("C API: Stats retrieval", "[c_api]") {
   REQUIRE(stats.current_entries > 0);
 
   cyclone_cache_destroy(cache);
+}
+
+TEST_CASE(
+    "C API: disable_wrap_retention selects flush mode; zero keeps "
+    "the default",
+    "[c_api][retention]") {
+  // Observable through the retention counters: with wrap retention the very
+  // first write already advances the clean frontier through empty space.
+  auto frontier_advances_after_one_write = [](int disable) {
+    TempCacheDir tmp;
+    std::string cache_path = tmp.path();
+    CycloneCacheConfig config{};
+    config.cache_path = cache_path.c_str();
+    config.cache_size_bytes = static_cast<uint64_t>(10 * 1024 * 1024);
+    config.enable_checksum = 1;
+    config.disable_wrap_retention = disable;
+    CycloneCacheHandle *cache = nullptr;
+    REQUIRE(cyclone_cache_create(&config, &cache) == CYCLONE_OK);
+    const char *key = "mode_key";
+    const char *data = "mode_data";
+    REQUIRE(cyclone_cache_write(cache, key, strlen(key), data, strlen(data)) ==
+            CYCLONE_OK);
+    CycloneCacheStats stats{};
+    REQUIRE(cyclone_cache_stats(cache, &stats) == CYCLONE_OK);
+    cyclone_cache_destroy(cache);
+    return stats.frontier_advances;
+  };
+  REQUIRE(frontier_advances_after_one_write(1) == 0);
+  // Zero-initialised: the library default (CacheConfig::wrap_retention).
+  const bool default_retains = cyclone::CacheConfig{}.wrap_retention;
+  REQUIRE((frontier_advances_after_one_write(0) > 0) == default_retains);
 }
 
 // =============================================================================
