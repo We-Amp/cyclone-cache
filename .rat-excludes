@@ -31,4 +31,6 @@
 # libFuzzer seed corpora (fuzz/corpus/*/): opaque binary test inputs.
 corpus
 # Raw benchmark program output (no source header applies).
-doc/kv-cache-benchmark/.*\.txt
+.*-crc32c_bench\.txt
+churn-.*\.txt
+policy-replay\.txt
