@@ -10,9 +10,32 @@
 #include <string>
 #include <thread>
 
+#ifdef CYCLONE_TEST_SEAMS
+#include <cstdlib>
+#endif
+
 namespace cyclone {
 
 class CachePlugin;
+
+// Default of CacheConfig::wrap_retention / VolumeConfig::wrap_retention.
+inline constexpr bool kDefaultWrapRetention = false;
+
+namespace detail {
+// The default eviction mode.  Test builds only (CYCLONE_TEST_SEAMS, never
+// defined for the release library) let CYCLONE_TEST_WRAP_RETENTION=0/1
+// override the DEFAULT, so the whole suite can run in either mode; a config
+// that sets the field explicitly is unaffected.
+inline bool default_wrap_retention() {
+#ifdef CYCLONE_TEST_SEAMS
+  // NOLINTNEXTLINE(concurrency-mt-unsafe): read-only, test builds only
+  if (const char *forced = std::getenv("CYCLONE_TEST_WRAP_RETENTION")) {
+    return forced[0] == '1';
+  }
+#endif
+  return kDefaultWrapRetention;
+}
+}  // namespace detail
 
 inline constexpr size_t operator""_KB(unsigned long long v) { return v * 1024; }
 inline constexpr size_t operator""_MB(unsigned long long v) {
@@ -337,6 +360,10 @@ struct CacheConfig {
   // active regardless.
   bool unlink_superseded_alternates = true;
 
+  // Wrap retention (eviction policy of the circular data area); propagated
+  // to every volume added to this cache.  See VolumeConfig::wrap_retention.
+  bool wrap_retention = detail::default_wrap_retention();
+
   // Cross-process RAM-cache coherence.  Default OFF; propagated to
   // every volume added to this cache.
   //
@@ -488,6 +515,10 @@ struct CacheConfig {
     gc_superseded_on_start = enable;
     return *this;
   }
+  CacheConfig &set_wrap_retention(bool enable) {
+    wrap_retention = enable;
+    return *this;
+  }
   CacheConfig &set_cross_process_ram_coherence(bool enable) {
     cross_process_ram_coherence = enable;
     return *this;
@@ -566,6 +597,22 @@ struct VolumeConfig {
   // wrap-frontier link refusal and the single-id chain reset at the
   // traversal cap -- stay ACTIVE regardless of this setting.
   bool unlink_superseded_alternates = true;
+
+  // Wrap retention.  When a stripe's write cursor wraps, keep the previous
+  // pass readable until the forward fill actually needs its bytes: a clean
+  // frontier moves ahead of the cursor in fixed chunks, and only the chunks
+  // it is about to reuse are dropped.  When false (flush mode), a wrap makes
+  // the whole previous pass unreadable at once.  Retention holds about twice
+  // as much readable data per stripe; see doc/design/wrap-retention.md.
+  //
+  // Applies when the volume is CREATED: the mode is persisted in the volume
+  // header, and an open whose mode disagrees with the file goes through the
+  // same live-peer reset gate as a format change (refused while a peer holds
+  // the file, a cold reset otherwise, IncompatibleVersion with
+  // auto_reset_on_incompatible off).  All processes sharing a cache must
+  // therefore use the same setting.  Normally set from
+  // CacheConfig::wrap_retention.
+  bool wrap_retention = detail::default_wrap_retention();
 
   // Per-object content-size bound enforced at the write entry.
   // Normally set from CacheConfig::max_object_size; see its documentation

@@ -1075,3 +1075,37 @@ that exists at that point.
 7. **Docs.** Update `doc/architecture.md` (Glossary: frontier, pass stamp,
    `G`; the lease section) and `doc/multi-process.md` (retention region,
    mode mismatch), and move this record to "design record for shipped work".
+
+---
+
+## 14. Implementation notes
+
+What the implementation does where this record leaves a choice open, and
+every place it departs from the text above.  Each note names the commit
+that introduced it.
+
+**Step 4 (frontier, advance, stamp).**
+
+- *Stamp in both modes.*  The writer stamps `write_serial := P` in flush
+  mode too; flush-mode admission ignores the stamp, so this changes no
+  flush verdict and keeps a later mode change from meeting unstamped
+  documents.
+- *Seams in the retention wrap.*  The ungated wrap fires the writer seams
+  `kAfterIntentSet`, `kWrapAfterCursor` and `kAfterEpochStore` (it has no
+  gate, so no `kAfterGatePassed`); each advance fires `kAfterIntentSet`,
+  `kAfterGatePassed` and `kAfterEpochStore`.  A third reader seam,
+  `kSnapshotGen`, sits between the `G` and `W` loads of `Volume::snapshot`
+  for test 17; like the other reader seams it exists only in
+  `CYCLONE_TEST_SEAMS` builds.
+- *Counters.*  A ceiling-forced mandatory advance is counted in the existing
+  `wraps_forced_past_lease`; `wraps_deferred_by_lease` keeps counting only
+  flush-mode wrap deferrals, and `advances_deferred_by_lease` the retention
+  ones.  `writes_dropped_by_lease` counts drops in both modes.
+- *Test placement.*  Test 6 needs advances, so it lands in step 4 rather than
+  step 3; so do the mode legs of test 14 and the cross-process leg of 15
+  (step 3 carries their layout and geometry legs).
+- *Suite in both modes.*  The mode flag exists from step 4, but the
+  uniqueness rules (4.6) only arrive in step 5, so before step 5 retention
+  mode can leave a stale duplicate entry (for example after an alternate
+  write whose link was refused) and the full suite is only clean in flush
+  mode.  The both-modes run of test 18 starts at step 5.
