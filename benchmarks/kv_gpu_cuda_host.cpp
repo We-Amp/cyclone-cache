@@ -646,6 +646,14 @@ struct Row {
   RunOut r;
 };
 
+// Number of rows that ran (supported) but failed their correctness check;
+// main() turns a non-zero count into a failing exit status.
+size_t count_failed(const std::vector<Row> &rows) {
+  return static_cast<size_t>(std::count_if(
+      rows.begin(), rows.end(),
+      [](const Row &row) { return row.r.supported && !row.r.correct; }));
+}
+
 void print_table(const std::vector<Row> &rows) {
   std::printf(
       "\n| store | path | batch | blocks/s | GB/s | p50 us | p99 us | "
@@ -1500,5 +1508,9 @@ int main(int argc, char **argv) {
     std::printf("\nJSON lines written to %s\n", p.output.c_str());
   }
   cygpu_shutdown();
+  if (const size_t failed = count_failed(all_rows); failed != 0) {
+    std::fprintf(stderr, "%zu row(s) failed the correctness check\n", failed);
+    return 1;
+  }
   return 0;
 }
