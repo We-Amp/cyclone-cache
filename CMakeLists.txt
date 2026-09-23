@@ -241,6 +241,8 @@ if(CYCLONE_BUILD_BENCHMARKS)
   add_executable(kv_churn benchmarks/kv_churn.cpp)
   target_link_libraries(kv_churn PRIVATE cyclone-cache)
   target_include_directories(kv_churn PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  add_executable(kv_churn_policy benchmarks/kv_churn_policy.cpp)
+  target_link_libraries(kv_churn_policy PRIVATE cyclone-cache)
 
   add_executable(crc32c_bench benchmarks/crc32c_bench.cpp)
   target_link_libraries(crc32c_bench PRIVATE cyclone-cache)
