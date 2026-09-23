@@ -244,7 +244,7 @@ class PosixMappedFile : public MappedFile {
     // Each call gets its own budget, so chunking is what actually covers
     // the whole document; the extra syscalls are amortised by the caller,
     // which advises a given document once (Volume::maybe_advise_readahead).
-    constexpr size_t kChunkBytes = 512 * 1024;
+    constexpr size_t kChunkBytes = size_t{512} * 1024;
     while (advise_length > 0) {
       size_t chunk = advise_length < kChunkBytes ? advise_length : kChunkBytes;
       // NOLINTNEXTLINE(performance-no-int-to-ptr)

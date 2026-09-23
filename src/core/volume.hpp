@@ -1253,12 +1253,25 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // synchronisation and is never consulted for correctness.  The warm path
   // is a single relaxed load; the store only happens when a hint is
   // actually issued.  8192 slots = 64 KB per volume.
+  //
+  // Allocated ONLY when the hint is enabled (readahead_min_bytes != 0), and
+  // then once, here, at construction -- before the Volume can be published
+  // to any reader.  _config is fixed for the Volume's lifetime, so the
+  // pointer never changes after construction and concurrent readers load it
+  // without synchronisation.  When the hint is off the pointer stays null
+  // and is never dereferenced: maybe_advise_readahead() returns on the
+  // zero threshold before it would reach the filter.  (Declared after
+  // _config, so the initializer below sees the final configuration.)
   static constexpr size_t kReadaheadCacheSize = 8192;
   static constexpr unsigned kReadaheadCacheShift = 64 - 13;  // log2(8192)
   static constexpr uint32_t kReadaheadReadviseSeconds = 2;
-  std::unique_ptr<std::array<std::atomic<uint64_t>, kReadaheadCacheSize>>
-      _readahead_cache = std::make_unique<
-          std::array<std::atomic<uint64_t>, kReadaheadCacheSize>>();
+  using ReadaheadCache = std::array<std::atomic<uint64_t>, kReadaheadCacheSize>;
+  static std::unique_ptr<ReadaheadCache> make_readahead_cache(
+      size_t min_bytes) {
+    return min_bytes != 0 ? std::make_unique<ReadaheadCache>() : nullptr;
+  }
+  const std::unique_ptr<ReadaheadCache> _readahead_cache =
+      make_readahead_cache(_config.readahead_min_bytes);
 
   static size_t readahead_cache_index(uint64_t offset) {
     return static_cast<size_t>((offset * uint64_t{0x9E3779B97F4A7C15}) >>

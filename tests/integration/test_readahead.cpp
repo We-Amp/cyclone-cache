@@ -31,8 +31,9 @@
 //     same volume file re-reads a large document through the advise +
 //     CRC-verify path with no warm mapping.
 //   * ALTERNATE -- the second hook, on the selected-alternate read path.
-//   * BOUNDARY -- a document sized exactly at the threshold (advice fires)
-//     and one a byte under it (advice does not) both read back intact.
+//   * BOUNDARY -- a document whose length (header included) is exactly the
+//     threshold issues one hint, and one a byte under it issues none; both
+//     read back intact.
 
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
@@ -44,6 +45,7 @@
 #include <thread>
 #include <vector>
 
+#include "core/document.hpp"
 #include "cyclone/alternate.hpp"
 #include "cyclone/cache.hpp"
 #include "cyclone/config.hpp"
@@ -280,16 +282,28 @@ TEST_CASE("Documents at the readahead threshold boundary read back intact",
   TempCacheDir tmp("readahead_boundary");
   auto cache = make_cache(tmp, readahead_config(kThreshold));
 
-  // The threshold compares against the DOCUMENT length (header + content),
-  // so a content size at and just under the threshold brackets the
-  // fires/does-not-fire edge from both sides.
-  const CacheKey at("readahead-at");
-  write_doc(*cache, at, kThreshold, 3);
-  REQUIRE(read_and_verify(*cache, at, kThreshold, 3));
+  // The threshold compares against the DOCUMENT length, Document::len, which
+  // is the fixed header plus the (here empty) HTTP header plus the content.
+  // Size the CONTENT so the document itself lands exactly on each side of
+  // the edge, and pin which side fires through readahead_hints_issued: a
+  // content size of kThreshold - 1 would be a document well OVER the
+  // threshold and would not test the edge at all.
+  constexpr size_t kAtContent = kThreshold - Document::kHeaderSize;
+  constexpr size_t kUnderContent = kAtContent - 1;
 
+  // Document length kThreshold - 1: no hint.
   const CacheKey under("readahead-under");
-  write_doc(*cache, under, kThreshold - 1, 4);
-  REQUIRE(read_and_verify(*cache, under, kThreshold - 1, 4));
+  write_doc(*cache, under, kUnderContent, 4);
+  const uint64_t before_under = cache->stats().readahead_hints_issued;
+  REQUIRE(read_and_verify(*cache, under, kUnderContent, 4));
+  CHECK(cache->stats().readahead_hints_issued == before_under);
+
+  // Document length exactly kThreshold: exactly one hint.
+  const CacheKey at("readahead-at");
+  write_doc(*cache, at, kAtContent, 3);
+  const uint64_t before_at = cache->stats().readahead_hints_issued;
+  REQUIRE(read_and_verify(*cache, at, kAtContent, 3));
+  CHECK(cache->stats().readahead_hints_issued == before_at + 1);
 
   // One page over, to cover a range whose page-aligned end is past the
   // document end.

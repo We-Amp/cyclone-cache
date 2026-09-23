@@ -215,3 +215,45 @@ TEST_CASE("MappedFile advise_readahead addresses the file, not the mapping",
   }
   remove_temp_file(path);
 }
+
+#ifndef _WIN32
+TEST_CASE("MappedFile advise_willneed accepts a mid-page region over 512 KiB",
+          "[mapped_file]") {
+  // Pins the POSIX advise_willneed() contract the readahead path relies on:
+  // a document starts at an arbitrary file offset, so the region handed in
+  // starts mid-page.  madvise() rejects an unaligned start with EINVAL, so
+  // the implementation must round down to the page boundary; and a region
+  // longer than the 512 KiB chunk must be advised in several calls, the
+  // later ones starting on the chunk boundary.  Both used to be silent
+  // failures -- the hint never ran -- so this asserts SUCCESS, not merely
+  // "does not crash".
+  constexpr size_t kFileBytes = size_t{1} << 20;  // 1 MiB
+  auto path = create_temp_file(kFileBytes);
+  auto mf = MappedFile::create();
+
+  auto open_result = mf->open(path.string(), MappedFile::OpenMode::ReadOnly);
+  REQUIRE(open_result.has_value());
+
+  auto mapped = mf->map_region(0, kFileBytes, MappedFile::MapMode::ReadOnly);
+  REQUIRE(mapped.has_value());
+
+  // Starts 100 bytes into the first page and runs 600 KiB: unaligned start,
+  // more than one chunk, ends mid-page, and stays inside the mapping.
+  constexpr size_t kStart = 100;
+  constexpr size_t kLength = size_t{600} * 1024;
+  static_assert(kStart + kLength <= kFileBytes);
+  auto region = mapped->subspan(kStart, kLength);
+
+  const auto ec = mf->advise_willneed(region);
+  INFO("advise_willneed error: " << ec.message());
+  REQUIRE_FALSE(ec);
+
+  // The advice is a pure hint: contents are untouched.
+  REQUIRE(region[0] == std::byte{'X'});
+  REQUIRE(region[kLength - 1] == std::byte{'X'});
+
+  mf->unmap_region(*mapped);
+  mf->close();
+  remove_temp_file(path);
+}
+#endif

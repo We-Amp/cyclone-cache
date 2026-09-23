@@ -2199,7 +2199,10 @@ void Volume::maybe_advise_readahead(uint64_t doc_offset,
   if (threshold == 0 || region.size() < threshold) {
     return;
   }
-  if (!_mapped_file) {
+  // _readahead_cache is non-null whenever the threshold is non-zero (it is
+  // allocated at construction from the same, immutable, config); the check
+  // is defensive and sits past the size gate, so small reads never pay it.
+  if (!_mapped_file || !_readahead_cache) {
     return;
   }
   // Re-advise filter: at most one hint per document placement per
