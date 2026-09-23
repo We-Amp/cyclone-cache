@@ -1146,3 +1146,25 @@ that introduced it.
   its own and would hide whether the takeover repaired.  So in retention
   mode that leg covers the `kAfterIntentSet` and `kWrapAfterCursor` seams
   only; the repair decision does not depend on the seam.
+
+**Step 6 (default, C API, hammer).**
+
+- *The default stays off.*  D1 flips the default only after every gate
+  passes.  All of them passed except one. The PageSpeed `cache_burst_test`
+  (a cross-process stress test in the mod_pagespeed tree) could not be run
+  against this tree. The consumer checkouts pin an older Cyclone commit, and
+  their `third_party/cyclone.BUILD` predates `src/core/crc32c.cpp`, so the
+  run would need edits in the consumer repository. Flipping the default is a
+  one-line change to `kDefaultWrapRetention` once that run is green.
+- *Test 18 classification.*  The hammer uses a 2 s lease (so no borrow is
+  unprotected by lapse) and a 60 ms ceiling (so forced steps occur). A
+  content mismatch counts as a tear only when `wraps_forced_past_lease`
+  moved during that read. A forced step is the documented unprotected case,
+  and the test reports those reads separately. Any other mismatch fails the
+  test.
+- *No hardware divide on the read path.*  The snapshot splits `G` by
+  `N + 1`, and the chunk of a document is `(o - S) / Q`. Both divisors are
+  fixed at open, so `Stripe` holds a reciprocal (`FastDivU64`) for each. A
+  64-bit `DIV` on the i7-8750H made single-thread reads about 11 % slower
+  than before this work, in both modes. With the reciprocal the gap is
+  2-4 %.

@@ -20,6 +20,9 @@
 #ifndef _WIN32
 #include <sys/types.h>  // dev_t, ino_t (Volume::backing_identity)
 #endif
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>  // __umulh (FastDivU64)
+#endif
 
 #include "cyclone/alternate.hpp"
 #include "cyclone/config.hpp"
@@ -264,6 +267,46 @@ static_assert(retention_geometry(uint64_t{1} << 30).chunks == 64 &&
 static_assert(retention_geometry(uint64_t{1} << 20).chunks == 1,
               "a stripe of 1 MiB or less gets N = 1 (flush behaviour)");
 
+// Exact unsigned 64-bit division by a divisor fixed at open, without a
+// hardware divide.  The read hot path divides by N + 1 (the snapshot's
+// pass/frontier split) and by Q (a document's chunk) on every probe; a
+// 64-bit DIV costs 35-90 cycles on common x86 cores, which measured as an
+// ~11 % single-thread read regression.  Reciprocal m = floor((2^64 - 1) / d)
+// makes mulhi(n, m) either floor(n / d) or one less, for every n (the
+// deficit n * (2^64 / d - m) / 2^64 is below 1); one compare corrects it.
+class FastDivU64 {
+ public:
+  constexpr FastDivU64() = default;
+  constexpr explicit FastDivU64(uint64_t divisor)
+      : _d(divisor == 0 ? 1 : divisor), _m(_d <= 1 ? 0 : ~uint64_t{0} / _d) {}
+
+  [[nodiscard]] constexpr uint64_t divisor() const noexcept { return _d; }
+
+  [[nodiscard]] uint64_t quot(uint64_t n) const noexcept {
+    if (_d == 1) {
+      return n;
+    }
+    uint64_t q = mulhi(n, _m);
+    if (n - (q * _d) >= _d) {
+      ++q;
+    }
+    return q;
+  }
+
+ private:
+  [[nodiscard]] static uint64_t mulhi(uint64_t a, uint64_t b) noexcept {
+#if defined(_MSC_VER) && !defined(__clang__)
+    return __umulh(a, b);
+#else
+    __extension__ using U128 = unsigned __int128;
+    return static_cast<uint64_t>((static_cast<U128>(a) * b) >> 64U);
+#endif
+  }
+
+  uint64_t _d = 1;
+  uint64_t _m = 0;
+};
+
 // A reader's (or writer's) snapshot of one stripe -- Sigma in
 // doc/design/wrap-retention.md.  Loaded by Volume::snapshot(): the epoch
 // FIRST (seq_cst), then the write cursor (acquire).  Every admission
@@ -316,6 +359,10 @@ struct Stripe {
   // slot, and a wrap exposes everything at once.
   uint32_t chunks = 1;
   uint64_t chunk_size = 0;
+  // Divide-free N + 1 and Q for the read hot path (set with them in
+  // Volume::configure_frontier).
+  FastDivU64 gen_div{2};
+  FastDivU64 chunk_div{1};
   // Wrap retention on for this stripe's volume (VolumeConfig::wrap_retention
   // as persisted in VolumeHeader::retain_chunks).  Fixed at open.
   bool retain = false;
@@ -444,10 +491,10 @@ struct Stripe {
   // c(o) = (o - S) / Q, clamped to [0, N - 1].
   [[nodiscard]] uint32_t chunk_of(uint64_t relative_offset) const noexcept {
     const uint64_t start = data_start_rel();
-    if (relative_offset <= start || chunk_size == 0) {
+    if (chunks <= 1 || relative_offset <= start || chunk_size == 0) {
       return 0;
     }
-    const uint64_t c = (relative_offset - start) / chunk_size;
+    const uint64_t c = chunk_div.quot(relative_offset - start);
     return c >= chunks ? chunks - 1 : static_cast<uint32_t>(c);
   }
 
@@ -472,7 +519,7 @@ struct Stripe {
 
   // The pass P encoded in a generation word.
   [[nodiscard]] uint64_t pass_of(uint64_t gen) const noexcept {
-    return gen / (static_cast<uint64_t>(chunks) + 1);
+    return gen_div.quot(gen);
   }
 
   // Exposure threshold of a document from pass `pass` starting at
@@ -1405,7 +1452,8 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // token when leases are disabled.
   // `chunk` is the frontier chunk of the document being served
   // (Stripe::chunk_of): the borrow counts only against that chunk's slot.
-  [[nodiscard]] BorrowToken acquire_borrow(Stripe *stripe, uint32_t chunk);
+  [[nodiscard]] BorrowToken acquire_borrow(Stripe *stripe,
+                                           uint32_t chunk) const;
 
   // The stripe snapshot every admission of one probe or walk is decided
   // against: G FIRST (seq_cst), then the write cursor W (acquire)

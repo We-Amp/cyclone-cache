@@ -397,6 +397,7 @@ int main(int argc, char *argv[]) {
   size_t num_entries = 1000;
   size_t content_size = 4096;
   std::string output_file;
+  std::optional<bool> wrap_retention;  // unset = the library default
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -408,6 +409,8 @@ int main(int argc, char *argv[]) {
       content_size = std::stoul(argv[++i]);
     } else if (arg == "--output" && i + 1 < argc) {
       output_file = argv[++i];
+    } else if (arg == "--wrap-retention" && i + 1 < argc) {
+      wrap_retention = std::string(argv[++i]) == "on";
     } else if (arg == "--help" || arg == "-h") {
       std::cout << "Usage: " << argv[0] << " [options]\n";
       std::cout << "Options:\n";
@@ -418,6 +421,8 @@ int main(int argc, char *argv[]) {
       std::cout
           << "  --content-size B    Content size in bytes (default: 4096)\n";
       std::cout << "  --output FILE       Write JSON results to file\n";
+      std::cout << "  --wrap-retention on|off  Eviction mode (default: the "
+                   "library default)\n";
       std::cout << "  --help, -h          Show this help\n";
       return 0;
     }
@@ -436,6 +441,11 @@ int main(int argc, char *argv[]) {
   std::string cache_path = create_temp_file(cache_size_mb);
 
   CacheConfig config;
+  if (wrap_retention) {
+    config.wrap_retention = *wrap_retention;
+  }
+  std::cout << "Wrap retention: " << (config.wrap_retention ? "on" : "off")
+            << "\n\n";
   auto cache_result = Cache::create(config);
   if (!cache_result.has_value()) {
     std::cerr << "Failed to create cache\n";
@@ -497,6 +507,15 @@ int main(int argc, char *argv[]) {
   std::cout << "  RAM cache hits: " << stats.ram_cache_hits << "\n";
   std::cout << "  Disk cache hits: " << stats.disk_cache_hits << "\n";
   std::cout << "  Evictions: " << stats.evictions << "\n";
+  std::cout << "  Wraps: " << stats.write_buffer_wraps << "\n";
+  std::cout << "  Frontier advances: " << stats.frontier_advances << "\n";
+  std::cout << "  Advances deferred by lease: "
+            << stats.advances_deferred_by_lease << "\n";
+  std::cout << "  Early advances skipped: " << stats.early_advances_skipped
+            << "\n";
+  std::cout << "  Retained hits: " << stats.retained_hits << "\n";
+  std::cout << "  Writes dropped by lease: " << stats.writes_dropped_by_lease
+            << "\n";
 
   if (!output_file.empty()) {
     std::ofstream out(output_file);

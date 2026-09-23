@@ -8,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -104,9 +105,9 @@ struct RawDirectory {
     REQUIRE(file);
     REQUIRE(
         file->open(volume_file, MappedFile::OpenMode::ReadWrite).has_value());
-    auto mapped = file->map_region(VolumeHeader::kSize,
-                                   MmapDirectory::required_size(16 * 1024),
-                                   MappedFile::MapMode::ReadWrite);
+    auto mapped = file->map_region(
+        VolumeHeader::kSize, MmapDirectory::required_size(size_t{16} * 1024),
+        MappedFile::MapMode::ReadWrite);
     REQUIRE(mapped.has_value());
     region = *mapped;
     auto opened = MmapDirectory::open(region);
@@ -180,6 +181,40 @@ void spawn_seam_peer(SpawnedPeer &peer, const std::string &path, Seam seam,
 }
 
 }  // namespace
+
+TEST_CASE("FastDivU64 matches hardware division for every divisor in use",
+          "[retention][fastdiv]") {
+  // N + 1 in [2, 65], Q from 8-byte multiples up to stripe-sized data
+  // areas, plus the edges of the reciprocal (powers of two, 2^64 - 1).
+  std::vector<uint64_t> divisors;
+  for (uint64_t d = 1; d <= 65; ++d) {
+    divisors.push_back(d);
+  }
+  for (uint64_t d : {uint64_t{1} << 20, (uint64_t{1} << 20) + 8,
+                     uint64_t{16} << 20, uint64_t{33554424}, uint64_t{1} << 40,
+                     (uint64_t{1} << 63) + 1, ~uint64_t{0}}) {
+    divisors.push_back(d);
+  }
+  uint64_t x = 0x9E3779B97F4A7C15ULL;
+  for (const uint64_t d : divisors) {
+    const cyclone::FastDivU64 div(d);
+    CAPTURE(d);
+    for (uint64_t n :
+         {uint64_t{0}, uint64_t{1}, d - 1, d, d + 1, (2 * d) - 1, 2 * d,
+          ~uint64_t{0}, ~uint64_t{0} - 1, ~uint64_t{0} - d}) {
+      CAPTURE(n);
+      REQUIRE(div.quot(n) == n / d);
+    }
+    for (int i = 0; i < 20000; ++i) {
+      x ^= x << 13U;
+      x ^= x >> 7U;
+      x ^= x << 17U;
+      const uint64_t n = (i % 2 == 0) ? x : x >> (x & 63U);
+      CAPTURE(n);
+      REQUIRE(div.quot(n) == n / d);
+    }
+  }
+}
 
 TEST_CASE(
     "Retention 13: a proven-dead writer's stuck wrap intent is repaired by "
@@ -659,10 +694,10 @@ struct FrontierModel {
     bool mandatory;
   };
 
-  uint64_t frontier_rel(uint64_t fi) const {
+  [[nodiscard]] uint64_t frontier_rel(uint64_t fi) const {
     return fi >= n ? area : std::min(area, fi * q);
   }
-  uint64_t ceil_index(uint64_t rel) const {
+  [[nodiscard]] uint64_t ceil_index(uint64_t rel) const {
     return std::min(n, (rel + q - 1) / q);
   }
   // Advances made by the write whose end (relative to S) is `need`.
@@ -712,27 +747,28 @@ struct RetentionVolume {
     per_chunk = geom.chunk_size / kDoc;
   }
 
-  FrontierModel model() const {
+  [[nodiscard]] FrontierModel model() const {
     return FrontierModel{area, geom.chunk_size, geom.chunks, 0};
   }
-  bool put(uint64_t pass, uint64_t index) {
+  [[nodiscard]] bool put(uint64_t pass, uint64_t index) const {
     return write_entry(*cache, doc_key(pass, index), doc_content(pass, index));
   }
   // Pass 0: exactly fills the data area (the next document wraps).
-  void fill_pass0() {
+  void fill_pass0() const {
     for (uint64_t i = 0; i < per_pass; ++i) {
       REQUIRE(put(0, i));
     }
     REQUIRE(cache->stats().write_buffer_wraps == 0);
   }
-  std::optional<ReadHandle> read(uint64_t pass, uint64_t index) {
+  [[nodiscard]] std::optional<ReadHandle> read(uint64_t pass,
+                                               uint64_t index) const {
     auto r = cache->read_sync(CacheKey(doc_key(pass, index)));
     if (!r.has_value()) {
       return std::nullopt;
     }
     return std::move(*r);
   }
-  bool serves(uint64_t pass, uint64_t index) {
+  bool serves(uint64_t pass, uint64_t index) const {
     auto r = read(pass, index);
     return r.has_value() &&
            content_equals(r->content(), doc_content(pass, index));
@@ -785,7 +821,7 @@ struct WriterPause {
 struct ReaderPause {
   Rendezvous rv;
   std::atomic<bool> fired{false};
-  std::atomic<std::thread::id> only{};
+  std::atomic<std::thread::id> only;
   explicit ReaderPause(Volume::ReaderSeam seam) {
     Volume::s_reader_seam_for_test = [this, seam](Volume::ReaderSeam at) {
       if (at == seam && std::this_thread::get_id() == only.load() &&
@@ -1338,7 +1374,7 @@ TEST_CASE(
     REQUIRE((*c)->start().has_value());
     return std::move(*c);
   };
-  const uint64_t dir_region = MmapDirectory::required_size(16 * 1024);
+  const uint64_t dir_region = MmapDirectory::required_size(size_t{16} * 1024);
   std::vector<char> saved_dir(dir_region);
   std::string file;
   uint64_t max_version = 0;
@@ -1884,4 +1920,198 @@ TEST_CASE(
                          adm, &collided, &full);
   REQUIRE(c.slot == 3);
   REQUIRE(full);
+}
+
+// ---------------------------------------------------------------------------
+// Test 18 (TSan hammer variants of tests 3-6) -- the protocol under real
+// concurrency instead of seams: one writer drives wraps and frontier
+// advances as fast as it can while readers borrow documents all over the
+// stripe (current, retained, and the chunks right at the frontier), hold
+// some of them across many strict renews, and check every byte they are
+// ever handed.  Run under ThreadSanitizer this is the data-race check of the
+// advance's Dekker handshake (3, 4), the reader's own-chunk exposure check
+// (5) and the per-chunk gate with forced advances (6).
+//
+// The invariant checked on every borrow: while the borrow has only ever been
+// told kOk (or kCopyNow), its bytes are exactly what was written for its key.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct HammerResult {
+  uint64_t served = 0;
+  uint64_t held_checks = 0;
+  uint64_t torn_seen = 0;
+  uint64_t forced_tears = 0;  // documented: holds past a forced step
+  bool mismatch = false;
+};
+
+// `writer` and `reader` may be the same Cache (single process) or two views
+// of one file (cross-view).
+HammerResult hammer(Cache &writer, Cache &reader, std::chrono::milliseconds run,
+                    unsigned readers) {
+  std::atomic<uint64_t> latest{0};
+  std::atomic<bool> stop{false};
+  std::atomic<bool> mismatch{false};
+  std::atomic<uint64_t> served{0};
+  std::atomic<uint64_t> held_checks{0};
+  std::atomic<uint64_t> torn_seen{0};
+  std::atomic<uint64_t> forced_tears{0};
+
+  std::thread w([&] {
+    for (uint64_t n = 1; !stop.load(); ++n) {
+      (void)write_entry(writer, "hammer-" + std::to_string(n),
+                        doc_content(7, n));
+      latest.store(n);
+    }
+  });
+  std::vector<std::thread> rs;
+  rs.reserve(readers);
+  for (unsigned r = 0; r < readers; ++r) {
+    rs.emplace_back([&, r] {
+      uint64_t rng = 0x9E3779B97F4A7C15ULL * (r + 1);
+      auto next = [&rng] {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        return rng;
+      };
+      while (!stop.load()) {
+        const uint64_t top = latest.load();
+        if (top < 2) {
+          std::this_thread::yield();
+          continue;
+        }
+        // Mostly the last ~pass and a half: current, retained, and the
+        // chunks the frontier is about to expose.
+        const uint64_t back = next() % 300;
+        const uint64_t n = top > back ? top - back : 1;
+        // A CEILING-FORCED step (sampled before the read) is the one
+        // documented way a borrow loses its protection early: it resets
+        // every chunk's count, and a borrow taken late in a deferral
+        // episode may have almost no headroom left.  A mismatch that
+        // coincides with one is that contract, counted, not a bug.
+        const uint64_t forced0 = writer.stats().wraps_forced_past_lease;
+        auto classify_mismatch = [&] {
+          if (writer.stats().wraps_forced_past_lease == forced0) {
+            mismatch.store(true);
+          } else {
+            forced_tears.fetch_add(1);
+          }
+        };
+        auto rh = reader.read_sync(CacheKey("hammer-" + std::to_string(n)));
+        if (!rh.has_value()) {
+          continue;
+        }
+        served.fetch_add(1);
+        const auto want = doc_content(7, n);
+        if (!content_equals(rh->content(), want)) {
+          classify_mismatch();
+          continue;
+        }
+        // Hold every fourth borrow across a burst of strict renews; one in
+        // sixty-four for ~150 ms, past the ceiling, so forced advances (and
+        // forced wraps) tear some of them -- which must be reported, never
+        // served silently.
+        //
+        // The one documented exception: a CEILING-FORCED step resets every
+        // chunk's count, so a borrow it did not expose becomes unprotected
+        // while its renews still say kOk until G passes it ("holds longer
+        // than the ceiling are unprotected").  A mismatch that coincides
+        // with a forced step is that contract, counted, not a bug.
+        if (next() % 4 == 0) {
+          const bool long_hold = next() % 16 == 0;
+          for (int k = 0; k < (long_hold ? 150 : 16) && !stop.load(); ++k) {
+            if (long_hold) {
+              std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            const LeaseRenewal lr = rh->renew_lease_strict();
+            if (lr == LeaseRenewal::kTorn) {
+              torn_seen.fetch_add(1);
+              break;  // exposed: the bytes may be refilled now
+            }
+            if (!content_equals(rh->content(), want)) {
+              classify_mismatch();
+              break;
+            }
+            held_checks.fetch_add(1);
+            std::this_thread::yield();
+          }
+        }
+      }
+    });
+  }
+  // At least `run`, and until the ring has wrapped twice (sanitizer builds
+  // write far slower), capped at 60 s.
+  const auto start = std::chrono::steady_clock::now();
+  while (
+      std::chrono::steady_clock::now() - start < run ||
+      (writer.stats().write_buffer_wraps < 2 &&
+       std::chrono::steady_clock::now() - start < std::chrono::seconds(60))) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  stop.store(true);
+  w.join();
+  for (auto &t : rs) {
+    t.join();
+  }
+  return {served.load(), held_checks.load(), torn_seen.load(),
+          forced_tears.load(), mismatch.load()};
+}
+
+}  // namespace
+
+TEST_CASE(
+    "Retention 18: hammer -- concurrent advances, wraps and borrows never "
+    "hand out torn bytes (single process)",
+    "[retention][hammer][concurrent]") {
+  const bool retention = GENERATE(false, true);
+  CAPTURE(retention);
+  // A lease long enough never to lapse mid-check even under a sanitizer (a
+  // lapsed lease is unprotected by contract), and a SHORT ceiling: held
+  // borrows gate advances and wraps, and the long holds get forced past,
+  // all within the run.
+  RetentionVolume v("ret18", retention, std::chrono::milliseconds(2000),
+                    std::chrono::milliseconds(60));
+  const auto result =
+      hammer(*v.cache, *v.cache, std::chrono::milliseconds(1500), 4);
+  CAPTURE(result.served, result.held_checks, result.torn_seen,
+          result.forced_tears);
+  REQUIRE_FALSE(result.mismatch);
+  REQUIRE(result.served > 0);
+  const auto st = v.cache->stats();
+  REQUIRE(st.write_buffer_wraps >= 1);
+  if (retention) {
+    REQUIRE(st.frontier_advances > 0);
+  }
+  v.cache->stop();
+}
+
+TEST_CASE(
+    "Retention 18: hammer -- a reader view never sees torn bytes while a "
+    "writer view wraps and advances (cross-view, shared slots)",
+    "[retention][hammer][concurrent][multiprocess]") {
+  const bool retention = GENERATE(false, true);
+  CAPTURE(retention);
+  TempCacheDir tmp("ret18mp");
+  auto open_view = [&](uint32_t index) {
+    auto config = retention_config(retention, std::chrono::milliseconds(2000),
+                                   std::chrono::milliseconds(60), false);
+    config.set_multi_process(index, 2);
+    auto c = Cache::create(config);
+    REQUIRE(c.has_value());
+    REQUIRE((*c)->add_volume(tmp.path(), kRetVol).has_value());
+    REQUIRE((*c)->start().has_value());
+    return std::move(*c);
+  };
+  auto writer = open_view(0);  // owns the single stripe
+  auto reader = open_view(1);
+  const auto result =
+      hammer(*writer, *reader, std::chrono::milliseconds(1500), 4);
+  CAPTURE(result.served, result.held_checks, result.torn_seen,
+          result.forced_tears);
+  REQUIRE_FALSE(result.mismatch);
+  REQUIRE(result.served > 0);
+  reader->stop();
+  writer->stop();
 }

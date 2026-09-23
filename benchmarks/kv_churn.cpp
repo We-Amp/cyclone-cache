@@ -38,6 +38,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -102,6 +103,7 @@ struct Options {
   std::string path;
   std::string output;
   std::string drop_caches_cmd;
+  std::optional<bool> wrap_retention;  // unset = the library default
 };
 
 // ---------------------------------------------------------------------------
@@ -332,6 +334,9 @@ std::unique_ptr<Cache> open_store(const Options& opts) {
   config.optimization_config.enabled = false;
   config.directory_sync_interval = std::chrono::milliseconds{0};
   config.set_multi_process(0, 1);
+  if (opts.wrap_retention) {
+    config.wrap_retention = *opts.wrap_retention;
+  }
   auto created = Cache::create(config);
   if (!created) {
     std::cerr << "Cache::create failed: "
@@ -539,6 +544,8 @@ void usage(const char* argv0) {
             << "  --path DIR              store directory\n"
             << "  --output FILE           append the JSON line to FILE\n"
             << "  --drop-caches-cmd CMD   run before the warm-up\n"
+            << "  --wrap-retention on|off eviction mode (default: the "
+               "library default)\n"
             << "  --print-vectors         print the stream heads and exit\n";
 }
 
@@ -577,6 +584,8 @@ int main(int argc, char* argv[]) {
       opts.output = argv[++i];
     } else if (a == "--drop-caches-cmd" && has) {
       opts.drop_caches_cmd = argv[++i];
+    } else if (a == "--wrap-retention" && has) {
+      opts.wrap_retention = std::string(argv[++i]) == "on";
     } else if (a == "--print-vectors") {
       vectors_only = true;
     } else {
@@ -645,7 +654,12 @@ int main(int argc, char* argv[]) {
                "default, max_object_size 0, ram_cache_size 0, sync_on_write "
                "false, hit tracking/optimization/dir sync off\n"
             << "  eviction                = FIFO by stripe wrap (no app "
-               "index)\n";
+               "index), wrap retention "
+            << ((opts.wrap_retention ? *opts.wrap_retention
+                                     : kDefaultWrapRetention)
+                    ? "ON"
+                    : "OFF")
+            << "\n";
 
   // Warm-up + measured phase.
   Shared shared;
@@ -775,6 +789,17 @@ int main(int argc, char* argv[]) {
     << (st1.writes_dropped_by_lease - st0.writes_dropped_by_lease)
     << ",\"cy_wraps_deferred_by_lease\":"
     << (st1.wraps_deferred_by_lease - st0.wraps_deferred_by_lease)
+    << ",\"cy_wrap_retention\":"
+    << ((opts.wrap_retention ? *opts.wrap_retention : kDefaultWrapRetention)
+            ? "true"
+            : "false")
+    << ",\"cy_frontier_advances\":"
+    << (st1.frontier_advances - st0.frontier_advances)
+    << ",\"cy_advances_deferred_by_lease\":"
+    << (st1.advances_deferred_by_lease - st0.advances_deferred_by_lease)
+    << ",\"cy_retained_hits\":" << (st1.retained_hits - st0.retained_hits)
+    << ",\"cy_stamp_rejections\":"
+    << (st1.stamp_rejections - st0.stamp_rejections)
     << ",\"cy_tag_collision_evictions\":" << st1.tag_collision_evictions
     << ",\"cy_entries\":" << st1.current_entries
     << ",\"cy_readahead_hints\":" << st1.readahead_hints_issued
