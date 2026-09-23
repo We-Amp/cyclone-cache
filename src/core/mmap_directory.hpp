@@ -484,10 +484,15 @@ class MmapDirectory {
   /// collider eviction, *bucket_full_evicted a full-bucket eviction of the
   /// entry nearest the wrap cursor.  See the sentinels on
   /// Directory.
+  /// With `admission`: the victim order and the in-bracket uniqueness
+  /// cleanup of Directory::insert (see there); the admission view is
+  /// refreshed INSIDE the bracket, under phase_lock.
   bool insert(const CacheKey &key, uint64_t offset, uint64_t size,
               uint64_t verified_offset = kMatchAnyTag,
               bool *collision_evicted = nullptr,
-              bool *bucket_full_evicted = nullptr);
+              bool *bucket_full_evicted = nullptr,
+              InsertAdmission *admission = nullptr,
+              std::span<const uint64_t> clear_offsets = {});
 
   /// Remove an entry
   /// Returns true if entry was found and removed

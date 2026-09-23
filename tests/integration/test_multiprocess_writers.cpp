@@ -1465,8 +1465,11 @@ TEST_CASE("A borrow held in one process defers another process's wrap",
   REQUIRE(borrows_after_release == 0);
   // The reader's borrowed bytes were never overwritten.
   REQUIRE(reader_flags == kReaderIntact);
-  // The wrap was DEFERRED, not performed, for the whole flood.
-  REQUIRE(wraps_under_borrow == 0);
+  // The step that would reuse the borrowed bytes was DEFERRED for the whole
+  // flood.  Flush mode: that step is the wrap itself, so none happened.
+  // Wrap retention: the wrap is ungated and happens exactly once; the
+  // frontier advance over the borrowed chunk is what waited.
+  REQUIRE(wraps_under_borrow == (VolumeConfig{}.wrap_retention ? 1U : 0U));
   // ...and the writers noticed: the fills were dropped by the lease gate.
   REQUIRE(writer_dropped_by_lease > 0);
   REQUIRE(writer_nospace > 0);

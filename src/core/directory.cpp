@@ -211,14 +211,140 @@ std::vector<DirEntry> Directory::probe_all(const CacheKey &key) const {
   return results;
 }
 
+InsertChoice choose_insert_slot(const DirEntry *bucket, size_t slots,
+                                uint16_t tag, uint64_t verified_offset,
+                                uint64_t match_any_tag,
+                                const InsertAdmission &adm,
+                                bool *collision_evicted,
+                                bool *bucket_full_evicted,
+                                uint64_t new_offset) {
+  int same_spot = -1;
+  int first_empty = -1;
+  int first_inadmissible = -1;
+  int first_collider = -1;
+  int oldest_retained = -1;
+  int oldest_current = -1;
+  for (size_t i = 0; i < slots; ++i) {
+    const DirEntry &e = bucket[i];
+    if (e.is_empty()) {
+      if (first_empty < 0) {
+        first_empty = static_cast<int>(i);
+      }
+      continue;
+    }
+    const AdmitClass cls = adm.classify(e.offset(), e.phase());
+    // 1. The verified same-key entry, whatever its class (rule 1: a rewrite
+    //    of K updates K's admitted entry, current or retained, in place).
+    if (e.tag() == tag &&
+        (verified_offset == match_any_tag ? cls != AdmitClass::kReject
+                                          : e.offset() == verified_offset)) {
+      return {static_cast<int>(i), true, true};
+    }
+    if (new_offset != 0 && e.tag() == tag && e.offset() == new_offset) {
+      if (same_spot < 0) {
+        same_spot = static_cast<int>(i);
+      }
+      continue;
+    }
+    if (cls == AdmitClass::kReject) {
+      if (first_inadmissible < 0) {
+        first_inadmissible = static_cast<int>(i);
+      }
+      continue;
+    }
+    if (e.tag() == tag) {
+      if (first_collider < 0) {
+        first_collider = static_cast<int>(i);
+      }
+      continue;
+    }
+    int &oldest =
+        cls == AdmitClass::kRetained ? oldest_retained : oldest_current;
+    if (oldest < 0 || e.offset() < bucket[oldest].offset()) {
+      oldest = static_cast<int>(i);
+    }
+  }
+  if (same_spot >= 0) {
+    return {same_spot, true, false};
+  }
+  if (first_empty >= 0) {
+    return {first_empty, false, false};
+  }
+  if (first_inadmissible >= 0) {
+    return {first_inadmissible, true, false};
+  }
+  if (first_collider >= 0) {
+    if (collision_evicted != nullptr) {
+      *collision_evicted = true;
+    }
+    return {first_collider, true, false};
+  }
+  const int oldest = oldest_retained >= 0 ? oldest_retained : oldest_current;
+  if (oldest >= 0 && bucket_full_evicted != nullptr) {
+    *bucket_full_evicted = true;
+  }
+  return {oldest, oldest >= 0, false};
+}
+
 bool Directory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
                        uint64_t verified_offset, bool *collision_evicted,
-                       bool *bucket_full_evicted) {
+                       bool *bucket_full_evicted, InsertAdmission *admission,
+                       std::span<const uint64_t> clear_offsets) {
   uint32_t bucket_idx = key.bucket_hash() % _num_buckets;
   uint16_t tag = key.tag();
   bool cur_phase = current_phase();
 
   DirEntry *bucket = &_entries[bucket_idx * kEntriesPerBucket];
+
+  if (admission != nullptr) {
+    // Writers are externally serialized (class comment), so the refresh
+    // and the choice need no bracket of their own; the mutation below is
+    // published through one odd->even bracket.
+    admission->refresh();
+    const InsertChoice choice = choose_insert_slot(
+        bucket, kEntriesPerBucket, tag, verified_offset, kMatchAnyTag,
+        *admission, collision_evicted, bucket_full_evicted, offset);
+    if (choice.slot < 0) {
+      return false;
+    }
+    size_t cleared = 0;
+    begin_bucket_write(bucket_idx);
+    if (choice.verified) {
+      bucket[choice.slot].set_offset(offset);
+      bucket[choice.slot].set_approx_size(size);
+      bucket[choice.slot].set_phase(cur_phase);
+    } else {
+      DirEntry new_entry;
+      new_entry.set_offset(offset);
+      new_entry.set_approx_size(size);
+      new_entry.set_tag(tag);
+      new_entry.set_phase(cur_phase);
+      new_entry.set_head(true);
+      bucket[choice.slot] = new_entry;
+    }
+    // Uniqueness cleanup (rule 2), in the same bracket as the insert.
+    for (size_t i = 0; i < kEntriesPerBucket; ++i) {
+      if (static_cast<int>(i) == choice.slot || bucket[i].is_empty() ||
+          bucket[i].tag() != tag) {
+        continue;
+      }
+      for (uint64_t off : clear_offsets) {
+        if (bucket[i].offset() == off) {
+          bucket[i].clear();
+          ++cleared;
+          break;
+        }
+      }
+    }
+    end_bucket_write(bucket_idx);
+    if (!choice.replaces) {
+      _count.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (cleared != 0) {
+      _count.fetch_sub(cleared, std::memory_order_relaxed);
+    }
+    return true;
+  }
 
   // Single-pass scan: find the verified same-tag entry, first empty slot,
   // first stale slot, first colliding foreign entry, or the entry nearest the
@@ -378,18 +504,25 @@ bool Directory::remove_at(const CacheKey &key, uint64_t target_offset) {
 
   DirEntry *bucket = &_entries[bucket_idx * kEntriesPerBucket];
 
+  // EVERY entry with this tag at this offset goes: two such entries (one of
+  // them dead) cannot be told apart, and removing only the first could leave
+  // the live one behind.
+  size_t removed = 0;
   for (size_t i = 0; i < kEntriesPerBucket; ++i) {
     if (!bucket[i].is_empty() && bucket[i].tag() == target_tag &&
         bucket[i].offset() == target_offset) {
-      begin_bucket_write(bucket_idx);
+      if (removed == 0) {
+        begin_bucket_write(bucket_idx);
+      }
       bucket[i].clear();
-      end_bucket_write(bucket_idx);
-      _count.fetch_sub(1, std::memory_order_relaxed);
-      return true;
+      ++removed;
     }
   }
-
-  return false;
+  if (removed != 0) {
+    end_bucket_write(bucket_idx);
+    _count.fetch_sub(removed, std::memory_order_relaxed);
+  }
+  return removed != 0;
 }
 
 void Directory::toggle_phase() {

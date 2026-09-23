@@ -31,7 +31,7 @@
 //                                 mapped peer.  The path here is the actual
 //                                 on-disk (fingerprinted) file, not the raw
 //                                 add_volume path.
-//   seam <raw-path> <size-bytes> <seam> <crash|hang> <content-bytes>
+//   seam <raw-path> <size-bytes> <seam> <crash|hang> <content-bytes> [wrap]
 //                                 open a Cache (multi-process, leases off)
 //                                 and write <content-bytes> documents until
 //                                 the writer reaches Volume::WriterSeam
@@ -42,7 +42,9 @@
 //                                 blocks until released, then _exit()s
 //                                 WITHOUT leaving the window (a live holder
 //                                 stalled inside it).  Exit 1 if the seam was
-//                                 never reached.
+//                                 never reached.  With `wrap`, only the
+//                                 write that WRAPS arms the seam (not an
+//                                 earlier frontier advance).
 //   borrow <raw-path> <size-bytes> <key>...
 //                                 open a Cache (multi-process, 600 s lease),
 //                                 take a disk borrow of every key, say READY
@@ -50,6 +52,7 @@
 //                                 killed (a zero-copy reader; SIGKILL leaks
 //                                 its borrow counts).
 
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
@@ -183,7 +186,7 @@ int run_hold(const char* file_path) {
 constexpr int kSeamCrashExit = 42;
 
 int run_seam(const char* path, unsigned long long size, int seam, bool crash,
-             unsigned long long content_bytes) {
+             unsigned long long content_bytes, bool wrap_only) {
   cyclone::CacheConfig config;
   config.set_multi_process(0, 1);
   config.set_ram_cache_size(0);
@@ -206,9 +209,13 @@ int run_seam(const char* path, unsigned long long size, int seam, bool crash,
   }
 
   const auto target = static_cast<cyclone::Volume::WriterSeam>(seam);
+  // wrap_only: fire only inside the write that WRAPS (armed just before it),
+  // not at an earlier frontier advance.
+  static std::atomic<bool> armed{false};
+  armed.store(!wrap_only);
   cyclone::Volume::s_writer_seam_for_test =
       [target, crash](cyclone::Volume::WriterSeam at) {
-        if (at != target) {
+        if (at != target || !armed.load()) {
           return;
         }
         if (crash) {
@@ -222,7 +229,14 @@ int run_seam(const char* path, unsigned long long size, int seam, bool crash,
   std::vector<std::byte> content(static_cast<size_t>(content_bytes),
                                  std::byte{0x5A});
   const size_t max_writes = static_cast<size_t>(size / content_bytes) * 4 + 8;
+  // On-disk size of one document (132-byte header, 8-byte padding).
+  const uint64_t doc_bytes = (content_bytes + 132 + 7) & ~uint64_t{7};
   for (size_t i = 0; i < max_writes; ++i) {
+    if (wrap_only) {
+      // Single stripe: current_bytes is the cursor's stripe-relative offset.
+      const auto st = (*cache)->stats();
+      armed.store(st.current_bytes + doc_bytes > st.stripe_bytes);
+    }
     const cyclone::CacheKey key("seam-peer-" + std::to_string(i));
     auto wh = (*cache)->write_sync(key, content.size());
     if (!wh.has_value()) {
@@ -285,7 +299,8 @@ int main(int argc, char** argv) {
   if (argc >= 7 && std::strcmp(argv[1], "seam") == 0) {
     return run_seam(argv[2], std::strtoull(argv[3], nullptr, 10),
                     std::atoi(argv[4]), std::strcmp(argv[5], "crash") == 0,
-                    std::strtoull(argv[6], nullptr, 10));
+                    std::strtoull(argv[6], nullptr, 10),
+                    argc >= 8 && std::strcmp(argv[7], "wrap") == 0);
   }
   if (argc >= 4 && std::strcmp(argv[1], "open") == 0) {
     return run_open(argv[2], std::strtoull(argv[3], nullptr, 10));

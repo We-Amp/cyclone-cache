@@ -166,11 +166,17 @@ const char *seam_name(Seam s) {
 }
 
 void spawn_seam_peer(SpawnedPeer &peer, const std::string &path, Seam seam,
-                     bool crash) {
-  REQUIRE(peer.spawn(peer_exe(),
-                     {"seam", path, std::to_string(kVolSize),
-                      std::to_string(static_cast<int>(seam)),
-                      crash ? "crash" : "hang", std::to_string(kPeerContent)}));
+                     bool crash, bool wrap_only = false) {
+  std::vector<std::string> args = {"seam",
+                                   path,
+                                   std::to_string(kVolSize),
+                                   std::to_string(static_cast<int>(seam)),
+                                   crash ? "crash" : "hang",
+                                   std::to_string(kPeerContent)};
+  if (wrap_only) {
+    args.emplace_back("wrap");
+  }
+  REQUIRE(peer.spawn(peer_exe(), args));
 }
 
 }  // namespace
@@ -242,6 +248,17 @@ TEST_CASE(
     "[retention][crash][multiprocess]") {
   for (Seam seam : kAllSeams) {
     CAPTURE(seam_name(seam));
+    // The escalating writer below must not open an intent window of its own
+    // (its clear would hide whether the takeover repaired).  With wrap
+    // retention, once the wrap has stored the new G the very next write
+    // needs a frontier advance -- which is an intent window -- so the two
+    // seams after that point cannot be observed this way.  The repair
+    // decision (repair_after_forced_release) does not depend on the seam,
+    // and the other two seams cover it.
+    if (CacheConfig{}.wrap_retention &&
+        (seam == Seam::kAfterGatePassed || seam == Seam::kAfterEpochStore)) {
+      continue;
+    }
     TempCacheDir tmp("ret13e");
     const std::string path = tmp.path();
 
@@ -249,7 +266,8 @@ TEST_CASE(
     const std::string file = volume_file_of(*view);
 
     SpawnedPeer peer;
-    spawn_seam_peer(peer, path, seam, /*crash=*/false);
+    // Park inside the WRAPPING write's window (not a pass-0 advance's).
+    spawn_seam_peer(peer, path, seam, /*crash=*/false, /*wrap_only=*/true);
     auto ready = peer.wait_ready(kPeerDeadline);
     REQUIRE(ready.has_value());
     REQUIRE(*ready == "READY");  // parked INSIDE the window, alive
@@ -1417,11 +1435,15 @@ TEST_CASE(
     REQUIRE(v.cache->stats().write_buffer_wraps == 1);
     rp.rv.release();
     reader.join();
+    // Pass-0 snapshot, post-wrap cursor: the entry now carries the new
+    // phase (the rewrite took over its slot in place), so the stale snapshot
+    // cannot classify it at all, and a surviving stale copy would carry
+    // pass 0's phase with a pass-1 stamp at o < W -- rejected by the stamp.
+    // Either way: a miss or the genuine new version, never pass-0 bytes.
     if (got.has_value()) {
-      // Only ever the genuine current version (never pass-0 bytes torn).
       REQUIRE(content_equals(got->content(), doc_content(1, 0)));
     } else {
-      REQUIRE(v.cache->stats().stamp_rejections > before);
+      REQUIRE(v.cache->stats().stamp_rejections >= before);
     }
     got.reset();
     v.cache->stop();
@@ -1449,4 +1471,417 @@ TEST_CASE(
     REQUIRE(v.serves(1, victim));
     v.cache->stop();
   }
+}
+
+// ===========================================================================
+// Wrap retention: uniqueness, purge and chains (design sections 4.5-4.7).
+// ===========================================================================
+
+namespace {
+
+class IdSelector : public StorageAlternateSelector {
+ public:
+  explicit IdSelector(AlternateId want) : _want(want) {}
+  [[nodiscard]] std::optional<size_t> select(
+      std::span<const AlternateInfo> alternates,
+      const AlternateSelectionContext & /*ctx*/) const override {
+    for (size_t i = 0; i < alternates.size(); ++i) {
+      if (alternates[i].id == _want) {
+        return i;
+      }
+    }
+    return std::nullopt;
+  }
+
+ private:
+  AlternateId _want;
+};
+
+bool put_alternate(Cache &cache, const std::string &key, AlternateId id,
+                   std::span<const std::byte> content) {
+  auto wh = cache.write_alternate_sync(CacheKey(key), id, content.size());
+  if (!wh.has_value()) {
+    return false;
+  }
+  if (!wh->write_sync(content).has_value()) {
+    return false;
+  }
+  return wh->close_sync().has_value();
+}
+
+std::optional<ReadHandle> read_alternate(Cache &cache, const std::string &key,
+                                         AlternateId id) {
+  IdSelector want(id);
+  AlternateSelectionContext ctx;
+  auto r = cache.read_alternate_sync(CacheKey(key), want, ctx);
+  if (!r.has_value()) {
+    return std::nullopt;
+  }
+  return std::move(*r);
+}
+
+size_t alternate_count(Cache &cache, const std::string &key) {
+  auto alts = cache.list_alternates_sync(CacheKey(key));
+  return alts.has_value() ? alts->size() : 0;
+}
+
+uint64_t read_u64(const std::string &file, uint64_t offset) {
+  std::ifstream f(file, std::ios::in | std::ios::binary);
+  REQUIRE(f.is_open());
+  f.seekg(static_cast<std::streamoff>(offset));
+  uint64_t v = 0;
+  f.read(reinterpret_cast<char *>(&v), sizeof(v));
+  REQUIRE(f.good());
+  return v;
+}
+
+// Pass 0 with chosen indices written as alternates of `key` (same on-disk
+// size as every other document, so the layout is unchanged).
+void fill_pass0_with(
+    RetentionVolume &v, const std::string &key,
+    std::initializer_list<std::pair<uint64_t, AlternateId>> alternates) {
+  for (uint64_t i = 0; i < v.per_pass; ++i) {
+    bool written = false;
+    for (const auto &[index, id] : alternates) {
+      if (index == i) {
+        REQUIRE(put_alternate(*v.cache, key, id, doc_content(0, i)));
+        written = true;
+      }
+    }
+    if (!written) {
+      REQUIRE(v.put(0, i));
+    }
+  }
+  REQUIRE(v.cache->stats().write_buffer_wraps == 0);
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Test 9 -- one resolvable entry per key (B2): rewrites of retained keys,
+// same-offset fixed-size rewrites, and alternate writes over retained and
+// wrap-raced heads.  No duplicate survives; no self-loop forms.
+// ---------------------------------------------------------------------------
+
+TEST_CASE(
+    "Retention 9: a rewrite of a retained key updates its entry in place and "
+    "leaves exactly one resolving entry",
+    "[retention][uniqueness]") {
+  RetentionVolume v("ret9a", true, std::chrono::milliseconds(0),
+                    std::chrono::milliseconds(0));
+  v.fill_pass0();
+  REQUIRE(v.put(1, 0));                    // wrap
+  const uint64_t k = 6 * v.per_chunk + 5;  // retained, chunk 6
+  REQUIRE(v.serves(0, k));
+  const uint64_t entries_before = v.cache->stats().current_entries;
+  const auto v2 = doc_content(7, k);
+  REQUIRE(write_entry(*v.cache, doc_key(0, k), v2));
+  // Rule 1: the retained entry was ELECTED and updated in place.
+  REQUIRE(v.cache->stats().current_entries == entries_before);
+  {
+    auto r = v.read(0, k);
+    REQUIRE(r.has_value());
+    REQUIRE(content_equals(r->content(), v2));
+  }
+  // Removing the key removes every entry of it: nothing resurfaces, not
+  // even after the frontier sweeps the old copy's chunk and the ring wraps.
+  REQUIRE(v.cache->remove_sync(CacheKey(doc_key(0, k))).has_value());
+  REQUIRE_FALSE(v.read(0, k).has_value());
+  for (uint64_t i = 1; i < 2 * v.per_pass; ++i) {
+    REQUIRE(v.put(2, i));
+    if (i % 32 == 0) {
+      REQUIRE_FALSE(v.read(0, k).has_value());
+    }
+  }
+  REQUIRE(v.cache->stats().write_buffer_wraps >= 2);
+  REQUIRE_FALSE(v.read(0, k).has_value());
+  v.cache->stop();
+}
+
+TEST_CASE(
+    "Retention 9: a fixed-size rewrite that lands on its own retained offset "
+    "resolves to the new document only",
+    "[retention][uniqueness]") {
+  RetentionVolume v("ret9b", true, std::chrono::milliseconds(0),
+                    std::chrono::milliseconds(0));
+  v.fill_pass0();
+  const uint64_t j = 3 * v.per_chunk + 7;
+  // Pass 1: documents 0 .. j-1, then the key of pass-0 document j, which
+  // lands at exactly j * kDoc -- its own retained copy's offset.
+  for (uint64_t i = 0; i < j; ++i) {
+    REQUIRE(v.put(1, i));
+  }
+  const auto v2 = doc_content(8, j);
+  REQUIRE(write_entry(*v.cache, doc_key(0, j), v2));
+  {
+    auto r = v.read(0, j);
+    REQUIRE(r.has_value());
+    REQUIRE(content_equals(r->content(), v2));
+  }
+  REQUIRE(v.cache->remove_sync(CacheKey(doc_key(0, j))).has_value());
+  REQUIRE_FALSE(v.read(0, j).has_value());
+  // Two more passes: the stale entry (if any survived in the bucket) never
+  // resolves the key again.
+  for (uint64_t i = 0; i < 2 * v.per_pass; ++i) {
+    REQUIRE(v.put(3, i));
+  }
+  REQUIRE_FALSE(v.read(0, j).has_value());
+  v.cache->stop();
+}
+
+TEST_CASE(
+    "Retention 9: an alternate write over a retained or wrap-raced head "
+    "refuses the link, updates the head in place and forms no self-loop",
+    "[retention][uniqueness][alternate]") {
+  SECTION("retained head, new head lands on the old head's offset") {
+    RetentionVolume v("ret9c", true, std::chrono::milliseconds(600000),
+                      std::chrono::milliseconds(300));
+    const uint64_t c = 5;
+    const uint64_t h = c * v.per_chunk;  // head at exactly the chunk start
+    const std::string key = "self-loop-K";
+    fill_pass0_with(v, key, {{h, AlternateId::Original}});
+    // A borrow elsewhere in chunk c pins the frontier at the chunk start, so
+    // the retained head stays admissible while the cursor walks up to it.
+    auto pin = v.read(0, h + 1);
+    REQUIRE(pin.has_value());
+    for (uint64_t i = 0; i < h; ++i) {
+      REQUIRE(v.put(1, i));
+    }
+    // The cursor sits exactly on the head's offset.  The first attempt's
+    // mandatory advance defers (and starts the episode); past the ceiling
+    // the second is forced -- and lands the new head ON the old one.  A
+    // DIFFERENT id, so the write plans a link to the old head (the same id
+    // would supersede it and plan no link at all).
+    const auto newer = doc_content(9, h);
+    const auto refusals0 = v.cache->stats().alternate_wrap_refusals;
+    REQUIRE_FALSE(put_alternate(*v.cache, key, AlternateId::Brotli, newer));
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    REQUIRE(put_alternate(*v.cache, key, AlternateId::Brotli, newer));
+    REQUIRE(v.cache->stats().wraps_forced_past_lease == 1);
+    // The planned link to the RETAINED head was refused (D5)...
+    REQUIRE(v.cache->stats().alternate_wrap_refusals == refusals0 + 1);
+
+    auto alts = v.cache->list_alternates_sync(CacheKey(key));
+    REQUIRE(alts.has_value());
+    REQUIRE(alts->size() == 1);
+    REQUIRE((*alts)[0].id == AlternateId::Brotli);
+    // ... so no self-loop: the new head sits at the old head's offset and
+    // its link is zero, not its own offset.
+    REQUIRE(read_u64(volume_file_of(*v.cache),
+                     (*alts)[0].disk_offset +
+                         Document::kNextAlternateOffsetPos) == 0);
+    auto r = read_alternate(*v.cache, key, AlternateId::Brotli);
+    REQUIRE(r.has_value());
+    REQUIRE(content_equals(r->content(), newer));
+    r.reset();
+    // The retained Original is gone with the refused link (accepted, D5).
+    REQUIRE_FALSE(read_alternate(*v.cache, key, AlternateId::Original));
+    pin.reset();
+    v.cache->stop();
+  }
+  SECTION("wrap-raced head: updated in place, no duplicate") {
+    RetentionVolume v("ret9d", true, std::chrono::milliseconds(0),
+                      std::chrono::milliseconds(0));
+    const std::string key = "raced-K";
+    // Pass 0 ends with the key's Brotli + Original chain in its last chunk;
+    // the next alternate write wraps.
+    fill_pass0_with(v, key,
+                    {{v.per_pass - 2, AlternateId::Brotli},
+                     {v.per_pass - 1, AlternateId::Original}});
+    REQUIRE(alternate_count(*v.cache, key) == 2);
+    const uint64_t entries_before = v.cache->stats().current_entries;
+    const auto newer = doc_content(10, 1);
+    REQUIRE(put_alternate(*v.cache, key, AlternateId::Original, newer));
+    REQUIRE(v.cache->stats().write_buffer_wraps == 1);
+    // One entry, updated in place (B2a): no stale head beside it.
+    REQUIRE(v.cache->stats().current_entries == entries_before);
+    REQUIRE(alternate_count(*v.cache, key) == 1);
+    REQUIRE_FALSE(read_alternate(*v.cache, key, AlternateId::Brotli));
+    // Still exactly one after the frontier sweeps the old head's chunk.
+    for (uint64_t i = 1; i + 4 < v.per_pass; ++i) {
+      REQUIRE(v.put(1, i));
+    }
+    REQUIRE(alternate_count(*v.cache, key) == 1);
+    auto r = read_alternate(*v.cache, key, AlternateId::Original);
+    REQUIRE(r.has_value());
+    REQUIRE(content_equals(r->content(), newer));
+    r.reset();
+    v.cache->stop();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Test 10 -- purging a retained key removes every entry of it; removing an
+// alternate from a retained chain removes the whole entry (S7).
+// ---------------------------------------------------------------------------
+
+TEST_CASE(
+    "Retention 10: purging a retained key, and removing an alternate from a "
+    "retained chain, removes the whole entry",
+    "[retention][uniqueness][alternate]") {
+  RetentionVolume v("ret10", true, std::chrono::milliseconds(0),
+                    std::chrono::milliseconds(0));
+  const std::string chain_key = "retained-chain";
+  const uint64_t b = 10 * v.per_chunk;
+  fill_pass0_with(v, chain_key,
+                  {{b, AlternateId::Brotli}, {b + 1, AlternateId::Original}});
+  REQUIRE(v.put(1, 0));  // wrap: everything above is retained now
+
+  // Plain key in chunk 9.
+  const uint64_t k = 9 * v.per_chunk + 2;
+  REQUIRE(v.serves(0, k));
+  const uint64_t entries = v.cache->stats().current_entries;
+  REQUIRE(v.cache->remove_sync(CacheKey(doc_key(0, k))).has_value());
+  REQUIRE(v.cache->stats().current_entries == entries - 1);
+  REQUIRE_FALSE(v.read(0, k).has_value());
+  REQUIRE_FALSE(v.cache->remove_sync(CacheKey(doc_key(0, k))).has_value());
+
+  // The retained chain walks (retained -> retained, downward) ...
+  REQUIRE(alternate_count(*v.cache, chain_key) == 2);
+  REQUIRE(read_alternate(*v.cache, chain_key, AlternateId::Brotli));
+  // ... and removing ONE alternate removes the whole entry.
+  REQUIRE(
+      v.cache->remove_alternate_sync(CacheKey(chain_key), AlternateId::Brotli)
+          .has_value());
+  REQUIRE(alternate_count(*v.cache, chain_key) == 0);
+  REQUIRE_FALSE(read_alternate(*v.cache, chain_key, AlternateId::Original));
+  REQUIRE_FALSE(read_alternate(*v.cache, chain_key, AlternateId::Brotli));
+  v.cache->stop();
+}
+
+// ---------------------------------------------------------------------------
+// Test 11 -- retained chain hops: retained -> retained downward works and
+// the borrow sits on the SERVED node's chunk; targets below F and upward
+// hops are rejected.
+// ---------------------------------------------------------------------------
+
+TEST_CASE(
+    "Retention 11: retained chains walk downward, borrow on the served "
+    "node's chunk, and reject targets below the frontier and upward hops",
+    "[retention][alternate]") {
+  RetentionVolume v("ret11", true, std::chrono::milliseconds(600000),
+                    std::chrono::milliseconds(600000));
+  const std::string key = "hop-K";
+  const uint64_t tail = 2 * v.per_chunk + 3;  // Brotli, chunk 2
+  const uint64_t head = 7 * v.per_chunk + 3;  // Original (head), chunk 7
+  fill_pass0_with(v, key,
+                  {{tail, AlternateId::Brotli}, {head, AlternateId::Original}});
+  REQUIRE(v.put(1, 0));  // wrap
+
+  // retained -> retained, downward: served.
+  auto held = read_alternate(*v.cache, key, AlternateId::Brotli);
+  REQUIRE(held.has_value());
+  REQUIRE(content_equals(held->content(), doc_content(0, tail)));
+  REQUIRE(v.cache->stats().retained_hits >= 1);
+  // The borrow counts in the served node's chunk (2), not the head's (7):
+  // the fill stops exactly at chunk 2.
+  uint64_t i = 1;
+  while (v.put(1, i)) {
+    ++i;
+  }
+  REQUIRE(i == 2 * v.per_chunk);
+  held.reset();
+
+  // Past chunk 2 (but short of the head's chunk 7): the hop's target is
+  // below F -- rejected; the head alone remains.
+  for (; i < 5 * v.per_chunk; ++i) {
+    REQUIRE(v.put(1, i));
+  }
+  REQUIRE_FALSE(read_alternate(*v.cache, key, AlternateId::Brotli));
+  REQUIRE(alternate_count(*v.cache, key) == 1);
+  REQUIRE(read_alternate(*v.cache, key, AlternateId::Original));
+
+  // An UPWARD link out of the retained head is never followed: point it at
+  // a higher retained document and the walk ends at the head.
+  auto alts = v.cache->list_alternates_sync(CacheKey(key));
+  REQUIRE(alts.has_value());
+  const uint64_t head_abs = (*alts)[0].disk_offset;
+  // Links are stripe-relative: S (relative) is stripe_bytes - A on this
+  // single-stripe volume, and the head is pass-0 document `head`.
+  const uint64_t head_rel =
+      (v.cache->stats().stripe_bytes - v.area) + head * kDoc;
+  const uint64_t upward_rel = head_rel + 3 * kDoc;
+  const std::string file = volume_file_of(*v.cache);
+  poke_file(file, head_abs + Document::kNextAlternateOffsetPos,
+            std::as_bytes(std::span<const uint64_t>(&upward_rel, 1)));
+  REQUIRE(alternate_count(*v.cache, key) == 1);
+  REQUIRE(read_alternate(*v.cache, key, AlternateId::Original));
+  v.cache->stop();
+}
+
+// ---------------------------------------------------------------------------
+// Section 4.7 -- the insert victim order.
+// ---------------------------------------------------------------------------
+
+namespace {
+class TableAdmission final : public InsertAdmission {
+ public:
+  std::array<AdmitClass, 8> by_offset{};  // indexed by offset / 1000
+  void refresh() override {}
+  [[nodiscard]] AdmitClass classify(uint64_t rel, bool) const override {
+    return by_offset[rel / 1000];
+  }
+};
+DirEntry entry(uint64_t offset, uint16_t tag) {
+  DirEntry e;
+  e.set_offset(offset);
+  e.set_tag(tag);
+  e.set_approx_size(4096);
+  return e;
+}
+}  // namespace
+
+TEST_CASE(
+    "Retention 4.7: the insert victim order is verified, empty, "
+    "inadmissible, collider, then the oldest admissible",
+    "[retention][directory]") {
+  TableAdmission adm;
+  adm.by_offset = {AdmitClass::kReject,   AdmitClass::kCurrent,
+                   AdmitClass::kCurrent,  AdmitClass::kRetained,
+                   AdmitClass::kRetained, AdmitClass::kReject,
+                   AdmitClass::kCurrent,  AdmitClass::kCurrent};
+  constexpr uint16_t kTag = 7;
+  constexpr uint64_t kAny = Directory::kMatchAnyTag;
+  bool collided = false;
+  bool full = false;
+
+  // 1. The verified entry wins over everything, whatever its class.
+  std::array<DirEntry, 4> b = {entry(1000, 1), DirEntry{}, entry(3000, kTag),
+                               entry(4000, kTag)};
+  auto c =
+      choose_insert_slot(b.data(), 4, kTag, 4000, kAny, adm, &collided, &full);
+  REQUIRE(c.slot == 3);
+  REQUIRE(c.verified);
+  // 2. Then an empty slot.
+  c = choose_insert_slot(b.data(), 4, kTag, Directory::kNoVerifiedEntry, kAny,
+                         adm, &collided, &full);
+  REQUIRE(c.slot == 1);
+  REQUIRE_FALSE(c.replaces);
+  // 3. Then an inadmissible one (offset 5000 is rejected by the table).
+  b = {entry(1000, 1), entry(5000, 2), entry(3000, kTag), entry(6000, 3)};
+  c = choose_insert_slot(b.data(), 4, kTag, Directory::kNoVerifiedEntry, kAny,
+                         adm, &collided, &full);
+  REQUIRE(c.slot == 1);
+  REQUIRE(c.replaces);
+  REQUIRE_FALSE(collided);
+  // 4. Then a live tag collider (counted).
+  b = {entry(1000, 1), entry(2000, 2), entry(3000, kTag), entry(6000, 3)};
+  c = choose_insert_slot(b.data(), 4, kTag, Directory::kNoVerifiedEntry, kAny,
+                         adm, &collided, &full);
+  REQUIRE(c.slot == 2);
+  REQUIRE(collided);
+  // 5. Then the oldest admissible: the retained one nearest F first ...
+  collided = false;
+  b = {entry(1000, 1), entry(4000, 2), entry(3000, 4), entry(6000, 3)};
+  c = choose_insert_slot(b.data(), 4, kTag, Directory::kNoVerifiedEntry, kAny,
+                         adm, &collided, &full);
+  REQUIRE(c.slot == 2);  // retained at 3000, below the one at 4000
+  REQUIRE(full);
+  // ... else the lowest-offset current one.
+  full = false;
+  b = {entry(7000, 1), entry(2000, 2), entry(6000, 4), entry(1000, 3)};
+  c = choose_insert_slot(b.data(), 4, kTag, Directory::kNoVerifiedEntry, kAny,
+                         adm, &collided, &full);
+  REQUIRE(c.slot == 3);
+  REQUIRE(full);
 }
