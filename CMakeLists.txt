@@ -16,6 +16,20 @@ option(CYCLONE_BUILD_TESTS "Build tests" ON)
 option(CYCLONE_BUILD_HTTP_PLUGIN "Build HTTP alternate plugin" ON)
 option(CYCLONE_BUILD_EXAMPLES "Build examples" ON)
 option(CYCLONE_BUILD_BENCHMARKS "Build benchmarks" ON)
+option(CYCLONE_BUILD_CUDA_BENCHMARKS "Build the CUDA KV transfer benchmark" OFF)
+if(CYCLONE_BUILD_CUDA_BENCHMARKS)
+  if(WIN32)
+    # kv_gpu_cuda_host.cpp uses POSIX file and mmap APIs (unistd, sys/mman).
+    message(FATAL_ERROR
+      "CYCLONE_BUILD_CUDA_BENCHMARKS is not supported on Windows: the "
+      "kv_gpu_cuda host translation unit is POSIX-only")
+  endif()
+  if(NOT CYCLONE_BUILD_BENCHMARKS)
+    message(WARNING
+      "CYCLONE_BUILD_CUDA_BENCHMARKS=ON has no effect while "
+      "CYCLONE_BUILD_BENCHMARKS=OFF; kv_gpu_cuda will not be built")
+  endif()
+endif()
 option(CYCLONE_ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(CYCLONE_USE_BUNDLED_SHA256 "Use bundled SHA-256 instead of OpenSSL (for cross-compilation)" OFF)
 
@@ -228,6 +242,128 @@ if(CYCLONE_BUILD_BENCHMARKS)
 
   add_executable(concurrent_read_bench benchmarks/concurrent_read_bench.cpp)
   target_link_libraries(concurrent_read_bench PRIVATE cyclone-cache)
+
+  add_executable(kv_bench benchmarks/kv_bench.cpp)
+  target_link_libraries(kv_bench PRIVATE cyclone-cache)
+
+  # Apple-only: the Metal GPU-transfer experiment (ObjC++).  EVERYTHING it
+  # needs -- including enable_language(OBJCXX), which would otherwise probe for
+  # an Objective-C++ compiler on every platform -- lives inside this guard, so
+  # Linux and Windows configures are bit-for-bit unaffected.
+  if(APPLE)
+    enable_language(OBJCXX)
+    find_library(METAL_FRAMEWORK Metal)
+    find_library(FOUNDATION_FRAMEWORK Foundation)
+    if(METAL_FRAMEWORK AND FOUNDATION_FRAMEWORK)
+      add_executable(kv_gpu_metal benchmarks/kv_gpu_metal.mm)
+      set_target_properties(kv_gpu_metal PROPERTIES
+        OBJCXX_STANDARD 23
+        OBJCXX_STANDARD_REQUIRED ON)
+      target_compile_options(kv_gpu_metal PRIVATE -fobjc-arc)
+      target_link_libraries(kv_gpu_metal PRIVATE
+        cyclone-cache
+        ${METAL_FRAMEWORK}
+        ${FOUNDATION_FRAMEWORK})
+
+      # LMDB is the optional second zero-copy store to compare against; the
+      # benchmark prints "lmdb: not built" and skips those rows without it.
+      find_path(LMDB_INCLUDE_DIR lmdb.h
+        HINTS /opt/homebrew/opt/lmdb/include /usr/local/opt/lmdb/include)
+      find_library(LMDB_LIBRARY NAMES lmdb
+        HINTS /opt/homebrew/opt/lmdb/lib /usr/local/opt/lmdb/lib)
+      if(LMDB_INCLUDE_DIR AND LMDB_LIBRARY)
+        message(STATUS "kv_gpu_metal: LMDB ${LMDB_LIBRARY}")
+        target_compile_definitions(kv_gpu_metal PRIVATE
+          CYCLONE_KV_GPU_HAVE_LMDB)
+        target_include_directories(kv_gpu_metal SYSTEM PRIVATE
+          ${LMDB_INCLUDE_DIR})
+        target_link_libraries(kv_gpu_metal PRIVATE ${LMDB_LIBRARY})
+      else()
+        message(STATUS
+          "kv_gpu_metal: LMDB not found - the lmdb comparison rows are absent")
+      endif()
+    else()
+      message(STATUS
+        "kv_gpu_metal: Metal/Foundation not found - target not built")
+    endif()
+  endif()
+
+  # Opt-in: the CUDA GPU-transfer experiment, the discrete-GPU counterpart of
+  # kv_gpu_metal.  OFF by default and EVERYTHING it needs -- including
+  # enable_language(CUDA) and find_package(CUDAToolkit), both of which would
+  # otherwise probe for nvcc on machines that have none -- lives inside this
+  # guard, so an ordinary configure is bit-for-bit unaffected.
+  #
+  # The target is deliberately two translation units.  Cyclone's public
+  # headers are C++23 (std::expected) and nvcc 12.4 stops at C++20, so the
+  # store logic is compiled as C++23 by the host compiler in
+  # kv_gpu_cuda_host.cpp and only the CUDA runtime calls go through nvcc in
+  # kv_gpu_cuda.cu, behind the plain-C seam in kv_gpu_cuda.h.  Pass
+  # -DCMAKE_CUDA_HOST_COMPILER=g++-13 (CUDA 12.4 accepts GCC <= 13) and
+  # -DCMAKE_CUDA_ARCHITECTURES=<sm> for the device in the machine.
+  if(CYCLONE_BUILD_CUDA_BENCHMARKS)
+    # The default has to be in place before enable_language(CUDA): that call
+    # seeds CMAKE_CUDA_ARCHITECTURES from the compiler's own default, after
+    # which a NOT DEFINED check never fires.
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+      # Pascal: the GTX 1050 the experiment was first run on.
+      set(CMAKE_CUDA_ARCHITECTURES 61)
+    endif()
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    if(CMAKE_CUDA_HOST_COMPILER)
+      message(STATUS
+        "kv_gpu_cuda: nvcc host compiler ${CMAKE_CUDA_HOST_COMPILER}")
+    endif()
+    message(STATUS
+      "kv_gpu_cuda: CUDA ${CUDAToolkit_VERSION}, architectures "
+      "${CMAKE_CUDA_ARCHITECTURES}")
+
+    # CMake can only request a CUDA dialect it has a flag for, and CUDA20
+    # arrived in CMake 3.25 -- Ubuntu 22.04 ships 3.22, where asking for it
+    # fails the generate step outright ("does not know the compile flags to
+    # use to enable it").  The .cu is deliberately plain (runtime calls,
+    # memset/strncpy), so it compiles as C++17 just as well; ask for 20 only
+    # where CMake actually knows the flag.
+    if(DEFINED CMAKE_CUDA20_STANDARD_COMPILE_OPTION)
+      set(CYCLONE_CUDA_STD 20)
+    else()
+      set(CYCLONE_CUDA_STD 17)
+      message(STATUS
+        "kv_gpu_cuda: CMake ${CMAKE_VERSION} has no CUDA20 dialect - "
+        "building the .cu as C++17")
+    endif()
+
+    add_executable(kv_gpu_cuda
+      benchmarks/kv_gpu_cuda.cu
+      benchmarks/kv_gpu_cuda_host.cpp)
+    set_target_properties(kv_gpu_cuda PROPERTIES
+      CUDA_STANDARD ${CYCLONE_CUDA_STD}
+      CUDA_STANDARD_REQUIRED ON
+      CXX_STANDARD 23
+      CXX_STANDARD_REQUIRED ON)
+    target_link_libraries(kv_gpu_cuda PRIVATE cyclone-cache CUDA::cudart)
+
+    # LMDB is the optional second zero-copy store to compare against; the
+    # benchmark prints "lmdb: not built" and skips those rows without it.
+    find_path(LMDB_INCLUDE_DIR lmdb.h
+      HINTS /opt/homebrew/opt/lmdb/include /usr/local/opt/lmdb/include)
+    find_library(LMDB_LIBRARY NAMES lmdb
+      HINTS /opt/homebrew/opt/lmdb/lib /usr/local/opt/lmdb/lib)
+    if(LMDB_INCLUDE_DIR AND LMDB_LIBRARY)
+      message(STATUS "kv_gpu_cuda: LMDB ${LMDB_LIBRARY}")
+      # The definition is only meaningful to the host TU; the .cu never sees
+      # a store.
+      set_source_files_properties(benchmarks/kv_gpu_cuda_host.cpp PROPERTIES
+        COMPILE_DEFINITIONS CYCLONE_KV_GPU_HAVE_LMDB)
+      target_include_directories(kv_gpu_cuda SYSTEM PRIVATE
+        ${LMDB_INCLUDE_DIR})
+      target_link_libraries(kv_gpu_cuda PRIVATE ${LMDB_LIBRARY})
+    else()
+      message(STATUS
+        "kv_gpu_cuda: LMDB not found - the lmdb comparison rows are absent")
+    endif()
+  endif()
 endif()
 
 if(CYCLONE_BUILD_FUZZERS)
