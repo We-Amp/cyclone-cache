@@ -369,8 +369,8 @@ buffer cache but not yet in the caller's page tables — `MADV_WILLNEED` in
 512 KiB chunks took **50 µs** with one process and **305 µs** with four
 concurrent ones, against **5 µs / 10 µs** for `fcntl(F_RDADVISE)` doing the
 same job. Against the four-reader `multiprocess_read` phase of `kv_bench`
-that difference is the whole ballgame: the madvise hint cost macOS 85 % of
-its multi-process read throughput and 30 % of its `restart` throughput,
+that difference is the whole ballgame: the madvise hint cost macOS 85–86 %
+of its multi-process read throughput and 29 % of its `restart` throughput,
 while `F_RDADVISE` lands inside noise of no hint at all and still buys the
 cold-read win. Apple Silicon's 16 KiB base page and Darwin's own clustered
 pagein are why the *upside* is smaller there than on Linux in the first
@@ -414,10 +414,13 @@ error is discarded, because a failed hint only costs the previous behaviour.
 is *not* discarded — it is how the platform says "use the address-range
 call instead".
 
-Measured effect on a cold 2 MiB read (Linux, NVMe): 0.140 → 0.427 GB/s with
-CRC verification on, 0.179 → 2.327 GB/s with it off — after which the cold
-path is bounded by the software CRC32, not by I/O. `MADV_POPULATE_READ` was
-measured on top of this and did not help. On macOS the same phases go
+Measured effect on a cold 2 MiB read (Linux, NVMe, median of three runs):
+0.120 → 0.446 GB/s with CRC verification on, 0.179 → 2.327 GB/s with it
+off. The verified path was then bounded by the checksum (the byte-wise CRC32
+of the time, since replaced — see
+[Document checksum](#document-format)); with CRC-32C the same read runs at
+2.17 GB/s. `MADV_POPULATE_READ` was measured on top of this and did not
+help. On macOS the same phases go
 0.248 → 0.474 GB/s (first touch) and stay level on `restart`, with the
 four-process read phase inside noise; see
 [doc/kv-cache-benchmark.md](kv-cache-benchmark.md) for both platforms'
