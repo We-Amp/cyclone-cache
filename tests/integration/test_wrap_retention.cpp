@@ -13,11 +13,13 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "core/mmap_directory.hpp"
@@ -279,7 +281,10 @@ TEST_CASE(
       REQUIRE(raw.dir->current_phase() ==
               ((raw.dir->shared_wrap_count() & 1U) != 0));
       REQUIRE(raw.dir->lease_expiry_ns() == 0);
-      REQUIRE(borrow_slot::count(raw.dir->borrow_slot_raw()) == 0);
+      for (size_t c = 0; c < MmapDirectory::kMaxChunks; ++c) {
+        REQUIRE(borrow_slot::count_of<uint32_t>(raw.dir->chunk_borrow_raw(c)) ==
+                0);
+      }
     }
     const auto after = make_content(4, 4096);
     REQUIRE(write_entry(*reopened, "after-reopen", after));
@@ -288,4 +293,294 @@ TEST_CASE(
     REQUIRE(content_equals(r->content(), after));
     reopened->stop();
   }
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers for the layout / gate cases below.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::unique_ptr<Cache> open_mp_view_with(const std::string &path,
+                                         std::chrono::milliseconds lease,
+                                         std::chrono::milliseconds ceiling) {
+  CacheConfig config;
+  config.set_multi_process(0, 1);
+  config.set_ram_cache_size(0);
+  config.read_lease_duration = lease;
+  config.lease_wrap_ceiling = ceiling;
+  auto cache = Cache::create(config);
+  REQUIRE(cache.has_value());
+  REQUIRE((*cache)->add_volume(path, kVolSize).has_value());
+  REQUIRE((*cache)->start().has_value());
+  return std::move(*cache);
+}
+
+uint32_t chunk_count(const MmapDirectory &dir, size_t chunk) {
+  return borrow_slot::count_of<uint32_t>(dir.chunk_borrow_raw(chunk));
+}
+uint8_t chunk_generation(const MmapDirectory &dir, size_t chunk) {
+  return borrow_slot::generation_of<uint32_t>(dir.chunk_borrow_raw(chunk));
+}
+
+// Overwrite `bytes` at `offset` of a volume FILE through the fd.  Only while
+// no process has the file mapped (see test_reset_gate_spawn.cpp).
+void poke_file(const std::string &file, uint64_t offset,
+               std::span<const std::byte> bytes) {
+  std::fstream f(file, std::ios::in | std::ios::out | std::ios::binary);
+  REQUIRE(f.is_open());
+  f.seekp(static_cast<std::streamoff>(offset));
+  f.write(reinterpret_cast<const char *>(bytes.data()),
+          static_cast<std::streamsize>(bytes.size()));
+  REQUIRE(f.good());
+}
+
+uint16_t peek_u16(const std::string &file, uint64_t offset) {
+  std::ifstream f(file, std::ios::in | std::ios::binary);
+  REQUIRE(f.is_open());
+  f.seekg(static_cast<std::streamoff>(offset));
+  uint16_t v = 0;
+  f.read(reinterpret_cast<char *>(&v), sizeof(v));
+  REQUIRE(f.good());
+  return v;
+}
+
+// Stripe 0's directory header sits right after the 64-byte VolumeHeader;
+// its version field follows the 4-byte magic.
+constexpr uint64_t kDir0VersionOffset = VolumeHeader::kSize + 4;
+
+// Open `path` as a fresh multi-process Cache; on failure return the error.
+std::pair<CacheError, std::unique_ptr<Cache>> try_open_mp(
+    const std::string &path, bool auto_reset) {
+  CacheConfig config;
+  config.set_multi_process(0, 1);
+  config.set_ram_cache_size(0);
+  auto cache = Cache::create(config);
+  REQUIRE(cache.has_value());
+  VolumeConfig vc;
+  vc.path = path;
+  vc.size = kVolSize;
+  vc.auto_reset_on_incompatible = auto_reset;
+  if (auto added = (*cache)->add_volume(vc); !added.has_value()) {
+    return {added.error(), nullptr};
+  }
+  if (auto started = (*cache)->start(); !started.has_value()) {
+    return {started.error(), nullptr};
+  }
+  return {CacheError::Success, std::move(*cache)};
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Test 7 -- one ceiling episode clears the leaked counts of EVERY chunk.
+//
+// A zero-copy reader killed with -9 never releases its borrows: their counts
+// stay in the shared per-chunk slots.  The anti-starvation ceiling is the
+// backstop; a forced step resets every chunk's slot (generation + 1), not
+// only the chunks it exposes, so one episode clears all of them (S4).
+// ---------------------------------------------------------------------------
+
+TEST_CASE(
+    "Retention 7: one ceiling episode clears the leaked borrow counts of "
+    "every chunk after the holder is killed",
+    "[retention][lease][multiprocess]") {
+  TempCacheDir tmp("ret7");
+  const std::string path = tmp.path();
+  // Long lease (the dead holder's stamp must read as live), short ceiling.
+  auto view = open_mp_view_with(path, std::chrono::milliseconds(600000),
+                                std::chrono::milliseconds(300));
+  const std::string file = volume_file_of(*view);
+
+  std::vector<std::string> keys;
+  for (int i = 0; i < 4; ++i) {
+    keys.push_back("held-" + std::to_string(i));
+    REQUIRE(write_entry(*view, keys.back(), make_content(i, 4096)));
+  }
+
+  SpawnedPeer holder;
+  std::vector<std::string> args = {"borrow", path, std::to_string(kVolSize)};
+  args.insert(args.end(), keys.begin(), keys.end());
+  REQUIRE(holder.spawn(peer_exe(), args));
+  auto ready = holder.wait_ready(kPeerDeadline);
+  REQUIRE(ready.has_value());
+  REQUIRE(*ready == "READY");
+
+  RawDirectory raw(file);
+  uint32_t held_total = 0;
+  for (size_t c = 0; c < MmapDirectory::kMaxChunks; ++c) {
+    held_total += chunk_count(*raw.dir, c);
+  }
+  REQUIRE(held_total == keys.size());
+  // Counts leaked in other chunks too (a dead reader of documents all over
+  // the stripe): the reset must clear them in the same episode.
+  REQUIRE(raw.dir->chunk_borrow_acquire(5).counted);
+  REQUIRE(raw.dir->chunk_borrow_acquire(MmapDirectory::kMaxChunks - 1).counted);
+
+  holder.kill();  // SIGKILL: the four borrows are never released
+
+  // Flood until the ring wraps AND the step that reuses the held bytes has
+  // gone through.  The dead holder's counts defer it until the ceiling
+  // passes, then one forced step goes through.
+  const auto filler = make_content(9, kPeerContent);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  for (size_t i = 0; view->stats().wraps_forced_past_lease == 0 &&
+                     std::chrono::steady_clock::now() < deadline;
+       ++i) {
+    (void)write_entry(*view, "flood-" + std::to_string(i), filler);
+  }
+  const auto st = view->stats();
+  REQUIRE(st.write_buffer_wraps >= 1);
+  REQUIRE(st.writes_dropped_by_lease >= 1);
+  REQUIRE(st.wraps_forced_past_lease >= 1);
+
+  for (size_t c = 0; c < MmapDirectory::kMaxChunks; ++c) {
+    CAPTURE(c);
+    REQUIRE(chunk_count(*raw.dir, c) == 0);
+  }
+  REQUIRE(chunk_generation(*raw.dir, 5) == 1);
+  REQUIRE(chunk_generation(*raw.dir, MmapDirectory::kMaxChunks - 1) == 1);
+  REQUIRE(view->stats().borrows_outstanding == 0);
+  view->stop();
+}
+
+// ---------------------------------------------------------------------------
+// Test 12 -- a peer's open never writes the shared frontier state (B4).
+//
+// init_stripes runs in EVERY opener, including while peers are live.  Only
+// an exclusive open may touch G, the chunk slots, the lease or the intent;
+// a shared open maps them as they are.
+// ---------------------------------------------------------------------------
+
+TEST_CASE(
+    "Retention 12: a shared open leaves G, the chunk slots, the lease and "
+    "the intent exactly as the live peer left them",
+    "[retention][multiprocess]") {
+  TempCacheDir tmp("ret12");
+  const std::string path = tmp.path();
+  auto first = open_mp_view(path);
+  REQUIRE(write_entry(*first, "a", make_content(1, 4096)));
+  const std::string file = volume_file_of(*first);
+
+  RawDirectory raw(file);
+  // Plant distinctive live-peer state.
+  raw.dir->set_exposure_gen(0x1234);
+  REQUIRE(raw.dir->chunk_borrow_acquire(2).counted);
+  REQUIRE(raw.dir->chunk_borrow_acquire(40).counted);
+  raw.dir->stamp_lease_expiry(0xABCDEF, 0xABCDEF);
+  raw.dir->set_wrap_intent(true);
+  const uint64_t pos = raw.dir->get_shared_write_pos();
+  std::vector<std::byte> before(raw.region.begin(), raw.region.end());
+
+  auto second = open_mp_view(path);  // shared: `first` is live
+
+  REQUIRE(raw.dir->exposure_gen() == 0x1234);
+  REQUIRE(chunk_count(*raw.dir, 2) == 1);
+  REQUIRE(chunk_count(*raw.dir, 40) == 1);
+  REQUIRE(raw.dir->lease_expiry_ns() == 0xABCDEF);
+  REQUIRE(raw.dir->wrap_intent());
+  REQUIRE(raw.dir->get_shared_write_pos() == pos);
+  // Byte-for-byte: the whole directory (header, versions, entries and the
+  // retention region) is untouched by the second open.
+  REQUIRE(std::memcmp(before.data(), raw.region.data(), before.size()) == 0);
+
+  raw.dir->set_wrap_intent(false);
+  second->stop();
+  first->stop();
+}
+
+// ---------------------------------------------------------------------------
+// Test 14 (layout legs) -- a directory of another MmapDirectory version.
+//
+// kVersion is mixed into the fingerprint, so a v1 peer resolves to a
+// different file.  A v1 directory reached anyway (legacy or explicit path)
+// goes through the live-peer reset gate like any incompatible format: it is
+// refused while a peer holds the file, IncompatibleVersion with auto-reset
+// off, and a cold reset with no peer -- and it is NEVER init()ed in place
+// under a live peer.
+// ---------------------------------------------------------------------------
+
+TEST_CASE(
+    "Retention 14: a kVersion 1 peer resolves to a different file, and a "
+    "wrong-version directory is never re-initialised under a live peer",
+    "[retention][layout][multiprocess]") {
+  // The v1 name for the golden geometry (see test_fingerprint_filenames).
+  REQUIRE(fingerprint_cache_path("cyclone.dat", size_t{256} << 20, 0,
+                                 /*mmap_directory=*/true) !=
+          "cyclone-8-93cd38a16f167c85.dat");
+
+  TempCacheDir tmp("ret14v");
+  const std::string path = tmp.path();
+  std::string file;
+  {
+    auto view = open_mp_view(path);
+    REQUIRE(write_entry(*view, "old", make_content(3, 4096)));
+    file = volume_file_of(*view);
+    view->stop();
+  }
+  const uint16_t v1 = 1;
+  poke_file(file, kDir0VersionOffset,
+            std::as_bytes(std::span<const uint16_t>(&v1, 1)));
+
+  // A live peer holds the file: refuse, and leave the foreign directory
+  // exactly as it is.
+  {
+    SpawnedPeer holder;
+    REQUIRE(holder.spawn(peer_exe(), {"hold", file}));
+    auto ready = holder.wait_ready(kPeerDeadline);
+    REQUIRE(ready.has_value());
+    REQUIRE(*ready == "READY");
+    auto [err, cache] = try_open_mp(path, true);
+    REQUIRE_FALSE(cache);
+    REQUIRE(err == CacheError::ResetRefusedLivePeer);
+    REQUIRE(peek_u16(file, kDir0VersionOffset) == 1);  // never init()ed
+    holder.request_exit();
+    REQUIRE(holder.wait_exit(kPeerDeadline).has_value());
+  }
+  // Auto-reset off: IncompatibleVersion, still untouched.
+  {
+    auto [err, cache] = try_open_mp(path, false);
+    REQUIRE_FALSE(cache);
+    REQUIRE(err == CacheError::IncompatibleVersion);
+    REQUIRE(peek_u16(file, kDir0VersionOffset) == 1);
+  }
+  // No peer: cold reset.  The directory is ours again and the old entry is
+  // gone with it.
+  {
+    auto [err, cache] = try_open_mp(path, true);
+    REQUIRE(err == CacheError::Success);
+    REQUIRE(cache);
+    REQUIRE(peek_u16(file, kDir0VersionOffset) == MmapDirectory::kVersion);
+    REQUIRE_FALSE(cache->read_sync(CacheKey("old")).has_value());
+    cache->stop();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Test 15 (geometry leg) -- N and Q are a pure function of the data area.
+// ---------------------------------------------------------------------------
+
+TEST_CASE(
+    "Retention 15: the frontier geometry depends only on the data area, and "
+    "N is clamped for small stripes",
+    "[retention][layout]") {
+  // D2: Q = max(1 MiB, round_up(ceil(A / 64), 8)),
+  //     N = clamp(ceil(A / Q), 1, 64).
+  for (uint64_t a :
+       {uint64_t{4096}, uint64_t{1} << 20, (uint64_t{1} << 20) + 8,
+        uint64_t{3469248}, uint64_t{32} << 20, (uint64_t{32} << 20) - 724992,
+        uint64_t{128} << 20, uint64_t{1} << 30, uint64_t{1} << 40}) {
+    CAPTURE(a);
+    const FrontierGeometry g = retention_geometry(a);
+    REQUIRE(g.chunks >= 1);
+    REQUIRE(g.chunks <= MmapDirectory::kMaxChunks);
+    REQUIRE(g.chunk_size >= kMinFrontierChunk);
+    REQUIRE(g.chunk_size % 8 == 0);
+    REQUIRE(g.chunk_size * g.chunks >= a);       // the chunks cover the area
+    REQUIRE(g.chunk_size * (g.chunks - 1) < a);  // and none is empty
+  }
+  REQUIRE(retention_geometry(uint64_t{1} << 20).chunks == 1);  // flush-like
+  REQUIRE(retention_geometry(4096).chunks == 1);
+  REQUIRE(retention_geometry(uint64_t{1} << 40).chunks == 64);
 }

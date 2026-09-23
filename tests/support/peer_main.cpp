@@ -43,6 +43,12 @@
 //                                 WITHOUT leaving the window (a live holder
 //                                 stalled inside it).  Exit 1 if the seam was
 //                                 never reached.
+//   borrow <raw-path> <size-bytes> <key>...
+//                                 open a Cache (multi-process, 600 s lease),
+//                                 take a disk borrow of every key, say READY
+//                                 and HOLD the handles until released or
+//                                 killed (a zero-copy reader; SIGKILL leaks
+//                                 its borrow counts).
 
 #include <cerrno>
 #include <chrono>
@@ -230,9 +236,52 @@ int run_seam(const char* path, unsigned long long size, int seam, bool crash,
   return 1;
 }
 
+// Open a Cache with a long read lease, take a disk borrow of every listed
+// key and HOLD the handles: the stand-in for a zero-copy reader.  The
+// parent SIGKILLs it to leak the counts (test 7) or releases it.
+int run_borrow(const char* path, unsigned long long size, int nkeys,
+               char** keys) {
+  cyclone::CacheConfig config;
+  config.set_multi_process(0, 1);
+  config.set_ram_cache_size(0);
+  config.read_lease_duration = std::chrono::milliseconds(600000);
+  config.lease_wrap_ceiling = std::chrono::milliseconds(600000);
+
+  auto cache = cyclone::Cache::create(config);
+  if (!cache.has_value()) {
+    say("ERR " + std::to_string(static_cast<int>(cache.error())));
+    return 1;
+  }
+  if (auto added = (*cache)->add_volume(path, static_cast<size_t>(size));
+      !added.has_value()) {
+    say("ERR " + std::to_string(static_cast<int>(added.error())));
+    return 1;
+  }
+  if (auto started = (*cache)->start(); !started.has_value()) {
+    say("ERR " + std::to_string(static_cast<int>(started.error())));
+    return 1;
+  }
+  std::vector<cyclone::ReadHandle> held;
+  for (int i = 0; i < nkeys; ++i) {
+    auto rh = (*cache)->read_sync(cyclone::CacheKey(keys[i]));
+    if (!rh.has_value()) {
+      say(std::string("ERR miss ") + keys[i]);
+      return 1;
+    }
+    held.push_back(std::move(*rh));
+  }
+  say("READY");
+  wait_for_release();
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc >= 5 && std::strcmp(argv[1], "borrow") == 0) {
+    return run_borrow(argv[2], std::strtoull(argv[3], nullptr, 10), argc - 4,
+                      argv + 4);
+  }
   if (argc >= 7 && std::strcmp(argv[1], "seam") == 0) {
     return run_seam(argv[2], std::strtoull(argv[3], nullptr, 10),
                     std::atoi(argv[4]), std::strcmp(argv[5], "crash") == 0,

@@ -1188,30 +1188,87 @@ TEST_CASE(
   REQUIRE(borrow_slot::generation(slot.load()) == 1);
 }
 
-TEST_CASE("MmapDirectory borrow slot round-trips through the shared header",
-          "[mmap_directory][borrow_slot]") {
+TEST_CASE(
+    "MmapDirectory per-chunk borrow slots round-trip through the retention "
+    "region",
+    "[mmap_directory][borrow_slot]") {
   std::vector<std::byte> region(MmapDirectory::required_size(64));
   auto dir = MmapDirectory::init(region, 64);
   REQUIRE(dir.has_value());
 
-  REQUIRE(dir->borrow_slot_raw() == 0);
-  auto acquired = dir->borrow_acquire();
+  REQUIRE(dir->chunk_borrow_raw(3) == 0);
+  auto acquired = dir->chunk_borrow_acquire(3);
   REQUIRE(acquired.counted);
-  REQUIRE(borrow_slot::count(dir->borrow_slot_raw()) == 1);
+  REQUIRE(borrow_slot::count_of<uint32_t>(dir->chunk_borrow_raw(3)) == 1);
+  REQUIRE(dir->chunk_borrow_raw(4) == 0);  // chunks are independent
 
   // A second view on the same region observes and mutates the same slot.
   auto view2 = MmapDirectory::open(region);
   REQUIRE(view2.has_value());
-  REQUIRE(borrow_slot::count(view2->borrow_slot_raw()) == 1);
-  view2->borrow_release(acquired.generation);
-  REQUIRE(dir->borrow_slot_raw() == 0);
+  REQUIRE(borrow_slot::count_of<uint32_t>(view2->chunk_borrow_raw(3)) == 1);
+  view2->chunk_borrow_release(3, acquired.generation);
+  REQUIRE(dir->chunk_borrow_raw(3) == 0);
 
-  // Force reset through one view invalidates a count taken through another.
-  auto again = dir->borrow_acquire();
+  // Force reset through one view invalidates counts taken through another,
+  // in EVERY chunk at once.
+  auto again = dir->chunk_borrow_acquire(3);
+  auto other = dir->chunk_borrow_acquire(63);
   REQUIRE(again.counted);
-  REQUIRE(view2->borrow_force_reset());
-  REQUIRE(borrow_slot::count(dir->borrow_slot_raw()) == 0);
-  dir->borrow_release(again.generation);  // Stale: generation-dropped
-  REQUIRE(borrow_slot::count(dir->borrow_slot_raw()) == 0);
-  REQUIRE(borrow_slot::generation(dir->borrow_slot_raw()) == 1);
+  REQUIRE(other.counted);
+  REQUIRE(view2->chunk_borrows_force_reset_all());
+  REQUIRE(borrow_slot::count_of<uint32_t>(dir->chunk_borrow_raw(3)) == 0);
+  REQUIRE(borrow_slot::count_of<uint32_t>(dir->chunk_borrow_raw(63)) == 0);
+  dir->chunk_borrow_release(3, again.generation);  // Stale: dropped
+  REQUIRE(borrow_slot::count_of<uint32_t>(dir->chunk_borrow_raw(3)) == 0);
+  REQUIRE(borrow_slot::generation_of<uint32_t>(dir->chunk_borrow_raw(3)) == 1);
+  // A slot that held nothing keeps its generation.
+  REQUIRE(borrow_slot::generation_of<uint32_t>(dir->chunk_borrow_raw(5)) == 0);
+
+  // Out-of-range chunks are inert, never out-of-bounds.
+  REQUIRE_FALSE(dir->chunk_borrow_acquire(MmapDirectory::kMaxChunks).counted);
+  REQUIRE(dir->chunk_borrow_raw(MmapDirectory::kMaxChunks) == 0);
+
+  // The exposure generation is shared the same way.
+  REQUIRE(dir->exposure_gen() == 0);
+  view2->set_exposure_gen(77);
+  REQUIRE(dir->exposure_gen() == 77);
+}
+
+TEST_CASE("MmapDirectory u32 chunk slot counts past 255",
+          "[mmap_directory][borrow_slot]") {
+  // The cross-process slot is {gen:8, count:24}: the 255 saturation of the
+  // 16-bit shard slot (a borrow at saturation rides along UNCOUNTED) does
+  // not exist at any realistic concurrency.
+  std::atomic<uint32_t> slot{0};
+  for (int i = 0; i < 1000; ++i) {
+    REQUIRE(borrow_slot::acquire(slot).counted);
+  }
+  REQUIRE(borrow_slot::count_of<uint32_t>(slot.load()) == 1000);
+  REQUIRE(borrow_slot::generation_of<uint32_t>(slot.load()) == 0);
+  REQUIRE(borrow_slot::force_reset(slot));
+  REQUIRE(borrow_slot::count_of<uint32_t>(slot.load()) == 0);
+  REQUIRE(borrow_slot::generation_of<uint32_t>(slot.load()) == 1);
+}
+
+TEST_CASE("MmapDirectory layout: the retention region fits the old slack",
+          "[mmap_directory][layout]") {
+  // 16384 buckets is the production directory (kDirectoryEntriesPerSegment).
+  // The retention region (G + 64 x u32 = 264 bytes) sits after the entries
+  // and must not move the page-rounded data offset (177 pages).
+  REQUIRE(MmapDirectory::required_size(16 * 1024) == 721224);
+  REQUIRE((MmapDirectory::required_size(16 * 1024) + 4095) / 4096 == 177);
+  REQUIRE(MmapDirectory::retention_offset(16 * 1024) % 8 == 0);
+}
+
+TEST_CASE("MmapDirectory recognises a foreign-version directory",
+          "[mmap_directory][layout]") {
+  std::vector<std::byte> region(MmapDirectory::required_size(64));
+  REQUIRE_FALSE(MmapDirectory::is_foreign_version(region));  // zeroed
+  auto dir = MmapDirectory::init(region, 64);
+  REQUIRE(dir.has_value());
+  REQUIRE_FALSE(MmapDirectory::is_foreign_version(region));  // ours
+  const uint16_t v1 = 1;
+  std::memcpy(region.data() + 4, &v1, sizeof(v1));  // Header::version
+  REQUIRE(MmapDirectory::is_foreign_version(region));
+  REQUIRE_FALSE(MmapDirectory::open(region).has_value());
 }
