@@ -652,8 +652,8 @@ class VolumeReadHandleImpl : public ReadHandleImpl {
   // client-paced drain that races Cache::stop() — the borrow-lifetime
   // use-after-free the old raw Volume* left open (mapped_file_weak kept
   // the mapping alive but NOT the Volume or its _stripes).  epoch_start is
-  // the wrap epoch captured at probe time; the checked renew fails (so the
-  // embedder copies/aborts) iff it moved.
+  // the served document's exposure threshold (BorrowEpoch); the checked
+  // renew fails (so the embedder copies/aborts) iff G passed it.
   std::weak_ptr<Volume> volume_weak;
   Stripe* stripe = nullptr;
   BorrowEpoch epoch_start{};
@@ -1176,6 +1176,14 @@ std::string fingerprint_cache_path(const std::string& path, size_t size,
   mix_u64_le(static_cast<uint64_t>(g.num_stripes));       // 3. stripe count
   mix_u64_le(static_cast<uint64_t>(g.base_stripe_size));  // 4. base stripe size
   mix_u64_le(static_cast<uint64_t>(g.stripe_remainder));  // 5. remainder
+  // 6. The shared directory's layout/protocol version, for mmap volumes
+  // only: peers whose MmapDirectory versions differ must never map the same
+  // file (a v1 binary would count its borrows where a v2 writer never
+  // looks, and init() over the other's directory).  Single-process files
+  // carry no shared directory, so their names are unaffected.
+  if (mmap_directory) {
+    mix_u16_le(MmapDirectory::kVersion);
+  }
 
   // Render the full u64 as 16 lowercase hex chars, most-significant nibble
   // first.
@@ -1627,7 +1635,18 @@ std::expected<void, CacheError> Volume::open_locked(bool created_new) {
       const bool geometry_mismatch =
           _mp_config.enabled &&
           (header.stripe_count != 0 && header.stripe_count != derived_count);
-      if (!header.is_compatible() || geometry_mismatch) {
+      // A stripe directory of ANOTHER MmapDirectory version (valid magic,
+      // wrong version) belongs to a binary whose reader protocol differs
+      // from ours (v1 counts borrows in the retired header slot and never
+      // honours the exposure generation).  kVersion in the fingerprint keeps
+      // such binaries on different files; reaching one here means an
+      // explicit or legacy path.  Treat it exactly like an incompatible
+      // format: through the live-peer reset gate below, never an in-place
+      // init() under a peer that may still be serving from it.
+      const bool directory_version_mismatch =
+          _mp_config.enabled && has_foreign_directory_version();
+      if (!header.is_compatible() || geometry_mismatch ||
+          directory_version_mismatch) {
         if (!_config.auto_reset_on_incompatible) {
           return make_unexpected(CacheError::IncompatibleVersion);
         }
@@ -2055,6 +2074,55 @@ std::expected<void, CacheError> Volume::reset() {
   return {};
 }
 
+// The retention region (G + 64 per-chunk borrow slots) lives in the slack
+// between the mmap directory's entries and the page-rounded data offset, so
+// adding it moved no stripe's data offset.  Both numbers are on-disk format.
+static_assert(MmapDirectory::required_size(kDirectoryEntriesPerSegment) ==
+                  721224,
+              "mmap directory size (header + versions + entries + retention)");
+static_assert((MmapDirectory::required_size(kDirectoryEntriesPerSegment) +
+               4095) / 4096 ==
+                  177,
+              "the data offset must stay at 177 pages");
+
+bool Volume::has_foreign_directory_version() const {
+  const StripeGeometry geom =
+      compute_stripe_geometry(_config.size, _config.stripe_size);
+  uint64_t offset = VolumeHeader::kSize;
+  std::array<std::byte, sizeof(MmapDirectory::Header)> head{};
+  for (size_t i = 0; i < geom.num_stripes; ++i) {
+    const size_t stripe_size =
+        geom.base_stripe_size +
+        (i + 1 == geom.num_stripes ? geom.stripe_remainder : 0);
+#ifdef _WIN32
+    // Open path only (under the init lock, before any I/O thread exists),
+    // like read_header's lseek+read pair.
+    if (CYCLONE_LSEEK(_fd, static_cast<int64_t>(offset), SEEK_SET) !=
+        static_cast<int64_t>(offset)) {
+      return false;
+    }
+    const auto got =
+        CYCLONE_READ(_fd, head.data(), static_cast<unsigned>(head.size()));
+#else
+    const ssize_t got =
+        pread(_fd, head.data(), head.size(), static_cast<off_t>(offset));
+#endif
+    if (got == static_cast<decltype(got)>(head.size()) &&
+        MmapDirectory::is_foreign_version(head)) {
+      return true;
+    }
+    offset += stripe_size;
+  }
+  return false;
+}
+
+void Volume::configure_frontier(Stripe& stripe) const {
+  const uint64_t data_area = stripe.size - stripe.data_start_rel();
+  // Flush mode: one chunk spanning the whole data area.
+  stripe.chunks = 1;
+  stripe.chunk_size = data_area;
+}
+
 std::expected<void, CacheError> Volume::init_stripes(bool exclusive) {
   // Account for volume header at the start
   size_t usable_size = _config.size - VolumeHeader::kSize;
@@ -2105,6 +2173,15 @@ std::expected<void, CacheError> Volume::init_stripes(bool exclusive) {
       // Check if directory needs initialization or can be opened
       auto mmap_dir = MmapDirectory::open(*dir_region);
       if (!mmap_dir) {
+        // Never init() over a directory another binary version is using
+        // unless this opener PROVED there is no live peer: an old opener's
+        // failed open() would otherwise zero a live peer's header.
+        // open_locked routes a foreign version through the reset gate, so
+        // reaching this with one means a peer raced us in; fail closed.
+        if (!exclusive && MmapDirectory::is_foreign_version(*dir_region)) {
+          _mapped_file->unmap_region(*dir_region);
+          return make_unexpected(CacheError::IncompatibleVersion);
+        }
         // Initialize new directory
         auto new_dir =
             MmapDirectory::init(*dir_region, kDirectoryEntriesPerSegment);
@@ -2121,6 +2198,7 @@ std::expected<void, CacheError> Volume::init_stripes(bool exclusive) {
       size_t page_size = 4096;
       stripe->data_offset =
           offset + ((dir_size + page_size - 1) / page_size) * page_size;
+      configure_frontier(*stripe);
 
       // Recover write_pos from the mmap'd directory header.
       // This ensures cross-process writes don't overwrite each other.
@@ -2158,6 +2236,7 @@ std::expected<void, CacheError> Volume::init_stripes(bool exclusive) {
       dir_area = (dir_area + 7u) & ~static_cast<size_t>(7u);
       stripe->data_offset = stripe->offset + dir_area;
       stripe->write_pos = stripe->data_offset;
+      configure_frontier(*stripe);
     }
 
     // Multi-process: mark stripe ownership
@@ -2378,7 +2457,6 @@ std::expected<ReadHandle, CacheError> Volume::read_sync(const CacheKey& key) {
     // against it, and a borrow revalidates against its epoch
     // (stamp-then-revalidate; disk borrows only).
     const StripeSnapshot snap = snapshot(stripe);
-    const BorrowEpoch epoch_start = borrow_epoch(snap);
 
     stripe->probe_each(key, snap, [&](const DirEntry& dir_entry, AdmitClass) {
       if (found) {
@@ -2469,8 +2547,13 @@ std::expected<ReadHandle, CacheError> Volume::read_sync(const CacheKey& key) {
       // bytes may be (about to be) overwritten: release, discard and
       // retry/miss.  This revalidation is deliberately independent of the
       // checksum-validation cache above (a cached CRC verdict must never
-      // short-circuit it).
-      BorrowToken borrow = acquire_borrow(stripe);
+      // short-circuit it).  The borrow counts against the chunk of the
+      // document it aliases, and revalidates against that document's own
+      // exposure threshold.
+      const BorrowEpoch epoch_start =
+          borrow_epoch(stripe, snap.pass, dir_entry.offset());
+      BorrowToken borrow =
+          acquire_borrow(stripe, stripe->chunk_of(dir_entry.offset()));
       stamp_read_lease(stripe);
       if (!borrow_still_valid(stripe, epoch_start)) {
         release_borrow(stripe, borrow);
@@ -2734,10 +2817,9 @@ void Volume::record_wrap(Stripe* stripe) noexcept {
     stripe->mmap_directory->record_shared_wrap(now_ns);
   } else {
     _wrap_count.fetch_add(1, std::memory_order_relaxed);
-    // Per-stripe epoch for the stamp-then-revalidate protocol
-    // (the non-mmap counterpart of shared_wrap_count).
-    stripe->local_wrap_count.fetch_add(1, std::memory_order_seq_cst);
   }
+  // TELEMETRY ONLY.  The reader epoch is the exposure generation G (see
+  // StripeSnapshot); the wrap counts above are statistics.
 
   // Process-local interval tracking: covers only wraps performed by this
   // process, volume-wide across stripes (see VolumeStats for semantics).
@@ -2764,16 +2846,14 @@ void Volume::repair_wrap_state(Stripe* stripe) {
     return;  // Process-local state dies with the process: nothing to repair.
   }
   MmapDirectory& dir = *stripe->mmap_directory;
-  // Phase FIRST, intent LAST: a reader that observes the cleared intent must
-  // also observe the re-derived phase (both seq_cst, program order).  The
-  // pass count is the authoritative epoch; the phase is only ever its low
-  // bit.  A writer that died between the phase toggle and the pass-count
-  // bump left the two disagreeing (every current-pass entry then reads as
-  // previous-pass and vice versa); re-deriving closes that drift.  Entries
-  // of the "wrong" phase that become visible again are exactly the
-  // phase-ABA survivors invariants 8 and 9 already reject by key and
-  // position, so this can only ever turn serves into misses.
-  dir.set_current_phase((dir.shared_wrap_count() & 1U) != 0);
+  // Phase FIRST, intent LAST: a writer that observes the cleared intent
+  // must also observe the re-derived phase (both seq_cst, program order).
+  // The pass P = G / (N + 1) is the authoritative epoch; the phase entries
+  // are stamped with is only ever its low bit.  A writer that died between
+  // the phase store and the G store left the two disagreeing (new inserts
+  // would carry the wrong class); re-deriving closes that drift.  Readers
+  // derive the phase from G themselves, so they never saw the drift.
+  dir.set_current_phase((stripe->pass_of(dir.exposure_gen()) & 1U) != 0);
   dir.set_wrap_intent(false);
 }
 
@@ -2796,23 +2876,23 @@ void Volume::repair_after_forced_release(
 // read_alternate_sync disk hits; RAM-cache hits and misses never stamp or
 // count): after locating the entry, register the borrow in the stripe's
 // outstanding-borrow accounting (acquire_borrow — a seq_cst CAS count+1 on
-// THIS THREAD's borrow shard for non-mmap stripes, on the single shared
-// slot for mmap stripes) and stamp
-// the stripe lease (seq_cst CAS-max now + T, with the write-avoidance
+// the served document's CHUNK slot: in THIS THREAD's borrow shard for
+// non-mmap stripes, in the shared retention region for mmap stripes) and
+// stamp the stripe lease (seq_cst CAS-max now + T, with the write-avoidance
 // guard) BEFORE the borrow escapes, then revalidate via
 // borrow_still_valid(): the writer's wrap-intent flag must be clear
-// (loaded FIRST) and the wrap epoch (shared_wrap_count + phase captured at
-// probe start) unchanged.  If either check fails, a wrap raced (or is
-// racing) the read between probe and stamp: release the borrow, discard,
-// and retry/miss.  The revalidation is deliberately NOT routed through the
-// checksum-validation cache.  The count is dropped on ReadHandle
-// close/destruction (release_borrow) — closing the handle is what returns
-// write capacity to the stripe.
+// (loaded FIRST) and a fresh exposure generation G must not have passed
+// the document's exposure threshold.  If either check fails, a wrap or an
+// advance raced (or is racing) the read between probe and stamp: release
+// the borrow, discard, and retry/miss.  The revalidation is deliberately NOT
+// routed through the checksum-validation cache.  The count is dropped on
+// ReadHandle close/destruction (release_borrow) — closing the handle is what
+// returns write capacity to the stripe.
 //
 // Writer protocol: inside allocate_write_slot (the single shared
 // allocation helper used by BOTH wrap sites), the writer sets the shared
 // wrap-intent flag (seq_cst) BEFORE the gate loads; the gate
-// (lease_permits_wrap) runs BEFORE evict_if_needed()/toggle_phase() and
+// (lease_gate) runs BEFORE the phase / exposure-generation publish and
 // defers the wrap only while BOTH hold:
 //   - the stripe's outstanding-borrow count is nonzero (a live ReadHandle
 //     still aliases the region), AND
@@ -2851,23 +2931,28 @@ void Volume::stamp_read_lease(Stripe* stripe) const {
   }
 }
 
-BorrowToken Volume::acquire_borrow(Stripe* stripe) {
+BorrowToken Volume::acquire_borrow(Stripe* stripe, uint32_t chunk) {
   if (_lease_t_ns == 0 || stripe == nullptr) {
     return {};  // Leases disabled: the wrap gate is off, nothing to count.
+  }
+  if (chunk >= MmapDirectory::kMaxChunks) {
+    chunk = MmapDirectory::kMaxChunks - 1;  // defensive; chunk_of clamps
   }
   borrow_slot::Acquired acquired;
   uint8_t shard = 0;
   if (stripe->use_mmap_directory && stripe->mmap_directory) {
-    acquired = stripe->mmap_directory->borrow_acquire();
+    acquired = stripe->mmap_directory->chunk_borrow_acquire(chunk);
   } else {
     // THIS THREAD's shard: the CAS stays on a thread-local
     // cache line instead of bouncing one stripe-global slot line across
-    // every reading core.  The token records the shard so the release
-    // lands on the same slot.
+    // every reading core.  The token records the shard (and the chunk) so
+    // the release lands on the same slot.
     shard = static_cast<uint8_t>(thread_shard_index(Stripe::kBorrowShards));
-    acquired = borrow_slot::acquire(stripe->local_borrow_shards[shard].slot);
+    acquired =
+        borrow_slot::acquire(stripe->local_borrow_shards[shard].slots[chunk]);
   }
-  return {acquired.generation, acquired.counted, true, shard};
+  return {acquired.generation, acquired.counted, true, shard,
+          static_cast<uint8_t>(chunk)};
 }
 
 void Volume::release_borrow(Stripe* stripe, BorrowToken token) {
@@ -2878,10 +2963,11 @@ void Volume::release_borrow(Stripe* stripe, BorrowToken token) {
     return;  // close() freed the stripes: leaked-count case, documented.
   }
   if (stripe->use_mmap_directory && stripe->mmap_directory) {
-    stripe->mmap_directory->borrow_release(token.generation);
+    stripe->mmap_directory->chunk_borrow_release(token.chunk, token.generation);
   } else {
-    borrow_slot::release(stripe->local_borrow_shards[token.shard].slot,
-                         token.generation);
+    borrow_slot::release(
+        stripe->local_borrow_shards[token.shard].slots[token.chunk],
+        token.generation);
   }
 }
 
@@ -2918,12 +3004,12 @@ void Volume::set_read_anchors(const std::shared_ptr<VolumeReadAnchor>* slots,
   _read_anchor_count = count;
 }
 
-std::pair<uint64_t, bool> Volume::wrap_epoch(const Stripe* stripe) const {
+void Volume::store_exposure_gen(Stripe* stripe, uint64_t gen) {
   if (stripe->use_mmap_directory && stripe->mmap_directory) {
-    return stripe->mmap_directory->wrap_epoch();
+    stripe->mmap_directory->set_exposure_gen(gen);
+  } else {
+    stripe->local_exposure_gen.store(gen, std::memory_order_seq_cst);
   }
-  bool phase = stripe->directory ? stripe->directory->current_phase() : false;
-  return {stripe->local_wrap_count.load(std::memory_order_seq_cst), phase};
 }
 
 void Volume::set_wrap_intent(Stripe* stripe, bool active) {
@@ -2945,25 +3031,29 @@ bool Volume::borrow_still_valid(const Stripe* stripe,
                                 const BorrowEpoch& epoch_start) const {
   // Order is load-bearing (see the Dekker proof in allocate_write_slot):
   // the intent flag is loaded FIRST.  If intent == 0 was read from a
-  // completed wrap's clear, that clear is seq_cst-after the wrap-count
-  // publish, so the epoch loads below (later in the seq_cst total order)
-  // must observe the changed epoch.  If intent == 0 predates a concurrent
-  // writer's intent-store, that writer's later lease load is
-  // seq_cst-after our stamp and defers.
+  // completed wrap's or advance's clear, that clear is seq_cst-after its G
+  // store, so the G load below (later in the seq_cst total order) observes
+  // the new G -- which exposes this borrow's chunk if the operation crossed
+  // it.  If intent == 0 predates a concurrent writer's intent-store, that
+  // writer's later count load is seq_cst-after our count CAS and defers.
   if (wrap_intent_set(stripe)) {
-    return false;  // A wrap decision is in flight — discard and retry.
+    return false;  // A wrap/advance is in flight — discard and retry.
   }
-  const auto now = wrap_epoch(stripe);
-  return BorrowEpoch{now.first, now.second} == epoch_start;
+  return stripe->exposure_gen() <= epoch_start.threshold;
 }
 
 StripeSnapshot Volume::snapshot(const Stripe* stripe) const {
   StripeSnapshot snap;
-  // Epoch FIRST (seq_cst), cursor after (acquire) -- see the declaration.
-  const auto epoch = wrap_epoch(stripe);
-  snap.pass = epoch.first;
-  snap.phase = epoch.second;
+  // G FIRST (seq_cst), cursor after (acquire) -- see the declaration.
+  snap.gen = stripe->exposure_gen();
+  const uint64_t n = stripe->chunks;
+  snap.pass = snap.gen / (n + 1);
+  // Clamp, never repair: a corrupt or foreign G with f > N reads as a
+  // fully exposed pass.
+  snap.frontier = std::min<uint64_t>(snap.gen % (n + 1), n);
+  snap.phase = (snap.pass & 1U) != 0;
   snap.cursor_rel = stripe->current_write_cursor() - stripe->offset;
+  snap.frontier_rel = stripe->frontier_rel_of(snap.frontier);
   return snap;
 }
 
@@ -3004,8 +3094,11 @@ bool Volume::renew_read_lease(Stripe* stripe, const BorrowEpoch& epoch_start) {
   // hot leased stripe (every writer attempt sets-then-clears intent).  An
   // in-flight wrap that actually commits moves the epoch and is caught on
   // the next renew or by the embedder's pre-write revalidation.
-  const auto now = wrap_epoch(stripe);
-  if (BorrowEpoch{now.first, now.second} != epoch_start) {
+  //
+  // "The epoch moved" is now "a fresh G passed THIS borrow's exposure
+  // threshold": only the wrap or advance that exposes the borrow's own
+  // chunk fails it (doc/design/wrap-retention.md section 4.4).
+  if (stripe->exposure_gen() > epoch_start.threshold) {
     return false;
   }
   stamp_read_lease(stripe);  // Still valid — extend the lease.
@@ -3052,9 +3145,11 @@ LeaseRenewal Volume::renew_read_lease_strict(Stripe* stripe,
   // holds intent right now.  A bare intent with an UNMOVED epoch is a wrap
   // still in its pre-record_wrap decision window: the region is intact but a
   // commit may land during the aliased send, so de-alias by copying.
+  // "Epoch moved" = a fresh G passed this borrow's exposure threshold (the
+  // wrap or advance that exposes its own chunk has published).
   const bool intent = wrap_intent_set(stripe);  // load intent FIRST
-  const auto now = wrap_epoch(stripe);          // then epoch
-  const bool epoch_moved = BorrowEpoch{now.first, now.second} != epoch_start;
+  const bool epoch_moved =
+      stripe->exposure_gen() > epoch_start.threshold;  // then G
   // PREMISE (restored): "any overwrite of a borrowed region is a wrap" holds
   // for every borrow this protocol can hand out, because a borrow is only
   // ever taken through a node BEHIND the write cursor — the phase-ABA
@@ -3077,32 +3172,38 @@ LeaseRenewal Volume::renew_read_lease_strict(Stripe* stripe,
   return LeaseRenewal::kOk;
 }
 
-bool Volume::lease_permits_wrap(Stripe* stripe) {
+bool Volume::lease_gate(Stripe* stripe, uint32_t chunk_lo, uint32_t chunk_hi,
+                        bool episode) {
   if (_lease_t_ns == 0) {
     return true;  // Leases disabled — pre-lease behavior.
   }
+  chunk_hi = std::min<uint32_t>(chunk_hi, MmapDirectory::kMaxChunks);
 
   // Both gate loads are seq_cst and run AFTER the caller's wrap-intent
   // store (Dekker pairing with the reader's acquire/stamp RMWs — proof at
-  // allocate_write_slot).
+  // allocate_write_slot).  Only the chunks about to be exposed are summed:
+  // a borrow elsewhere in the stripe is not endangered by this step.
   uint64_t expiry;
-  uint64_t borrow_count;
+  uint64_t borrow_count = 0;
   if (stripe->use_mmap_directory && stripe->mmap_directory) {
     expiry = stripe->mmap_directory->lease_expiry_ns();
-    borrow_count =
-        borrow_slot::count(stripe->mmap_directory->borrow_slot_raw());
+    for (uint32_t c = chunk_lo; c < chunk_hi; ++c) {
+      borrow_count += borrow_slot::count_of<uint32_t>(
+          stripe->mmap_directory->chunk_borrow_raw(c));
+    }
   } else {
     expiry = stripe->local_lease_expiry_ns.load(std::memory_order_seq_cst);
-    // Sum every borrow shard.  Each seq_cst load pairs with
-    // that shard's acquire CAS: for any given reader, either its CAS
-    // precedes this load in the seq_cst total order (the sum counts it
-    // and the wrap defers), or this gate's earlier intent-store precedes
-    // the reader's intent-load (the reader discards its borrow) — the
-    // single-slot Dekker argument, quantified per shard.
-    borrow_count = 0;
+    // Sum every borrow shard's slots for the exposed chunks.  Each seq_cst
+    // load pairs with that shard's acquire CAS: for any given reader,
+    // either its CAS precedes this load in the seq_cst total order (the sum
+    // counts it and the step defers), or this gate's earlier intent-store
+    // precedes the reader's intent-load (the reader discards its borrow) —
+    // the single-slot Dekker argument, quantified per shard and per chunk.
     for (const auto& shard : stripe->local_borrow_shards) {
-      borrow_count +=
-          borrow_slot::count(shard.slot.load(std::memory_order_seq_cst));
+      for (uint32_t c = chunk_lo; c < chunk_hi; ++c) {
+        borrow_count +=
+            borrow_slot::count(shard.slots[c].load(std::memory_order_seq_cst));
+      }
     }
   }
 
@@ -3119,10 +3220,18 @@ bool Volume::lease_permits_wrap(Stripe* stripe) {
   // stopped renewing, or crashed) are unprotected exactly as before.
   bool borrows_outstanding = borrow_count != 0;
   if (!lease_active || !borrows_outstanding) {
-    // Nothing to protect: reset the continuous-deferral episode and proceed.
-    stripe->wrap_deferred_since_ns.store(0, std::memory_order_relaxed);
-    publish_wrap_deferred_deadline(stripe, 0);  // STEP-3: no force pending
+    if (episode) {
+      // Nothing to protect: end any continuous-deferral episode.
+      stripe->wrap_deferred_since_ns.store(0, std::memory_order_relaxed);
+      publish_wrap_deferred_deadline(stripe, 0);  // STEP-3: no force pending
+    }
     return true;
+  }
+  if (!episode) {
+    // The early (optional) advance is a pure gate check (S1): no deferral
+    // clock, no published deadline, never a force.  A borrow burst shorter
+    // than the runway therefore never drops a write.
+    return false;
   }
 
   // Anti-starvation ceiling: the backstop for counted-but-dead borrows — a
@@ -3134,19 +3243,22 @@ bool Volume::lease_permits_wrap(Stripe* stripe) {
     _wraps_forced_past_lease.fetch_add(1, std::memory_order_relaxed);
     stripe->wrap_deferred_since_ns.store(0, std::memory_order_relaxed);
     publish_wrap_deferred_deadline(stripe, 0);  // STEP-3: force consumed
-    // clear the outstanding-borrow slot (generation+1, count 0)
-    // so leaked state costs at most this one ceiling episode.  Live holders
-    // invalidated here find out via the moved epoch on their next
-    // renew/strict-renew (kTorn), exactly as forced wraps always worked;
-    // their late releases are dropped by the generation check.
+    // Clear EVERY chunk's outstanding-borrow slot (generation+1, count 0),
+    // not only the exposed ones (S4): one ceiling episode clears leaked
+    // counts everywhere.  Live holders invalidated here find out via G on
+    // their next renew/strict-renew (kTorn) once their own chunk is
+    // exposed, exactly as forced wraps always worked; their late releases
+    // are dropped by the generation check.
     if (stripe->use_mmap_directory && stripe->mmap_directory) {
-      stripe->mmap_directory->borrow_force_reset();
+      stripe->mmap_directory->chunk_borrows_force_reset_all();
     } else {
       for (auto& shard : stripe->local_borrow_shards) {
-        borrow_slot::force_reset(shard.slot);
+        for (auto& slot : shard.slots) {
+          borrow_slot::force_reset(slot);
+        }
       }
     }
-    return true;  // Forced wrap: >ceiling holds are unprotected (documented).
+    return true;  // Forced: >ceiling holds are unprotected (documented).
   }
   if (since == 0) {
     stripe->wrap_deferred_since_ns.store(now, std::memory_order_relaxed);
@@ -3154,7 +3266,7 @@ bool Volume::lease_permits_wrap(Stripe* stripe) {
     // reader serving a zero-copy borrow can copy-out before it fires.
     publish_wrap_deferred_deadline(stripe, now + _lease_ceiling_ns);
   }
-  return false;  // Defer the wrap; caller drops the fill.
+  return false;  // Defer; the caller drops the fill.
 }
 
 void Volume::publish_wrap_deferred_deadline(Stripe* stripe,
@@ -3339,7 +3451,9 @@ std::expected<Volume::WriteSlot, CacheError> Volume::allocate_write_slot(
     // flag is cleared and the fill dropped.
     set_wrap_intent(stripe, true);
     writer_seam(WriterSeam::kAfterIntentSet);
-    if (!lease_permits_wrap(stripe)) {
+    // Flush mode: the wrap exposes the whole previous pass at once, so it is
+    // gated over every chunk (N = 1: the one slot every borrow counts in).
+    if (!lease_gate(stripe, 0, stripe->chunks, /*episode=*/true)) {
       set_wrap_intent(stripe, false);
       _wraps_deferred_by_lease.fetch_add(1, std::memory_order_relaxed);
       _writes_dropped_by_lease.fetch_add(1, std::memory_order_relaxed);
@@ -3354,64 +3468,63 @@ std::expected<Volume::WriteSlot, CacheError> Volume::allocate_write_slot(
     // commits nothing here.  A holder escalated AFTER that gate (a second
     // multi-second escalation landing inside this short section) can still
     // commit these wrap mutations alongside the usurper's own wrap.  The
-    // exposure is bounded: intent-flag and epoch/wrap-count perturbations
-    // are reader-detectable (retry/miss), and the worst case — BOTH wraps
-    // toggle the phase, netting the phase back and "resurrecting" prior-
-    // phase entries — is caught per-read by the full-key verify + CRC
-    // envelope and the phase-ABA positional guard at both read choke
-    // points (probe + hop).  Detectable degradation, not silent overlap;
-    // the undetectable channel stays gated at publish/pwrite below.
+    // exposure is bounded: intent-flag and G perturbations are
+    // reader-detectable (retry/miss) -- G only ever moves forward, since
+    // each wrap re-reads it -- and a phase published out of step with G is
+    // caught per-read by the full-key verify + CRC envelope and the
+    // positional guard at both read choke points (probe + hop).  Detectable
+    // degradation, not silent overlap; the undetectable channel stays gated
+    // at publish/pwrite below.
     writer_seam(WriterSeam::kAfterGatePassed);
-    evict_if_needed(stripe, doc_size);
+    const uint64_t pass = stripe->pass_of(stripe->exposure_gen());
 
-    // Check again after eviction
-    available = data_area_end - stripe->write_pos;
-    if (doc_size > available) {
-      // Wrap to beginning of data area
-      stripe->write_pos = data_area_start;
-      // Multi-process: lower the SHARED guard cursor to the wrap target NOW,
-      // inside the intent window, not at commit_write_slot.  Readers' phase-
-      // ABA positional guard reads shared_write_pos; the wrap below makes
-      // every two-wrap survivor in [data_area_start, old cursor) current-phase
-      // again, and this wrap's own reservation starts at data_area_start.
-      // Left HIGH until commit, the guard would admit such a survivor for the
-      // whole reservation->pwrite window, and its borrow revalidates cleanly
-      // (intent already cleared, epoch already bumped) -- a torn live borrow
-      // once the pwrite lands.  It would also make a wrap whose first fill
-      // never commits wrap AGAIN on the next write (the next writer adopts
-      // the stale high cursor above), a second phase toggle with no pass in
-      // between.
-      //
-      // Ordering proof (in the style of the wrap-intent Dekker proof above).
-      // This release store is program-order BEFORE record_wrap's seq_cst
-      // epoch RMW.  A reader captures epoch_start (seq_cst load) before it
-      // probes, and the probe loads the cursor (acquire) after that:
-      //  - epoch_start reads the post-wrap count: it synchronizes with the
-      //    RMW, so the cursor load sees this store or a later one.  Later
-      //    stores are commit_write_slot's, published only after the fill is
-      //    durable, so the guard never covers unfilled bytes (F6 holds).
-      //    Everything at/after data_area_start is rejected until then.
-      //  - epoch_start reads the pre-wrap count: borrow_still_valid's later
-      //    epoch load (or its intent load) is where the reader catches this
-      //    wrap, exactly as before; the cursor value is irrelevant there.
-      // Lowering the cursor only ever REJECTS more (a miss), never exposes
-      // unfilled bytes.  Revalidate the lock first, like commit_write_slot: a
-      // usurped holder must not move the usurper's cursor (its
-      // commit_write_slot then fails the same check and skips the insert).
-      if (has_write_lock &&
-          stripe->mmap_directory->revalidate_write_lock(write_token)) {
-        stripe->mmap_directory->set_shared_write_pos(data_area_start);
-      }
-      writer_seam(WriterSeam::kWrapAfterCursor);
-      record_wrap(stripe);
-      writer_seam(WriterSeam::kAfterEpochStore);
+    // Wrap to beginning of data area
+    stripe->write_pos = data_area_start;
+    // Multi-process: lower the SHARED guard cursor to the wrap target NOW,
+    // inside the intent window, not at commit_write_slot.  Readers' phase-
+    // ABA positional guard reads shared_write_pos; the wrap below makes
+    // every two-wrap survivor in [data_area_start, old cursor) current-phase
+    // again, and this wrap's own reservation starts at data_area_start.
+    // Left HIGH until commit, the guard would admit such a survivor for the
+    // whole reservation->pwrite window, and its borrow revalidates cleanly
+    // (intent already cleared, G already stored) -- a torn live borrow once
+    // the pwrite lands.  It would also make a wrap whose first fill never
+    // commits wrap AGAIN on the next write (the next writer adopts the stale
+    // high cursor above), a second pass with no fill in between.
+    //
+    // Ordering proof (in the style of the wrap-intent Dekker proof above).
+    // This release store is program-order BEFORE the seq_cst G store below.
+    // A reader loads G (seq_cst) before it loads the cursor (acquire):
+    //  - G reads the post-wrap value: it synchronizes with the store, so
+    //    the cursor load sees this store or a later one.  Later stores are
+    //    commit_write_slot's, published only after the fill is durable, so
+    //    the guard never covers unfilled bytes (F6 holds).  Everything
+    //    at/after data_area_start is rejected until then.
+    //  - G reads the pre-wrap value: borrow_still_valid's later G load (or
+    //    its intent load) is where the reader catches this wrap, exactly as
+    //    before; the cursor value is irrelevant there.
+    // Lowering the cursor only ever REJECTS more (a miss), never exposes
+    // unfilled bytes.  Revalidate the lock first, like commit_write_slot: a
+    // usurped holder must not move the usurper's cursor (its
+    // commit_write_slot then fails the same check and skips the insert).
+    if (has_write_lock &&
+        stripe->mmap_directory->revalidate_write_lock(write_token)) {
+      stripe->mmap_directory->set_shared_write_pos(data_area_start);
     }
+    writer_seam(WriterSeam::kWrapAfterCursor);
+    // New pass P + 1.  The phase new entries carry is derived from it, then
+    // G publishes the pass with the frontier at N: flush mode exposes the
+    // whole previous pass (every borrow of it now reads as exposed).
+    publish_wrap_phase(stripe, pass + 1);
+    store_exposure_gen(
+        stripe, (pass + 1) * (uint64_t{stripe->chunks} + 1) + stripe->chunks);
+    record_wrap(stripe);  // telemetry
+    writer_seam(WriterSeam::kAfterEpochStore);
 
-    // Wrap decision + publish complete (toggle/reset/record done) — only
-    // now release the intent flag.  ORDER IS LOAD-BEARING: the reader-side
-    // Dekker leg "intent read as 0 from this clear => the epoch load sees
-    // the change" holds only because the phase toggle (evict_if_needed)
-    // and record_wrap's epoch bump stay program-order BEFORE this store.
+    // Wrap decision + publish complete — only now release the intent flag.
+    // ORDER IS LOAD-BEARING: the reader-side Dekker leg "intent read as 0
+    // from this clear => the G load sees the change" holds only because the
+    // G store stays program-order BEFORE this store.
     set_wrap_intent(stripe, false);
   }
 
@@ -3579,14 +3692,18 @@ VolumeStats Volume::stats() const {
       result.wrap_count += stripe->mmap_directory->shared_wrap_count();
       last_wrap_ns = std::max(
           last_wrap_ns, stripe->mmap_directory->shared_last_wrap_time_ns());
-      // Borrow gauge: live borrows registered in the SHARED slot
-      // (borrows held by all processes; saturates at 255 per stripe).
-      result.borrows_outstanding +=
-          borrow_slot::count(stripe->mmap_directory->borrow_slot_raw());
+      // Borrow gauge: live borrows registered in the SHARED per-chunk
+      // slots (borrows held by all processes).
+      for (uint32_t c = 0; c < stripe->chunks; ++c) {
+        result.borrows_outstanding += borrow_slot::count_of<uint32_t>(
+            stripe->mmap_directory->chunk_borrow_raw(c));
+      }
     } else {
       for (const auto& shard : stripe->local_borrow_shards) {
-        result.borrows_outstanding +=
-            borrow_slot::count(shard.slot.load(std::memory_order_relaxed));
+        for (uint32_t c = 0; c < stripe->chunks; ++c) {
+          result.borrows_outstanding += borrow_slot::count(
+              shard.slots[c].load(std::memory_order_relaxed));
+        }
       }
     }
   }
@@ -3842,46 +3959,35 @@ std::expected<void, CacheError> Volume::commit_write(
   return {};
 }
 
-void Volume::evict_if_needed(Stripe* stripe, size_t required_space) {
-  (void)required_space;
-
-  // Toggle the GC phase. All directory entries from the previous phase
-  // become stale: insert() can overwrite them, and probe/probe_each skip
-  // them. This implements ATS-inspired phase-based eviction — when the
-  // write position wraps, old entries pointing to now-overwritten disk
-  // regions are logically invalidated in a single O(1) operation.
+void Volume::publish_wrap_phase(Stripe* stripe, uint64_t new_pass) {
+  // The GC phase new entries carry, DERIVED from the pass (phase = P & 1)
+  // rather than toggled.  All directory entries of the previous pass then
+  // carry the other phase, which is how admission tells the two passes
+  // apart without touching a single entry: the O(1) flush of the
+  // ATS-inspired design.
   //
-  // INVARIANT (2-wrap phase ABA): phase() is a single bit, so an entry that
-  // SURVIVES its bucket through TWO wraps of this stripe reads as
-  // current-phase again and is no longer skipped as stale.  Two cases:
+  // INVARIANT (2-wrap phase ABA): the phase is a single bit, so an entry
+  // that SURVIVES its bucket through TWO wraps of this stripe carries the
+  // current phase again.  Two cases, both covered by admission:
   //
   // - Offset REUSED by a later pass: the entry aliases a DIFFERENT
-  //   document.  Under SINGLE-THREADED construction this cannot become a
-  //   wrong serve — the read path re-verifies the stored 256-bit first_key
-  //   (a DirEntry carries only a 12-bit tag), so the aliased entry
-  //   resolves to a clean miss or the correct live document; and any
+  //   document.  The read path re-verifies the stored 256-bit first_key (a
+  //   DirEntry carries only a 12-bit tag), so the aliased entry resolves to
+  //   a clean miss or the correct live document; and any
   //   directory-reachable document is fully written and synced before its
-  //   entry publishes (commit_write's ordering invariant), so the
-  //   never-invalidated checksum-validation cache cannot turn the reuse
-  //   into a torn serve.  Pinned by test_wrap_phase_aba.cpp (A)/(B).  Do
-  //   not weaken the read-path first_key check on the assumption that the
-  //   phase bit alone evicts stale entries.
+  //   entry publishes (commit_write's ordering invariant).  Pinned by
+  //   test_wrap_phase_aba.cpp (A)/(B).
   //
   // - Offset NOT reused (trailing-gap survivor, variable doc sizes): the
-  //   entry points at INTACT bytes sitting AHEAD of write_pos.  A borrow
-  //   taken through it passes every gauntlet leg legitimately, yet the
-  //   region is later overwritten by the plain in-pass FORWARD fill — no
-  //   wrap event, so neither lease_permits_wrap nor the intent/epoch
-  //   revalidation runs (both live in allocate_write_slot's wrap branch
-  //   only).  This VOIDS the renew_lease premise that "any overwrite of a
-  //   borrowed region is a wrap" (see the verdict comment there) and
-  //   tears bytes under a live, in-term lease.  KNOWN GAP, tracked
-  //   separately; demonstrated deterministically by the [!mayfail]
-  //   forward-fill test in test_wrap_phase_aba.cpp (C).
+  //   entry points at INTACT bytes sitting AHEAD of the write cursor, which
+  //   the plain forward fill later overwrites with no wrap event.  The
+  //   positional leg of admission (Stripe::admit_position / admit_hop)
+  //   rejects it.  Pinned by test_wrap_phase_aba.cpp (C)-(F).
+  const bool phase = (new_pass & 1U) != 0;
   if (stripe->use_mmap_directory && stripe->mmap_directory) {
-    stripe->mmap_directory->toggle_phase();
+    stripe->mmap_directory->set_current_phase(phase);
   } else if (stripe->directory) {
-    stripe->directory->toggle_phase();
+    stripe->directory->set_current_phase(phase);
   }
 
   ++_evictions;
@@ -4729,7 +4835,6 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
 
     // Snapshot the stripe at probe start (see read_sync).
     const StripeSnapshot snap = snapshot(stripe);
-    const BorrowEpoch epoch_start = borrow_epoch(snap);
     // Resurrection guard (see Stripe::remove_epoch): captured before the
     // probe, re-checked in the RAM-cache put's predicate below and
     // once more after a put that inserted.
@@ -4991,8 +5096,14 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
       // wrap raced (or is racing) this read — release, discard and
       // retry/miss.  Runs before the RAM-cache put below so possibly-
       // overwritten bytes are never cached, and is deliberately
-      // independent of the checksum-validation cache above.
-      BorrowToken borrow = acquire_borrow(stripe);
+      // independent of the checksum-validation cache above.  The borrow
+      // counts against the chunk of the SERVED node (not the head), and
+      // revalidates against that node's own exposure threshold.
+      const uint64_t selected_rel = selected_offset - stripe->offset;
+      const BorrowEpoch epoch_start =
+          borrow_epoch(stripe, snap.pass, selected_rel);
+      BorrowToken borrow =
+          acquire_borrow(stripe, stripe->chunk_of(selected_rel));
       stamp_read_lease(stripe);
       // Read-side acquire fence (see renew_read_lease): the chain walk
       // above copied header bytes into owned AlternateInfo with plain

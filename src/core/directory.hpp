@@ -266,12 +266,19 @@ class Directory {
   [[nodiscard]] size_t capacity() const { return _entries.size(); }
   [[nodiscard]] size_t bucket_count() const { return _num_buckets; }
 
-  // seq_cst: the phase is one half of the reader's stamp-then-revalidate
-  // wrap epoch (see Volume::wrap_epoch) — mirror MmapDirectory.
+  // The phase new entries are stamped with.  Readers never use it: they
+  // derive the phase from the pass in their stripe snapshot (see
+  // Volume::snapshot); only insert() and the legacy probe paths load it.
   [[nodiscard]] bool current_phase() const {
     return _current_phase.load(std::memory_order_seq_cst);
   }
   void toggle_phase();
+  // Store the phase outright (seq_cst).  The wrap derives it from the pass
+  // (phase = pass & 1) instead of toggling; mutators are externally
+  // serialized (class comment), like toggle_phase.
+  void set_current_phase(bool phase) {
+    _current_phase.store(phase, std::memory_order_seq_cst);
+  }
 
   [[nodiscard]] std::span<const std::byte> serialize() const;
   void deserialize(std::span<const std::byte> data);

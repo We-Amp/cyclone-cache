@@ -9,6 +9,7 @@
 #include <optional>
 #include <span>
 #include <thread>
+#include <type_traits>
 #include <utility>
 
 #include "cyclone/key.hpp"
@@ -43,46 +44,76 @@
 
 namespace cyclone {
 
-// Per-stripe outstanding-borrow accounting: a packed
-// {generation:8, count:8} slot manipulated with seq_cst RMWs.  Shared by
-// the cross-process slot in MmapDirectory::Header (offset 34, via
-// std::atomic_ref) and the process-local Stripe slot (std::atomic) —
-// template on the atomic-like type so both use one implementation.
+// Outstanding-borrow accounting: a packed {generation:8, count} slot
+// manipulated with seq_cst RMWs.  Two widths share one implementation:
 //
-// count — live disk-hit borrows (open ReadHandles) on the stripe.  The
-// wrap gate (Volume::lease_permits_wrap) defers a wrap only while
-// count > 0 AND the read lease is live: a closed handle releases write
-// capacity immediately instead of blocking writers for the rest of its
-// lease (the write-starvation fix).  Saturates at 255: a borrow
+//   uint16_t {gen:8, count:8}   the process-local per-thread, per-chunk
+//                               shard slots (Stripe::BorrowShard);
+//   uint32_t {gen:8, count:24}  the cross-process per-chunk slots in the
+//                               mmap directory's retention region (see
+//                               MmapDirectory::RetentionRegion), where every
+//                               process's borrows of one chunk share a slot.
+//
+// Templated on the atomic-like type (std::atomic or std::atomic_ref); the
+// packed word type is whatever that type's load() returns.  The generation
+// is always the top 8 bits.
+//
+// count — live disk-hit borrows (open ReadHandles) whose document starts in
+// the slot's chunk.  The gate (Volume::lease_gate) defers a wrap or a
+// frontier advance over that chunk only while count > 0 AND the read lease
+// is live: a closed handle releases write capacity immediately instead of
+// blocking writers for the rest of its lease (the write-starvation fix).
+// Saturates at the field maximum (255 for u16, 2^24-1 for u32): a borrow
 // acquired at saturation rides along uncounted (counted == false) and its
 // release is a no-op — the slot stays maximally protective and drains as
-// the counted holders close.
+// the counted holders close.  The 24-bit cross-process field makes that
+// ride-along unreachable in practice.
 //
-// generation — ABA guard for leaked counts.  A ceiling-forced wrap calls
-// force_reset (generation+1, count = 0) so a count leaked by a crashed
-// borrow holder starves the stripe for at most one lease_wrap_ceiling
-// episode; release() drops decrements whose generation no longer matches
-// (their increment is gone with the reset).  Residual risk: an 8-bit
-// generation recurs after exactly 256 forced-wrap resets, so a handle
-// held across 256 ceiling episodes (>= 256 x lease_wrap_ceiling, ~4h at
-// defaults, its bytes long since force-overwritten) that closes at that
-// precise recurrence mis-decrements one live borrow — accepted as
-// negligible against the 2-byte budget the shared header has left.
+// generation — ABA guard for leaked counts.  A ceiling-forced wrap or
+// advance calls force_reset (generation+1, count = 0) on EVERY chunk slot,
+// so a count leaked by a crashed borrow holder starves the stripe for at
+// most one lease_wrap_ceiling episode; release() drops decrements whose
+// generation no longer matches (their increment is gone with the reset).
+// Residual risk: an 8-bit generation recurs after exactly 256 forced
+// resets, so a handle held across 256 ceiling episodes (>= 256 x
+// lease_wrap_ceiling, ~4h at defaults, its bytes long since
+// force-overwritten) that closes at that precise recurrence mis-decrements
+// one live borrow — accepted as negligible.
 namespace borrow_slot {
 
-inline constexpr uint16_t kCountMask = 0x00FFU;
-inline constexpr unsigned kGenerationShift = 8;
+template <typename Word>
+inline constexpr unsigned kCountBits = sizeof(Word) * 8 - 8;
+template <typename Word>
+inline constexpr Word kCountMaskOf =
+    static_cast<Word>((uint64_t{1} << kCountBits<Word>)-1);
+
+template <typename Word>
+[[nodiscard]] constexpr uint8_t generation_of(Word slot) {
+  return static_cast<uint8_t>(slot >> kCountBits<Word>);
+}
+template <typename Word>
+[[nodiscard]] constexpr uint32_t count_of(Word slot) {
+  return static_cast<uint32_t>(slot & kCountMaskOf<Word>);
+}
+template <typename Word>
+[[nodiscard]] constexpr Word pack_of(uint8_t gen, uint32_t cnt) {
+  return static_cast<Word>((static_cast<uint64_t>(gen) << kCountBits<Word>) |
+                           (cnt & kCountMaskOf<Word>));
+}
+
+// The 16-bit spelling (process-local shard slots), kept by name.
+inline constexpr uint16_t kCountMask = kCountMaskOf<uint16_t>;
+inline constexpr unsigned kGenerationShift = kCountBits<uint16_t>;
 inline constexpr uint8_t kCountSaturated = 0xFFU;
 
 [[nodiscard]] constexpr uint8_t generation(uint16_t slot) {
-  return static_cast<uint8_t>(slot >> kGenerationShift);
+  return generation_of<uint16_t>(slot);
 }
 [[nodiscard]] constexpr uint8_t count(uint16_t slot) {
-  return static_cast<uint8_t>(slot & kCountMask);
+  return static_cast<uint8_t>(count_of<uint16_t>(slot));
 }
 [[nodiscard]] constexpr uint16_t pack(uint8_t gen, uint8_t cnt) {
-  return static_cast<uint16_t>(
-      (static_cast<uint16_t>(gen) << kGenerationShift) | cnt);
+  return pack_of<uint16_t>(gen, cnt);
 }
 
 struct Acquired {
@@ -95,32 +126,35 @@ struct Acquired {
 // seq_cst RMW is the reader's half of the Dekker pairing with the
 // writer's intent-store-then-count-load (proof at
 // Volume::allocate_write_slot).
-template <typename AtomicU16>
-[[nodiscard]] Acquired acquire(AtomicU16 &slot) {
-  uint16_t cur = slot.load(std::memory_order_seq_cst);
+template <typename AtomicWord>
+[[nodiscard]] Acquired acquire(AtomicWord &slot) {
+  using Word = std::remove_cv_t<decltype(slot.load())>;
+  Word cur = slot.load(std::memory_order_seq_cst);
   for (;;) {
-    if (count(cur) == kCountSaturated) {
-      return {generation(cur), false};
+    if (count_of<Word>(cur) == kCountMaskOf<Word>) {
+      return {generation_of<Word>(cur), false};
     }
-    uint16_t next = pack(generation(cur), static_cast<uint8_t>(count(cur) + 1));
+    Word next =
+        pack_of<Word>(generation_of<Word>(cur), count_of<Word>(cur) + 1);
     if (slot.compare_exchange_weak(cur, next, std::memory_order_seq_cst,
                                    std::memory_order_seq_cst)) {
-      return {generation(cur), true};
+      return {generation_of<Word>(cur), true};
     }
   }
 }
 
 // Drop a counted borrow: count-1 iff the generation still matches (a
-// mismatch means a forced wrap reset the slot since the acquire — the
+// mismatch means a forced reset cleared the slot since the acquire — the
 // increment is gone, so the release must not touch the new epoch's count).
-template <typename AtomicU16>
-void release(AtomicU16 &slot, uint8_t gen) {
-  uint16_t cur = slot.load(std::memory_order_seq_cst);
+template <typename AtomicWord>
+void release(AtomicWord &slot, uint8_t gen) {
+  using Word = std::remove_cv_t<decltype(slot.load())>;
+  Word cur = slot.load(std::memory_order_seq_cst);
   for (;;) {
-    if (generation(cur) != gen || count(cur) == 0) {
+    if (generation_of<Word>(cur) != gen || count_of<Word>(cur) == 0) {
       return;
     }
-    uint16_t next = pack(gen, static_cast<uint8_t>(count(cur) - 1));
+    Word next = pack_of<Word>(gen, count_of<Word>(cur) - 1);
     if (slot.compare_exchange_weak(cur, next, std::memory_order_seq_cst,
                                    std::memory_order_seq_cst)) {
       return;
@@ -128,19 +162,21 @@ void release(AtomicU16 &slot, uint8_t gen) {
   }
 }
 
-// Ceiling-forced wrap: invalidate all outstanding counts (generation+1,
+// Ceiling-forced reset: invalidate all outstanding counts (generation+1,
 // count = 0) so leaked state cannot starve the stripe past one ceiling
 // episode.  No-op (generation preserved) when the count is already 0, so
 // generations only burn when there was live-or-leaked state to clear.
 // Returns true when a reset happened.
-template <typename AtomicU16>
-bool force_reset(AtomicU16 &slot) {
-  uint16_t cur = slot.load(std::memory_order_seq_cst);
+template <typename AtomicWord>
+bool force_reset(AtomicWord &slot) {
+  using Word = std::remove_cv_t<decltype(slot.load())>;
+  Word cur = slot.load(std::memory_order_seq_cst);
   for (;;) {
-    if (count(cur) == 0) {
+    if (count_of<Word>(cur) == 0) {
       return false;
     }
-    uint16_t next = pack(static_cast<uint8_t>(generation(cur) + 1), 0);
+    Word next =
+        pack_of<Word>(static_cast<uint8_t>(generation_of<Word>(cur) + 1), 0);
     if (slot.compare_exchange_weak(cur, next, std::memory_order_seq_cst,
                                    std::memory_order_seq_cst)) {
       return true;
@@ -165,8 +201,15 @@ bool force_reset(AtomicU16 &slot) {
 /// ├────────────────────────────────────────┤
 /// │ Directory entries (10 bytes each)      │
 /// │   - 4 entries per bucket               │
+/// ├────────────────────────────────────────┤
+/// │ Retention region (v2, 8-byte aligned)  │
+/// │   - exposure generation G (8 bytes)    │
+/// │   - 64 per-chunk borrow slots (u32)    │
 /// └────────────────────────────────────────┘
 /// ```
+/// The retention region lives in what used to be slack between the entries
+/// and the page-rounded data offset, so the stripe's data offset is
+/// unchanged (static_assert in volume.cpp).
 ///
 /// Thread/Process Safety:
 /// - Multiple readers can read concurrently (lock-free)
@@ -179,7 +222,36 @@ class MmapDirectory {
   /// Maximum spins waiting for a writer to release the seqlock (even version).
   static constexpr size_t kMaxWriterWaitSpins = 1000;
   static constexpr uint32_t kMagic = 0x4D444952;  // "MDIR"
-  static constexpr uint16_t kVersion = 1;
+  // Version 2 (wrap retention): the retention region after the entries
+  // (exposure generation + per-chunk borrow slots) replaces the stripe-wide
+  // borrow slot at header offset 34, and the reader epoch is the exposure
+  // generation instead of {shared_wrap_count, current_phase}.  A v1 binary
+  // would neither count its borrows where a v2 writer looks nor honour the
+  // generation, so the two must never share a directory: kVersion is mixed
+  // into the fingerprinted filename (fingerprint_cache_path), and a v2
+  // opener never init()s over a v1 directory unless it holds the exclusive
+  // lifetime lock (Volume::open_locked).
+  static constexpr uint16_t kVersion = 2;
+
+  // Wrap retention: the maximum number of frontier chunks per stripe (N in
+  // doc/design/wrap-retention.md) and therefore of per-chunk borrow slots.
+  static constexpr size_t kMaxChunks = 64;
+
+  /// Cross-process retention state, placed 8-byte aligned right after the
+  /// directory entries.  Zeroed by init() like everything else.
+  struct RetentionRegion {
+    // G = pass * (N + 1) + frontier: the exposure generation, the ONLY
+    // reader epoch in v2.  Stored seq_cst, only by a write_lock holder.
+    uint64_t exposure_gen;
+    // Per-chunk outstanding-borrow slots, packed {generation:8, count:24}
+    // (borrow_slot helpers).  Chunk c counts every live borrow, from ANY
+    // process, of a document whose first byte lies in chunk c.
+    uint32_t chunk_borrows[kMaxChunks];
+  };
+  static_assert(sizeof(RetentionRegion) == 264,
+                "RetentionRegion is on-disk format (G + 64 x u32)");
+  static_assert(offsetof(RetentionRegion, chunk_borrows) == 8,
+                "chunk slots follow G");
 
   /// Header stored at the beginning of the mmap'd region
   struct Header {
@@ -250,6 +322,10 @@ class MmapDirectory {
     // Skew caveat: an old-build reader process does not count its borrows,
     // so during a rolling upgrade its borrows are protected only by the
     // lease timestamp, as before this fix.
+    //
+    // RETIRED in version 2: borrows are counted per chunk in the retention
+    // region (RetentionRegion::chunk_borrows).  The two bytes stay in the
+    // layout (the header is fully spent) and are kept zero.
     uint16_t stripe_borrow_slot;
 
     // Lease-protocol STEP-3 (2026-07-07): cross-process per-stripe force-wrap
@@ -345,8 +421,28 @@ class MmapDirectory {
   static_assert(std::atomic_ref<uint64_t>::is_always_lock_free,
                 "shared_write_pos requires lock-free uint64_t atomics");
 
+  /// Byte offsets of the version counters, the entries and the retention
+  /// region for `num_buckets` (caller guarantees no overflow).
+  static constexpr size_t entries_offset(size_t num_buckets) {
+    return (sizeof(Header) + num_buckets * sizeof(uint32_t) + 7) &
+           ~static_cast<size_t>(7);
+  }
+  static constexpr size_t retention_offset(size_t num_buckets) {
+    return (entries_offset(num_buckets) +
+            num_buckets * kEntriesPerBucket * sizeof(DirEntry) + 7) &
+           ~static_cast<size_t>(7);
+  }
+
   /// Calculate the total size needed for a directory with given bucket count
-  static size_t required_size(size_t num_buckets);
+  /// (SIZE_MAX on overflow).
+  static constexpr size_t required_size(size_t num_buckets) {
+    // Overflow guards: each product and sum below must fit size_t.
+    if (num_buckets > SIZE_MAX / (kEntriesPerBucket * sizeof(DirEntry) +
+                                  sizeof(uint32_t) + 1)) {
+      return SIZE_MAX;
+    }
+    return retention_offset(num_buckets) + sizeof(RetentionRegion);
+  }
 
   /// Initialize a new directory in the given memory region
   /// Returns nullopt if region is too small or num_buckets would overflow
@@ -465,27 +561,32 @@ class MmapDirectory {
   /// writer's staleness clamp instead).
   void stamp_lease_expiry(uint64_t new_expiry_ns, uint64_t skip_if_at_least_ns);
 
-  /// Raw packed {generation, count} borrow slot, seq_cst load.
-  /// The writer-side wrap gate reads this (count > 0 = borrows outstanding)
-  /// after its intent store and before any wrap side effect.
-  [[nodiscard]] uint16_t borrow_slot_raw() const;
+  /// Raw packed {generation:8, count:24} borrow slot of chunk `chunk`
+  /// (< kMaxChunks), seq_cst load.  The writer-side gate reads the slots of
+  /// the chunks it is about to expose (count > 0 = borrows outstanding)
+  /// after its intent store and before any side effect.
+  [[nodiscard]] uint32_t chunk_borrow_raw(size_t chunk) const;
 
-  /// Register a live borrow on this stripe (seq_cst CAS; count+1 unless
-  /// saturated).  Must run BEFORE the borrow escapes and before the
-  /// intent/epoch revalidation — see borrow_slot::acquire.
-  [[nodiscard]] borrow_slot::Acquired borrow_acquire();
+  /// Register a live borrow of a document starting in `chunk` (seq_cst
+  /// CAS; count+1 unless saturated).  Must run BEFORE the borrow escapes
+  /// and before the intent/epoch revalidation — see borrow_slot::acquire.
+  [[nodiscard]] borrow_slot::Acquired chunk_borrow_acquire(size_t chunk);
 
   /// Drop a counted borrow (generation-checked decrement); no-op when a
-  /// forced wrap reset the slot since the matching acquire.
-  void borrow_release(uint8_t generation);
+  /// forced reset cleared the slot since the matching acquire.
+  void chunk_borrow_release(size_t chunk, uint8_t generation);
 
-  /// Ceiling-forced wrap: generation+1, count = 0 (no-op when count == 0).
-  /// Returns true when outstanding state was cleared.
-  bool borrow_force_reset();
+  /// Ceiling-forced reset of EVERY chunk slot (generation+1, count = 0 on
+  /// each nonzero slot), so one ceiling episode clears leaked counts in all
+  /// chunks.  Returns true when any outstanding state was cleared.
+  bool chunk_borrows_force_reset_all();
 
-  /// Wrap epoch for the reader's stamp-then-revalidate protocol:
-  /// {shared_wrap_count, current_phase} loaded seq_cst.
-  [[nodiscard]] std::pair<uint64_t, bool> wrap_epoch() const;
+  /// Exposure generation G (seq_cst load); 0 on an invalid directory.
+  [[nodiscard]] uint64_t exposure_gen() const;
+
+  /// Publish a new exposure generation (seq_cst store).  Writer-side only,
+  /// under the write lock, inside the intent window.
+  void set_exposure_gen(uint64_t gen);
 
   /// Wrap-intent flag (seq_cst load).  True while a writer is
   /// inside the wrap decision + publish window; readers must discard the
@@ -615,14 +716,21 @@ class MmapDirectory {
       : _header(nullptr),
         _versions(nullptr),
         _entries(nullptr),
+        _retention(nullptr),
         _num_buckets(0) {}
+
+  /// True iff `region` starts with a directory header that carries our magic
+  /// but a DIFFERENT version -- a directory another binary is (or was)
+  /// using.  Such a region must never be init()ed without proof that no
+  /// peer is live (Volume::init_stripes).
+  static bool is_foreign_version(std::span<const std::byte> region);
 
  private:
   template <bool kFilterPhase, typename Callback>
   void probe_each_impl(const CacheKey &key, Callback &&callback) const;
 
   MmapDirectory(Header *header, uint32_t *versions, DirEntry *entries,
-                size_t num_buckets);
+                RetentionRegion *retention, size_t num_buckets);
 
   /// Get version counter for a bucket (atomic load)
   [[nodiscard]] uint32_t load_version(size_t bucket_idx) const;
@@ -659,6 +767,7 @@ class MmapDirectory {
   Header *_header;
   uint32_t *_versions;  // One per bucket (accessed via std::atomic_ref)
   DirEntry *_entries;
+  RetentionRegion *_retention;  // after the entries (see RetentionRegion)
   size_t _num_buckets;
 };
 
