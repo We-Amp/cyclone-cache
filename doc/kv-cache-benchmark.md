@@ -275,11 +275,6 @@ document builder → serialized record) and CRCs it before a single
    measured on top of the chunked `WILLNEED` and did not help (2.25 vs 2.33
    GB/s), so it is not used: `WILLNEED` already queues the large reads, and
    populating the PTEs up front only moves the per-page work.
-2. **Hardware CRC32** (ARMv8 / SSE4.2 intrinsics, >10 GB/s vs 0.55) and a
-   way for the verified state to outlive the process — the validation cache
-   could live beside the mmap directory so a restart and every peer process
-   inherit it. Covers the restart floor and the multi-process sub-scaling
-   on both platforms.
 2. **Fast CRC32** — ✅ **done** (then `src/core/crc32.{hpp,cpp}`; renamed
    to `crc32c.{hpp,cpp}` by the follow-up below). The byte-wise
    table routine was replaced by slice-by-16 tables plus an ARMv8
