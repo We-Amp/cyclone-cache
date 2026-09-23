@@ -17,6 +17,19 @@ option(CYCLONE_BUILD_HTTP_PLUGIN "Build HTTP alternate plugin" ON)
 option(CYCLONE_BUILD_EXAMPLES "Build examples" ON)
 option(CYCLONE_BUILD_BENCHMARKS "Build benchmarks" ON)
 option(CYCLONE_BUILD_CUDA_BENCHMARKS "Build the CUDA KV transfer benchmark" OFF)
+if(CYCLONE_BUILD_CUDA_BENCHMARKS)
+  if(WIN32)
+    # kv_gpu_cuda_host.cpp uses POSIX file and mmap APIs (unistd, sys/mman).
+    message(FATAL_ERROR
+      "CYCLONE_BUILD_CUDA_BENCHMARKS is not supported on Windows: the "
+      "kv_gpu_cuda host translation unit is POSIX-only")
+  endif()
+  if(NOT CYCLONE_BUILD_BENCHMARKS)
+    message(WARNING
+      "CYCLONE_BUILD_CUDA_BENCHMARKS=ON has no effect while "
+      "CYCLONE_BUILD_BENCHMARKS=OFF; kv_gpu_cuda will not be built")
+  endif()
+endif()
 option(CYCLONE_ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(CYCLONE_USE_BUNDLED_SHA256 "Use bundled SHA-256 instead of OpenSSL (for cross-compilation)" OFF)
 
@@ -289,12 +302,15 @@ if(CYCLONE_BUILD_BENCHMARKS)
   # -DCMAKE_CUDA_HOST_COMPILER=g++-13 (CUDA 12.4 accepts GCC <= 13) and
   # -DCMAKE_CUDA_ARCHITECTURES=<sm> for the device in the machine.
   if(CYCLONE_BUILD_CUDA_BENCHMARKS)
-    enable_language(CUDA)
-    find_package(CUDAToolkit REQUIRED)
+    # The default has to be in place before enable_language(CUDA): that call
+    # seeds CMAKE_CUDA_ARCHITECTURES from the compiler's own default, after
+    # which a NOT DEFINED check never fires.
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
       # Pascal: the GTX 1050 the experiment was first run on.
       set(CMAKE_CUDA_ARCHITECTURES 61)
     endif()
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
     if(CMAKE_CUDA_HOST_COMPILER)
       message(STATUS
         "kv_gpu_cuda: nvcc host compiler ${CMAKE_CUDA_HOST_COMPILER}")
