@@ -16,9 +16,9 @@ as a C++ API and a C ABI.
 |------|---------|----------------|
 | **Stripe (= Segment)** | The cache partitioning unit. The C API `num_segments` (`cyclone_c.h`) and `CacheKey::segment_hash()` (`key.hpp`) refer to the SAME stripes this doc describes — there is exactly ONE partitioning dimension. `stripe_index = key.segment_hash() % num_stripes`. | `key.hpp`, `cyclone_c.h`, "Volumes and Stripes" |
 | **Volume** | A single cache file on disk, divided into stripes for parallel access. | `src/core/volume.hpp`, "Volumes and Stripes" |
-| **VolumeHeader** | 64-byte header at offset 0; magic `0x43594C4E` ("CYLN") + format major/minor. Format major is **v7**. | `src/core/volume.hpp` (`VolumeHeader`) |
+| **VolumeHeader** | 64-byte header at offset 0; magic `0x43594C4E` ("CYLN") + format major/minor. Format major is **v8**. | `src/core/volume.hpp` (`VolumeHeader`) |
 | **Directory entry** | Compact 10-byte key→offset record. Bitfields: `tag` (12-bit collision tag), `phase` (1-bit phase GC), `head` (1-bit, first fragment), `pinned` (1-bit, reserved for do-not-evict — not enforced by eviction today), 40-bit `offset` (byte offset within the stripe; 1 TiB/stripe), `next` (bucket chain). Carries **no key material**. | `src/core/directory.hpp` (`DirEntry`) |
-| **Document / fragment** | On-disk record (132-byte header, format major **v7**). The format reserves `FirstFrag`/`MiddleFrag`/`LastFrag` types, but the implementation writes only `SingleFrag` documents today — a document must fit in one stripe's data area (write fails with `NoSpace` otherwise) and under `max_object_size` (`ObjectTooLarge`). | `src/core/document.hpp` (`Document`) |
+| **Document / fragment** | On-disk record (132-byte header, format major **v8**). The format reserves `FirstFrag`/`MiddleFrag`/`LastFrag` types, but the implementation writes only `SingleFrag` documents today — a document must fit in one stripe's data area (write fails with `NoSpace` otherwise) and under `max_object_size` (`ObjectTooLarge`). | `src/core/document.hpp` (`Document`) |
 | **bucket_hash / tag** | Within a stripe, `bucket_hash()` selects the directory bucket; `tag()` is the 12-bit collision tag. | `key.hpp` |
 | **Alternate / AlternateId** | A content variant under one key (Original, Brotli, Gzip, WebP, AVIF, JpegXL, Custom…). `AlternateId` normalizes UA capabilities into discrete classes. | `alternate.hpp` |
 | **Alternate chain** | Singly-linked list of alternates via `next_alternate_offset`. Directory points to the **head** (newest); **tail** is typically Original (oldest). Max 64 per key. | "Alternate Chains" |
@@ -157,9 +157,9 @@ overwritten.
 
 ### Document Format
 
-Each cached entry is a document with a 132-byte header (**v7** format,
+Each cached entry is a document with a 132-byte header (**v8** format,
 `document.hpp` (`Document`)). `Document::kVersionMajor` and
-`VolumeHeader::kFormatVersionMajor` are kept in lockstep at 7. The format
+`VolumeHeader::kFormatVersionMajor` are kept in lockstep at 8. The format
 reserves `FirstFrag`/`MiddleFrag`/`LastFrag` document types for spanning a
 large value across fragments, but the implementation writes only
 `SingleFrag` documents today (both write sites hardcode `Document::Type::SingleFrag`,
@@ -175,13 +175,13 @@ Document Header (132 bytes)
 ├─ frag_key     32 bytes  SHA-256 of this fragment
 ├─ header_len   uint32_t  metadata header size
 ├─ doc_type     uint8_t   Single / First / Middle / Last fragment (SingleFrag only, in practice)
-├─ ver_major    uint8_t   format version (7)
+├─ ver_major    uint8_t   format version (8)
 ├─ ver_minor    uint8_t   format version
 ├─ flags        uint8_t   document flags
 ├─ sync_serial  uint32_t
 ├─ write_serial uint32_t
 ├─ pin_until    uint32_t  pin expiration (Unix time)
-├─ checksum     uint32_t  CRC32 over header_data + content
+├─ checksum     uint32_t  CRC-32C over header_data + content
 ├─ frag_offset  uint32_t  offset within a multi-fragment document
 ├─ hit_count            uint32_t  persisted hit counter
 ├─ next_alternate_offset uint64_t offset to next alternate (chain)
@@ -190,6 +190,53 @@ Document Header (132 bytes)
 ├─ Header Data (variable)
 └─ Content Data (variable)
 ```
+
+**Document checksum.** `checksum` is a CRC-32**C** (Castagnoli) over
+header_data + content — everything after the 132-byte header. The convention
+is part of the on-disk format and is frozen: reflected polynomial
+`0x82F63B78`, init `0xFFFFFFFF`, reflected in and out, final XOR
+`0xFFFFFFFF`, so `crc32c("123456789") == 0xE3069283`. It lives in
+`src/core/crc32c.{hpp,cpp}`, behind `crc32c()` / `crc32c_update()`.
+
+CRC-32C replaced CRC-32/ISO-HDLC at format v8 for one reason: it is the
+polynomial *both* mainstream server architectures implement in hardware —
+it has a hardware path on x86-64 (SSE4.2 `crc32q`) as well as on ARMv8
+(`crc32cx`), where ISO-HDLC has instructions only on ARMv8, leaving x86 on
+the table path. On an i7-8750H it runs at 26.5 GB/s (table below). End to
+end it takes a cold 2 MiB read on Linux from 1.62 to 2.17 GB/s
+([kv-cache-benchmark.md](kv-cache-benchmark.md)).
+
+Implementations, all bit-identical, selected once on first use through a
+function pointer (no per-call feature branches):
+
+| Path | When | Apple M5, 2 MiB | i7-8750H, 2 MiB |
+|------|------|----------------:|----------------:|
+| byte-at-a-time table | reference only (the tests' oracle) | 0.61 GB/s | 0.50 GB/s |
+| slice-by-16 tables (portable) | everywhere else | 3.37 GB/s | 2.82 GB/s |
+| x86-64 SSE4.2 `crc32q`, 3-way interleaved | CPUID leaf 1 ECX bit 20 (`__get_cpuid` from `<cpuid.h>`; `__cpuid` wherever `_MSC_VER` is defined); the functions carry `target("sse4.2,crc32")` so the project's stock flags are unchanged | — | 26.51 GB/s |
+| ARMv8 `crc32cb/w/x`, 3-way interleaved | `__ARM_FEATURE_CRC32`, MSVC ARM64, or `AT_HWCAP & HWCAP_CRC32` on Linux aarch64 | 34.9 GB/s | — |
+
+Best of five `crc32c_bench --seconds 1` runs on an otherwise idle machine
+(clang on both; g++-13 reaches 19.3 GB/s on the same i7 loop); a run
+sharing the machine with a build loses a few percent. The portable path is
+the same slice-by-16 structure as the v7 ISO-HDLC one — the polynomial does
+not change its cost, so its rate is unchanged within that noise (3.37 here
+against 3.44 measured for ISO-HDLC on the M5, 2.82 against 2.83 on the i7).
+Single-stream hardware rates are 12.2 GB/s (M5) and 10.4 GB/s (i7); the
+3-way interleave is what lifts both to the figures in the table.
+
+Both hardware paths run **three** independent CRC registers over three
+adjacent blocks (8192 bytes, then 256) and stitch them back together with
+compile-time-generated GF(2) "advance over N zero bytes" operators: the
+`crc32` instruction has ~3 cycles of latency at one per cycle, so a single
+dependent chain leaves two thirds of the issue slots idle. On an M5 that is
+12.2 → 34.9 GB/s over 2 MiB. `crc32c_bench` times both, and
+`crc32c_update_hardware_1way()` exists so the comparison stays honest.
+
+This matters because the CRC-validation cache is per-process: the first
+read of an offset, every read after a restart, and every read in a second
+process re-verify the whole payload, so the CRC rate is the ceiling on cold
+read bandwidth. See [kv-cache-benchmark.md](kv-cache-benchmark.md).
 
 **Format version history** (a volume with a mismatched major version
 auto-resets on open when `auto_reset_on_incompatible`, default true,
@@ -202,6 +249,7 @@ auto-resets on open when `auto_reset_on_incompatible`, default true,
 | v5 | finer stripe granularity + persisted, authoritative `stripe_count` |
 | v6 | `hit_count` / `next_alternate_offset` / `last_access` laid out naturally aligned, so the in-place header RMW sites can store them atomically |
 | v7 | alternate chains are depth-bounded at write time; the bump leaves pre-bound (over-deep, possibly cyclic) chains behind rather than repairing them |
+| v8 | the document checksum is CRC-32C instead of CRC-32/ISO-HDLC; no byte of the layout moved, but every pre-v8 checksum was computed over a different polynomial, so the bump leaves those rings behind |
 
 ### Alternate Chains
 
@@ -616,6 +664,6 @@ disk hit (page fault) 50–200 µs; write 50–100 µs.
 ---
 
 *See also: [`multi-process.md`](multi-process.md) (cross-process model, seqlock,
-CRC32, read leases — the authoritative concurrency reference),
+CRC-32C, read leases — the authoritative concurrency reference),
 [`api-reference.md`](api-reference.md) (complete API),
 [`plugin-development.md`](plugin-development.md) (authoring plugins).*

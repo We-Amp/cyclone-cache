@@ -513,7 +513,7 @@ struct CacheConfig {
     // the bound.  See "Zero Values" below.
     size_t max_object_size = 64 * 1024 * 1024;
 
-    // Store a CRC32 with each document (default: true).  The C API copies
+    // Store a CRC-32C with each document (default: true).  The C API copies
     // this verbatim, so C 0 disables checksums outright.
     // See "Zero Values" below.
     bool enable_checksum = true;
@@ -584,7 +584,7 @@ to be discovered at runtime.
 **Checksums.**
 
 - C++ `CacheConfig::enable_checksum` defaults to `true`: every document
-  stored carries a CRC32, verified on read. (A stored CRC of `0` skips
+  stored carries a CRC-32C, verified on read. (A stored CRC of `0` skips
   verification, so documents written with checksums off still read back.)
 - C `CycloneCacheConfig::enable_checksum` is copied verbatim (`!= 0`). There
   is **no default and no sentinel mapping**, so `0` means **disabled** — the

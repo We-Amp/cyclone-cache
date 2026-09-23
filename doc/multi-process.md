@@ -10,7 +10,7 @@ Multi-process mode enables **write sharding** with **shared directory** across m
 - **Only the owning process can write** to its assigned stripes
 - **All processes can read from all stripes** (directory is shared via mmap)
 - **Writes to non-owned stripes are rejected** with `NotOwned` error
-- **Torn reads are detected** via CRC32 checksum validation
+- **Torn reads are detected** via CRC-32C checksum validation
 - **No inter-process locking** is required
 
 This design provides write isolation, shared cache visibility, and torn-read safety for multi-process deployments.
@@ -169,10 +169,10 @@ When a reader reads a document while another process is writing, the data may be
 3. Reader loads version counter again
 4. If versions differ, retry (up to `kMaxReadRetries = 100`)
 
-### Data Level (CRC32)
+### Data Level (CRC-32C)
 
 1. Reader maps the document region
-2. Reader validates the CRC32 checksum
+2. Reader validates the CRC-32C checksum
 3. If checksum fails:
    - Continue probing for the next candidate
    - After exhausting candidates, yield and retry
@@ -445,7 +445,7 @@ While this is now safe, best practice is still to release handles promptly to fr
 
 ### Borrow Safety Under Eviction (Read Leases)
 
-The seqlock + CRC32 gauntlet protects bytes only *inside* `read_sync`; a
+The seqlock + CRC-32C gauntlet protects bytes only *inside* `read_sync`; a
 borrowed `mapped_view()` span outlives it.  Lease-based region pinning protects the borrow itself: every disk-hit read stamps
 a shared per-stripe lease (`CacheConfig::read_lease_duration`, default 5s)
 in the mmap-directory header (offset 56), and a writer that needs to wrap
@@ -505,7 +505,7 @@ switch (result.error()) {
 
 ## On-Disk Format Versions
 
-The current on-disk format major version is **v7**
+The current on-disk format major version is **v8**
 (`VolumeHeader::kFormatVersionMajor` and `Document::kVersionMajor`, kept in
 lockstep). Version history:
 
@@ -516,10 +516,11 @@ lockstep). Version history:
 | v5 | finer auto-stripe granularity (32 MB) + persisted, authoritative `stripe_count` in the header |
 | v6 | `hit_count` / `next_alternate_offset` / `last_access` laid out naturally aligned, so the in-place header RMW sites can store them atomically |
 | v7 | alternate chains are depth-bounded at write time; the bump leaves pre-bound (over-deep, possibly cyclic) chains behind rather than repairing them |
+| v8 | the document checksum is CRC-32C (Castagnoli) instead of CRC-32/ISO-HDLC, so it has hardware instructions on x86-64 as well as ARMv8; pre-v8 checksums were computed over a different polynomial and the bump leaves those rings behind |
 
 ### Automatic Migration
 
-Migration is automatic: opening a volume whose major version predates v7
+Migration is automatic: opening a volume whose major version predates v8
 resets (reinitializes) it with the current format, losing the cached data —
 entries are cache data, so the cost is a one-time miss spike while the cache
 re-populates. With `auto_reset_on_incompatible = false`, the open fails with

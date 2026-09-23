@@ -54,7 +54,7 @@ bazel test //test/lib/cache:cache_burst_test  # Cross-process stress test
 ### Cross-Process Model
 
 See [doc/multi-process.md](doc/multi-process.md) for the cross-process model
-(seqlock directory, CRC32 torn-read detection). The phase-toggle and write-pos
+(seqlock directory, CRC-32C torn-read detection). The phase-toggle and write-pos
 CAS spinlocks (`phase_lock` / `write_lock`) are documented inline in
 `src/core/mmap_directory.hpp`. The durable rules distilled from past
 concurrency fixes live in "Concurrency invariants you must NOT break" below.
@@ -487,14 +487,14 @@ SHA-256, single thread except where noted, 4 KB objects;
 |-----------|------------|-------|
 | Key generation | 2.7-4.9M ops/sec | SHA-256 hashing, 0.2-0.3 µs |
 | Write (4KB) | 96K ops/sec | p50 10.1 µs, p99 14.6 µs |
-| Read (first-touch) | 131K ops/sec | p50 7.3 µs — page-in + CRC32 |
+| Read (first-touch) | 131K ops/sec | p50 7.3 µs — page-in + CRC-32C |
 | Read (warm, random) | 2.5M ops/sec | p50 0.33 µs |
 | Exists check | 4.4M ops/sec | 0.21 µs; directory lookup only |
 | Cache miss | 3.5M ops/sec | 0.29 µs; fast path |
 
 `read_sync` never populates the RAM tier, so the "warm" reads above are served
 from the mapped file (OS page cache), not the RAM cache; first-touch reads pay
-page-in plus CRC32 verification and are checksum-bound.
+page-in plus CRC-32C verification.
 
 Read scaling (`concurrent_read_bench 20000 512 2 0 512 ramoff` — 512 B objects,
 RAM tier off; a different harness, not comparable to the table above):
