@@ -98,14 +98,14 @@ JSON line per run, with at least:
   generation excluded);
 - `write_amp` = device bytes written (the block device holding the store,
   `/sys/dev/block/<maj:min>/stat`, including the final `syncfs`) / payload
-  bytes inserted; device bytes read is reported alongside;
+  bytes inserted; device bytes read is reported alongside;[^null]
 - on-disk footprint at the end (sum of allocated blocks under the store
   directory) and apparent file size;
 - peak RSS (`getrusage`) and peak cgroup `memory.current`;
 - LMDB: map size, high-water page, whether `MDB_MAP_FULL` occurred;
 - LRU stores: index entries and estimated index RAM;
 - Cyclone: `stats()` evictions, write-buffer wraps, writes dropped by lease,
-  tag-collision evictions, entries.
+  tag-collision evictions, entries.[^totals]
 
 ## Correctness
 
@@ -118,7 +118,7 @@ failure: the run exits non-zero.
 1. **Cyclone**: one volume, usable data area ≈ `C` (actual value printed),
    mmap directory ON, checksum ON and verified on read, default readahead,
    `max_object_size = 0`, `ram_cache_size = 0`, no per-write fsync, no
-   background subsystems. Eviction is Cyclone's own FIFO-by-wrap; no
+   background subsystems. Eviction is Cyclone's own FIFO-by-wrap;[^wrap] no
    application index.
 2. **LMDB**: `MDB_NOSYNC | MDB_NOMETASYNC | MDB_NOTLS` (± `MDB_WRITEMAP`:
    both measured briefly, the faster is kept and printed), map size
@@ -145,3 +145,24 @@ Cyclone having a lower hit ratio because FIFO evicts popular blocks is a real
 cost and must be stated, not normalised away. Also state qualitatively what
 LMDB needed that Cyclone didn't (app-level eviction code, volatile LRU index,
 fsync-off durability tradeoff) and vice versa.
+
+---
+
+Notes added after round 4 (the text above is unchanged from the
+pre-registered spec):
+
+[^null]: Device and cgroup counters are Linux-only. `kv_churn` emits
+    `write_amp`, `device_*` and `cgroup_*` as `null` where they are not
+    measured (another OS, or no cgroup v2).
+
+[^totals]: `kv_churn` reports these two as whole-run totals,
+    `cy_tag_collision_evictions_total` and `cy_entries_total` (warm-up
+    included); the other `cy_*` fields are measured-phase deltas. The round-4
+    JSONL files predate the rename and carry them as
+    `cy_tag_collision_evictions` and `cy_entries`.
+
+[^wrap]: Round 4 found that Cyclone's wrap eviction is worse than FIFO: a
+    wrap toggles the stripe's directory phase, so the whole previous pass
+    stops resolving at once (the phase flush). See
+    [Round 4](../kv-cache-benchmark.md#round-4-bounded-capacity-under-churn),
+    "Why: the hit ratio, and where it comes from".
