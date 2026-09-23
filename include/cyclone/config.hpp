@@ -47,7 +47,7 @@ enum class Tier : std::uint8_t {
 // Multi-process configuration for stripe affinity
 // When enabled, each process owns a subset of stripes and can only write to
 // those stripes. All processes can read from all stripes via mmap, with torn
-// read detection via CRC32.
+// read detection via CRC-32C.
 struct MultiProcessConfig {
   bool enabled = false;        // Disabled by default for backward compatibility
   uint32_t process_index = 0;  // This process's index (0 to total_processes-1)

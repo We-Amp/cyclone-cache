@@ -406,11 +406,11 @@ std::expected<void, CacheError> Cache::add_volume_locked(
   // in multi-process mode made every metadata write fsync the shared volume
   // inode, collapsing concurrent writers into serialized jbd2 journal commits
   // (an fsync convoy) that stalled the integrator's serving path.
-  // The periodic sync bounds the crash-loss window and the CRC32 read gauntlet
-  // (forced on below) downgrades any torn/unsynced entry to a cache miss, so
-  // dropping the per-write fsync loses no durability guarantee that matters for
-  // a reconstructible best-effort cache.  Integrators may still opt into
-  // per-write fsync explicitly via VolumeConfig::sync_on_write.
+  // The periodic sync bounds the crash-loss window and the CRC-32C read
+  // gauntlet (forced on below) downgrades any torn/unsynced entry to a cache
+  // miss, so dropping the per-write fsync loses no durability guarantee that
+  // matters for a reconstructible best-effort cache.  Integrators may still
+  // opt into per-write fsync explicitly via VolumeConfig::sync_on_write.
   VolumeConfig vol_config = config;
   // Structural-fingerprint the cache filename (upgrade safety): encode on-disk
   // FORMAT + GEOMETRY into the name so peers whose binaries disagree on layout
@@ -447,7 +447,7 @@ std::expected<void, CacheError> Cache::add_volume_locked(
       _impl->config.cross_process_ram_coherence;
   if (_impl->config.multi_process_config.enabled) {
     // Force read-side checksum verification: a persistent directory can
-    // surface a torn 10-byte DirEntry after a crash/power loss, and the CRC32
+    // surface a torn 10-byte DirEntry after a crash/power loss, and the CRC-32C
     // check in the read gauntlet is what downgrades such an entry to a cache
     // miss instead of serving garbage.  (enable_checksum is already
     // hard-required for multi-process in start().)

@@ -35,7 +35,7 @@ number below is reproducible with the commands in
 | **10 µs** | p50 for a 4 KB write, 14.6 µs p99 — **96 K writes/s**, no per-write fsync |
 | **~0.5 GB/s** | sustained single-thread write *and* first-read bandwidth at 64 KB–1 MB object sizes |
 | **0.4 µs** | to acquire a zero-copy view of a 1 MB object once it has been verified — cost is independent of object size |
-| **0** | stripe locks on the read path — per-bucket seqlocks, CRC32 and read leases instead |
+| **0** | stripe locks on the read path — per-bucket seqlocks, CRC-32C and read leases instead |
 | **10 bytes** | per directory entry; 132-byte document header; 1 TiB addressable per stripe |
 | **N processes** | may open the same cache file; each owns `stripe % N` for writes, all read everything |
 | **64** | content variants ("alternates") per key — compressed, transcoded, quantized… |
@@ -78,7 +78,7 @@ seqlock, a few guards, and a span into the mapped file:
 ```mermaid
 flowchart LR
     A["RAM tier<br/>probe"] -->|miss| B["Directory probe<br/>per-bucket seqlock"]
-    B --> C["Guards<br/>position · CRC32 · full key"]
+    B --> C["Guards<br/>position · CRC-32C · full key"]
     C --> D["Borrow region<br/>stamp lease"]
     D --> G{"Wrap intent or<br/>epoch moved?"}
     G -->|no| H["Serve<br/>zero-copy span"]
@@ -104,7 +104,7 @@ previous lap becomes stale. Details, with file:line anchors, live in
   writer from wrapping over bytes a reader is still holding.
 - **Multi-process by design.** Put the directory in the file
   (`MultiProcessConfig`), give each process an index, and worker processes
-  share one cache with seqlock + CRC32 torn-read detection — no daemon, no
+  share one cache with seqlock + CRC-32C torn-read detection — no daemon, no
   IPC.
 - **Crash-safe by ordering, not by fsync.** Data is durable before the
   directory entry is published; with the mmap directory the periodic
@@ -345,7 +345,7 @@ Close handles promptly; renew long holds with `renew_lease_strict()` and poll
 **Multi-process.** With `multi_process_config.enabled`, the directory lives in
 the cache file as a shared `MmapDirectory`. Process *i* of *N* writes only the
 stripes where `stripe % N == i` (`CacheError::NotOwned` otherwise) and reads
-all of them; readers detect torn documents by CRC32 and retry. Enable
+all of them; readers detect torn documents by CRC-32C and retry. Enable
 `cross_process_ram_coherence` to have a RAM-tier hit re-validated against the
 shared directory's bucket version, so a peer's purge is never served stale.
 The file must live on a filesystem with working byte-range locks (not NFS or
@@ -471,7 +471,7 @@ struct CacheConfig {
   size_t       ram_cache_size = 256_MB;           // 0 = no RAM tier
   RamCacheType ram_cache_type = RamCacheType::CLFUS;  // or LRU
   size_t       max_object_size = 64_MB;           // larger writes fail with ObjectTooLarge; 0 = unbounded
-  bool         enable_checksum = true;            // CRC32 per document
+  bool         enable_checksum = true;            // CRC-32C per document
   bool         verify_checksum_on_read = true;    // first read of each offset verifies it
   uint32_t     small_tier_percent = 0;            // 1..50 enables the small-object tier
   bool         cross_process_ram_coherence = false;
@@ -647,7 +647,7 @@ below is served from the memory-mapped disk tier.
 |-----------|------:|----:|----:|------:|
 | Key generation (SHA-256) | 2.7–4.9 M | 0.2–0.3 µs | 0.5 µs | 0.5 µs |
 | Write, 4 KB | 96 K | 10.1 µs | 14.6 µs | 25 µs |
-| Read, first touch (page-in + CRC32) | 131 K | 7.3 µs | 10.3 µs | 13.8 µs |
+| Read, first touch (page-in + CRC-32C) | 131 K | 7.3 µs | 10.3 µs | 13.8 µs |
 | Read, warm (random) | **2.5 M** | **0.33 µs** | 0.58 µs | 0.75 µs |
 | Exists | 4.4 M | 0.21 µs | 0.29 µs | 0.42 µs |
 | Miss | 3.5 M | 0.29 µs | 0.33 µs | 0.42 µs |
@@ -693,7 +693,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DCYCLONE_USE_BUNDLED_SHA256=ON && cma
 ## Thread safety and concurrency invariants
 
 - Readers take no stripe lock in any mode. Correctness comes from per-bucket
-  seqlocks (readers retry, never block), commit ordering, CRC32, full-key
+  seqlocks (readers retry, never block), commit ordering, CRC-32C, full-key
   re-verification, a positional guard against phase-bit ABA, and read leases.
 - Writers hold the stripe mutex only inside `commit_write`.
 - Everything a reader touches is sharded per thread: 64 read anchors per

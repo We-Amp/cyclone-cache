@@ -202,8 +202,9 @@ CRC-32C replaced CRC-32/ISO-HDLC at format v8 for one reason: it is the
 polynomial *both* mainstream server architectures implement in hardware —
 it has a hardware path on x86-64 (SSE4.2 `crc32q`) as well as on ARMv8
 (`crc32cx`), where ISO-HDLC has instructions only on ARMv8, leaving x86 on
-the table path. The x86-64 path is not yet measured; see the TODO in
-[kv-cache-benchmark.md](kv-cache-benchmark.md).
+the table path. On an i7-8750H it runs at 26.5 GB/s (table below). End to
+end it takes a cold 2 MiB read on Linux from 1.62 to 2.17 GB/s
+([kv-cache-benchmark.md](kv-cache-benchmark.md)).
 
 Implementations, all bit-identical, selected once on first use through a
 function pointer (no per-call feature branches):
@@ -212,7 +213,7 @@ function pointer (no per-call feature branches):
 |------|------|----------------:|----------------:|
 | byte-at-a-time table | reference only (the tests' oracle) | 0.61 GB/s | 0.50 GB/s |
 | slice-by-16 tables (portable) | everywhere else | 3.37 GB/s | 2.82 GB/s |
-| x86-64 SSE4.2 `crc32q`, 3-way interleaved | `__builtin_cpu_supports("sse4.2")` (`__cpuid` leaf 1 ECX bit 20 on MSVC); the one function carries `target("sse4.2")` so the project's stock flags are unchanged | — | 26.51 GB/s |
+| x86-64 SSE4.2 `crc32q`, 3-way interleaved | CPUID leaf 1 ECX bit 20 (`__get_cpuid` from `<cpuid.h>`; `__cpuid` wherever `_MSC_VER` is defined); the functions carry `target("sse4.2,crc32")` so the project's stock flags are unchanged | — | 26.51 GB/s |
 | ARMv8 `crc32cb/w/x`, 3-way interleaved | `__ARM_FEATURE_CRC32`, MSVC ARM64, or `AT_HWCAP & HWCAP_CRC32` on Linux aarch64 | 34.9 GB/s | — |
 
 Best of five `crc32c_bench --seconds 1` runs on an otherwise idle machine
@@ -663,6 +664,6 @@ disk hit (page fault) 50–200 µs; write 50–100 µs.
 ---
 
 *See also: [`multi-process.md`](multi-process.md) (cross-process model, seqlock,
-CRC32, read leases — the authoritative concurrency reference),
+CRC-32C, read leases — the authoritative concurrency reference),
 [`api-reference.md`](api-reference.md) (complete API),
 [`plugin-development.md`](plugin-development.md) (authoring plugins).*
