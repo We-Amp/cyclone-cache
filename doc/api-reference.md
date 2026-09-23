@@ -161,7 +161,20 @@ struct CacheStats {
     uint64_t current_entries;
     uint64_t current_bytes;
     uint64_t ram_cache_bytes;
+    uint64_t stripe_count;           // Stripes summed across disk volumes
+    uint64_t stripe_bytes;           // Their summed sizes
     uint64_t evictions;
+
+    // HitTracker flush diagnostics
+    uint64_t hit_flush_successes;
+    uint64_t hit_flush_failures;
+    uint64_t hit_flush_total_delta;     // Sum of all flushed hit deltas
+    uint64_t hit_flush_fsyncs;          // fsyncs after flush cycles
+    uint64_t hit_flush_lock_contended;  // Deltas dropped on lock contention
+
+    // Durability (see below)
+    uint64_t directory_syncs;  // Completed periodic directory syncs
+    uint64_t fsyncs;           // Every raw fd fsync, all volumes, all causes
 
     // Wrap-cadence telemetry (aggregated across volumes)
     uint64_t write_buffer_wraps;     // Circular write-buffer wraps since open
@@ -173,6 +186,16 @@ struct CacheStats {
     uint64_t wraps_deferred_by_lease;  // Wraps deferred by a live read lease
     uint64_t writes_dropped_by_lease;  // Fills dropped by deferred wraps
     uint64_t wraps_forced_past_lease;  // Wraps forced past lease_wrap_ceiling
+    uint64_t borrows_outstanding;      // GAUGE: open disk-hit borrows
+
+    // Directory-entry evictions that are not wraps (process-local; see below)
+    uint64_t tag_collision_evictions;  // Full bucket, colliding tag replaced
+    uint64_t bucket_full_evictions;    // Full bucket, no collision to displace
+
+    // Cross-process reset gate (see below)
+    uint64_t volumes_with_degraded_reset_gate;  // GAUGE; expected 0
+    uint64_t resets_under_degraded_gate;        // THE ALARM; expected 0
+    uint64_t resets_gate_verified;              // Healthy upgrade resets
 
     // Alternate-chain depth bound (process-local; see below)
     uint64_t alternate_shadows_unlinked;   // Superseded nodes spliced out
@@ -241,6 +264,35 @@ chain rather than linking to the pre-wrap one — expected on any cache that
 wraps while alternates are being re-recorded, and otherwise indistinguishable
 from an ordinary wrap.
 
+`tag_collision_evictions` and `bucket_full_evictions` count directory
+entries a write had to evict because the target bucket (4 entries) was
+full. The first counts the case where a *different* key with the same 12-bit
+tag already sat in the full bucket: that entry is replaced rather than
+updated in place, since only a full-key match may update in place. The
+second counts a full bucket of current-phase entries with no collision to
+displace: the entry nearest the wrap cursor is replaced so the write still
+lands. The two are disjoint, and both are process-local (the writer that
+evicts is the one that counts). Neither is counted in `evictions`, which
+counts wraps (one per phase flip). A steadily rising value suggests too
+few directory entries for the object count; see `VolumeStats` in
+`src/core/volume.hpp`.
+
+`fsyncs` counts every raw `fsync` on the volume files: per-write syncs when
+`VolumeConfig::sync_on_write` is set, the periodic `DirectorySyncer`
+(`directory_syncs` counts its completed cycles), HitTracker flushes
+(`hit_flush_fsyncs`), and syncs at initialisation and removal. With the
+default `sync_on_write = false` it should grow at about the sync interval,
+not with the write rate; a rate that follows writes is an fsync convoy.
+
+`borrows_outstanding` is a gauge of open disk-hit read handles (in
+multi-process mode it includes every process's borrows, saturating at 255
+per stripe). Nonzero while the cache is full means fills that need a wrap
+are being deferred for those readers. The reset-gate fields report whether
+an incompatible open could reset a volume under a live peer:
+`volumes_with_degraded_reset_gate` is nonzero only on a filesystem without
+working byte-range locks, and `resets_under_degraded_gate` counts resets
+that ran without the gate and should stay 0.
+
 `readahead_hints_issued` counts the large-document readahead hints the disk
 read path actually issued (see ["Large-Document
 Readahead"](#large-document-readahead) below), summed across volumes. It
@@ -249,9 +301,11 @@ kernel calls made, not large reads served: a hot document contributes at most
 one hint per re-advise interval (2 s) however often it is read, and a document
 below `readahead_min_bytes` never contributes. Process-local.
 
-The C API mirrors these fields at the end of `CycloneCacheStats`
-(append-only extension), **except `readahead_hints_issued`**, which is
-C++-only.
+`CycloneCacheStats` (C API) carries the core counters, the wrap and lease
+counters, `tag_collision_evictions`, `borrows_outstanding`, the reset-gate
+fields, `bucket_full_evictions`, the alternate counters and the RAM-coherence
+counters, in that append-only order. The stripe geometry, HitTracker flush,
+`directory_syncs`, `fsyncs` and `readahead_hints_issued` fields are C++-only.
 
 ```cpp
 void reset_stats();

@@ -29,6 +29,24 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (byte-wise reference, portable slice-by-16, hardware single-stream and
   3-way interleaved, and whatever runtime dispatch selected) over 4 KiB,
   64 KiB and 2 MiB buffers, and prints the selected path.
+- KV-cache storage-tier benchmarks, built with `CYCLONE_BUILD_BENCHMARKS`
+  (results and method in `doc/kv-cache-benchmark.md`):
+  - `kv_bench`: the workload in `doc/kv-cache-benchmark/kv-workload-spec.md`
+    (put, first-touch get, warm Zipf get in `view` / `copy` mode, restart,
+    multi-process read) over 512 KiB-32 MiB blocks; `--drop-caches-cmd`,
+    `--readahead-min-bytes` and `--pause-before-warm` for cold-cache and
+    readahead runs, and `readahead_hints_issued` printed per cold phase.
+  - `kv_churn`: a bounded-capacity tier under churn
+    (`doc/kv-cache-benchmark/kv-churn-spec.md`), get-or-insert against a full
+    volume, reporting hit ratio, served bandwidth, latency and Linux
+    device/cgroup counters.
+  - `kv_churn_policy`: replays the churn key streams through LRU, FIFO and
+    Cyclone's wrap eviction without I/O, to attribute hit-ratio differences.
+  - `kv_gpu_metal` (Apple only): host-to-GPU transfer of stored blocks on
+    Metal, including a single wrap of the whole volume mapping.
+  - `kv_gpu_cuda`, behind the new `CYCLONE_BUILD_CUDA_BENCHMARKS` option
+    (default `OFF`, not supported on Windows): the same experiment over
+    PCIe with `cudaHostRegister`.
 
 ### Changed
 
@@ -58,6 +76,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   file that lists srcs explicitly. No new copts or defines are needed: the
   hardware paths use per-function target attributes and runtime dispatch,
   so the stock compiler flags still build every path.
+- C API: `cyclone_c.h` now compiles as C11 as well as C++. `CycloneError`
+  and `CycloneTier` are `typedef uint8_t` plus an anonymous enum of their
+  constants (previously C++ `using X = enum : uint8_t`), so the ABI is
+  unchanged. From C++ this is observable: they are no longer distinct
+  types, so overloads on them collide with `uint8_t`, and streaming one
+  with `<<` prints a character rather than a number.
 - License: Apache License 2.0 (was BUSL-1.1). See `LICENSE` and `NOTICE`.
 - License: every file carries an Apache-2.0 SPDX header or is a documented
   exception, verified with Apache RAT.
@@ -71,3 +95,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   two-wrap survivor at the wrap target and take a borrow that the pwrite then
   tore. A wrap whose first write failed also left the cursor high, so the next
   write wrapped again (a second phase toggle with no pass in between).
+- HitTracker: the flush thread slept in fixed 100 ms slices, so a
+  `CacheConfig::hit_flush_interval` below 100 ms flushed late (a 50 ms
+  interval flushed after at least 100 ms). It now sleeps
+  `min(100 ms, remaining)`.

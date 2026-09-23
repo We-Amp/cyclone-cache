@@ -14,6 +14,7 @@
 // Consumers today:
 //   benchmarks/kv_bench.cpp       the five-phase storage-tier sweep
 //   benchmarks/kv_gpu_metal.mm    the Apple-silicon GPU transfer experiment
+//   benchmarks/kv_churn.cpp       bounded-capacity churn (kv-churn-spec.md)
 //
 // Header-only and deliberately free of Cyclone internals: it uses the public
 // CacheKey only, so a peer harness can be diffed against it line by line.
@@ -210,6 +211,86 @@ inline uint64_t copy_out(std::span<const std::byte> data,
   std::memcpy(buffer.data(), data.data(), len);
   return len == 0 ? 0
                   : static_cast<uint64_t>(std::to_integer<uint8_t>(buffer[0]));
+}
+
+// ---------------------------------------------------------------------------
+// Churn v1 (doc/kv-cache-benchmark/kv-churn-spec.md): a bounded-capacity
+// tier under get-or-insert.  Key index i still means key SHA-256("prefix-<i>")
+// and value xorshift64*(state i); what is new is WHICH indices are drawn.
+// ---------------------------------------------------------------------------
+inline constexpr uint64_t kChurnPermSeed = 0x243F6A8885A308D3ULL;
+inline constexpr uint64_t kChurnChoiceSeedBase = 1000003;
+inline constexpr uint64_t kChurnZipfSeedBase = 42;
+inline constexpr double kChurnScanFraction = 0.1;
+inline constexpr uint64_t kChurnScanBase = uint64_t{1} << 40;
+inline constexpr uint64_t kChurnScanThreadStride = uint64_t{1} << 32;
+
+// One fixed permutation of [0, u): Zipf rank r -> key index perm[r], so the
+// popular keys are not numerically adjacent.
+inline std::vector<uint64_t> churn_permutation(size_t u) {
+  std::vector<uint64_t> perm(u);
+  for (size_t i = 0; i < u; ++i) perm[i] = i;
+  uint64_t state = kChurnPermSeed;
+  for (size_t i = u; i > 1; --i) {
+    const size_t j = static_cast<size_t>(xorshift64star(state) % i);
+    std::swap(perm[i - 1], perm[j]);
+  }
+  return perm;
+}
+
+// Per-thread key-index stream for pattern "zipf" (scan = false) or
+// "zipf+scan" (scan = true).
+class ChurnStream {
+ public:
+  ChurnStream(const std::vector<uint64_t> &perm, uint32_t thread_id, bool scan)
+      : _perm(perm),
+        _zipf(perm.size(), kZipfTheta, kChurnZipfSeedBase + thread_id),
+        _choice(kChurnChoiceSeedBase + thread_id),
+        _scan(scan),
+        _scan_base(kChurnScanBase + thread_id * kChurnScanThreadStride) {}
+
+  uint64_t next() {
+    if (_scan) {
+      const double u = static_cast<double>(xorshift64star(_choice) >> 11) *
+                       (1.0 / 9007199254740992.0);
+      if (u < kChurnScanFraction) return _scan_base + _scan_next++;
+    }
+    return _perm[_zipf.next()];
+  }
+
+ private:
+  const std::vector<uint64_t> &_perm;
+  ZipfGenerator _zipf;
+  uint64_t _choice;
+  bool _scan;
+  uint64_t _scan_base;
+  uint64_t _scan_next = 0;
+};
+
+inline CacheKey churn_key(uint64_t index) {
+  const CacheKey hashed("prefix-" + std::to_string(index));
+  return CacheKey::from_digest(hashed.digest());
+}
+
+// Copies of the auto stripe-geometry constants (kAutoStripeGranularity,
+// kAutoStripeTarget in src/core/volume.hpp); kv_churn static_asserts them
+// against the originals and checks the stripe count its volume gets.
+inline constexpr size_t kChurnAutoStripeGranularity = size_t{32} * 1024 * 1024;
+inline constexpr size_t kChurnAutoStripeTarget = 16;
+
+// Stripe count of an auto-geometry volume with `usable` bytes after the
+// volume header: compute_stripe_geometry() in src/core/volume.cpp,
+// clamp(round(usable / granularity), 1, target).
+inline size_t churn_stripe_count(size_t usable) {
+  const size_t n =
+      (usable + kChurnAutoStripeGranularity / 2) / kChurnAutoStripeGranularity;
+  return std::clamp<size_t>(n, 1, kChurnAutoStripeTarget);
+}
+
+// The stripe a key index lands in: Volume::select_stripe() routes by
+// key.segment_hash() % stripe count.
+inline size_t churn_stripe_of(uint64_t index, size_t stripes) {
+  return churn_key(index).segment_hash() % stripes;
 }
 
 // ---------------------------------------------------------------------------

@@ -18,28 +18,30 @@ responses and their content-negotiated variants, rendered pages, transcoded
 images, or the [KV-cache tensors of an LLM prefix](#kv-cache-for-llm-inference).
 
 **Status:** v0.1.0, pre-release. On-disk format v8. The API is not yet frozen;
-pin a commit when you depend on it. All numbers below are from one machine
-(Apple M5 / macOS 27); expect different absolutes on Linux/NVMe.
+pin a commit when you depend on it. The numbers below are from one machine
+(Apple M5 / macOS 27) unless they name another; expect different absolutes
+on Linux/NVMe.
 
 ## Cyclone in numbers
 
-Measured on this repository at the current commit — Apple M5 (10 cores),
-macOS 27, Release build, bundled SHA-256, single thread unless stated. Every
-number below is reproducible with the commands in
+Measured on 2026-09-23 at commit `87cd986` — Apple M5 (10 cores), macOS
+27.0, Release build, bundled SHA-256, single thread unless stated, median of
+three runs. Every number below is reproducible with the commands in
 [Reproducing the numbers](#reproducing-the-numbers).
 
 | Number | What it means |
 |---:|---|
-| **0.33 µs** | p50 for a warm hit served from the mapped file (4 KB object) — **2.5 M reads/s** on one thread |
-| **17.6 M reads/s** | 4 threads hammering the mmap tier (512 B objects), 3.3× one thread; 22 M/s at 16 threads |
-| **10 µs** | p50 for a 4 KB write, 14.6 µs p99 — **96 K writes/s**, no per-write fsync |
-| **~0.5 GB/s** | sustained single-thread write *and* first-read bandwidth at 64 KB–1 MB object sizes |
+| **0.38 µs** | p50 for a warm hit served from the mapped file (4 KB object) — **2.3 M reads/s** on one thread |
+| **17.6 M reads/s** | 4 threads hammering the mmap tier (512 B objects), 3.3× one thread; 21 M/s at 16 threads |
+| **2.6 µs** | p50 for a 4 KB write, 21 µs p99 — **229 K writes/s**, no per-write fsync |
+| **11–13 GB/s** | single-thread first read of a 64 KB–1 MB object, checksum verified (hardware CRC-32C) |
+| **~1 GB/s** | sustained single-thread write of 2 MiB values over a 4 GiB dataset ([KV benchmark](doc/kv-cache-benchmark.md)) |
 | **0.4 µs** | to acquire a zero-copy view of a 1 MB object once it has been verified — cost is independent of object size |
 | **0** | stripe locks on the read path — per-bucket seqlocks, CRC-32C and read leases instead |
 | **10 bytes** | per directory entry; 132-byte document header; 1 TiB addressable per stripe |
 | **N processes** | may open the same cache file; each owns `stripe % N` for writes, all read everything |
 | **64** | content variants ("alternates") per key — compressed, transcoded, quantized… |
-| **639** | Catch2 test cases, 209 K assertions, plus libFuzzer harnesses; CI on Linux, macOS, Windows |
+| **657** | Catch2 test cases, about 150 K assertions, plus libFuzzer harnesses; CI on Linux, macOS, Windows |
 
 ## Architecture
 
@@ -90,7 +92,8 @@ Writers take exactly one stripe lock — the stripe's mutex in `commit_write` �
 and publish a directory entry only after the document bytes are durable, so a
 crash can never leave an entry pointing at torn data. Eviction is O(1):
 when a stripe's log wraps, a single phase bit flips and every entry from the
-previous lap becomes stale. Details, with file:line anchors, live in
+previous lap becomes stale — cheap, at a measurable hit-ratio cost for
+large-value tiers (see the [KV benchmark](doc/kv-cache-benchmark.md)). Details, with file:line anchors, live in
 [doc/architecture.md](doc/architecture.md) and
 [doc/multi-process.md](doc/multi-process.md).
 
@@ -207,7 +210,8 @@ examples, and benchmarks.
 | `CYCLONE_BUILD_TESTS` | ON | Build the `cyclone-tests` Catch2 binary |
 | `CYCLONE_BUILD_HTTP_PLUGIN` | ON | Build the RFC 7234 alternate-selection plugin (defines `CYCLONE_HTTP_PLUGIN` for consumers) |
 | `CYCLONE_BUILD_EXAMPLES` | ON | Build `examples/` |
-| `CYCLONE_BUILD_BENCHMARKS` | ON | Build `cache_benchmark`, `performance_baseline`, `concurrent_read_bench` |
+| `CYCLONE_BUILD_BENCHMARKS` | ON | Build `cache_benchmark`, `performance_baseline`, `concurrent_read_bench`, `kv_bench`, `kv_churn`, `kv_churn_policy`, `crc32c_bench`, and on Apple `kv_gpu_metal` |
+| `CYCLONE_BUILD_CUDA_BENCHMARKS` | OFF | Also build `kv_gpu_cuda` (needs the CUDA toolkit; not on Windows) |
 | `CYCLONE_BUILD_FUZZERS` | OFF | Build the libFuzzer harnesses in `fuzz/` (Clang only) |
 | `CYCLONE_ENABLE_ASAN` | OFF | AddressSanitizer for a quick local check |
 | `CYCLONE_USE_BUNDLED_SHA256` | OFF | Bundled SHA-256 instead of OpenSSL; ON in CI, required where OpenSSL headers are absent |
@@ -241,21 +245,36 @@ while you stream it to the device. Persist the key/value tensors of a prompt
 prefix to node-local NVMe, and the next request that shares the prefix loads
 them instead of recomputing them.
 
-- **Zero-copy loads.** On a disk hit `content()` aliases the mapped volume —
-  acquiring a view costs ~0.4 µs whether the value is 4 KB or 1 MB, and
-  nothing is copied into your address space on the way to the GPU.
+Measured against LMDB, RocksDB and file-per-block in
+[doc/kv-cache-benchmark.md](doc/kv-cache-benchmark.md): reads are in LMDB's
+class (warm, and cold on Linux/NVMe from 2 MiB up), writes run at about
+1 GB/s per thread, behind file-per-block, and as a **bounded** tier under
+churn Cyclone is not better than LMDB with an LRU: its wrap-based eviction
+holds a hit ratio about 9 points lower, so it serves 0.6–1.0× LMDB's
+throughput at 2 MiB, though with a lower hit-latency tail at 4 threads.
+
+- **Zero-copy loads.** On a disk hit `content()` aliases the mapped volume;
+  acquiring a view costs about 0.4 µs regardless of size. For device
+  transfer, register the whole volume mapping once (`volume_files()`,
+  `content_file_offset()`); pinning each returned span is slower than
+  staging.
 - **Safe aliasing under eviction.** The borrow + lease pins the region while
   your handle is open; `renew_lease_strict()` and `ns_until_forced_wrap()`
   tell you exactly when to de-alias.
 - **One cache, many workers.** Tensor-parallel ranks or replicas on one node
   share a single file: each owns a slice of stripes for writes, all read
   everything with no locks.
-- **Restart-warm.** With the mmap directory (multi-process mode) the index
-  lives in the file: a worker restart or redeploy does not cold-start the
-  prefix cache.
+- **Restart-warm index.** With the mmap directory the index lives in the
+  file, so a restart needs no rebuild step. Data pages still come back from
+  disk, and each first read re-verifies its checksum.
 - **Variants per prefix.** Up to 64 alternates per key, IDs 128–255 reserved
   for your own scheme — fp16 / fp8 / int4 copies of the same prefix, chosen
   at read time.
+- **Eviction is FIFO by wrap, not LRU.** When a stripe's log wraps, every
+  entry from its previous lap stops resolving at once, and the disk tier has
+  no scan resistance (CLFUS covers only the RAM tier, which a KV tier
+  normally disables). Under churn that costs about 9 hit-ratio points
+  against an LRU.
 - **Bring your own hash.** `CacheKey::from_digest()` takes a raw 32-byte
   digest, so a rolling hash over token blocks is the key; prefix chaining
   policy stays in your connector.
@@ -280,11 +299,12 @@ Sizing for KV blobs: raise `max_object_size` (default 64 MB; `0` removes the
 bound; the format tops out just under 4 GiB) and set `stripe_size` larger than
 your largest value — a document must fit in one stripe, and one that cannot is
 refused with `NoSpace`. Set `ram_cache_size = 0`
-and let the OS page cache be the RAM tier; consider
-`verify_checksum_on_read = false` for multi-hundred-MB values, where the CRC
-pass dominates the first read. Cyclone is a node-local tier behind a KV
-connector — it is not a distributed store, has no GPU-direct or RDMA path, and
-ships no Python bindings today. Write bandwidth is ~0.5 GB/s per thread.
+and let the OS page cache be the RAM tier. First-read checksum verification
+is cheap with hardware CRC-32C, and multi-process mode forces it on. Cyclone
+is a node-local tier behind a KV connector — it is not a distributed store,
+has no GPU-direct or RDMA path, and ships no Python bindings today. Write
+bandwidth at 2 MiB is about 1 GB/s per thread (`kv_bench`: 1.01 GB/s on
+Linux/NVMe, 0.7–1.3 GB/s across runs on an Apple M5).
 
 ## Concepts
 
@@ -555,10 +575,10 @@ See [doc/plugin-development.md](doc/plugin-development.md).
 `cyclone_c.h` exposes the cache with `extern "C"` linkage for FFI from
 Python, Rust, Go, Nginx modules, and friends, including an async read with a
 miss handler that coalesces concurrent misses for the same key into one
-origin fetch. Two caveats: the header itself currently needs a C++ compiler
-(it uses `using` aliases — bindings that call the ABI directly, such as
-ctypes or cffi, are unaffected), and C reads copy into a handle-owned buffer
-rather than aliasing the mapping.
+origin fetch. The header compiles as C11 and as C++. `CycloneError` and
+`CycloneTier` are `typedef uint8_t` with named constants, so from C++ they
+are plain integers, not distinct enum types. C reads copy into a
+handle-owned buffer rather than aliasing the mapping.
 
 ```c
 #include "cyclone/cyclone_c.h"
@@ -634,10 +654,12 @@ next_alternate_offset (8 B) · last_access · alternate_id · reserved
 
 ## Performance
 
-All figures: Apple M5 (10 cores), macOS 27, `-DCMAKE_BUILD_TYPE=Release
+All figures: Apple M5 (10 cores), macOS 27.0, `-DCMAKE_BUILD_TYPE=Release
 -DCYCLONE_USE_BUNDLED_SHA256=ON`, cache file on the internal SSD, default
-`CacheConfig`. The RAM tier is not populated by `read_sync`, so every "hit"
-below is served from the memory-mapped disk tier.
+`CacheConfig`; commit `87cd986`, 2026-09-23, median of three runs with the
+1-minute load average below 3 (other work was running on the machine). The
+RAM tier is not populated by `read_sync`, so every "hit" below is served
+from the memory-mapped disk tier.
 
 ### Single-thread latency, 4 KB objects (`performance_baseline`)
 
@@ -645,36 +667,41 @@ below is served from the memory-mapped disk tier.
 
 | Operation | ops/s | p50 | p99 | p99.9 |
 |-----------|------:|----:|----:|------:|
-| Key generation (SHA-256) | 2.7–4.9 M | 0.2–0.3 µs | 0.5 µs | 0.5 µs |
-| Write, 4 KB | 96 K | 10.1 µs | 14.6 µs | 25 µs |
-| Read, first touch (page-in + CRC-32C) | 131 K | 7.3 µs | 10.3 µs | 13.8 µs |
-| Read, warm (random) | **2.5 M** | **0.33 µs** | 0.58 µs | 0.75 µs |
-| Exists | 4.4 M | 0.21 µs | 0.29 µs | 0.42 µs |
-| Miss | 3.5 M | 0.29 µs | 0.33 µs | 0.42 µs |
-| Mixed 70 % read / 20 % exists / 10 % write | 1.2 M | 0.38 µs | 3.8 µs | 7.0 µs |
+| Key generation (SHA-256) | 2.9–4.8 M | 0.2–0.3 µs | 0.5 µs | 0.5 µs |
+| Write, 4 KB | 229 K | 2.6 µs | 21 µs | 165 µs |
+| Read, first touch (page-in + CRC-32C) | 1.18 M | 0.67 µs | 1.6 µs | 3.8 µs |
+| Read, warm (random) | **2.3 M** | **0.38 µs** | 0.54 µs | 0.67 µs |
+| Exists | 4.1 M | 0.21 µs | 0.29 µs | 0.38 µs |
+| Miss | 3.4 M | 0.29 µs | 0.38 µs | 0.46 µs |
+| Mixed 70 % read / 20 % exists / 10 % write | 1.8 M | 0.38 µs | 2.2 µs | 5.0 µs |
 
 ### Object-size sweep (`performance_baseline --content-size …`)
 
-| Object | Write ops/s (MB/s) | First read ops/s (MB/s) | Warm read p50 |
-|-------:|-------------------:|------------------------:|--------------:|
-| 4 KB | 95.7 K (374) | 131 K (512) | 0.33 µs |
-| 64 KB | 8.6 K (534) | 9.1 K (567) | 0.33 µs |
-| 1 MB | 526 (526) | 559 (559) | 0.38 µs |
+| Object | Write ops/s (MB/s) | Write p50 | First read ops/s (MB/s) | Warm read p50 |
+|-------:|-------------------:|----------:|------------------------:|--------------:|
+| 4 KB | 229 K (939) | 2.6 µs | 1.18 M (4 828) | 0.38 µs |
+| 64 KB | 23.9 K (1 563) | 12 µs | 168 K (10 984) | 0.33 µs |
+| 1 MB | 4 656 (4 882) | 152 µs | 12.1 K (12 704) | 0.38 µs |
 
-First reads pay page-in plus a CRC-32C over the content (hardware
-`crc32c*`/`crc32q` where the CPU has it, a slice-by-16 table otherwise); a
-warm read re-runs no CRC and copies nothing, so its cost does not grow with
-the object.
+MB/s is decimal. First reads pay page-in plus a CRC-32C over the content
+(hardware `crc32c*`/`crc32q` where the CPU has it, a slice-by-16 table
+otherwise); a warm read re-runs no CRC and copies nothing, so its cost does
+not grow with the object. These runs are short and stay in the page cache
+(500 × 1 MB is 0.5 GB). Write throughput varied up to 6× between runs as
+writeback kicked in, so read the write p50 as the steadier figure. A
+sustained multi-GiB write stream measures about 1 GB/s at 2 MiB (1.01 GB/s
+on Linux/NVMe; 0.7–1.3 GB/s across runs on this Mac) — see the
+[KV benchmark](doc/kv-cache-benchmark.md).
 
 ### Read scaling (`concurrent_read_bench`, 512 B objects, RAM tier off)
 
 | Threads | reads/s | vs 1 thread |
 |--------:|--------:|------------:|
 | 1 | 5.3 M | 1.0× |
-| 2 | 9.4 M | 1.8× |
+| 2 | 9.5 M | 1.8× |
 | 4 | 17.6 M | 3.3× |
-| 8 | 18.6 M | 3.5× |
-| 16 | 22.1 M | 4.2× |
+| 8 | 17.8 M | 3.3× |
+| 16 | 21.1 M | 3.9× |
 
 The M5 has 4 performance and 6 efficiency cores; scaling is near-linear across
 the performance cores and flattens as work lands on efficiency cores.
@@ -725,6 +752,10 @@ reporting.
 - [doc/multi-process.md](doc/multi-process.md) — the cross-process model in depth
 - [doc/api-reference.md](doc/api-reference.md) — complete API reference
 - [doc/plugin-development.md](doc/plugin-development.md) — writing plugins
+- [doc/kv-cache-benchmark.md](doc/kv-cache-benchmark.md) — Cyclone as an LLM
+  KV-cache tier against LMDB, RocksDB and file-per-block; workload specs in
+  [kv-workload-spec.md](doc/kv-cache-benchmark/kv-workload-spec.md) and
+  [kv-churn-spec.md](doc/kv-cache-benchmark/kv-churn-spec.md)
 - [CONTRIBUTING.md](CONTRIBUTING.md) — toolchain, formatting gate, sanitizers
 - [CHANGELOG.md](CHANGELOG.md)
 
