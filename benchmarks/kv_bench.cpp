@@ -86,6 +86,7 @@
 #include <optional>
 #include <span>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -336,6 +337,21 @@ void remove_volume_files(const Options &opts) {
   }
 }
 
+// Removes the volume files when the block-size iteration ends, on every exit
+// path (including the failure `break`s), so an aborted run does not leave a
+// multi-GiB volume behind in the temp directory.  Declare it BEFORE the Cache
+// so the Cache is destroyed (and its mappings released) first.
+class VolumeFilesGuard {
+ public:
+  explicit VolumeFilesGuard(const Options &opts) : _opts(opts) {}
+  ~VolumeFilesGuard() { remove_volume_files(_opts); }
+  VolumeFilesGuard(const VolumeFilesGuard &) = delete;
+  VolumeFilesGuard &operator=(const VolumeFilesGuard &) = delete;
+
+ private:
+  const Options &_opts;
+};
+
 CacheConfig make_config(const Options &opts) {
   CacheConfig config;
   config.ram_cache_size = 0;  // CLFUS is pointless for multi-MB blocks
@@ -574,14 +590,13 @@ bool verify_blocks(Cache &cache, const Dataset &ds, size_t block_size,
 }
 
 Record run_sequential_get(Cache &cache, const Dataset &ds, size_t block_size,
-                          const std::string &phase, bool verify_content) {
+                          const std::string &phase) {
   using clock = std::chrono::steady_clock;
   const size_t n = ds.keys.size();
   std::vector<double> latencies;
   latencies.reserve(n);
   uint64_t hits = 0;
   uint64_t bytes = 0;
-  uint64_t bad = 0;
   uint64_t sink = 0;
 
   const auto start = clock::now();
@@ -591,21 +606,6 @@ Record run_sequential_get(Cache &cache, const Dataset &ds, size_t block_size,
     if (rh.has_value()) {
       const auto content = rh->content();
       sink += touch_pages(content);
-      if (verify_content) {
-        uint64_t word = 0;
-        if (content.size() != block_size) {
-          ++bad;
-        } else {
-          std::memcpy(&word, content.data(), sizeof(word));
-          if (word != first_word_of_block(i)) ++bad;
-          const auto header = rh->header();
-          if (header.size() != kMetaSize ||
-              std::memcmp(header.data(), ds.metadata[i].data(), kMetaSize) !=
-                  0) {
-            ++bad;
-          }
-        }
-      }
       bytes += content.size();
       ++hits;
       rh->close();
@@ -617,9 +617,6 @@ Record run_sequential_get(Cache &cache, const Dataset &ds, size_t block_size,
   const double secs =
       std::chrono::duration<double>(clock::now() - start).count();
   g_sink.fetch_add(sink, std::memory_order_relaxed);
-  if (bad > 0) {
-    std::cerr << "  WARNING: " << bad << " content/metadata mismatches\n";
-  }
 
   Record r;
   r.phase = phase;
@@ -805,13 +802,34 @@ void print_usage(const char *argv0) {
       << "  --help, -h            Show this help\n";
 }
 
+// Strict unsigned parse: the whole string must be decimal digits (std::stoull
+// would accept "-1" and wrap it, or trailing junk).  Throws
+// std::invalid_argument / std::out_of_range, which main() turns into a usage
+// error.
+uint64_t parse_unsigned(const std::string &text) {
+  if (text.empty() ||
+      text.find_first_not_of("0123456789") != std::string::npos) {
+    throw std::invalid_argument("not an unsigned integer: " + text);
+  }
+  return std::stoull(text);
+}
+
+double parse_seconds(const std::string &text) {
+  size_t pos = 0;
+  const double v = std::stod(text, &pos);
+  if (pos != text.size() || !std::isfinite(v) || v <= 0.0) {
+    throw std::invalid_argument("not a positive number: " + text);
+  }
+  return v;
+}
+
 std::vector<uint32_t> parse_thread_list(const std::string &spec) {
   std::vector<uint32_t> out;
   std::stringstream ss(spec);
   std::string item;
   while (std::getline(ss, item, ',')) {
     if (item.empty()) continue;
-    out.push_back(static_cast<uint32_t>(std::stoul(item)));
+    out.push_back(static_cast<uint32_t>(parse_unsigned(item)));
   }
   return out;
 }
@@ -824,13 +842,30 @@ int main(int argc, char *argv[]) {
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
-    if (arg == "--block-size" && i + 1 < argc) {
-      opts.block_sizes.push_back(std::stoull(argv[++i]));
-    } else if (arg == "--seconds" && i + 1 < argc) {
-      opts.seconds = std::stod(argv[++i]);
-    } else if (arg == "--threads" && i + 1 < argc) {
-      opts.threads = parse_thread_list(argv[++i]);
-    } else if (arg == "--no-verify") {
+    // Numeric values that do not parse print the usage and exit 2 instead of
+    // escaping as an uncaught exception (std::terminate / abort).
+    try {
+      if (arg == "--block-size" && i + 1 < argc) {
+        const uint64_t bs = parse_unsigned(argv[++i]);
+        if (bs == 0) throw std::invalid_argument("block size 0");
+        opts.block_sizes.push_back(static_cast<size_t>(bs));
+        continue;
+      }
+      if (arg == "--seconds" && i + 1 < argc) {
+        opts.seconds = parse_seconds(argv[++i]);
+        continue;
+      }
+      if (arg == "--threads" && i + 1 < argc) {
+        opts.threads = parse_thread_list(argv[++i]);
+        continue;
+      }
+    } catch (const std::exception &e) {
+      std::cerr << "Invalid value for " << arg << ": " << argv[i] << " ("
+                << e.what() << ")\n";
+      print_usage(argv[0]);
+      return 2;
+    }
+    if (arg == "--no-verify") {
       opts.no_verify = true;
     } else if (arg == "--no-mmap-dir") {
       opts.no_mmap_dir = true;
@@ -955,6 +990,7 @@ int main(int argc, char *argv[]) {
     std::cerr << " ===\n";
 
     remove_volume_files(opts);
+    const VolumeFilesGuard volume_cleanup(opts);
     const Dataset ds = build_dataset(n);
 
     auto cache = open_store(opts, block_size);
@@ -984,8 +1020,7 @@ int main(int argc, char *argv[]) {
 
     std::cerr << "  [2/5] get_first_touch\n";
     drop_caches(opts);
-    record(
-        run_sequential_get(*cache, ds, block_size, "get_first_touch", false));
+    record(run_sequential_get(*cache, ds, block_size, "get_first_touch"));
 
     std::cerr << "  [3/5] get_warm (Zipf theta=" << kZipfTheta << ")\n";
     for (Mode mode : {Mode::kView, Mode::kCopy}) {
@@ -1006,7 +1041,7 @@ int main(int argc, char *argv[]) {
       exit_code = 1;
       break;
     }
-    record(run_sequential_get(*cache, ds, block_size, "restart", false));
+    record(run_sequential_get(*cache, ds, block_size, "restart"));
 
     if (opts.skip_multiprocess) {
       std::cerr << "  [5/5] multiprocess_read: skipped "
@@ -1035,7 +1070,8 @@ int main(int argc, char *argv[]) {
 
     cache->stop();
     cache.reset();
-    remove_volume_files(opts);
+    // volume_cleanup removes the volume files here, and on every failure
+    // `break` above.
   }
 
   print_markdown(std::cout, records);
