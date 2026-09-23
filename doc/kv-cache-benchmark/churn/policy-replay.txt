@@ -1,6 +1,9 @@
-zipf      block=2097152 U=24576 capacity=8191 blocks (511/stripe x 16): lru 0.8498 fifo 0.8179 stripe-fifo 0.8174 wrap-flush 0.7608
-zipf+scan block=2097152 U=24576 capacity=8191 blocks (511/stripe x 16): lru 0.7251 fifo 0.6867 stripe-fifo 0.6865 wrap-flush 0.6437
-zipf      block=2097152 U=3072 capacity=1023 blocks (63/stripe x 16): lru 0.8154 fifo 0.7774 stripe-fifo 0.7754 wrap-flush 0.7058
-zipf+scan block=2097152 U=3072 capacity=1023 blocks (63/stripe x 16): lru 0.6935 fifo 0.6478 stripe-fifo 0.6463 wrap-flush 0.5929
-zipf      block=524288 U=98304 capacity=32764 blocks (2046/stripe x 16): lru 0.8667 fifo 0.8385 stripe-fifo 0.8383 wrap-flush 0.7887
-zipf+scan block=524288 U=98304 capacity=32764 blocks (2046/stripe x 16): lru 0.7405 fifo 0.7053 stripe-fifo 0.7052 wrap-flush 0.6678
+# ./build/kv_churn_policy
+zipf      block=2097152 U=24576 capacity=8191 blocks (511/stripe x 16): lru 0.8498 fifo 0.8179 stripe-fifo 0.8172 wrap-flush 0.7605
+zipf+scan block=2097152 U=24576 capacity=8191 blocks (511/stripe x 16): lru 0.7251 fifo 0.6867 stripe-fifo 0.6867 wrap-flush 0.6438
+# ./build/kv_churn_policy 2097152 2147483648
+zipf      block=2097152 U=3072 capacity=1023 blocks (63/stripe x 16): lru 0.8154 fifo 0.7774 stripe-fifo 0.7726 wrap-flush 0.7029
+zipf+scan block=2097152 U=3072 capacity=1023 blocks (63/stripe x 16): lru 0.6935 fifo 0.6478 stripe-fifo 0.6444 wrap-flush 0.5902
+# ./build/kv_churn_policy 524288
+zipf      block=524288 U=98304 capacity=32764 blocks (2046/stripe x 16): lru 0.8667 fifo 0.8385 stripe-fifo 0.8385 wrap-flush 0.7883
+zipf+scan block=524288 U=98304 capacity=32764 blocks (2046/stripe x 16): lru 0.7405 fifo 0.7053 stripe-fifo 0.7051 wrap-flush 0.6680
