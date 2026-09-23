@@ -12,9 +12,10 @@
 // point in a fresh store; the sweep script runs each under a 4 GiB memory
 // cgroup so the tier is larger than the page cache.
 //
-// Eviction is Cyclone's own FIFO-by-wrap: the harness keeps no index.  The
-// peer harness (LMDB, file-per-block) runs the same streams and has to bring
-// its own LRU; `--print-vectors` prints the stream heads both must agree on.
+// Eviction is Cyclone's own, per stripe on wrap: the harness keeps no index.
+// The peer harness (LMDB, file-per-block) runs the same streams and has to
+// bring its own LRU; `--print-vectors` prints the stream heads both must agree
+// on.
 //
 // Cyclone tuning (printed at startup):
 //   volume size        the usable data area (stripes minus their mmap
@@ -28,7 +29,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
+#include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -44,6 +48,7 @@
 #include <vector>
 
 #include "core/mmap_directory.hpp"
+#include "core/volume.hpp"
 #include "cyclone/cache.hpp"
 #include "cyclone/config.hpp"
 #include "cyclone/error.hpp"
@@ -75,13 +80,20 @@ constexpr size_t kReopenGets = 10000;
 // Stream heads printed for the cross-harness check (the spec asks for 5;
 // 12 also shows the first zipf+scan scan keys).
 constexpr int kVectorLength = 12;
-// Directory buckets per stripe: kDirectoryEntriesPerSegment in
-// src/core/volume.cpp (not exported).  Only used to PRINT and size the data
-// area; the store itself never reads this.
+// Directory buckets per stripe.  Source of truth: kDirectoryEntriesPerSegment
+// in src/core/volume.cpp, file-local there and so not reachable for a
+// static_assert; keep the two in sync by hand.  Only used to PRINT and size
+// the data area; the store itself never reads this.
 constexpr size_t kDirBucketsPerStripe = 16 * 1024;
 constexpr size_t kPage = 4096;
-// VolumeHeader::kSize (src/core/volume.hpp).
 constexpr size_t kVolumeHeaderSize = 64;
+static_assert(kVolumeHeaderSize == VolumeHeader::kSize,
+              "kVolumeHeaderSize must match VolumeHeader::kSize");
+static_assert(kChurnAutoStripeGranularity == kAutoStripeGranularity &&
+                  kChurnAutoStripeTarget == kAutoStripeTarget,
+              "kv_workload.hpp's stripe-geometry copies are stale");
+// read_sync errors other than NotFound reported individually per thread.
+constexpr uint64_t kReadErrorReports = 5;
 
 double seconds_since(Clock::time_point t0) {
   return std::chrono::duration<double>(Clock::now() - t0).count();
@@ -105,7 +117,7 @@ struct Options {
 };
 
 // ---------------------------------------------------------------------------
-// Host instrumentation (Linux; zeros elsewhere)
+// Host instrumentation (Linux; reported as null where unavailable)
 // ---------------------------------------------------------------------------
 std::string run_command(const std::string& cmd) {
 #ifdef _WIN32
@@ -303,13 +315,13 @@ size_t dir_bytes_per_stripe() {
   return (raw + kPage - 1) / kPage * kPage;
 }
 
-// Auto geometry: 16 even-tiled stripes once the volume is >= 512 MiB, each
-// with a fixed-size mmap directory at its head.  Size the volume so the
-// stripes' DATA areas sum to the requested capacity.
+// Auto geometry: churn_stripe_count() even-tiled stripes (16 once the volume
+// is >= 512 MiB), each with a fixed-size mmap directory at its head.  Size the
+// volume so the stripes' DATA areas sum to the requested capacity.
 size_t volume_size_for(size_t capacity) {
-  constexpr size_t kStripes = 16;
+  const size_t stripes = churn_stripe_count(capacity);
   const size_t raw =
-      kVolumeHeaderSize + capacity + (kStripes * dir_bytes_per_stripe());
+      kVolumeHeaderSize + capacity + (stripes * dir_bytes_per_stripe());
   return (raw + kPage - 1) / kPage * kPage;
 }
 
@@ -321,6 +333,20 @@ void remove_volume_files(const Options& opts) {
     }
   }
 }
+
+// Removes the volume files on every exit path from main() once the store
+// exists.  Declared before the Cache it outlives, so the cache is closed
+// first.
+class VolumeFilesGuard {
+ public:
+  explicit VolumeFilesGuard(const Options& opts) : _opts(opts) {}
+  VolumeFilesGuard(const VolumeFilesGuard&) = delete;
+  VolumeFilesGuard& operator=(const VolumeFilesGuard&) = delete;
+  ~VolumeFilesGuard() { remove_volume_files(_opts); }
+
+ private:
+  const Options& _opts;
+};
 
 std::unique_ptr<Cache> open_store(const Options& opts) {
   CacheConfig config;
@@ -447,7 +473,14 @@ class Worker {
     }
     const auto t1 = Clock::now();
     ++_stats.misses;
-    if (rh.error() != CacheError::NotFound) ++_stats.read_errors;
+    if (rh.error() != CacheError::NotFound) {
+      if (++_stats.read_errors <= kReadErrorReports) {
+        std::cerr << "WARNING: read_sync on index " << idx << " failed: "
+                  << cache_error_category().message(
+                         static_cast<int>(rh.error()))
+                  << " (counted as a miss)\n";
+      }
+    }
     if (!insert_on_miss) return true;
 
     fill_block(_gen, idx);  // "compute" the block: harness work, not timed
@@ -542,6 +575,25 @@ void usage(const char* argv0) {
             << "  --print-vectors         print the stream heads and exit\n";
 }
 
+// Whole-string numeric parses; false on junk, overflow or a trailing suffix.
+bool parse_u64(const char* s, uint64_t& out) {
+  const char* end = s + std::strlen(s);
+  const auto [p, ec] = std::from_chars(s, end, out);
+  return ec == std::errc() && p == end && p != s;
+}
+
+bool parse_double(const char* s, double& out) {
+  char* end = nullptr;
+  errno = 0;
+  out = std::strtod(s, &end);
+  return errno == 0 && end != s && *end == '\0' && std::isfinite(out);
+}
+
+// JSON number, or null when the value was not measured on this host.
+std::string num_or_null(bool valid, uint64_t v) {
+  return valid ? std::to_string(v) : "null";
+}
+
 std::string fixed(double v, int prec) {
   std::ostringstream o;
   o << std::fixed << std::setprecision(prec) << v;
@@ -554,23 +606,30 @@ int main(int argc, char* argv[]) {
   Options opts;
   opts.path = std::filesystem::temp_directory_path().string();
   bool vectors_only = false;
-  for (int i = 1; i < argc; ++i) {
+  bool args_ok = true;
+  for (int i = 1; i < argc && args_ok; ++i) {
     const std::string a = argv[i];
     const bool has = i + 1 < argc;
+    uint64_t u = 0;
     if (a == "--block-size" && has) {
-      opts.block_size = std::stoull(argv[++i]);
+      args_ok = parse_u64(argv[++i], u) && u > 0;
+      opts.block_size = u;
     } else if (a == "--capacity" && has) {
-      opts.capacity = std::stoull(argv[++i]);
+      args_ok = parse_u64(argv[++i], u) && u > 0;
+      opts.capacity = u;
     } else if (a == "--pattern" && has) {
       opts.pattern = argv[++i];
     } else if (a == "--threads" && has) {
-      opts.threads = static_cast<uint32_t>(std::stoul(argv[++i]));
+      args_ok = parse_u64(argv[++i], u) && u > 0 && u <= 4096;
+      opts.threads = static_cast<uint32_t>(u);
     } else if (a == "--seconds" && has) {
-      opts.seconds = std::stod(argv[++i]);
+      args_ok = parse_double(argv[++i], opts.seconds) && opts.seconds > 0;
     } else if (a == "--fill-factor" && has) {
-      opts.fill_factor = std::stod(argv[++i]);
+      args_ok =
+          parse_double(argv[++i], opts.fill_factor) && opts.fill_factor >= 0;
     } else if (a == "--max-warmup-seconds" && has) {
-      opts.max_warmup_seconds = std::stod(argv[++i]);
+      args_ok = parse_double(argv[++i], opts.max_warmup_seconds) &&
+                opts.max_warmup_seconds >= 0;
     } else if (a == "--path" && has) {
       opts.path = argv[++i];
     } else if (a == "--output" && has) {
@@ -581,12 +640,23 @@ int main(int argc, char* argv[]) {
       vectors_only = true;
     } else {
       usage(argv[0]);
-      return a == "--help" || a == "-h" ? 0 : 1;
+      return a == "--help" || a == "-h" ? 0 : 2;
     }
+    if (!args_ok) std::cerr << "bad value for " << a << "\n";
+  }
+  // The key universe 3 x C / block must hold at least one key.
+  if (args_ok && opts.capacity < opts.block_size) {
+    std::cerr << "--capacity must be at least --block-size\n";
+    args_ok = false;
+  }
+  if (!args_ok) {
+    usage(argv[0]);
+    return 2;
   }
   if (opts.pattern != "zipf" && opts.pattern != "zipf+scan") {
     std::cerr << "unknown pattern " << opts.pattern << "\n";
-    return 1;
+    usage(argv[0]);
+    return 2;
   }
   const bool scan = opts.pattern == "zipf+scan";
   const size_t universe = 3 * opts.capacity / opts.block_size;
@@ -598,6 +668,7 @@ int main(int argc, char* argv[]) {
   std::error_code ec;
   std::filesystem::create_directories(opts.path, ec);
   remove_volume_files(opts);
+  const VolumeFilesGuard volume_files(opts);
 
   const std::string cg = cgroup_dir();
   std::cerr
@@ -626,6 +697,13 @@ int main(int argc, char* argv[]) {
   auto cache = open_store(opts);
   if (!cache) return 1;
   const CacheStats geo = cache->stats();
+  const size_t expected_stripes =
+      churn_stripe_count(volume_size_for(opts.capacity) - kVolumeHeaderSize);
+  if (geo.stripe_count != expected_stripes) {
+    std::cerr << "WARNING: volume has " << geo.stripe_count
+              << " stripes, the auto-geometry model predicts "
+              << expected_stripes << "\n";
+  }
   const uint64_t data_area =
       geo.stripe_bytes - geo.stripe_count * dir_bytes_per_stripe();
   std::cerr << "Cyclone tuning:\n"
@@ -706,11 +784,14 @@ int main(int argc, char* argv[]) {
   const double gets = static_cast<double>(total.hits + total.misses);
   const double bs = static_cast<double>(opts.block_size);
   const uint64_t inserted = total.inserts * opts.block_size;
-  const double wa =
-      inserted > 0 && dev0.valid
-          ? static_cast<double>(dev1.write_bytes - dev0.write_bytes) /
-                static_cast<double>(inserted)
-          : 0.0;
+  const bool dev_valid = dev0.valid && dev1.valid;
+  const std::string wa =
+      inserted > 0 && dev_valid
+          ? fixed(static_cast<double>(dev1.write_bytes - dev0.write_bytes) /
+                      static_cast<double>(inserted),
+                  3)
+          : "null";
+  const bool cg_valid = !cg.empty();
   const Footprint fp = footprint(opts.path, kVolumeStem);
   const uint64_t mem_file_end = memory_stat_field(cg, "file");
   const uint64_t mem_anon_end = memory_stat_field(cg, "anon");
@@ -731,6 +812,7 @@ int main(int argc, char* argv[]) {
   }
   const double reopen_hit = static_cast<double>(reopen.stats().hits) /
                             static_cast<double>(kReopenGets);
+  total.read_errors += reopen.stats().read_errors;
   cache->stop();
   cache.reset();
   sampler.stop();
@@ -755,15 +837,17 @@ int main(int argc, char* argv[]) {
     << ",\"put_failures\":" << total.put_failures
     << ",\"read_errors\":" << total.read_errors
     << ",\"verified\":" << total.verified << std::setprecision(3)
-    << ",\"write_amp\":" << wa
-    << ",\"device_write_bytes\":" << (dev1.write_bytes - dev0.write_bytes)
-    << ",\"device_read_bytes\":" << (dev1.read_bytes - dev0.read_bytes)
+    << ",\"write_amp\":" << wa << ",\"device_write_bytes\":"
+    << num_or_null(dev_valid, dev1.write_bytes - dev0.write_bytes)
+    << ",\"device_read_bytes\":"
+    << num_or_null(dev_valid, dev1.read_bytes - dev0.read_bytes)
     << ",\"footprint_bytes\":" << fp.allocated
     << ",\"apparent_bytes\":" << fp.apparent
     << ",\"peak_rss_kib\":" << peak_rss_kib()
-    << ",\"cgroup_mem_peak\":" << sampler.peak()
-    << ",\"cgroup_file_end\":" << mem_file_end
-    << ",\"cgroup_anon_end\":" << mem_anon_end << ",\"warmup_s\":" << warm_s
+    << ",\"cgroup_mem_peak\":" << num_or_null(cg_valid, sampler.peak())
+    << ",\"cgroup_file_end\":" << num_or_null(cg_valid, mem_file_end)
+    << ",\"cgroup_anon_end\":" << num_or_null(cg_valid, mem_anon_end)
+    << ",\"warmup_s\":" << warm_s
     << ",\"warmup_inserted_bytes\":" << warm_inserted
     << ",\"warmup_capped\":" << (warm_capped ? "true" : "false")
     << ",\"reopen_hit_ratio\":" << reopen_hit
@@ -775,8 +859,8 @@ int main(int argc, char* argv[]) {
     << (st1.writes_dropped_by_lease - st0.writes_dropped_by_lease)
     << ",\"cy_wraps_deferred_by_lease\":"
     << (st1.wraps_deferred_by_lease - st0.wraps_deferred_by_lease)
-    << ",\"cy_tag_collision_evictions\":" << st1.tag_collision_evictions
-    << ",\"cy_entries\":" << st1.current_entries
+    << ",\"cy_tag_collision_evictions_total\":" << st1.tag_collision_evictions
+    << ",\"cy_entries_total\":" << st1.current_entries
     << ",\"cy_readahead_hints\":" << st1.readahead_hints_issued
     << ",\"failed\":" << (failed ? "true" : "false") << "}";
   std::cout << j.str() << "\n";
@@ -784,10 +868,14 @@ int main(int argc, char* argv[]) {
     std::ofstream out(opts.output, std::ios::app);
     out << j.str() << "\n";
   }
-  remove_volume_files(opts);
   if (failed) {
     std::cerr << "RUN FAILED (content mismatch)\n";
     return 2;
+  }
+  if (total.read_errors > 0) {
+    std::cerr << "RUN FAILED: " << total.read_errors
+              << " read_sync errors other than NotFound (counted as misses)\n";
+    return 3;
   }
   return 0;
 }

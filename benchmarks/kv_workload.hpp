@@ -272,6 +272,27 @@ inline CacheKey churn_key(uint64_t index) {
   return CacheKey::from_digest(hashed.digest());
 }
 
+// Copies of the auto stripe-geometry constants (kAutoStripeGranularity,
+// kAutoStripeTarget in src/core/volume.hpp); kv_churn static_asserts them
+// against the originals and checks the stripe count its volume gets.
+inline constexpr size_t kChurnAutoStripeGranularity = size_t{32} * 1024 * 1024;
+inline constexpr size_t kChurnAutoStripeTarget = 16;
+
+// Stripe count of an auto-geometry volume with `usable` bytes after the
+// volume header: compute_stripe_geometry() in src/core/volume.cpp,
+// clamp(round(usable / granularity), 1, target).
+inline size_t churn_stripe_count(size_t usable) {
+  const size_t n =
+      (usable + kChurnAutoStripeGranularity / 2) / kChurnAutoStripeGranularity;
+  return std::clamp<size_t>(n, 1, kChurnAutoStripeTarget);
+}
+
+// The stripe a key index lands in: Volume::select_stripe() routes by
+// key.segment_hash() % stripe count.
+inline size_t churn_stripe_of(uint64_t index, size_t stripes) {
+  return churn_key(index).segment_hash() % stripes;
+}
+
 // ---------------------------------------------------------------------------
 // Latency percentiles: sort, index = p * (n - 1) -- the same idiom as
 // benchmarks/performance_baseline.cpp, so percentile columns are comparable

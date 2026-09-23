@@ -9,7 +9,8 @@
 //
 //   lru         what the LMDB / filedir harness implements
 //   fifo        one global FIFO
-//   stripe fifo FIFO per stripe, 16 stripes routed by key hash
+//   stripe fifo FIFO per stripe, keys routed as Volume::select_stripe does
+//               (segment_hash() % stripe count; count from the auto geometry)
 //   wrap flush  Cyclone today: per stripe, a wrap toggles the directory
 //               phase and every entry of the previous pass stops resolving at
 //               once (Volume::evict_if_needed), so the stripe restarts empty
@@ -21,7 +22,6 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
 #include <deque>
 #include <list>
 #include <string>
@@ -37,18 +37,10 @@ using namespace cyclone::kv_workload;
 
 namespace {
 
-constexpr size_t kStripes = 16;
 constexpr uint64_t kMeasuredGets = 400000;
 // Per-document overhead on the Cyclone side (document header + 64 B
 // metadata), rounded up.
 constexpr size_t kCycloneDocOverhead = 264;
-
-size_t stripe_of(uint64_t index) {
-  const auto d = churn_key(index).digest();
-  uint32_t h = 0;
-  std::memcpy(&h, d.data() + 8, sizeof(h));
-  return h % kStripes;
-}
 
 class Lru {
  public:
@@ -110,15 +102,20 @@ class WrapFlush {
 };
 
 void run(size_t block, size_t capacity, size_t universe, bool scan) {
+  // kv_churn sizes the volume so the stripes' data areas sum to `capacity`;
+  // the mmap directories and volume header it adds on top are small next to
+  // the 32 MiB rounding step, so the count is taken from `capacity` (kv_churn
+  // prints the count its volume actually got).
+  const size_t stripes = churn_stripe_count(capacity);
   const size_t lru_blocks = capacity / (block + kMetaSize);
   const size_t stripe_blocks =
-      capacity / kStripes / (block + kCycloneDocOverhead);
+      capacity / stripes / (block + kCycloneDocOverhead);
   const auto perm = churn_permutation(universe);
   ChurnStream stream(perm, 0, scan);
   Lru lru(lru_blocks);
   Fifo fifo(lru_blocks);
-  std::vector<Fifo> sfifo(kStripes, Fifo(stripe_blocks));
-  std::vector<WrapFlush> flush(kStripes, WrapFlush(stripe_blocks));
+  std::vector<Fifo> sfifo(stripes, Fifo(stripe_blocks));
+  std::vector<WrapFlush> flush(stripes, WrapFlush(stripe_blocks));
   const uint64_t warm_inserts = 2 * capacity / block;
   uint64_t inserts = 0;
   uint64_t gets = 0;
@@ -126,7 +123,7 @@ void run(size_t block, size_t capacity, size_t universe, bool scan) {
   while (gets < kMeasuredGets) {
     const uint64_t k = stream.next();
     const bool measure = inserts >= warm_inserts;
-    const size_t s = stripe_of(k);
+    const size_t s = churn_stripe_of(k, stripes);
     const std::array<bool, 4> hit = {lru.access(k), fifo.access(k),
                                      sfifo[s].access(k), flush[s].access(k)};
     if (!hit[0]) ++inserts;
@@ -141,7 +138,7 @@ void run(size_t block, size_t capacity, size_t universe, bool scan) {
       "%-9s block=%zu U=%zu capacity=%zu blocks (%zu/stripe x %zu): lru %.4f "
       "fifo %.4f stripe-fifo %.4f wrap-flush %.4f\n",
       scan ? "zipf+scan" : "zipf", block, universe, lru_blocks, stripe_blocks,
-      kStripes, ratio(0), ratio(1), ratio(2), ratio(3));
+      stripes, ratio(0), ratio(1), ratio(2), ratio(3));
 }
 
 }  // namespace
