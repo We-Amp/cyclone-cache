@@ -4,6 +4,7 @@
 #include "mapped_file.hpp"
 
 #include <cerrno>
+#include <climits>
 
 #include "cyclone/detail/expected_compat.hpp"
 
@@ -225,8 +226,34 @@ class PosixMappedFile : public MappedFile {
 
   std::error_code advise_willneed(std::span<std::byte> region) override {
 #ifdef MADV_WILLNEED
-    if (madvise(region.data(), region.size(), MADV_WILLNEED) < 0) {
-      return std::make_error_code(static_cast<std::errc>(errno));
+    // madvise() requires a page-aligned start address.  Regions handed out
+    // by map_region() may start mid-page (a document begins at an arbitrary
+    // file offset), so round the start down to the page boundary and extend
+    // the length to match — this stays within the enclosing mapping,
+    // mirroring sync() and unmap_region().  Without this the call fails with
+    // EINVAL and the readahead silently never happens.
+    long page_size = sysconf(_SC_PAGESIZE);
+    auto addr = reinterpret_cast<uintptr_t>(region.data());
+    uintptr_t page_addr = addr & ~(page_size - 1);
+    size_t advise_length = region.size() + (addr - page_addr);
+
+    // Issue the advice in bounded chunks.  Linux clamps ONE MADV_WILLNEED
+    // to max(bdi->io_pages, ra_pages) pages (force_page_cache_ra()), so a
+    // single call over a multi-megabyte range silently reads ahead only the
+    // first ~1 MB of it and the rest still faults in one page at a time.
+    // Each call gets its own budget, so chunking is what actually covers
+    // the whole document; the extra syscalls are amortised by the caller,
+    // which advises a given document once (Volume::maybe_advise_readahead).
+    constexpr size_t kChunkBytes = size_t{512} * 1024;
+    while (advise_length > 0) {
+      size_t chunk = advise_length < kChunkBytes ? advise_length : kChunkBytes;
+      // NOLINTNEXTLINE(performance-no-int-to-ptr)
+      if (madvise(reinterpret_cast<void *>(page_addr), chunk, MADV_WILLNEED) <
+          0) {
+        return std::make_error_code(static_cast<std::errc>(errno));
+      }
+      page_addr += chunk;
+      advise_length -= chunk;
     }
 #else
     (void)region;
@@ -243,6 +270,44 @@ class PosixMappedFile : public MappedFile {
     (void)region;
 #endif
     return {};
+  }
+
+  std::error_code advise_readahead(uint64_t file_offset,
+                                   size_t length) override {
+#if defined(F_RDADVISE)
+    if (_fd < 0) {
+      return std::make_error_code(std::errc::bad_file_descriptor);
+    }
+    if (length == 0) {
+      return {};
+    }
+    // Darwin's asynchronous readahead: it queues a clustered read of the
+    // range into the unified buffer cache and returns immediately, so a
+    // subsequent fault on the shared mapping is a minor fault instead of a
+    // serial 4 KiB major fault.  ra_count is an int, so a range larger than
+    // INT_MAX is clamped; that only shortens the hint.
+    struct radvisory ra;
+    ra.ra_offset = static_cast<off_t>(file_offset);
+    ra.ra_count = length > static_cast<size_t>(INT_MAX)
+                      ? INT_MAX
+                      : static_cast<int>(length);
+    if (fcntl(_fd, F_RDADVISE, &ra) < 0) {
+      return std::make_error_code(static_cast<std::errc>(errno));
+    }
+    return {};
+#else
+    (void)file_offset;
+    (void)length;
+    return std::make_error_code(std::errc::not_supported);
+#endif
+  }
+
+  [[nodiscard]] bool supports_advise_readahead() const noexcept override {
+#if defined(F_RDADVISE)
+    return true;
+#else
+    return false;
+#endif
   }
 
   [[nodiscard]] uint64_t file_size() const override { return _file_size; }
@@ -479,7 +544,26 @@ class Win32MappedFile : public MappedFile {
   }
 
   std::error_code advise_willneed(std::span<std::byte> region) override {
+    // Windows equivalent of MADV_WILLNEED: ask the memory manager to fetch
+    // the range in as few large I/Os as it can.  PrefetchVirtualMemory has
+    // been available since Windows 8 / Server 2012 -- the version guard is
+    // for toolchains whose headers still default to an older target, where
+    // this degrades to the no-op it was before.  Like the POSIX side this
+    // is a pure hint, so a failure is not an error for the caller.
+#if defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0602
+    if (region.empty()) {
+      return {};
+    }
+    WIN32_MEMORY_RANGE_ENTRY entry;
+    entry.VirtualAddress = region.data();
+    entry.NumberOfBytes = region.size();
+    if (PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0) == 0) {
+      return std::error_code(static_cast<int>(GetLastError()),
+                             std::system_category());
+    }
+#else
     (void)region;
+#endif
     return {};
   }
 
@@ -487,6 +571,18 @@ class Win32MappedFile : public MappedFile {
     (void)region;
     return {};
   }
+
+  // Windows has no file-offset readahead call that beats
+  // PrefetchVirtualMemory, so the readahead hint stays on
+  // advise_willneed(); see Volume::maybe_advise_readahead.
+  std::error_code advise_readahead(uint64_t file_offset,
+                                   size_t length) override {
+    (void)file_offset;
+    (void)length;
+    return std::make_error_code(std::errc::not_supported);
+  }
+
+  bool supports_advise_readahead() const noexcept override { return false; }
 
   uint64_t file_size() const override { return _file_size; }
 

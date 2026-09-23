@@ -202,6 +202,15 @@ struct CacheStats {
   //     same crowding signal.
   uint64_t ram_coherence_rejections = 0;
   uint64_t ram_coherence_put_rejections = 0;
+
+  // Large-document readahead hints issued on the disk read path, summed
+  // across all volumes (see CacheConfig::readahead_min_bytes).  Counts the
+  // hints that got past the per-document re-advise filter, so it is a
+  // measure of kernel calls made rather than of large reads served.
+  // PROCESS-LOCAL.  Appended at the tail so positional initialisation and
+  // the layout of the fields above are unchanged; NOT mirrored in
+  // CycloneCacheStats (the C API).
+  uint64_t readahead_hints_issued = 0;
 };
 
 // Thread-safe counters for stats updated from background threads (hit tracker).

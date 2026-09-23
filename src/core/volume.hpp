@@ -12,6 +12,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -444,6 +445,13 @@ struct VolumeStats {
   uint64_t evictions = 0;
   uint64_t directory_syncs = 0;  // Completed sync_directory() calls
   uint64_t fsyncs = 0;           // Total raw fd fsyncs performed
+
+  // Large-document readahead hints actually issued on the disk read path
+  // (see VolumeConfig::readahead_min_bytes).  Counts only the hints that
+  // got past the re-advise filter, so it measures kernel calls made, not
+  // large reads served: a hot document contributes at most one hint per
+  // re-advise interval however often it is read.  PROCESS-LOCAL.
+  uint64_t readahead_hints_issued = 0;
 
   // Wrap-cadence telemetry: how often the circular write buffer wraps back
   // to the start of a stripe's data area (steady-clock based). Sizing
@@ -1008,6 +1016,11 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // for the per-write-fsync convoy.
   mutable std::atomic<uint64_t> _fsyncs{0};
 
+  // Readahead hints actually issued by this volume (see VolumeStats).  Only
+  // bumped when the re-advise filter lets a hint through, so it is off the
+  // warm read path; it is the observable that makes the filter testable.
+  mutable std::atomic<uint64_t> _readahead_hints{0};
+
   // Wrap-cadence telemetry (see VolumeStats for semantics). Each wrap event
   // is already serialized per stripe (stripe->mutex + cross-process
   // write_lock), so atomics only cover concurrent wraps on different
@@ -1203,6 +1216,87 @@ class Volume : public std::enable_shared_from_this<Volume> {
     (*_checksum_cache)[checksum_cache_index(offset)].store(
         pack_checksum_entry(offset, checksum), std::memory_order_relaxed);
   }
+
+  // Large-document readahead (see VolumeConfig::readahead_min_bytes).
+  // Called on the disk read path once a document's byte range is known but
+  // before anything touches its content, so the kernel can fetch the range
+  // with a few large asynchronous I/Os instead of one serial fault per page
+  // (the volume mapping is MADV_RANDOM, which otherwise suppresses
+  // readahead entirely).
+  //
+  // CONCURRENCY: this is a pure hint over an address range.  Apart from the
+  // lossy dedupe filter below it takes no lock, reads and writes no shared
+  // cache state, and never dereferences the region, so it is safe to call
+  // outside the borrow/lease window and participates in none of the reader
+  // protocols.  All errors are ignored.
+  void maybe_advise_readahead(uint64_t doc_offset,
+                              std::span<std::byte> region) noexcept;
+
+  // Re-advise filter for the readahead hint.  The hint only pays for itself
+  // when the range is NOT already resident: once it is, the madvise() still
+  // walks every page, and on a warm 2 MiB view-mode read that walk cost
+  // more than the read itself (261 k -> 68 k gets/s measured).  So a
+  // document placement is advised at most once every
+  // kReadaheadReadviseSeconds.
+  //
+  // Why DECAYED and not once-ever: a KV tier is normally larger than RAM,
+  // so "advised once, evicted from the page cache, read cold again" is the
+  // common case, not the exception -- a permanent filter would silently
+  // drop the readahead exactly where it is worth most.  The interval only
+  // has to be long enough that a hot key cannot pay for a madvise() per
+  // read: at 275 k gets/s on one key, 2 s caps it at one hint per ~550 k
+  // reads.
+  //
+  // Direct-mapped, lossy and lock-free BY DESIGN, exactly like
+  // _checksum_cache: a collision, a torn pairing or a lost update costs one
+  // redundant or one skipped hint and nothing else, so it needs no
+  // synchronisation and is never consulted for correctness.  The warm path
+  // is a single relaxed load; the store only happens when a hint is
+  // actually issued.  8192 slots = 64 KB per volume.
+  //
+  // Allocated ONLY when the hint is enabled (readahead_min_bytes != 0), and
+  // then once, here, at construction -- before the Volume can be published
+  // to any reader.  _config is fixed for the Volume's lifetime, so the
+  // pointer never changes after construction and concurrent readers load it
+  // without synchronisation.  When the hint is off the pointer stays null
+  // and is never dereferenced: maybe_advise_readahead() returns on the
+  // zero threshold before it would reach the filter.  (Declared after
+  // _config, so the initializer below sees the final configuration.)
+  static constexpr size_t kReadaheadCacheSize = 8192;
+  static constexpr unsigned kReadaheadCacheShift = 64 - 13;  // log2(8192)
+  static constexpr uint32_t kReadaheadReadviseSeconds = 2;
+  using ReadaheadCache = std::array<std::atomic<uint64_t>, kReadaheadCacheSize>;
+  static std::unique_ptr<ReadaheadCache> make_readahead_cache(
+      size_t min_bytes) {
+    return min_bytes != 0 ? std::make_unique<ReadaheadCache>() : nullptr;
+  }
+  const std::unique_ptr<ReadaheadCache> _readahead_cache =
+      make_readahead_cache(_config.readahead_min_bytes);
+
+  static size_t readahead_cache_index(uint64_t offset) {
+    return static_cast<size_t>((offset * uint64_t{0x9E3779B97F4A7C15}) >>
+                               kReadaheadCacheShift);
+  }
+
+  // Slot layout: high 40 bits identify the document placement, low 24 bits
+  // carry the steady-clock second at which it was last advised.
+  static constexpr unsigned kReadaheadTickBits = 24;
+  static constexpr uint32_t kReadaheadTickMask = (1u << kReadaheadTickBits) - 1;
+
+  // Placement identity: offset AND length, so a reused offset now holding a
+  // differently sized document re-advises.  Forced nonzero so a populated
+  // slot never reads as the empty (zero) slot.
+  static uint64_t readahead_discriminator(uint64_t offset, size_t length) {
+    uint64_t mixed =
+        (offset * uint64_t{0x9E3779B97F4A7C15}) ^
+        (static_cast<uint64_t>(length) * uint64_t{0xD6E8FEB86659FD93});
+    return ((mixed >> 24) | 1u) & 0xFFFFFFFFFFull;
+  }
+
+  // Seconds off the steady clock, truncated to kReadaheadTickBits.  The
+  // epoch is irrelevant: only modular differences are compared, so the
+  // ~194-day wrap costs at most one redundant or skipped hint.
+  static uint32_t readahead_tick() noexcept;
 
   Stripe *select_stripe(const CacheKey &key);
   // Body of open() that runs under the exclusive cross-process init

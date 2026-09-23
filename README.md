@@ -475,6 +475,7 @@ struct CacheConfig {
   bool         verify_checksum_on_read = true;    // first read of each offset verifies it
   uint32_t     small_tier_percent = 0;            // 1..50 enables the small-object tier
   bool         cross_process_ram_coherence = false;
+  size_t       readahead_min_bytes = 256_KB;      // readahead hint for docs >= this; 0 = off
   std::chrono::milliseconds directory_sync_interval{30000};  // multi-process durability cadence
   std::chrono::milliseconds read_lease_duration{5000};       // 0 disables leases
   std::chrono::milliseconds lease_wrap_ceiling{60000};

@@ -196,6 +196,7 @@ if(CYCLONE_BUILD_TESTS)
     tests/integration/test_max_object_size.cpp
     tests/integration/test_write_handle_volume_lifetime.cpp
     tests/integration/test_reset_gate_spawn.cpp
+    tests/integration/test_readahead.cpp
   )
   # Compile guard: cyclone_c.h is the C ABI header, so it must stay valid C11
   # (it once used C++ alias declarations and did not compile as C).  Built as
