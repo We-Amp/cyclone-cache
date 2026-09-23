@@ -154,7 +154,9 @@ and CRC-on-first-read come as a package. With verification off
 > checksum now runs at 12.2 GB/s on the M5 (ARMv8 `crc32`) and 2.8 GB/s on
 > the i7-8750H (slice-by-16), and the restart phase in this same
 > configuration moved from 0.558 to 8.54 GB/s. Every number in the tables
-> below predates that change.
+> below predates that change. The checksum has since moved again, to
+> CRC-32C at on-disk format v8 (34.9 GB/s on the M5) — see the follow-up
+> under fix-list item 2.
 
 **Multi-process readers scale worse than threads, for the same reason.**
 Four Cyclone reader processes reach 46 GB/s in copy mode, 0.65× a single
@@ -274,7 +276,8 @@ document builder → serialized record) and CRCs it before a single
    measured on top of the chunked `WILLNEED` and did not help (2.25 vs 2.33
    GB/s), so it is not used: `WILLNEED` already queues the large reads, and
    populating the PTEs up front only moves the per-page work.
-2. **Fast CRC32** — ✅ **done** (`src/core/crc32.{hpp,cpp}`). The byte-wise
+2. **Fast CRC32** — ✅ **done** (then `src/core/crc32.{hpp,cpp}`; renamed
+   to `crc32c.{hpp,cpp}` by the follow-up below). The byte-wise
    table routine was replaced by slice-by-16 tables plus an ARMv8
    `crc32b/w/x` path, selected once through a function pointer. The on-disk
    convention is untouched (reflected `0xEDB88320`, init/xorout
@@ -288,7 +291,7 @@ document builder → serialized record) and CRCs it before a single
 
    Both machines print the same checksum for the same buffer, and the unit
    test pins every path against a verbatim copy of the old byte-wise
-   routine (`tests/unit/test_crc32.cpp`).
+   routine (then `tests/unit/test_crc32.cpp`).
 
    End to end on the M5 (`kv_bench --block-size 2097152 --seconds 5
    --threads 1 --skip-multiprocess`, warm page cache): restart
@@ -297,12 +300,74 @@ document builder → serialized record) and CRCs it before a single
    first-touch read **137 k → 1.12 M ops/s**. The restart floor is now the
    page-cache/copy rate, not the checksum.
 
-   Note on x86-64: SSE4.2's `crc32` instruction is CRC-32**C**
-   (Castagnoli), a *different* polynomial — using it would change the
-   on-disk format and invalidate every existing cache file, so x86-64 runs
-   the portable table path. If the format is ever revved, the options are
-   adopting CRC-32C outright or adding a PCLMULQDQ folding path for the
-   current polynomial (>20 GB/s, no format change).
+   Follow-up — **CRC-32C, on-disk format v8** (✅ done). The note this item
+   used to carry said x86-64 had to stay on the table path because SSE4.2's
+   `crc32` instruction computes CRC-32**C**, a different polynomial. That
+   was the open decision, and it has been taken: the document checksum *is*
+   CRC-32C from format major v8 (reflected `0x82F63B78`, init/xorout
+   `0xFFFFFFFF`), which has a hardware path on x86-64 (SSE4.2 `crc32q`) as
+   well as on ARMv8 (`crc32cx`). Existing cache files are abandoned (not
+   deleted) on open — the format major is part of the fingerprinted
+   filename, so consumers take a cold cache, never a misparse, and the
+   superseded v7 file stays on disk until it is reclaimed. The files are now
+   `src/core/crc32c.{hpp,cpp}`, `tests/unit/test_crc32c.cpp` and
+   `./build-rel/crc32c_bench`. Both hardware paths run three interleaved CRC
+   registers (8192- then 256-byte blocks, recombined through
+   compile-time-generated GF(2) zero-shift operators), because the
+   instruction is latency- not throughput-bound:
+
+   | 2 MiB buffer | byte-wise | slice-by-16 | hw, 1 stream | hw, 3-way |
+   |---|---:|---:|---:|---:|
+   | Apple M5 (clang, Release) | 0.61 GB/s | 3.37 GB/s | 12.19 GB/s | **34.93 GB/s** |
+   | i7-8750H (clang-20, Release) | 0.50 GB/s | 2.82 GB/s | 10.41 GB/s | **26.51 GB/s** |
+   | i7-8750H (g++-13, Release) | — | 3.76 GB/s | 8.36 GB/s | 19.26 GB/s |
+
+   (Best of five `crc32c_bench --seconds 1` runs on an otherwise idle
+   machine; raw i7 output in
+   [`kv-cache-benchmark/crc32c/i7-8750H-crc32c_bench.txt`](kv-cache-benchmark/crc32c/i7-8750H-crc32c_bench.txt).
+   GCC schedules the same intrinsics less well than clang; the project's
+   reference toolchain is clang-20.)
+
+   **End to end on Linux (i7-8750H, Samsung 970 PRO, ext4, page cache
+   dropped before the cold phases).** Measured on round 3's tree with this
+   change merged in (readahead + CRC-32C), the same `kv_bench` invocation
+   and the same peers' numbers as round 3; raw data in
+   [`kv-cache-benchmark/crc32c/`](kv-cache-benchmark/crc32c/). Dirty-page
+   limits were left at the kernel defaults this time (round 3 had raised
+   them to 12 GiB, which is what hung the box after that sweep).
+
+   | 2 MiB blocks | round 3 | **+ CRC-32C** | filedir | lmdb |
+   |---|---:|---:|---:|---:|
+   | PUT, GB/s | 0.81 | **1.01** | 1.44 | 0.15 |
+   | Cold first-touch GET, GB/s | 1.62 | **2.17** | 1.76 | 2.15 |
+   | Cold restart GET, GB/s | 1.44 | **1.97** | 1.73 | 2.16 |
+   | Cold first-touch, verification off | 2.31 | 2.33 | — | — |
+   | Warm GET copy, 1 thread, GB/s | 10.5 | **13.1** | 6.5 | 12.9 |
+   | 4 reader processes, view, gets/s | 621 k | **755 k** | 26 k | 585 k |
+   | 4 reader processes, copy, GB/s | 9.8 | **12.3** | 11.8 | 10.9 |
+
+   Cold first-touch by block size, GB/s (restart in parentheses):
+
+   | | 512 KiB | 2 MiB | 8 MiB | 32 MiB |
+   |---|---:|---:|---:|---:|
+   | round 3 | 0.63 (0.55) | 1.62 (1.44) | 1.63 (1.53) | 1.28 (1.18) |
+   | **+ CRC-32C** | **1.19 (0.67)** | **2.17 (1.97)** | **3.03 (2.80)** | **3.40 (3.33)** |
+   | filedir | 0.94 | 1.76 | 2.51 | 2.60 |
+   | lmdb | 1.93 | 2.15 | 2.12 | 2.20 |
+
+   What it says: with verification on, the 2 MiB cold path now sits 7 %
+   under its own no-verify ceiling (2.17 vs 2.33 GB/s) instead of 30 %, and
+   level with LMDB. At 8 and 32 MiB, where readahead has the most to
+   queue, Cyclone reads cold faster than every peer. 512 KiB is still
+   per-get-overhead-bound (1.2 GB/s against LMDB's 1.9): the fix list's
+   remaining cold-path item is the verified state outliving the process.
+   Puts gain 10–40 % because the write path checksums too. The warm and
+   multi-process rows also moved, but round 3 was measured on a box carrying
+   a leaked dirty-page count and this round on a fresh boot, so treat gains
+   outside the cold phases as partly machine state; the cold phases, which
+   drop the page cache first, are the comparison this round is about. The
+   i7's CRC-32C rate is 9.4× its old slice-by-16 ceiling, so on x86 the
+   checksum has left the critical path.
 
    Still open from this item: a way for the *verified state* to outlive the
    process — the CRC-validation cache could live beside the mmap directory

@@ -153,17 +153,19 @@ std::string create_temp_file(const std::string &name, size_t size_mb) {
   return path;
 }
 
-// IEEE CRC32, byte-for-byte identical to Document::compute_checksum (see
-// src/core/document.cpp).  Exposed in raw-state form so test (B) can
-// brute-force a top-16 collision cheaply (prefix state computed once,
-// only a 4-byte tail re-hashed per candidate).
-uint32_t crc32_update(uint32_t state, std::span<const std::byte> data) {
+// CRC-32C, byte-for-byte identical to Document::compute_checksum (see
+// src/core/document.cpp and the convention block in src/core/crc32c.hpp).
+// Written out here rather than called, so the forged checksums this file
+// plants come from an independent implementation.  Exposed in raw-state form
+// so test (B) can brute-force a top-16 collision cheaply (prefix state
+// computed once, only a 4-byte tail re-hashed per candidate).
+uint32_t oracle_crc32c_update(uint32_t state, std::span<const std::byte> data) {
   static const std::array<uint32_t, 256> table = [] {
     std::array<uint32_t, 256> t{};
     for (uint32_t n = 0; n < 256; ++n) {
       uint32_t c = n;
       for (int k = 0; k < 8; ++k) {
-        c = ((c & 1) != 0u) ? (0xedb88320 ^ (c >> 1)) : (c >> 1);
+        c = ((c & 1) != 0u) ? (0x82f63b78 ^ (c >> 1)) : (c >> 1);
       }
       t[n] = c;
     }
@@ -175,8 +177,8 @@ uint32_t crc32_update(uint32_t state, std::span<const std::byte> data) {
   return state;
 }
 
-uint32_t crc32_ref(std::span<const std::byte> data) {
-  return crc32_update(0xFFFFFFFFu, data) ^ 0xFFFFFFFFu;
+uint32_t oracle_crc32c(std::span<const std::byte> data) {
+  return oracle_crc32c_update(0xFFFFFFFFu, data) ^ 0xFFFFFFFFu;
 }
 
 std::vector<std::byte> make_content(size_t index, size_t size) {
@@ -473,7 +475,7 @@ TEST_CASE(
     "[wrap][checksum]") {
   // Drive the CRC-skip condition deterministically:
   //   1. Write A at offset O and READ it -> caches pack(O, top16(crc(A))).
-  //   2. Flood with documents whose payload CRC32 shares A's top 16 bits
+  //   2. Flood with documents whose payload CRC-32C shares A's top 16 bits
   //      (constructed below) until a wrap lands one of them at O.
   //   3. Read that document: is_checksum_validated(O, crc(new)) returns
   //      true off the STALE verdict, so the new bytes' CRC is skipped.
@@ -485,16 +487,16 @@ TEST_CASE(
   // wrong/partial document would surface here as a content mismatch), and
   // the replaced key misses cleanly.
   auto content_a = make_content(0, kDocSize);
-  uint32_t crc_a = crc32_ref(content_a);
+  uint32_t crc_a = oracle_crc32c(content_a);
   REQUIRE(crc_a != 0);  // read path consults the cache only when checksum != 0
 
-  // Brute-force a DIFFERENT payload whose CRC32 shares A's top 16 bits
+  // Brute-force a DIFFERENT payload whose CRC-32C shares A's top 16 bits
   // (~65536 candidates expected).  The stored checksum covers the payload
   // (empty header + content), so the content CRC is exactly what the read
   // path compares.  Cheap: the prefix CRC state is computed once and only
   // the 4-byte tail is re-hashed per candidate.
   std::vector<std::byte> content_b = make_content(1, kDocSize);
-  const uint32_t prefix_state = crc32_update(
+  const uint32_t prefix_state = oracle_crc32c_update(
       0xFFFFFFFFu,
       std::span<const std::byte>(content_b).first(content_b.size() - 4));
   bool collided = false;
@@ -504,14 +506,14 @@ TEST_CASE(
         static_cast<std::byte>((probe >> 8) & 0xFF),
         static_cast<std::byte>((probe >> 16) & 0xFF),
         static_cast<std::byte>((probe >> 24) & 0xFF)};
-    uint32_t crc_b = crc32_update(prefix_state, tail) ^ 0xFFFFFFFFu;
+    uint32_t crc_b = oracle_crc32c_update(prefix_state, tail) ^ 0xFFFFFFFFu;
     if ((crc_b >> 16) == (crc_a >> 16) && crc_b != 0) {
       std::copy(tail.begin(), tail.end(), content_b.end() - 4);
       collided = true;
     }
   }
   REQUIRE(collided);
-  REQUIRE((crc32_ref(content_b) >> 16) == (crc_a >> 16));
+  REQUIRE((oracle_crc32c(content_b) >> 16) == (crc_a >> 16));
   REQUIRE_FALSE(content_equals(content_b, content_a));
 
   std::string path = create_temp_file("checksum_reuse", kVolMB);
@@ -1541,7 +1543,7 @@ std::pair<void *, size_t> f6_map_shared_dir(size_t num_buckets) {
 constexpr size_t kF6cRecSize = size_t{64} * 1024;
 constexpr uint32_t kF6cRecsPerWriter = 120;
 
-// Fill one self-describing record: [writer][seq][pattern...][crc32(prefix)].
+// Fill one self-describing record: [writer][seq][pattern...][crc32c(prefix)].
 void f6c_fill_record(std::span<std::byte> buf, uint32_t writer_id,
                      uint32_t seq) {
   auto *hdr = reinterpret_cast<uint32_t *>(buf.data());
@@ -1551,7 +1553,7 @@ void f6c_fill_record(std::span<std::byte> buf, uint32_t writer_id,
     buf[k] = static_cast<std::byte>((writer_id * 131u + seq * 17u + k) & 0xFFu);
   }
   uint32_t crc =
-      crc32_ref(std::span<const std::byte>(buf.data(), buf.size() - 4));
+      oracle_crc32c(std::span<const std::byte>(buf.data(), buf.size() - 4));
   std::memcpy(buf.data() + buf.size() - 4, &crc, 4);
 }
 
@@ -1561,7 +1563,7 @@ bool f6c_record_valid(std::span<const std::byte> buf) {
   uint32_t stored = 0;
   std::memcpy(&stored, buf.data() + buf.size() - 4, 4);
   uint32_t crc =
-      crc32_ref(std::span<const std::byte>(buf.data(), buf.size() - 4));
+      oracle_crc32c(std::span<const std::byte>(buf.data(), buf.size() - 4));
   if (crc != stored) return false;
   uint32_t writer = 0;
   uint32_t seq = 0;

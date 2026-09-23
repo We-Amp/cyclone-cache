@@ -232,15 +232,15 @@ struct CacheConfig {
   std::chrono::seconds gc_interval{60};
   double gc_evacuate_threshold = 0.8;
 
-  // Store a CRC32 with each document (verified on read whenever the stored
-  // CRC is non-zero).  The C API copies CycloneCacheConfig::enable_checksum
-  // here verbatim with no default and no sentinel mapping, so a
-  // zero-initialised C config runs with checksums DISABLED rather than this
-  // default of true -- the one remaining C field whose zero-init
-  // diverges; see CycloneCacheConfig::enable_checksum.
+  // Store a CRC-32C with each document (verified on read whenever the
+  // stored CRC is non-zero).  The C API copies
+  // CycloneCacheConfig::enable_checksum here verbatim with no default and no
+  // sentinel mapping, so a zero-initialised C config runs with checksums
+  // DISABLED rather than this default of true -- the one remaining C field
+  // whose zero-init diverges; see CycloneCacheConfig::enable_checksum.
   bool enable_checksum = true;
   bool verify_checksum_on_read =
-      true;  // Verify CRC32 on every read (disable for perf)
+      true;  // Verify CRC-32C on every read (disable for perf)
   bool enable_compression = false;
   int io_queue_depth = 64;
 
@@ -534,9 +534,10 @@ struct VolumeConfig {
   size_t max_fragments = 0;
   double ram_cache_proportion = 1.0;
 
-  // Verify CRC32 checksums on every read.  When false, read-side verification
-  // is skipped (write-side checksums are still computed).  Safe to disable when
-  // using persistent mmap with a single writer (no torn reads possible).
+  // Verify CRC-32C checksums on every read.  When false, read-side
+  // verification is skipped (write-side checksums are still computed).
+  // Safe to disable when using persistent mmap with a single writer (no
+  // torn reads possible).
   bool verify_checksum_on_read = true;
 
   // Issue a readahead hint over a document's own byte range on the disk read

@@ -69,9 +69,9 @@ TEST_CASE("VolumeHeader constants are correct", "[version]") {
   REQUIRE(VolumeHeader::kMagic == 0x43594C4E);
   REQUIRE(VolumeHeader::kSize == 64);
   // Deliberate tripwire (see the twin assertion on Document::kVersionMajor):
-  // Version 7 leaves pre-depth-bound alternate chains behind, and the two
-  // constants move in lockstep.
-  REQUIRE(VolumeHeader::kFormatVersionMajor == 7);
+  // Version 8 switches the document checksum to CRC-32C, leaving every
+  // pre-v8 ring behind, and the two constants move in lockstep.
+  REQUIRE(VolumeHeader::kFormatVersionMajor == 8);
   REQUIRE(VolumeHeader::kFormatVersionMinor == 0);
 }
 

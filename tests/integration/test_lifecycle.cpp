@@ -449,7 +449,7 @@ TEST_CASE("Cache handles missing file on restart", "[lifecycle][error]") {
   }
 
   // Delete the REAL backing file(s).  add_volume() structural-fingerprints the
-  // filename (cyclone.dat -> cyclone-7-<hex>.dat, plus a possible ".small"
+  // filename (cyclone.dat -> cyclone-8-<hex>.dat, plus a possible ".small"
   // sibling), so removing the raw cache_path would miss the file the library
   // actually uses.  Remove the whole temp directory subtree and recreate it
   // empty (a single remove_all, not an iterate-while-removing loop, which is
