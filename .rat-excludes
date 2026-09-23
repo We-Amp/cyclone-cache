@@ -32,3 +32,5 @@
 corpus
 # Raw benchmark program output (no source header applies).
 .*-crc32c_bench\.txt
+churn-.*\.txt
+policy-replay\.txt
