@@ -83,6 +83,8 @@ consteval size_t wire_offset_of(size_t field_index) {
 // next_alternate_offset is 16, last_access is 17, alternate_id is 18 (v6)
 static_assert(wire_offset_of(7) == Document::kVersionMajorOffset,
               "kVersionMajorOffset out of sync with field table");
+static_assert(wire_offset_of(11) == Document::kWriteSerialOffset,
+              "kWriteSerialOffset out of sync with field table");
 static_assert(wire_offset_of(13) == Document::kChecksumOffset,
               "kChecksumOffset out of sync with field table");
 static_assert(wire_offset_of(15) == Document::kHitCountOffset,

@@ -211,6 +211,26 @@ struct CacheStats {
   // the layout of the fields above are unchanged; NOT mirrored in
   // CycloneCacheStats (the C API).
   uint64_t readahead_hints_issued = 0;
+
+  // Wrap retention (CacheConfig::wrap_retention; PROCESS-LOCAL, summed
+  // across volumes, appended at the tail).  All stay 0 in flush mode.  Full
+  // semantics on VolumeStats in src/core/volume.hpp.
+  //   frontier_advances: gated moves of the clean frontier that published.
+  //   advances_deferred_by_lease: mandatory advances deferred by a live
+  //     borrow of a chunk they would expose; each dropped its fill (also in
+  //     writes_dropped_by_lease).  Watch it the way wraps_deferred_by_lease
+  //     is watched in flush mode.
+  //   early_advances_skipped: optional runway advances skipped because a
+  //     chunk was borrowed (never drops a fill).
+  //   retained_hits: disk hits served from the retained previous pass --
+  //     what retention buys, directly.
+  //   stamp_rejections: candidates whose pass stamp contradicted their
+  //     class (stale survivors; lost timeline after power loss).
+  uint64_t frontier_advances = 0;
+  uint64_t advances_deferred_by_lease = 0;
+  uint64_t early_advances_skipped = 0;
+  uint64_t retained_hits = 0;
+  uint64_t stamp_rejections = 0;
 };
 
 // Thread-safe counters for stats updated from background threads (hit tracker).
