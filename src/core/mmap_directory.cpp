@@ -346,7 +346,9 @@ std::optional<DirEntry> MmapDirectory::probe(const CacheKey &key) const {
 // after.  Concurrent writers spin-wait until the version is even.
 bool MmapDirectory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
                            uint64_t verified_offset, bool *collision_evicted,
-                           bool *bucket_full_evicted) {
+                           bool *bucket_full_evicted,
+                           InsertAdmission *admission,
+                           std::span<const uint64_t> clear_offsets) {
   if (_header == nullptr) {
     return false;
   }
@@ -365,6 +367,51 @@ bool MmapDirectory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
 
   // Acquire writer lock (CAS even → odd, spins if another writer holds it).
   acquire_writer(bucket_idx);
+
+  if (admission != nullptr) {
+    // Boundaries are loaded HERE, inside the bracket and under phase_lock:
+    // an independently opened writer in another process may have wrapped
+    // or advanced since the caller's election (S9).
+    admission->refresh();
+    const InsertChoice choice = choose_insert_slot(
+        bucket, kEntriesPerBucket, tag, verified_offset, kMatchAnyTag,
+        *admission, collision_evicted, bucket_full_evicted, offset);
+    size_t cleared = 0;
+    if (choice.slot >= 0) {
+      DirEntry new_entry = choice.verified ? bucket[choice.slot] : DirEntry{};
+      new_entry.set_offset(offset);
+      new_entry.set_approx_size(size);
+      new_entry.set_tag(tag);
+      new_entry.set_phase(cur_phase);
+      if (!choice.verified) {
+        new_entry.set_head(true);
+      }
+      std::memcpy(&bucket[choice.slot], &new_entry, sizeof(DirEntry));
+      // Uniqueness cleanup (rule 2), in the same bracket as the insert.
+      for (size_t i = 0; i < kEntriesPerBucket; ++i) {
+        if (static_cast<int>(i) == choice.slot || bucket[i].is_empty() ||
+            bucket[i].tag() != tag) {
+          continue;
+        }
+        for (uint64_t off : clear_offsets) {
+          if (bucket[i].offset() == off) {
+            bucket[i].clear();
+            ++cleared;
+            break;
+          }
+        }
+      }
+    }
+    release_writer(bucket_idx);
+    release_phase_lock();
+    if (choice.slot >= 0 && !choice.replaces) {
+      increment_count();
+    }
+    for (size_t i = 0; i < cleared; ++i) {
+      decrement_count();
+    }
+    return choice.slot >= 0;
+  }
 
   bool success = false;
   bool was_update = false;
@@ -547,23 +594,23 @@ bool MmapDirectory::remove_at(const CacheKey &key, uint64_t target_offset) {
 
   acquire_writer(bucket_idx);
 
-  bool found = false;
+  // EVERY entry with this tag at this offset goes (see Directory::remove_at).
+  size_t removed = 0;
   for (size_t i = 0; i < kEntriesPerBucket; ++i) {
     if (!bucket[i].is_empty() && bucket[i].tag() == target_tag &&
         bucket[i].offset() == target_offset) {
       bucket[i].clear();
-      found = true;
-      break;
+      ++removed;
     }
   }
 
   release_writer(bucket_idx);
 
-  if (found) {
+  for (size_t i = 0; i < removed; ++i) {
     decrement_count();
   }
 
-  return found;
+  return removed != 0;
 }
 
 void MmapDirectory::clear() {

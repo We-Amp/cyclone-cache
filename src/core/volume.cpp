@@ -2727,6 +2727,7 @@ std::expected<void, CacheError> Volume::remove_sync(const CacheKey& key) {
 
   // Phase 2: For each candidate, read the document to verify the full SHA-256
   // key (not just the 12-bit tag), then remove the correct entry precisely.
+  bool removed_live = false;
   for (size_t ci = 0; ci < num_candidates; ++ci) {
     const auto& candidate = candidates[ci];
 
@@ -2772,12 +2773,21 @@ std::expected<void, CacheError> Volume::remove_sync(const CacheKey& key) {
         stamp_admits(stripe, snap, candidate.cls, reader.document());
     _mapped_file->unmap_region(*mapped);
 
-    if (stored_key != key || !stamp_ok) {
-      continue;  // Tag collision or stale survivor — not our entry
+    if (stored_key != key) {
+      continue;  // Tag collision — not our entry
     }
 
-    // Full key match — remove this specific entry using precise offset match
-    if (stripe->remove_entry_at(key, candidate.dir_offset)) {
+    // Full key match — remove this specific entry using precise offset
+    // match.  EVERY same-key entry goes (B2d), retained ones included, and
+    // stale survivors of the key with it; each clear decrements the entry
+    // count, so count() stays exact.  Only a live one makes the key "found".
+    if (stripe->remove_entry_at(key, candidate.dir_offset) && stamp_ok) {
+      removed_live = true;
+    }
+  }
+
+  if (removed_live) {
+    {
       // ---- Invalidate the RAM copies this remove orphans (post-removal) --
       //
       // ORDERING (load-bearing).  Both steps run AFTER the directory entry
@@ -3962,31 +3972,77 @@ std::expected<void, CacheError> Volume::commit_write(
   // allocate_write_slot (no phase toggle can race the probe), costs one
   // 132-byte header map per same-tag candidate on the write path only —
   // the read path was already full-key-verified.
+  //
+  // Uniqueness (wrap retention, design section 4.6): the probe yields the
+  // retained class too, so a rewrite of a key whose admitted entry is in the
+  // previous pass ELECTS that entry and updates it in place (rule 1) -- a
+  // current entry is preferred when both exist.  Every other same-key
+  // entry, and every candidate whose document proves it dead (bad magic, or
+  // a pass stamp its class contradicts), is cleared in the insert's own
+  // seqlock bracket (rule 2): at most one entry resolves the key afterwards.
   uint64_t verified_offset = Directory::kNoVerifiedEntry;
+  AdmitClass verified_cls = AdmitClass::kReject;
+  std::array<uint64_t, Directory::kEntriesPerBucket> clear_offsets{};
+  size_t clear_count = 0;
+  auto add_clear = [&](uint64_t off) {
+    for (size_t i = 0; i < clear_count; ++i) {
+      if (clear_offsets[i] == off) {
+        return;
+      }
+    }
+    if (clear_count < clear_offsets.size()) {
+      clear_offsets[clear_count++] = off;
+    }
+  };
   const StripeSnapshot snap = snapshot(stripe);
   stripe->probe_each(key, snap, [&](const DirEntry& dir_entry, AdmitClass cls) {
+    if (dir_entry.offset() == verified_offset) {
+      return true;  // a retried scan re-yields the elected entry
+    }
     auto mdoc = map_document(*_mapped_file, stripe->offset + dir_entry.offset(),
                              Document::kHeaderSize, stripe->size, false);
     if (!mdoc) {
-      return true;  // Unreadable candidate — treat as foreign, keep looking
+      // Bad magic / length: nothing any key can resolve through it.  (A
+      // mapping failure lands here too; clearing then costs at most one
+      // cache entry, never a wrong serve.)
+      if (stripe->in_data_area(dir_entry.offset())) {
+        add_clear(dir_entry.offset());
+      }
+      return true;
     }
     CacheKey stored_key = mdoc->reader.first_key();
     const bool stamp_ok =
         stamp_admits(stripe, snap, cls, mdoc->reader.document());
     _mapped_file->unmap_region(mdoc->region);
-    if (stored_key != key || !stamp_ok) {
-      return true;  // Tag collision or stale survivor, keep looking
+    if (!stamp_ok) {
+      add_clear(dir_entry.offset());  // a stale survivor, whoever's key
+      return true;
     }
-    verified_offset = dir_entry.offset();
-    return false;  // Verified our entry — stop
+    if (stored_key != key) {
+      return true;  // A live tag collision: another key's entry, keep it
+    }
+    if (verified_offset == Directory::kNoVerifiedEntry ||
+        (cls == AdmitClass::kCurrent && verified_cls != AdmitClass::kCurrent)) {
+      if (verified_offset != Directory::kNoVerifiedEntry) {
+        add_clear(verified_offset);  // a retained duplicate loses
+      }
+      verified_offset = dir_entry.offset();
+      verified_cls = cls;
+    } else {
+      add_clear(dir_entry.offset());  // a duplicate
+    }
+    return true;
   });
 
   // Update directory — publishes the entry.  MUST stay after the data sync
   // above; see the ordering-invariant comment there.
   bool collision_evicted = false;
   bool bucket_full_evicted = false;
-  if (!stripe->insert(key, relative_offset, doc_size, verified_offset,
-                      &collision_evicted, &bucket_full_evicted)) {
+  StripeAdmission admission(*this, *stripe);
+  if (!stripe->insert(
+          key, relative_offset, doc_size, verified_offset, &collision_evicted,
+          &bucket_full_evicted, &admission,
+          std::span<const uint64_t>(clear_offsets.data(), clear_count))) {
     return make_unexpected(CacheError::InternalError);
   }
   if (collision_evicted) {
@@ -4109,6 +4165,26 @@ std::optional<BorrowEpoch> Volume::admit_document(const Stripe* stripe,
     return std::nullopt;
   }
   return epoch;
+}
+
+bool Volume::node_admissible_now(const Stripe* stripe, uint64_t relative_offset,
+                                 const Document& doc) const {
+  if (!stripe->in_data_area(relative_offset)) {
+    return false;
+  }
+  const StripeSnapshot now = snapshot(stripe);
+  if (!stripe->retain) {
+    // Flush: a live node sits behind the cursor (invariant 9).
+    return relative_offset < now.cursor_rel;
+  }
+  // The node's stamp names its class; the class's position leg decides.
+  if (doc.write_serial == static_cast<uint32_t>(now.pass)) {
+    return relative_offset < now.cursor_rel;
+  }
+  if (now.pass > 0 && doc.write_serial == static_cast<uint32_t>(now.pass - 1)) {
+    return relative_offset >= now.frontier_rel;
+  }
+  return false;
 }
 
 uint64_t Volume::chunk_index_ceil(const Stripe* stripe, uint64_t abs_offset) {
@@ -4321,59 +4397,87 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
     uint64_t rel_offset;
     uint64_t next_rel;
     uint8_t id;
+    AdmitClass cls;  // the node's admission class (a link may only target
+                     // a current node: D5)
   };
   std::array<ChainNode, Document::kMaxChainTraversalDepth> nodes;
   size_t node_count = 0;
 
-  stripe->probe_each(key, snap, [&](const DirEntry& dir_entry, AdmitClass cls) {
-    // Directory::probe_each may re-invoke a callback for the same entry when
-    // a version change retries the scan, so every piece of state this
-    // callback accumulates is reset on entry.  Carrying a stale predecessor
-    // across a retried scan would splice against a different chain snapshot.
-    head_relative_offset = 0;
-    unique_alternate_ids.reset();
-    key_exists = false;
-    chain_truncated = false;
-    cycle_detected = false;
-    chain_fully_walked = false;
-    node_count = 0;
-
-    uint64_t doc_offset = stripe->offset + dir_entry.offset();
-
-    auto mapped = _mapped_file->map_region(doc_offset, Document::kHeaderSize,
-                                           MappedFile::MapMode::ReadOnly);
-    if (!mapped) {
-      return true;
+  // Resolve the head: every admitted same-key entry, by class.  Uniqueness
+  // (design section 4.6): the write below updates the ELECTED entry in
+  // place and clears every other same-key entry in the same seqlock
+  // bracket, so at most one entry resolves the key afterwards.  A current
+  // entry wins over a retained one (it is the newer version).  An entry
+  // whose document carries this key but a stamp its class contradicts is a
+  // stale survivor: never elected, always cleared.
+  AdmitClass head_cls = AdmitClass::kReject;
+  std::array<uint64_t, Directory::kEntriesPerBucket> clear_offsets{};
+  size_t clear_count = 0;
+  {
+    struct HeadCandidate {
+      uint64_t rel;
+      AdmitClass cls;
+      bool live;  // key matches AND stamp matches the class
+    };
+    std::array<HeadCandidate, Directory::kEntriesPerBucket> heads{};
+    size_t head_count = 0;
+    stripe->probe_each(
+        key, snap, [&](const DirEntry& dir_entry, AdmitClass cls) {
+          // A version change may retry the scan: never record an entry
+          // twice.
+          for (size_t i = 0; i < head_count; ++i) {
+            if (heads[i].rel == dir_entry.offset()) {
+              return true;
+            }
+          }
+          auto mdoc =
+              map_document(*_mapped_file, stripe->offset + dir_entry.offset(),
+                           Document::kHeaderSize, stripe->size, false);
+          if (!mdoc) {
+            return true;
+          }
+          const bool same_key = mdoc->reader.first_key() == key;
+          const bool stamp_ok =
+              stamp_admits(stripe, snap, cls, mdoc->reader.document());
+          _mapped_file->unmap_region(mdoc->region);
+          if (same_key && head_count < heads.size()) {
+            heads[head_count++] = {dir_entry.offset(), cls, stamp_ok};
+          }
+          return true;
+        });
+    int elected = -1;
+    for (size_t i = 0; i < head_count; ++i) {
+      if (heads[i].live &&
+          (elected < 0 || (heads[i].cls == AdmitClass::kCurrent &&
+                           heads[elected].cls != AdmitClass::kCurrent))) {
+        elected = static_cast<int>(i);
+      }
     }
-
-    DocumentReader reader(*mapped);
-    if (!reader.is_valid()) {
-      _mapped_file->unmap_region(*mapped);
-      return true;
+    for (size_t i = 0; i < head_count; ++i) {
+      if (static_cast<int>(i) != elected) {
+        clear_offsets[clear_count++] = heads[i].rel;
+      }
     }
-
-    CacheKey stored_key = reader.first_key();
-    if (stored_key != key ||
-        !stamp_admits(stripe, snap, cls, reader.document())) {
-      _mapped_file->unmap_region(*mapped);
-      return true;
+    if (elected >= 0) {
+      key_exists = true;
+      head_relative_offset = heads[elected].rel;
+      head_cls = heads[elected].cls;
     }
+  }
 
-    // Found the head - count alternates in chain
-    key_exists = true;
-    head_relative_offset = dir_entry.offset();
-
+  if (key_exists) {
     // Count unique alternate IDs in the chain (duplicates don't count
     // toward the limit — they arise from concurrent nginx writes).
-    uint64_t current_offset = doc_offset;
-    uint64_t current_rel = dir_entry.offset();
-    AdmitClass node_cls = cls;  // the head's class; hops land in the current
+    uint64_t current_rel = head_relative_offset;
+    uint64_t current_offset = stripe->offset + current_rel;
+    AdmitClass node_cls = head_cls;  // each hop re-derives it
     while (current_offset != 0 &&
            node_count < Document::kMaxChainTraversalDepth) {
       // Cycle guard.  O(d^2) compares with d <= 128 (1-8 in steady state) on
       // an array already in cache — nanoseconds, and it is what makes the
       // splice's "the successor is a descendant in an ACYCLIC walk" argument
-      // hold.
+      // hold.  (Hops only go downward now, so a cycle can only come from a
+      // corrupt chain; the guard stays as defence in depth.)
       bool repeat = false;
       for (size_t i = 0; i < node_count; ++i) {
         if (nodes[i].rel_offset == current_rel) {
@@ -4391,14 +4495,18 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
       if (!doc) break;
       if (!stamp_admits(stripe, snap, node_cls, doc->reader.document())) {
         _mapped_file->unmap_region(doc->region);
-        break;  // a stale node ends the visible chain
+        // A stale node ends the VISIBLE chain -- for every reader, and for
+        // good: a stamp that contradicts its class never matches again.
+        current_offset = 0;
+        chain_fully_walked = true;
+        break;
       }
 
       unique_alternate_ids.set(doc->reader.document().alternate_id);
       uint64_t next_offset = doc->reader.document().next_alternate_offset;
-      nodes[node_count] =
-          ChainNode{current_rel, next_offset,
-                    static_cast<uint8_t>(doc->reader.document().alternate_id)};
+      nodes[node_count] = ChainNode{
+          current_rel, next_offset,
+          static_cast<uint8_t>(doc->reader.document().alternate_id), node_cls};
       ++node_count;
       _mapped_file->unmap_region(doc->region);
 
@@ -4407,8 +4515,18 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
         chain_fully_walked = true;
         break;
       }
-      if (!stripe->admit_hop(next_offset, snap)) break;
-      node_cls = AdmitClass::kCurrent;
+      node_cls = stripe->admit_hop(next_offset, current_rel, node_cls, snap);
+      if (node_cls == AdmitClass::kReject) {
+        // An inadmissible link ends the visible chain for every reader, and
+        // stays inadmissible: a current hop must point downward (static), a
+        // retained one at or beyond F (which only grows within a pass).  So
+        // the walk HAS seen the whole chain any reader can reach -- which
+        // is also how a corrupt cyclic link is terminated without ever
+        // being followed.
+        current_offset = 0;
+        chain_fully_walked = true;
+        break;
+      }
       current_rel = next_offset;
       current_offset = stripe->offset + next_offset;
     }
@@ -4422,10 +4540,7 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
         cycle_detected) {
       chain_truncated = true;
     }
-
-    _mapped_file->unmap_region(*mapped);
-    return false;
-  });
+  }
 
   // Depth high-water mark: recorded for EVERY alternate write, including the
   // ones rejected below — a rejected write is exactly when the operator most
@@ -4534,7 +4649,7 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
         // walk did; it passed moments ago under this lock and the cursor has
         // not moved, so a failure here means something is wrong and we fall
         // back to today's plain prepend.
-        if (stripe->admit_hop(nodes[first_keeper].rel_offset, snap)) {
+        if (nodes[first_keeper].cls == AdmitClass::kCurrent) {
           new_next_offset = nodes[first_keeper].rel_offset;
           shadows_unlinked_at_publish = first_keeper;
         } else {
@@ -4642,7 +4757,15 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
   // NOT gated by the unlink kill switch: this is a safety guard, and the
   // unlink makes its precondition MORE likely (a spliced head points further
   // back, i.e. at the bytes a wrap recycles first).  The two ship together.
-  const bool wrap_raced_write = wrapped_since(stripe, snap);
+  // Wrap retention (S6, D5): links never cross a pass.  Refuse the link
+  // when the allocation wrapped (the pass P moved -- never compare the
+  // frontier: an advance does not recycle behind-cursor bytes) or when the
+  // head it would point at is a RETAINED document of the previous pass.  A
+  // retained head is never linked, so a fixed-size new head that lands on
+  // the old head's offset cannot form a self-loop (test 9).
+  const bool wrap_raced_write =
+      wrapped_since(stripe, snap) ||
+      (key_exists && head_cls != AdmitClass::kCurrent);
   // A refusal is only COUNTED when the stamped link was actually live
   //: new_next_offset is still the value the planner stamped into the
   // document, and it is already 0 when there was no pre-wrap chain to orphan
@@ -4732,11 +4855,17 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
   // evicted and counted).
   bool collision_evicted = false;
   bool bucket_full_evicted = false;
-  if (!stripe->insert(key, relative_offset, doc_size,
-                      (key_exists && !wrap_raced_write)
-                          ? head_relative_offset
-                          : Directory::kNoVerifiedEntry,
-                      &collision_evicted, &bucket_full_evicted)) {
+  //
+  // B2a: the verified head is updated IN PLACE even when the link was
+  // refused -- never inserted beside it with kNoVerifiedEntry, which would
+  // leave the old head resolvable as a stale duplicate.  Every other
+  // same-key entry found above is cleared in the same bracket.
+  StripeAdmission admission(*this, *stripe);
+  if (!stripe->insert(
+          key, relative_offset, doc_size,
+          key_exists ? head_relative_offset : Directory::kNoVerifiedEntry,
+          &collision_evicted, &bucket_full_evicted, &admission,
+          std::span<const uint64_t>(clear_offsets.data(), clear_count))) {
     return make_unexpected(CacheError::InternalError);
   }
   if (collision_evicted) {
@@ -4972,6 +5101,7 @@ Volume::list_alternates_sync(const CacheKey& key) {
           found_head = true;
           uint64_t current_offset = doc_offset;
           size_t chain_depth = 0;
+          AdmitClass node_cls = cls;  // each hop re-derives it
 
           while (current_offset != 0 &&
                  chain_depth < Document::kMaxChainTraversalDepth) {
@@ -4987,9 +5117,7 @@ Volume::list_alternates_sync(const CacheKey& key) {
             // Cross-key escape guard — see the identical check in
             // read_alternate_sync's walk.  Same for the pass stamp.
             if (doc->reader.first_key() != key ||
-                !stamp_admits(stripe, snap,
-                              chain_depth == 0 ? cls : AdmitClass::kCurrent,
-                              doc->reader.document())) {
+                !stamp_admits(stripe, snap, node_cls, doc->reader.document())) {
               _mapped_file->unmap_region(doc->region);
               chain_incomplete = true;
               break;
@@ -5002,7 +5130,9 @@ Volume::list_alternates_sync(const CacheKey& key) {
             _mapped_file->unmap_region(doc->region);
 
             if (next_offset == 0) break;
-            if (!stripe->admit_hop(next_offset, snap)) break;
+            node_cls = stripe->admit_hop(
+                next_offset, current_offset - stripe->offset, node_cls, snap);
+            if (node_cls == AdmitClass::kReject) break;
             ++chain_depth;
             current_offset = stripe->offset + next_offset;
           }
@@ -5177,6 +5307,7 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
           // AlternateInfo for later retrieval
           std::vector<uint64_t> alternate_offsets;
           std::vector<AdmitClass> alternate_classes;
+          AdmitClass node_cls = cls;  // each hop re-derives it
 
           while (current_offset != 0 &&
                  chain_depth < Document::kMaxChainTraversalDepth) {
@@ -5198,8 +5329,6 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
             // document of a DIFFERENT key.  Never accept a node that does not
             // belong to this key — without this check such a walk could
             // enumerate (and later serve) another key's content.
-            const AdmitClass node_cls =
-                chain_depth == 0 ? cls : AdmitClass::kCurrent;
             if (doc->reader.first_key() != key ||
                 !stamp_admits(stripe, snap, node_cls, doc->reader.document())) {
               _mapped_file->unmap_region(doc->region);
@@ -5216,7 +5345,9 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
             _mapped_file->unmap_region(doc->region);
 
             if (next_offset == 0) break;
-            if (!stripe->admit_hop(next_offset, snap)) break;
+            node_cls = stripe->admit_hop(
+                next_offset, current_offset - stripe->offset, node_cls, snap);
+            if (node_cls == AdmitClass::kReject) break;
             ++chain_depth;
             current_offset = stripe->offset + next_offset;
           }
@@ -5547,8 +5678,9 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
 }
 
 std::expected<void, CacheError> Volume::commit_header_rmw(
-    Stripe* stripe, std::byte* header, const CacheKey& expected_key,
-    AlternateId expected_alt, const StripeSnapshot& snap_start, bool blocking,
+    Stripe* stripe, std::byte* header, uint64_t target_rel,
+    const CacheKey& expected_key, AlternateId expected_alt,
+    const StripeSnapshot& snap_start, bool blocking,
     const std::function<void()>& apply) {
   // Cross-process-safe in-place mutation of a LIVE published document's fixed
   // header.  The two RMW sites -- the hit-count bump and the middle/tail chain
@@ -5586,12 +5718,17 @@ std::expected<void, CacheError> Volume::commit_header_rmw(
   // closing it fully means keying the checksum-validation cache by wrap epoch
   // (filed separately).  This fix reduces the header-RMW silent channel from
   // deterministic-on-any-wrap-racing-a-resolve down to that residual.
+  // Identity + re-admission: the header still carries our key and
+  // alternate, AND the node is still admissible under a snapshot taken now
+  // (wrap retention: an advance over the target since its resolution --
+  // advances run under these same locks -- makes it inadmissible).
   auto identity_ok = [&]() {
     DocumentReader reader(
         std::span<const std::byte>(header, Document::kHeaderSize));
     return reader.is_valid() && reader.first_key() == expected_key &&
            static_cast<AlternateId>(reader.document().alternate_id) ==
-               expected_alt;
+               expected_alt &&
+           node_admissible_now(stripe, target_rel, reader.document());
   };
 
   // Fail closed if `header` is not 8-aligned: `apply` stores through
@@ -5660,8 +5797,9 @@ std::expected<void, CacheError> Volume::repoint_chain_link(
                                               std::memory_order_release);
   };
 
-  auto res = commit_header_rmw(stripe, header, key, pred_alternate_id,
-                               snap_start, blocking, apply);
+  auto res =
+      commit_header_rmw(stripe, header, pred_absolute_offset - stripe->offset,
+                        key, pred_alternate_id, snap_start, blocking, apply);
   if (res.has_value() && _config.sync_on_write) {
     _mapped_file->sync(*region, MappedFile::SyncMode::Sync);
   }
@@ -5697,6 +5835,7 @@ std::expected<void, CacheError> Volume::remove_alternate_sync(
     // Find the head document
     uint64_t head_relative_offset = 0;
     bool found_head = false;
+    AdmitClass head_cls = AdmitClass::kReject;
 
     stripe->probe_each(
         key, snap, [&](const DirEntry& dir_entry, AdmitClass cls) {
@@ -5726,6 +5865,7 @@ std::expected<void, CacheError> Volume::remove_alternate_sync(
           }
 
           head_relative_offset = dir_entry.offset();
+          head_cls = cls;
           found_head = true;
           _mapped_file->unmap_region(*mapped);
           return false;
@@ -5744,12 +5884,17 @@ std::expected<void, CacheError> Volume::remove_alternate_sync(
     bool target_is_head = false;
 
     uint64_t current_offset = stripe->offset + head_relative_offset;
+    AdmitClass node_cls = head_cls;  // each hop re-derives it
 
     while (current_offset != 0 &&
            chain_depth < Document::kMaxChainTraversalDepth) {
       auto mdoc = map_document(*_mapped_file, current_offset,
                                Document::kHeaderSize, stripe->size, false);
       if (!mdoc) break;
+      if (!stamp_admits(stripe, snap, node_cls, mdoc->reader.document())) {
+        _mapped_file->unmap_region(mdoc->region);
+        break;  // a stale node ends the visible chain
+      }
 
       const Document& doc = mdoc->reader.document();
       auto current_id = static_cast<AlternateId>(doc.alternate_id);
@@ -5772,7 +5917,9 @@ std::expected<void, CacheError> Volume::remove_alternate_sync(
       }
 
       // Validate offset before following (security)
-      if (!stripe->admit_hop(next_offset, snap)) {
+      node_cls = stripe->admit_hop(next_offset, current_offset - stripe->offset,
+                                   node_cls, snap);
+      if (node_cls == AdmitClass::kReject) {
         return make_unexpected(CacheError::ChainCorrupted);
       }
 
@@ -5782,6 +5929,21 @@ std::expected<void, CacheError> Volume::remove_alternate_sync(
 
     if (target_absolute_offset == 0) {
       return make_unexpected(CacheError::AlternateNotFound);
+    }
+
+    // S7: removal on a RETAINED chain removes the whole entry.  A retained
+    // chain belongs to the previous pass: splicing it would store into a
+    // document the frontier is about to hand to the forward fill, and its
+    // head cannot be repointed at a successor without re-publishing retained
+    // bytes as fresh.  Dropping the key costs only the other alternates of
+    // an entry that is on its way out anyway.
+    if (head_cls == AdmitClass::kRetained) {
+      stripe->remove_entry_at(key, head_relative_offset);
+      if (_ram_cache) {
+        stripe->remove_epoch.fetch_add(1, std::memory_order_acq_rel);
+        _ram_cache->remove_all(key);
+      }
+      return {};
     }
 
     if (target_is_head) {
@@ -5794,7 +5956,8 @@ std::expected<void, CacheError> Volume::remove_alternate_sync(
         stripe->remove_entry_at(key, head_relative_offset);
       } else {
         // Validate target_next_offset before following (security)
-        if (!stripe->admit_hop(target_next_offset, snap)) {
+        if (stripe->admit_hop(target_next_offset, head_relative_offset,
+                              head_cls, snap) == AdmitClass::kReject) {
           return make_unexpected(CacheError::ChainCorrupted);
         }
 
@@ -5816,8 +5979,9 @@ std::expected<void, CacheError> Volume::remove_alternate_sync(
 
         // head_relative_offset was verified by full first_key comparison
         // above — repoint exactly that entry, never a same-tag collider.
+        StripeAdmission admission(*this, *stripe);
         stripe->insert(key, target_next_offset, next_doc_size,
-                       head_relative_offset);
+                       head_relative_offset, nullptr, nullptr, &admission);
       }
 
       // Head was removed or changed - invalidate RAM cache.
@@ -5940,12 +6104,17 @@ std::expected<void, CacheError> Volume::update_hit_count_sync(
     // Found head - traverse chain to find the right alternate
     uint64_t current_offset = doc_offset;
     size_t chain_depth = 0;
+    AdmitClass node_cls = cls;  // each hop re-derives it
 
     while (current_offset != 0 &&
            chain_depth < Document::kMaxChainTraversalDepth) {
       auto mdoc = map_document(*_mapped_file, current_offset,
                                Document::kHeaderSize, stripe->size, false);
       if (!mdoc) break;
+      if (!stamp_admits(stripe, snap, node_cls, mdoc->reader.document())) {
+        _mapped_file->unmap_region(mdoc->region);
+        break;  // a stale node ends the visible chain
+      }
 
       const Document& doc = mdoc->reader.document();
       auto current_id = static_cast<AlternateId>(doc.alternate_id);
@@ -5960,7 +6129,9 @@ std::expected<void, CacheError> Volume::update_hit_count_sync(
       _mapped_file->unmap_region(mdoc->region);
 
       if (next_offset == 0) break;
-      if (!stripe->admit_hop(next_offset, snap)) break;
+      node_cls = stripe->admit_hop(next_offset, current_offset - stripe->offset,
+                                   node_cls, snap);
+      if (node_cls == AdmitClass::kReject) break;
       current_offset = stripe->offset + next_offset;
       ++chain_depth;
     }
@@ -6008,8 +6179,9 @@ std::expected<void, CacheError> Volume::update_hit_count_sync(
         .store(last_access_ms, std::memory_order_release);
   };
 
-  auto result = commit_header_rmw(stripe, header, key, alternate_id, snap,
-                                  /*blocking=*/false, apply);
+  auto result = commit_header_rmw(
+      stripe, header, target_offset - stripe->offset, key, alternate_id, snap,
+      /*blocking=*/false, apply);
   _mapped_file->unmap_region(*region);  // AFTER the lock is released (M1)
 
   // Note: no fsync here (write amplification).  Hit counts are best-effort and

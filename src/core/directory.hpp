@@ -86,6 +86,57 @@ struct alignas(2) DirEntry {
 static_assert(sizeof(DirEntry) == DirEntry::kSize,
               "DirEntry must be exactly 10 bytes");
 
+// Outcome of the position leg of admission (see Stripe::admit_position in
+// volume.hpp).  kCurrent = an entry of the pass the snapshot is in, sitting
+// behind the write cursor.  kRetained (wrap retention only) = an entry of
+// the PREVIOUS pass whose bytes lie at or beyond the clean frontier, i.e.
+// not yet handed to the forward fill.
+enum class AdmitClass : uint8_t { kReject, kCurrent, kRetained };
+
+// How insert() tells admissible entries from dead ones, supplied by the
+// stripe that owns the directory (doc/design/wrap-retention.md section
+// 4.7).  refresh() is called INSIDE the insert's seqlock bracket (and, for
+// the mmap directory, under phase_lock): it reloads the stripe's exposure
+// generation and write cursor there, because in multi-process mode an
+// independently opened writer can wrap or advance between the caller's
+// election and the insert.
+class InsertAdmission {
+ public:
+  virtual ~InsertAdmission() = default;
+  virtual void refresh() = 0;
+  [[nodiscard]] virtual AdmitClass classify(uint64_t relative_offset,
+                                            bool phase) const = 0;
+};
+
+// Victim choice for an insert under an InsertAdmission (section 4.7):
+//   1. the verified same-key entry, whatever its class (in place);
+//   2. an empty slot;
+//   3. an inadmissible slot (runway, previous pass behind the frontier,
+//      current phase at or ahead of the cursor);
+//   4. a tag collider (reported via *collision_evicted);
+//   5. the oldest admissible entry: the retained one nearest the frontier
+//      (lowest offset) if any, else the lowest-offset current one
+//      (reported via *bucket_full_evicted).
+// Returns the slot index and whether the slot held an entry (no count
+// change) -- or -1 when the bucket is empty of candidates (impossible for a
+// 4-slot bucket).  Shared by Directory and MmapDirectory.
+struct InsertChoice {
+  int slot = -1;
+  bool replaces = false;  // slot held an entry: the count does not change
+  bool verified = false;  // slot is the verified same-key entry
+};
+//
+// Before 2, an entry with this tag already AT `new_offset` (the offset the
+// caller just wrote) is taken over: its bytes are the ones the new document
+// replaced, so it is dead, and leaving it beside the new entry would give
+// the bucket two same-tag entries at one offset -- which a precise
+// remove_at(tag, offset) cannot tell apart.  0 = no such check.
+[[nodiscard]] InsertChoice choose_insert_slot(
+    const DirEntry *bucket, size_t slots, uint16_t tag,
+    uint64_t verified_offset, uint64_t match_any_tag,
+    const InsertAdmission &adm, bool *collision_evicted,
+    bool *bucket_full_evicted, uint64_t new_offset = 0);
+
 // In-memory (single-process) directory.
 //
 // Reader synchronization is a per-bucket SEQLOCK, mirroring MmapDirectory:
@@ -245,10 +296,20 @@ class Directory {
   // land the write, *collision_evicted is set to true.  When the bucket is
   // full and nothing collides, the entry nearest the wrap cursor is evicted
   // instead and *bucket_full_evicted is set to true.
+  //
+  // With `admission` (the Volume always passes one): the victim order of
+  // choose_insert_slot, the verified entry is updated in place whatever its
+  // phase, and every OTHER entry with this key's tag at an offset listed in
+  // `clear_offsets` is cleared in the same seqlock bracket (the uniqueness
+  // rule: one resolvable entry per key; the caller verified those offsets
+  // hold a stale or duplicate copy of this key).  Without it: the legacy
+  // current-phase-only behaviour described above.
   bool insert(const CacheKey &key, uint64_t offset, uint64_t size,
               uint64_t verified_offset = kMatchAnyTag,
               bool *collision_evicted = nullptr,
-              bool *bucket_full_evicted = nullptr);
+              bool *bucket_full_evicted = nullptr,
+              InsertAdmission *admission = nullptr,
+              std::span<const uint64_t> clear_offsets = {});
 
   // WARNING: matches on the 12-bit tag only (a DirEntry holds no key
   // material), so a colliding foreign key's entry can be removed.

@@ -282,12 +282,6 @@ struct StripeSnapshot {
   uint64_t frontier_rel = 0;  // F = min(S + f * Q, E), relative
 };
 
-// Outcome of the position leg of admission.  kCurrent = an entry of the
-// pass the snapshot is in, sitting behind the write cursor.  kRetained
-// (wrap retention only) = an entry of the PREVIOUS pass whose bytes lie at
-// or beyond the clean frontier, i.e. not yet handed to the forward fill.
-enum class AdmitClass : uint8_t { kReject, kCurrent, kRetained };
-
 // What a borrow must re-verify after it registered itself.  A borrow of a
 // document from pass p whose first byte lies in chunk c is EXPOSED -- its
 // bytes may be handed to the forward fill -- once G exceeds
@@ -544,10 +538,32 @@ struct Stripe {
   // head, an intact node AHEAD of the cursor that the forward fill will
   // overwrite with no wrap event.  Same boundary and cursor source as the
   // probe leg.  0 (end of chain) is never admitted.
-  [[nodiscard]] bool admit_hop(uint64_t target_rel,
-                               const StripeSnapshot &snap) const {
-    return target_rel != 0 && in_data_area(target_rel) &&
-           target_rel < snap.cursor_rel;
+  //
+  // Wrap retention (design section 4.5): a live link always points DOWNWARD
+  // into the same pass -- documents of one pass lie in write order and
+  // links never cross a pass (D5) -- so the target must lie strictly below
+  // its source, in the source's own class region:
+  //   current  source s: S <= t < s  -> current  (stamp P)
+  //   retained source s: F <= t < s  -> retained (stamp P - 1)
+  // Every upward hop is rejected.  The retained -> retained hop is what
+  // keeps a retained chain (Brotli -> Gzip -> Original) walkable past its
+  // head.  The returned class selects the stamp the target must carry.
+  [[nodiscard]] AdmitClass admit_hop(uint64_t target_rel, uint64_t source_rel,
+                                     AdmitClass source_cls,
+                                     const StripeSnapshot &snap) const {
+    if (target_rel == 0 || !in_data_area(target_rel) ||
+        target_rel >= source_rel) {
+      return AdmitClass::kReject;
+    }
+    if (source_cls == AdmitClass::kCurrent) {
+      return target_rel < snap.cursor_rel ? AdmitClass::kCurrent
+                                          : AdmitClass::kReject;
+    }
+    if (source_cls == AdmitClass::kRetained && retain &&
+        target_rel >= snap.frontier_rel) {
+      return AdmitClass::kRetained;
+    }
+    return AdmitClass::kReject;
   }
 
   // Probe the directory for `key`, handing the callback ONLY entries that
@@ -584,13 +600,17 @@ struct Stripe {
   bool insert(const CacheKey &key, uint64_t offset, uint64_t size,
               uint64_t verified_offset = Directory::kMatchAnyTag,
               bool *collision_evicted = nullptr,
-              bool *bucket_full_evicted = nullptr) {
+              bool *bucket_full_evicted = nullptr,
+              InsertAdmission *admission = nullptr,
+              std::span<const uint64_t> clear_offsets = {}) {
     if (use_mmap_directory && mmap_directory) {
       return mmap_directory->insert(key, offset, size, verified_offset,
-                                    collision_evicted, bucket_full_evicted);
+                                    collision_evicted, bucket_full_evicted,
+                                    admission, clear_offsets);
     } else if (directory) {
       return directory->insert(key, offset, size, verified_offset,
-                               collision_evicted, bucket_full_evicted);
+                               collision_evicted, bucket_full_evicted,
+                               admission, clear_offsets);
     }
     return false;
   }
@@ -1103,9 +1123,12 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // take before it resolved the offset).  `blocking` selects
   // acquire_write_lock (control path) vs try_acquire_write_lock (hit path).
   // Returns Busy on contention or a raced wrap; the caller drops or retries.
+  // `target_rel` is the target's offset relative to the stripe: under the
+  // lock the store also re-runs admission on it (node_admissible_now).
   std::expected<void, CacheError> commit_header_rmw(
-      Stripe *stripe, std::byte *header, const CacheKey &expected_key,
-      AlternateId expected_alt, const StripeSnapshot &snap_start, bool blocking,
+      Stripe *stripe, std::byte *header, uint64_t target_rel,
+      const CacheKey &expected_key, AlternateId expected_alt,
+      const StripeSnapshot &snap_start, bool blocking,
       const std::function<void()> &apply);
 
   // Repoint one chain link in place: store `new_next_offset` into the
@@ -1643,6 +1666,35 @@ class Volume : public std::enable_shared_from_this<Volume> {
       s_writer_seam_for_test(seam);
     }
   }
+
+  // The insert-time admission view of one stripe (see InsertAdmission in
+  // directory.hpp): refresh() re-snapshots G and W inside the directory's
+  // seqlock bracket; classify() is the position leg against that snapshot.
+  class StripeAdmission final : public InsertAdmission {
+   public:
+    StripeAdmission(const Volume &volume, const Stripe &stripe)
+        : _volume(volume), _stripe(stripe) {}
+    void refresh() override { _snap = _volume.snapshot(&_stripe); }
+    [[nodiscard]] AdmitClass classify(uint64_t relative_offset,
+                                      bool phase) const override {
+      return _stripe.admit_position(relative_offset, phase, _snap);
+    }
+
+   private:
+    const Volume &_volume;
+    const Stripe &_stripe;
+    StripeSnapshot _snap;
+  };
+
+  // Is the chain node at `relative_offset`, whose header is `doc`, still
+  // admissible NOW (fresh snapshot)?  For the in-place header stores, which
+  // re-run admission on their target under the lock (S6): a class implied
+  // by the node's stamp (P current, P - 1 retained) plus that class's
+  // position leg.  This is what catches an advance over the target between
+  // its resolution and the store -- advances run under the same locks.
+  [[nodiscard]] bool node_admissible_now(const Stripe *stripe,
+                                         uint64_t relative_offset,
+                                         const Document &doc) const;
 
   // --- Wrap retention (doc/design/wrap-retention.md section 4.3) ----------
   //

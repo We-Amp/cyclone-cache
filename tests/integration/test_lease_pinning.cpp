@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -133,6 +134,26 @@ constexpr size_t kCacheSizeMB = 4;
 constexpr size_t kCacheSize = kCacheSizeMB * 1024 * 1024;
 constexpr size_t kChunkSize = static_cast<const size_t>(64 * 1024);
 
+// The step a live borrow defers, in each eviction mode.  Flush mode: the
+// gated WRAP itself, so no wrap happens while the borrow is held.  Wrap
+// retention: the wrap is ungated and happens exactly once; the mandatory
+// frontier ADVANCE over the borrowed chunk is what waits (the borrowed
+// documents here all sit in the stripe's first chunk).  Both drop the
+// fills.
+void require_borrow_deferred_step(const CacheStats &stats, bool retention) {
+  CAPTURE(retention);
+  if (retention) {
+    REQUIRE(stats.write_buffer_wraps == 1);
+    REQUIRE(stats.advances_deferred_by_lease > 0);
+    REQUIRE(stats.wraps_deferred_by_lease == 0);
+  } else {
+    REQUIRE(stats.write_buffer_wraps == 0);
+    REQUIRE(stats.wraps_deferred_by_lease > 0);
+    REQUIRE(stats.advances_deferred_by_lease == 0);
+  }
+  REQUIRE(stats.writes_dropped_by_lease > 0);
+}
+
 // Shared scenario for the overwrite-under-borrow regression: hold a
 // borrowed ReadHandle on the first document in the stripe, then flood the
 // cache far past capacity so the write position wants to wrap over it.
@@ -145,10 +166,11 @@ struct OverwriteOutcome {
 };
 
 OverwriteOutcome run_overwrite_under_borrow(
-    std::chrono::milliseconds lease_duration) {
+    std::chrono::milliseconds lease_duration, bool retention) {
   std::string cache_path = create_temp_file("overwrite", kCacheSizeMB);
 
   CacheConfig config;
+  config.wrap_retention = retention;
   config.ram_cache_size = 0;       // Every read is a disk (mmap-borrow) hit
   config.enable_checksum = false;  // Overwritten regions are the point here
   config.read_lease_duration = lease_duration;
@@ -212,9 +234,10 @@ struct StripeRetentionOutcome {
 
 StripeRetentionOutcome run_stripe_retention(size_t vol_size_mb,
                                             size_t stripe_size,
-                                            size_t chunk_size) {
+                                            size_t chunk_size, bool retention) {
   std::string cache_path = create_temp_file("stripe_retention", vol_size_mb);
   CacheConfig config;
+  config.wrap_retention = retention;
   config.ram_cache_size = 0;  // Force disk (mmap-borrow) hits.
   config.enable_checksum = false;
   // Pin the lease and the anti-starvation ceiling well past the flood's
@@ -273,12 +296,12 @@ TEST_CASE("Lease pinning keeps borrowed bytes intact under wrap pressure",
   // of this test, so the flood drops its fills and the borrowed bytes
   // survive untouched.  THE PROTECTION IS WHAT MAKES THIS GREEN — see the
   // companion test below, which demonstrates the corruption with T=0.
-  auto outcome = run_overwrite_under_borrow(std::chrono::milliseconds(5000));
+  const bool retention = GENERATE(false, true);
+  auto outcome =
+      run_overwrite_under_borrow(std::chrono::milliseconds(5000), retention);
 
   REQUIRE(outcome.borrowed_bytes_intact);
-  REQUIRE(outcome.stats.write_buffer_wraps == 0);
-  REQUIRE(outcome.stats.wraps_deferred_by_lease > 0);
-  REQUIRE(outcome.stats.writes_dropped_by_lease > 0);
+  require_borrow_deferred_step(outcome.stats, retention);
   REQUIRE(outcome.stats.wraps_forced_past_lease == 0);
 }
 
@@ -287,7 +310,9 @@ TEST_CASE("Without the lease a wrap overwrites bytes under a live borrow",
   // T=0 disables the protocol: this is the pre-lease behavior and the
   // overwrite-under-borrow corruption class — the same scenario as above now
   // mutates the borrowed span in place under the live ReadHandle.
-  auto outcome = run_overwrite_under_borrow(std::chrono::milliseconds(0));
+  const bool retention = GENERATE(false, true);
+  auto outcome =
+      run_overwrite_under_borrow(std::chrono::milliseconds(0), retention);
 
   REQUIRE_FALSE(outcome.borrowed_bytes_intact);
   REQUIRE(outcome.stats.write_buffer_wraps >= 1);
@@ -300,11 +325,14 @@ TEST_CASE("Single-stripe volume pins the whole cache under a live borrow",
   // One stripe == the whole cache: the borrow blocks every wrap.  Safety holds
   // (victim intact) but NO write makes progress — the regression shape.  A
   // small volume keeps this fast; the single-stripe pin is size-independent.
+  // (With wrap retention the ungated wrap does happen, once; the advance
+  // over the borrowed first chunk is what blocks every write after it.)
+  const bool retention = GENERATE(false, true);
   auto single = run_stripe_retention(/*vol_size_mb=*/4,
                                      /*stripe_size=*/4ULL * 1024 * 1024,
-                                     /*chunk_size=*/kChunkSize);
+                                     /*chunk_size=*/kChunkSize, retention);
   REQUIRE(single.victim_intact);
-  REQUIRE(single.write_buffer_wraps == 0);
+  REQUIRE(single.write_buffer_wraps == (retention ? 1 : 0));
   REQUIRE(single.writes_dropped_by_lease > 0);
 }
 
@@ -316,8 +344,9 @@ TEST_CASE(
   // pins only its own while floods to the others wrap and land — write progress
   // restored AND the borrowed bytes stay intact.  Regression guard for the 1GB
   // single-stripe default that halved the mixed-workload hit rate.
+  const bool retention = GENERATE(false, true);
   auto various = run_stripe_retention(/*vol_size_mb=*/512, /*stripe_size=*/0,
-                                      /*chunk_size=*/512ULL * 1024);
+                                      /*chunk_size=*/512ULL * 1024, retention);
   REQUIRE(various.victim_intact);
   REQUIRE(various.write_buffer_wraps >= 1);
 }
@@ -433,8 +462,10 @@ TEST_CASE("Sharded borrow accounting: cross-thread borrows all gate the wrap",
   // are closed on the main thread) must drain the exact shard that was
   // counted.
   std::string cache_path = create_temp_file("shards", kCacheSizeMB);
+  const bool retention = GENERATE(false, true);
 
   CacheConfig config;
+  config.wrap_retention = retention;
   config.ram_cache_size = 0;  // Every read is a disk (mmap-borrow) hit
   config.enable_checksum = false;
   config.read_lease_duration = std::chrono::milliseconds(5000);
@@ -485,8 +516,7 @@ TEST_CASE("Sharded borrow accounting: cross-thread borrows all gate the wrap",
   }
   {
     auto stats = cache->stats();
-    REQUIRE(stats.write_buffer_wraps == 0);
-    REQUIRE(stats.wraps_deferred_by_lease > 0);
+    require_borrow_deferred_step(stats, retention);
     REQUIRE(stats.wraps_forced_past_lease == 0);
   }
   for (size_t i = 0; i < kReaders; ++i) {
@@ -520,8 +550,10 @@ TEST_CASE("Sharded borrow accounting: cross-thread borrows all gate the wrap",
 TEST_CASE("renew_lease extends protection past T; lapsing frees the writer",
           "[lease][eviction]") {
   std::string cache_path = create_temp_file("renew", kCacheSizeMB);
+  const bool retention = GENERATE(false, true);
 
   CacheConfig config;
+  config.wrap_retention = retention;
   config.ram_cache_size = 0;
   config.enable_checksum = false;
   config.read_lease_duration = std::chrono::milliseconds(1000);  // T = 1s
@@ -572,7 +604,7 @@ TEST_CASE("renew_lease extends protection past T; lapsing frees the writer",
   {
     auto stats = cache->stats();
     REQUIRE(stats.writes_dropped_by_lease >= 6);
-    REQUIRE(stats.write_buffer_wraps == 0);
+    require_borrow_deferred_step(stats, retention);
     REQUIRE(stats.wraps_forced_past_lease == 0);
   }
 
@@ -893,9 +925,11 @@ TEST_CASE(
   // a long-CLOSED borrow kept a fresh view write-starved.  That is the
   // write-starvation starvation defect, removed on purpose.)
   std::string cache_path = create_temp_file("secondview", kCacheSizeMB);
+  const bool retention = GENERATE(false, true);
 
   auto make_view = [&](uint32_t process_index) {
     CacheConfig config;
+    config.wrap_retention = retention;
     config.ram_cache_size = 0;
     config.set_enable_checksum(true);  // Required in multi-process mode
     config.set_multi_process(process_index, 2);
@@ -934,9 +968,7 @@ TEST_CASE(
   }
   {
     auto stats = writer_view->stats();
-    REQUIRE(stats.write_buffer_wraps == 0);
-    REQUIRE(stats.wraps_deferred_by_lease > 0);
-    REQUIRE(stats.writes_dropped_by_lease > 0);
+    require_borrow_deferred_step(stats, retention);
   }
   REQUIRE(content_matches(rh->content(), 0));
 

@@ -1109,3 +1109,40 @@ that introduced it.
   mode can leave a stale duplicate entry (for example after an alternate
   write whose link was refused) and the full suite is only clean in flush
   mode.  The both-modes run of test 18 starts at step 5.
+
+**Step 5 (uniqueness, remove, alternates).**
+
+- *Election preference.*  When a bucket holds both a current and a retained
+  admitted entry of the same key (only possible for state written before
+  the uniqueness rules existed), the commit paths elect the current one --
+  it is the newer version -- and clear the other.
+- *Same-offset takeover (addition to 4.7).*  Before step 2 of the victim
+  order, `insert` takes over an entry with the key's tag that already sits
+  at the offset just written.  Its bytes are the ones the new document
+  replaced, so it is dead; left beside the new entry, the bucket would hold
+  two same-tag entries at one offset, which `remove_at(tag, offset)` cannot
+  tell apart.  This is reached with fixed-size documents, where a rewrite
+  lands exactly on its own retained copy after the frontier exposed it.
+  For the same reason `remove_at` now clears every entry with that tag and
+  offset, not only the first.
+- *A rejected hop ends the visible chain.*  The alternate write's walk
+  treats an inadmissible link (and a stale node) as the end of the chain
+  for the planner (`chain_fully_walked`).  That is sound because the
+  verdict is permanent: a current hop must point downward, which is static,
+  and a retained hop at or beyond `F`, which only rises within a pass.  A
+  side effect is that a corrupt cyclic link is never followed at all (every
+  cycle contains a self or upward link); the cycle guard stays as defence
+  in depth.  `test_alternate_chain_bound.cpp`'s cycle case is updated
+  accordingly: the write now heals by the build-time splice instead of the
+  traversal-cap reset or rejection.
+- *Flush-mode behaviour changes.*  All deliberate, all in the direction of
+  fewer stale entries: upward hops are rejected (4.5), the commit election
+  clears same-key duplicates and dead same-tag entries, `remove_sync`
+  removes every same-key entry, and inadmissible slots (including
+  two-wrap survivors at or ahead of the cursor) are reclaimed before a live
+  collider.
+- *Test 13, escalation leg.*  With retention, once the wrap has stored the
+  new `G` the next write needs an advance, which opens an intent window of
+  its own and would hide whether the takeover repaired.  So in retention
+  mode that leg covers the `kAfterIntentSet` and `kWrapAfterCursor` seams
+  only; the repair decision does not depend on the seam.

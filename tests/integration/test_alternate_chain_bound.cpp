@@ -562,24 +562,32 @@ TEST_CASE("A cyclic alternate chain terminates the walk and heals",
   const uint64_t stripe_base = tail->disk_offset - tail_rel;
   const uint64_t head_rel = head->disk_offset - stripe_base;
 
-  SECTION("single-id cycle: the chain is reset, with NO in-place store") {
-    // Point the head at itself.  Every reachable node is now an Original, so
-    // the walk sees one id and the traversal-boundary reset applies.
+  // Since wrap retention, hop admission only follows DOWNWARD links (a live
+  // link always points to an older document of the same pass; design
+  // section 4.5), so a cyclic link -- necessarily a self or upward link
+  // somewhere -- is never followed at all: the walk ends there, for every
+  // reader and every writer.  (Before, the walk followed the cycle and the
+  // cycle guard stopped it; both cases below then fell into the traversal
+  // cap's reset or rejection.  That guard stays as defence in depth.)  The
+  // write sees the whole VISIBLE chain, so it heals by the ordinary
+  // build-time splice: no in-place repoint, no reset, no rejection.
+
+  SECTION("single-id cycle: the self-link is never followed; the write heals") {
+    // Point the head at itself.
     write_next_link(file, head->disk_offset, head_rel);
 
     const auto before = cache->stats();
-    // The write must terminate (a cycle-blind walk would spin to the cap) and
-    // succeed rather than wedge the key.
+    // The write must terminate and succeed rather than wedge the key.
     put_alt_ok(*cache, key, AlternateId::Original,
                stamped(AlternateId::Original, 2));
     const auto after = cache->stats();
 
-    REQUIRE(after.alternate_chain_resets - before.alternate_chain_resets == 1);
-    // LOAD-BEARING: a cycle means "predecessor" is not a reliable notion, so
-    // no in-place repoint may run.  The proof that a splice cannot create a
-    // cycle depends entirely on this rule.
-    REQUIRE(after.alternate_shadows_unlinked ==
-            before.alternate_shadows_unlinked);
+    // The superseded Original is dropped at BUILD time (the new head links
+    // past it), never by an in-place repoint of a node whose successor is
+    // a cyclic link.
+    REQUIRE(after.alternate_chain_resets == before.alternate_chain_resets);
+    REQUIRE(after.alternate_splice_deferred ==
+            before.alternate_splice_deferred);
 
     auto healed = cache->list_alternates_sync(key);
     REQUIRE(healed.has_value());
@@ -588,28 +596,27 @@ TEST_CASE("A cyclic alternate chain terminates the walk and heals",
     REQUIRE(read_stamp(*cache, key, AlternateId::Original) == 2);
   }
 
-  SECTION("multi-id cycle: rejected, not silently truncated") {
-    // Original -> Brotli -> Original.  Two distinct ids, so the boundary reset
-    // must NOT fire: resetting would drop a live Brotli the caller never asked
-    // to lose.
+  SECTION("multi-id cycle: the upward link is never followed; Brotli lives") {
+    // Original -> Brotli -> Original (upward).  The visible chain is
+    // [Original, Brotli]; the back-link is invisible to every walk.
     write_next_link(file, tail->disk_offset, head_rel);
+    {
+      auto before_write = cache->list_alternates_sync(key);
+      REQUIRE(before_write.has_value());
+      REQUIRE(before_write->size() == 2);  // terminated, not spun to the cap
+    }
 
     const auto before = cache->stats();
-    auto wh = cache->write_alternate_sync(key, AlternateId::Original, 4096);
-    bool rejected = !wh.has_value();
-    if (!rejected) {
-      (void)wh->write_sync(stamped(AlternateId::Original, 2));
-      auto closed = wh->close_sync();
-      rejected = !closed.has_value() &&
-                 closed.error() == CacheError::TooManyAlternates;
-    } else {
-      rejected = wh.error() == CacheError::TooManyAlternates;
-    }
-    REQUIRE(rejected);
+    put_alt_ok(*cache, key, AlternateId::Original,
+               stamped(AlternateId::Original, 2));
     const auto after = cache->stats();
     REQUIRE(after.alternate_chain_resets == before.alternate_chain_resets);
-    REQUIRE(after.alternate_shadows_unlinked ==
-            before.alternate_shadows_unlinked);
+
+    auto healed = cache->list_alternates_sync(key);
+    REQUIRE(healed.has_value());
+    REQUIRE(healed->size() == 2);  // the live Brotli was not lost
+    REQUIRE(find_alt(*healed, AlternateId::Brotli) != nullptr);
+    REQUIRE(read_stamp(*cache, key, AlternateId::Original) == 2);
   }
 
   cache->stop();
