@@ -28,6 +28,7 @@
 #include "cyclone/key.hpp"
 #include "cyclone/task.hpp"
 #include "directory.hpp"
+#include "document.hpp"
 #include "hit_tracker.hpp"
 #include "mmap_directory.hpp"
 #include "thread_shard.hpp"
@@ -212,6 +213,29 @@ std::string fingerprint_base_stem(const std::string &stem);
 bool inodes_match(int fd, const std::string &path);
 #endif
 
+// A reader's (or writer's) snapshot of one stripe -- Sigma in
+// doc/design/wrap-retention.md.  Loaded by Volume::snapshot(): the epoch
+// FIRST (seq_cst), then the write cursor (acquire).  Every admission
+// decision for one probe or walk is made against the same snapshot.
+struct StripeSnapshot {
+  uint64_t pass = 0;        // P: the stripe's pass (wrap) number
+  bool phase = false;       // phase carried by this pass's entries
+  uint64_t cursor_rel = 0;  // W: write cursor, relative to the stripe
+};
+
+// Outcome of the position leg of admission.  kCurrent = an entry of the
+// pass the snapshot is in, sitting behind the write cursor.
+enum class AdmitClass : uint8_t { kReject, kCurrent };
+
+// What a borrow must re-verify after it registered itself (the epoch it was
+// admitted under).  Opaque to the read handle: it only carries it back to
+// the renew paths.
+struct BorrowEpoch {
+  uint64_t pass = 0;
+  bool phase = false;
+  friend bool operator==(const BorrowEpoch &, const BorrowEpoch &) = default;
+};
+
 struct Stripe {
   uint64_t offset = 0;
   uint64_t size = 0;
@@ -327,52 +351,82 @@ struct Stripe {
     return write_pos.load(std::memory_order_acquire);
   }
 
-  // Phase-ABA POSITIONAL GUARD predicate — the shared check behind
-  // BOTH guard legs: the directory-PROBE leg (probe_each below) and the
-  // chain-HOP leg (is_valid_chain_offset in volume.cpp).  A LIVE node always
-  // sits STRICTLY BEHIND the write cursor: both commit paths advance the
-  // cursor past the whole document only AFTER its fill is durable
-  // (commit_write_slot, F6 — never at reservation, so the cursor never
-  // covers reserved-but-unwritten bytes), and strictly before the entry (or
-  // any chain pointer to it) is published.  A node AT or AHEAD of the cursor is
-  // therefore a stale survivor whose bytes the ordinary forward fill will
-  // overwrite IN PLACE — no wrap event, so none of the lease/epoch machinery
-  // fires; reading through it hands out a tearable borrow.  The `<` (i.e.
-  // rejecting `>=`) is load-bearing: at the exact tear boundary the cursor
-  // sits AT the survivor's offset (the overwriter is the very next
-  // reservation) with the bytes still intact — admitting it there is
-  // precisely the tear.  A torn/stale-low cursor read only LOWERS the cursor,
-  // which only WIDENS rejection (at worst a benign miss), never admits a
-  // survivor.  One O(1) lock-free load; no locks on the read path.
-  [[nodiscard]] bool is_behind_write_cursor(uint64_t relative_offset) const {
-    return offset + relative_offset < current_write_cursor();
+  // Start of the data area, relative to the stripe (S in the design).
+  [[nodiscard]] uint64_t data_start_rel() const noexcept {
+    return data_offset - offset;
   }
 
-  // Helper to probe directory regardless of type.
+  // Header-bounds leg shared by every admission: a node must start inside
+  // the data area [S, E) with room for at least a document header.
+  [[nodiscard]] bool in_data_area(uint64_t relative_offset) const noexcept {
+    return relative_offset >= data_start_rel() && relative_offset < size &&
+           relative_offset + Document::kHeaderSize <= size;
+  }
+
+  // ADMISSION, position leg (doc/design/wrap-retention.md section 4.4): the
+  // single predicate that decides whether a directory entry may be mapped,
+  // against a snapshot of the stripe taken BEFORE the probe.  Every site
+  // that resolves a directory entry goes through here (via probe_each
+  // below): reads, chain-head lookups, the write elections, remove and the
+  // hit-count probe.
   //
-  // Phase-ABA positional guard, PROBE leg.  probe_each only ever yields
-  // CURRENT-PHASE entries (Directory/MmapDirectory skip stale-phase slots),
-  // and a legitimate current-phase entry was written this pass, so it is
-  // strictly behind the cursor (see is_behind_write_cursor above).  A
-  // current-phase entry at/ahead of the cursor is, by construction, a
-  // survivor of two GC-phase toggles (a phase ABA); reject it BEFORE the
-  // callback maps or borrows.  This leg covers every directory probe
-  // (primary reads, chain-head lookups, the write-election, remove and
-  // hit-count probes).  Chain HOPS consume offsets from document headers
-  // instead of the directory — a same-key pre-wrap tail reachable with ONE
-  // wrap — and are guarded by the same predicate in is_valid_chain_offset.
+  // Phase-ABA positional guard, PROBE leg: a legitimate current-phase entry
+  // was written this pass, so it sits strictly BEHIND the write cursor --
+  // both commit paths publish the cursor past a document only after its
+  // fill is durable (commit_write_slot, F6) and strictly before the entry
+  // (or any chain pointer to it) is published.  A current-phase entry
+  // at/ahead of the cursor is therefore a survivor of two phase toggles
+  // whose bytes the ordinary forward fill will overwrite IN PLACE, with no
+  // wrap event for the lease/epoch machinery to see.  The `<` (rejecting
+  // `>=`) is load-bearing: at the exact tear boundary the cursor sits AT
+  // the survivor's offset with the bytes still intact.  A torn/stale-low
+  // cursor only WIDENS rejection (a benign miss), never admits a survivor.
+  [[nodiscard]] AdmitClass admit_position(uint64_t relative_offset,
+                                          bool entry_phase,
+                                          const StripeSnapshot &snap) const {
+    if (!in_data_area(relative_offset)) {
+      return AdmitClass::kReject;
+    }
+    if (entry_phase == snap.phase && relative_offset < snap.cursor_rel) {
+      return AdmitClass::kCurrent;
+    }
+    return AdmitClass::kReject;
+  }
+
+  // ADMISSION, chain-hop leg: may a walk follow a next_alternate_offset to
+  // `target_rel`?  Hops consume offsets from DOCUMENT HEADERS, bypassing
+  // the directory probe entirely -- and a SAME-KEY dark node passes both the
+  // bounds check and the walks' cross-key guard.  Reachable with ONE wrap: a
+  // head committed across a wrap keeps next pointing at the pre-wrap old
+  // head, an intact node AHEAD of the cursor that the forward fill will
+  // overwrite with no wrap event.  Same boundary and cursor source as the
+  // probe leg.  0 (end of chain) is never admitted.
+  [[nodiscard]] bool admit_hop(uint64_t target_rel,
+                               const StripeSnapshot &snap) const {
+    return target_rel != 0 && in_data_area(target_rel) &&
+           target_rel < snap.cursor_rel;
+  }
+
+  // Probe the directory for `key`, handing the callback ONLY entries that
+  // pass the position leg against `snap`, together with their class.  The
+  // directory yields tag matches of both phases; the phase test lives in
+  // admit_position so that it is made against the snapshot, never against a
+  // separate load of the directory's own phase.
   template <typename Callback>
-  void probe_each(const CacheKey &key, Callback &&callback) const {
-    auto guarded = [this, &callback](const DirEntry &entry) -> bool {
-      if (!is_behind_write_cursor(entry.offset())) {
-        return true;  // Phase-ABA survivor: skip, keep scanning the bucket.
+  void probe_each(const CacheKey &key, const StripeSnapshot &snap,
+                  Callback &&callback) const {
+    auto admitted = [this, &snap, &callback](const DirEntry &entry) -> bool {
+      const AdmitClass cls =
+          admit_position(entry.offset(), entry.phase(), snap);
+      if (cls == AdmitClass::kReject) {
+        return true;  // Inadmissible: skip, keep scanning the bucket.
       }
-      return callback(entry);
+      return callback(entry, cls);
     };
     if (use_mmap_directory && mmap_directory) {
-      mmap_directory->probe_each(key, guarded);
+      mmap_directory->probe_each_all_phases(key, admitted);
     } else if (directory) {
-      directory->probe_each(key, guarded);
+      directory->probe_each_all_phases(key, admitted);
     }
   }
 
@@ -852,14 +906,14 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // header, shared by the two RMW sites (hit-count bump; middle/tail chain
   // repoint).  Runs `apply` (pure std::atomic_ref stores on the mapped
   // `header`, no syscalls) under the stripe write lock, fenced against a wrap
-  // recycling the target's bytes since `epoch_start` (which the caller MUST
-  // sample before it resolved the offset).  `blocking` selects
+  // recycling the target's bytes since `snap_start` (which the caller MUST
+  // take before it resolved the offset).  `blocking` selects
   // acquire_write_lock (control path) vs try_acquire_write_lock (hit path).
   // Returns Busy on contention or a raced wrap; the caller drops or retries.
   std::expected<void, CacheError> commit_header_rmw(
       Stripe *stripe, std::byte *header, const CacheKey &expected_key,
-      AlternateId expected_alt, std::pair<uint64_t, bool> epoch_start,
-      bool blocking, const std::function<void()> &apply);
+      AlternateId expected_alt, const StripeSnapshot &snap_start, bool blocking,
+      const std::function<void()> &apply);
 
   // Repoint one chain link in place: store `new_next_offset` into the
   // next_alternate_offset field of the LIVE published document at
@@ -881,7 +935,7 @@ class Volume : public std::enable_shared_from_this<Volume> {
   std::expected<void, CacheError> repoint_chain_link(
       Stripe *stripe, uint64_t pred_absolute_offset,
       AlternateId pred_alternate_id, const CacheKey &key,
-      uint64_t new_next_offset, std::pair<uint64_t, bool> epoch_start,
+      uint64_t new_next_offset, const StripeSnapshot &snap_start,
       bool blocking);
 
   // Flush volume file descriptor to disk (fsync on POSIX, _commit on Windows).
@@ -919,8 +973,7 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // write-avoidance guard).  Called by ReadHandle::renew_lease() for
   // client-paced transfers.  Returns false when leases are disabled
   // (T == 0), i.e. there is no protection to renew.
-  bool renew_read_lease(Stripe *stripe,
-                        const std::pair<uint64_t, bool> &epoch_start);
+  bool renew_read_lease(Stripe *stripe, const BorrowEpoch &epoch_start);
   // Lease amendment (2026-07-07): intent-checked lease renewal for the ALIASED
   // zero-copy serve path.  Stamps the lease FIRST, then Dekker-revalidates
   // (borrow_still_valid: wrap_intent loaded before epoch) so a normal wrap
@@ -929,8 +982,8 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // renew_read_lease() above is safe ONLY for the copy-then-verify path,
   // whose read is observable; an aliased writev's read is not.  See
   // LeaseRenewal for how the embedder must act on each result.
-  LeaseRenewal renew_read_lease_strict(
-      Stripe *stripe, const std::pair<uint64_t, bool> &epoch_start);
+  LeaseRenewal renew_read_lease_strict(Stripe *stripe,
+                                       const BorrowEpoch &epoch_start);
   // Lease-protocol STEP-3: ns until a ceiling-forced wrap could overwrite a
   // borrow on this stripe (UINT64_MAX = none deferred / leases off).
   [[nodiscard]] uint64_t ns_until_forced_wrap(const Stripe *stripe) const;
@@ -1135,13 +1188,33 @@ class Volume : public std::enable_shared_from_this<Volume> {
   [[nodiscard]] std::pair<uint64_t, bool> wrap_epoch(
       const Stripe *stripe) const;
 
+  // The stripe snapshot every admission of one probe or walk is decided
+  // against: the epoch FIRST (seq_cst), then the write cursor (acquire).
+  // The order matters: a wrap between the two loads can only LOWER the
+  // cursor the snapshot carries, which rejects more, never admits more.
+  [[nodiscard]] StripeSnapshot snapshot(const Stripe *stripe) const;
+
+  // The epoch a borrow admitted under `snap` must still be in when it
+  // revalidates (and on every renew).
+  [[nodiscard]] static BorrowEpoch borrow_epoch(const StripeSnapshot &snap) {
+    return {snap.pass, snap.phase};
+  }
+
+  // Writer-side fence: has the stripe wrapped since `snap_start`?  Only a
+  // wrap reuses bytes behind the cursor, and every wrap moves the epoch.
+  [[nodiscard]] bool wrapped_since(const Stripe *stripe,
+                                   const StripeSnapshot &snap_start) const {
+    const auto now = wrap_epoch(stripe);
+    return BorrowEpoch{now.first, now.second} != borrow_epoch(snap_start);
+  }
+
   // Reader-side borrow revalidation, run after stamp_read_lease(): the
   // borrow is valid only if no writer holds the wrap-intent flag (loaded
   // seq_cst FIRST — the intent-before-epoch order is part of the Dekker
   // proof at allocate_write_slot) AND the wrap epoch still matches the
   // probe-start capture.  On false the caller unmaps and retries/misses.
-  [[nodiscard]] bool borrow_still_valid(
-      const Stripe *stripe, const std::pair<uint64_t, bool> &epoch_start) const;
+  [[nodiscard]] bool borrow_still_valid(const Stripe *stripe,
+                                        const BorrowEpoch &epoch_start) const;
 
   // Writer-side wrap-intent flag (shared header offset 33 in mmap mode,
   // Stripe::local_wrap_intent otherwise), seq_cst.

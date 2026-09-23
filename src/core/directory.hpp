@@ -9,6 +9,7 @@
 #include <optional>
 #include <span>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "cyclone/key.hpp"
@@ -146,6 +147,22 @@ class Directory {
   // same entry (the Volume read paths do: candidate probing is idempotent).
   template <typename Callback>
   void probe_each(const CacheKey &key, Callback &&callback) const {
+    probe_each_impl<true>(key, std::forward<Callback>(callback));
+  }
+
+  // As probe_each, but yields tag matches of BOTH phases: the caller
+  // classifies each entry against its own stripe snapshot (see
+  // Stripe::probe_each / admit_position in volume.hpp).  A reader must never
+  // mix the directory's own phase load into that decision -- the phase is
+  // derived from the pass count in the snapshot instead.
+  template <typename Callback>
+  void probe_each_all_phases(const CacheKey &key, Callback &&callback) const {
+    probe_each_impl<false>(key, std::forward<Callback>(callback));
+  }
+
+ private:
+  template <bool kFilterPhase, typename Callback>
+  void probe_each_impl(const CacheKey &key, Callback &&callback) const {
     uint32_t bucket_idx = key.bucket_hash() % _num_buckets;
     uint16_t target_tag = key.tag();
 
@@ -188,7 +205,7 @@ class Directory {
           continue;
         }
         // Skip stale entries from a previous GC phase
-        if (entry.phase() != cur_phase) {
+        if (kFilterPhase && entry.phase() != cur_phase) {
           continue;
         }
         if (entry.tag() == target_tag) {
@@ -221,6 +238,7 @@ class Directory {
     }
   }
 
+ public:
   // Insert or update an entry.  verified_offset selects which same-tag
   // entry (if any) may be updated in place — see the sentinels above.  When
   // the bucket is full and a colliding foreign entry must be evicted to
