@@ -8,16 +8,18 @@
 #
 #   run-churn.sh STORE PATTERN THREADS CAPACITY SECONDS OUT.jsonl LOG [ARGS...]
 #
-# STORE is cyclone (benchmarks/kv_churn) or lmdb / filedir (the peer
-# harness's kvchurn).  Environment: CYCLONE_BUILD (dir holding kv_churn),
-# PEER_BUILD (dir holding kvchurn), DATA (store directory root), MEMORY_MAX
-# (cgroup memory.max, default 4G).  Needs passwordless sudo for systemd-run
-# and drop_caches.
+# STORE is cyclone (benchmarks/kv_churn) or lmdb / filedir (kvchurn, the
+# peer harness's churn driver).  The peer harness is not published; it
+# implements kv-churn-spec.md, which is enough to reimplement it.
+# Environment: CYCLONE_BUILD (dir holding kv_churn, default ./build),
+# PEER_BUILD (dir holding kvchurn; required for lmdb / filedir), DATA (store
+# directory root), MEMORY_MAX (cgroup memory.max, default 4G).  Needs
+# passwordless sudo for systemd-run and drop_caches.
 set -u
 store=$1 pattern=$2 threads=$3 capacity=$4 seconds=$5 out=$6 log=$7
 shift 7
-CYCLONE_BUILD=${CYCLONE_BUILD:-$HOME/cyclone-churn/build}
-PEER_BUILD=${PEER_BUILD:-$HOME/cyclone-kv-bench/build}
+CYCLONE_BUILD=${CYCLONE_BUILD:-$PWD/build}
+PEER_BUILD=${PEER_BUILD:-}
 DATA=${DATA:-$HOME/kvdata/churn}
 MEMORY_MAX=${MEMORY_MAX:-4G}
 DROP='sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null'
@@ -25,6 +27,9 @@ DROP='sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null'
 mkdir -p "$DATA"
 if [ "$store" = cyclone ]; then
   cmd=("$CYCLONE_BUILD/kv_churn" --path "$DATA/cyclone")
+elif [ -z "$PEER_BUILD" ]; then
+  echo "run-churn.sh: set PEER_BUILD to the directory holding kvchurn" >&2
+  exit 2
 else
   cmd=("$PEER_BUILD/kvchurn" --store "$store" --path "$DATA/$store")
 fi

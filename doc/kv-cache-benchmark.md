@@ -1,12 +1,57 @@
 # Cyclone as an LLM KV-cache storage tier — benchmark
 
-**Status:** four rounds on two laptops (macOS/Apple silicon and Linux/NVMe
-with a quiesced page cache); round 3 measures the first two fixes the earlier
-rounds called for, and round 4 a bounded-capacity tier under churn. Treat every number as an instrument reading rather than a
-marketing number. The point of this round is to find out where Cyclone
-stands against the storage backends that LLM serving stacks put behind their
-KV connectors today, and to measure — not guess — which of its known
-limitations matter for this workload.
+## Summary
+
+Five rounds of measurements, taken 2026-09-21 to 2026-09-23 on two laptops.
+One is an Apple M5 running macOS, where only a warm page cache can be
+measured. The other is an i7-8750H with a Samsung 970 PRO NVMe running Linux,
+where the page cache is dropped before each cold phase. The peers are LMDB,
+RocksDB (BlobDB) and one file per block (`filedir`). The Cyclone trees
+measured, in order:
+
+- **Rounds 1 and 2:** the stock tree (macOS warm, then Linux cold). This is
+  the baseline every later Cyclone number is compared against.
+- **Round 3:** stock plus platform-aware readahead and a fast CRC32.
+- **Round 3b:** round 3 with the CRC-32C checksum (on-disk format v8). This
+  is the current read path.
+- **Round 4:** the round-3b tree as a bounded-capacity tier under churn.
+
+Each number is one machine's reading. Treat differences under about 20 % as
+noise unless a section says otherwise.
+
+Where Cyclone stands now:
+
+- **Warm reads:** same class as LMDB. Both return a span into a mapping that
+  already exists, with no syscall per get. This is not a differentiator.
+- **Cold reads, Linux/NVMe:** level with LMDB at 2 MiB (2.17 vs 2.15 GB/s,
+  checksum verified). Ahead of every peer at 8 and 32 MiB (3.03 and
+  3.40 GB/s, peers 2.1–2.6). Behind at 512 KiB (1.19 vs LMDB's 1.93).
+- **Writes:** about 1 GB/s per thread at 2 MiB, 1.4× behind file-per-block
+  (1.01 vs 1.44 GB/s on Linux).
+- **Bounded tier under churn:** partial, not significantly better than LMDB.
+  Cyclone holds a hit ratio 8–9 points lower than LMDB with an LRU, so at
+  2 MiB it serves 0.62–1.02× LMDB's throughput. Its hit p99 at 4 threads is
+  lower: 0.26–0.29× LMDB's.
+- **GPU transfer:** registering the whole volume mapping once reaches the
+  PCIe ceiling (12.79 of 12.82 GB/s, 2.3× over staging). Pinning each
+  returned span is slower than staging. LMDB also keeps every value in one
+  mapping and reaches the same ceiling.
+
+| Current number (2 MiB unless stated) | Cyclone | Peers | Round |
+|---|---:|---|---|
+| Warm GET copy, 1 thread, macOS | 63.6 GB/s | LMDB 64.9, filedir 18.0 | [3](#round-3-readahead-and-a-fast-crc32) |
+| Warm GET copy, 1 thread, Linux (DRAM-bound) | 13.1 GB/s | LMDB 12.9, filedir 6.5 | [3b](#round-3b-crc-32c-on-disk-format-v8) |
+| Cold first-touch GET, Linux | 2.17 GB/s | LMDB 2.15, filedir 1.76 | [3b](#round-3b-crc-32c-on-disk-format-v8) |
+| Cold restart GET, Linux | 1.97 GB/s | LMDB 2.16, filedir 1.73 | [3b](#round-3b-crc-32c-on-disk-format-v8) |
+| Cold first-touch, 512 KiB / 8 MiB / 32 MiB, Linux | 1.19 / 3.03 / 3.40 GB/s | LMDB 1.93 / 2.12 / 2.20 | [3b](#round-3b-crc-32c-on-disk-format-v8) |
+| PUT, 1 thread, Linux | 1.01 GB/s | filedir 1.44, RocksDB 0.61 | [3b](#round-3b-crc-32c-on-disk-format-v8) |
+| 4 reader processes, `view`, Linux | 755 k gets/s | LMDB 585 k | [3b](#round-3b-crc-32c-on-disk-format-v8) |
+| Churn, `zipf`, 4 threads: hit ratio / served | 0.757 / 1.41 GB/s | LMDB 0.849 / 1.61 | [4](#round-4-bounded-capacity-under-churn) |
+| Host→GPU, mapping registered once (CUDA, batch 16) | 12.79 GB/s | LMDB 12.81, staged 5.51 | [CUDA](#device-transfer-cuda-gtx-1050-pcie) |
+
+Peer rows come from the round-1 and round-2 sweeps and were not re-run for
+the later rounds. Round 4 has its own peers (LMDB and file-per-block, each
+with an LRU).
 
 ## The role being benchmarked
 
@@ -29,10 +74,12 @@ that role, not against the engines themselves.
 | RocksDB (BlobDB) | the default reach-for key-value store |
 | Cyclone | `benchmarks/kv_bench.cpp` |
 
-CacheLib (Meta's hybrid DRAM/NVMe cache) is the obvious missing peer; it did
-not make round one.
+CacheLib (Meta's hybrid DRAM/NVMe cache) is the obvious missing peer; it is
+not included in any round.
 
-## Workload
+## Method
+
+### Workload (v1)
 
 One written spec drives every harness so the numbers are comparable; both
 harnesses print reference vectors (`kv_bench --print-vectors`) that must
@@ -59,7 +106,20 @@ agree byte-for-byte.
 - Latency is measured around the get/put call *plus* the touch/copy.
   GB/s is decimal, over value bytes only.
 
-## Store tuning (all printed by the harnesses)
+### Churn workload (round 4)
+
+Round 4 uses a separate spec,
+[`kv-churn-spec.md`](kv-cache-benchmark/kv-churn-spec.md), whose decision
+criteria were fixed before any run. The tier has a bounded capacity
+C = 16 GiB of payload, and the key universe is 3 × C. Every operation is
+get-or-insert: a hit copies the block into a staging buffer, and a miss
+generates the block and puts it. Two access patterns run: Zipf(0.99), and
+`zipf+scan`, where 10 % of operations are never-seen keys. Each store runs in
+a 4 GiB memory cgroup and is measured for 120 s after a warm-up that inserts
+2 × C. Stores, tuning and results are in
+[Round 4](#round-4-bounded-capacity-under-churn).
+
+### Store tuning (all printed by the harnesses)
 
 - **Cyclone:** `max_object_size = 0`, `ram_cache_size = 0` (the CLFUS tier is
   for small objects; the OS page cache is the RAM tier here), mmap directory
@@ -67,35 +127,86 @@ agree byte-for-byte.
   phase and can be shared by the reader processes, `enable_checksum = true`
   (mandatory in that mode, and it forces `verify_checksum_on_read`). Two
   variants isolate specific costs: `--no-mmap-dir --no-verify` (in-memory
-  directory, no CRC on read) and a build without the blanket `MADV_RANDOM`
-  on the whole-file mapping.
+  directory, no checksum on read) and, in round 1, a build without the
+  blanket `MADV_RANDOM` on the whole-file mapping.
 - **filedir / filedir-read:** `open(O_CREAT|O_TRUNC)` + `writev`, no fsync;
   reads `mmap`/`munmap` per get, or `pread` into a per-thread buffer.
-- **LMDB 1.0.2:** 16 GiB map, default (durable) flags — it is the only store
-  here that fsyncs every put; one read txn per get, zero-copy `MDB_val`.
-- **RocksDB 11.8.1:** BlobDB (`min_blob_size = 0`), no compression, no block
-  cache, WAL on, `sync = false`. `Get` copies into a `std::string`, so its
-  `view` mode is a copy plus the page touch. Phase 5 skipped (one RW process
-  per directory).
+- **LMDB:** 16 GiB map, default (durable) flags — it is the only store here
+  that fsyncs every put; one read txn per get, zero-copy `MDB_val`. Round 4
+  uses different flags (listed there).
+- **RocksDB:** BlobDB (`min_blob_size = 0`), no compression, no block cache,
+  WAL on, `sync = false`. `Get` copies into a `std::string`, so its `view`
+  mode is a copy plus the page touch. Phase 5 skipped (one RW process per
+  directory).
 
-## Machine
+Store versions, as recorded in the raw JSON lines:
 
-Apple M5 (4 performance + 6 efficiency cores), 16 GiB RAM, macOS 27.0, APFS on
-the internal SSD, everything Release/`-O2`. With 16 GiB RAM a 4 GiB dataset
-stays page-cache resident once written, so every phase here measures the
-software path over cached pages, not the SSD; the page cache cannot be
-dropped without root on macOS. The [Linux section](#linux-cold-page-cache-ubuntu-2204-i7-8750h-samsung-970-pro)
-repeats the sweep with a quiesced cache, which is where the cold-read
-result comes from.
+| Store | macOS (rounds 1, 3; Metal) | Linux (rounds 2, 3, 3b, 4; CUDA) |
+|---|---|---|
+| LMDB | 1.0.2 | 0.9.24 |
+| RocksDB | 11.8.1 | 9.10.0 (not in round 4) |
+| filedir | plain files on APFS | plain files on ext4 |
+| Cyclone | this repository, at the tree named by each round | same |
 
-## Results (2026-09-21, Apple M5, second run)
+The Metal and CUDA result files do not record the LMDB version. They ran on
+the same two machines.
+
+### Machines
+
+- **macOS:** Apple M5 (4 performance + 6 efficiency cores), 16 GiB RAM,
+  macOS 27.0 (26A428), APFS on the internal SSD, Release/`-O2` builds. With
+  16 GiB of RAM a 4 GiB dataset stays in the page cache once written, and
+  macOS cannot drop the page cache without root. Every macOS phase therefore
+  measures the software path over cached pages, not the SSD.
+- **Linux:** Intel Core i7-8750H (6 cores / 12 threads), 23 GiB RAM, Samsung
+  970 PRO NVMe, ext4, Ubuntu 22.04.5 (kernel 5.15.0-191), clang-20. It has
+  root, so `sync; echo 3 > /proc/sys/vm/drop_caches` runs before the
+  first-touch and restart phases (`--drop-caches-cmd` in both harnesses).
+  All cold-read results come from this machine. It has dual-channel DDR4, so
+  `copy` saturates at about 12 GB/s for every store. The CUDA section adds
+  this laptop's GTX 1050.
+
+### Reproducing
+
+```bash
+# Cyclone (this repository)
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DCYCLONE_USE_BUNDLED_SHA256=ON && cmake --build build -j
+./build/kv_bench --print-vectors                # must match the peer harness
+./build/kv_bench --seconds 10 --path /fast/ssd --output results/cyclone.jsonl
+./build/kv_bench --block-size 2097152 --no-mmap-dir --no-verify --output results/cyclone-noverify.jsonl
+```
+
+Round 4 (churn) runs one point per invocation, inside a 4 GiB memory
+cgroup:
+
+```bash
+./build/kv_churn --print-vectors                # must match kvchurn's
+doc/kv-cache-benchmark/churn/run-churn.sh cyclone zipf+scan 4 17179869184 120 churn.jsonl churn.txt
+./build/kv_churn_policy                         # eviction-policy replay, no I/O
+```
+
+The peer harness is not published. It contains the file-per-block, LMDB and
+RocksDB adapters for both workloads (`kvchurn` is its churn driver), plus a
+runner and a report generator. It is a plain implementation of
+[`kv-workload-spec.md`](kv-cache-benchmark/kv-workload-spec.md) and
+[`kv-churn-spec.md`](kv-cache-benchmark/kv-churn-spec.md), and those two
+files are enough to reimplement it. A reimplementation must print the same
+reference vectors as `kv_bench --print-vectors` and
+`kv_churn --print-vectors`. `run-churn.sh` finds a peer build through
+`PEER_BUILD`. Run each store's sizes with nothing else on the machine, and
+delete each size's data before the next.
+
+## Round 1: macOS, warm page cache
+
+> **Cyclone rows superseded by rounds 3 and 3b; peer rows current.** Stock
+> tree, 2026-09-21, Apple M5. This is the second run; the first was
+> withdrawn (see [Corrections](#corrections-to-the-first-run)).
 
 Full generated tables are in the appendix; raw JSON lines are in
 [`doc/kv-cache-benchmark/`](kv-cache-benchmark/). `cyclone` is the stock
 build with the tuning above; `cyclone-noverify` uses the in-memory directory
 and no CRC on read; `cyclone-nomadv` is a build without the blanket
-`MADV_RANDOM` (2 MiB only). The first run of this benchmark was withdrawn —
-see [Corrections](#corrections-to-the-first-run).
+`MADV_RANDOM` (2 MiB only).
 
 ### Headline, 2 MiB blocks (the Llama-8B 16-token block)
 
@@ -150,14 +261,6 @@ index persistent also forces `verify_checksum_on_read`, so restart-warmth
 and CRC-on-first-read come as a package. With verification off
 (`cyclone-noverify`) first-touch runs at 37 GB/s.
 
-> **Update — fixed.** The table routine is gone; see fix-list item 2. The
-> checksum now runs at 12.2 GB/s on the M5 (ARMv8 `crc32`) and 2.8 GB/s on
-> the i7-8750H (slice-by-16), and the restart phase in this same
-> configuration moved from 0.558 to 8.54 GB/s. Every number in the tables
-> below predates that change. The checksum has since moved again, to
-> CRC-32C at on-disk format v8 (34.9 GB/s on the M5) — see the follow-up
-> under fix-list item 2.
-
 **Multi-process readers scale worse than threads, for the same reason.**
 Four Cyclone reader processes reach 46 GB/s in copy mode, 0.65× a single
 thread, where four threads reach 1.1× and LMDB's four processes 1.2× (78
@@ -174,8 +277,8 @@ store reads clean pages faster, and the first-touch column varies 2–40×
 between runs and sizes for every store, so it is reported but not used to
 rank anything. The `cyclone-nomadv` experiment (removing the blanket
 `MADV_RANDOM` on the mapping) landed inside that noise: it is a plausible
-cause of per-page faulting on 2 MiB blocks and stays on the list below, but
-this round did not measure it.
+cause of per-page faulting on 2 MiB blocks, and round 3's readahead work
+addressed that mechanism.
 
 **Writes.** 0.40–0.48 GB/s per thread, a third of file-per-block and below
 RocksDB. The write path copies the value three times (handle buffer →
@@ -183,246 +286,11 @@ document builder → serialized record) and CRCs it before a single
 `pwrite`; there is no scatter-gather or reserve-in-place API yet. LMDB's
 0.18 is not comparable — it fsyncs every put.
 
-### What to change, in order
+## Round 2: Linux, cold page cache
 
-1. **Readahead for large reads — DONE, 3.7× cold (13× with CRC out of the
-   way), with a per-platform hint.** The blanket `MADV_RANDOM` on the whole
-   mapping (right for 4 KB HTTP objects) turned a cold 2 MiB read into ≈512
-   serial NVMe faults: 0.06 GB/s on Linux against 1.7–2.2 for the peers.
-   The disk read path now advises exactly the document's byte range, after
-   the full-key re-verification and before the CRC pass makes the first
-   content touch, for documents ≥ `CacheConfig::readahead_min_bytes`
-   (default 256 KiB, 0 = off). `MADV_RANDOM` stays, so small objects are
-   untouched. Two details carry most of the win: on Linux the advice is
-   issued in 512 KiB chunks, because the kernel clamps a single
-   `MADV_WILLNEED` to `max(bdi->io_pages, ra_pages)` pages and so silently
-   covers only the first ~1.25 MB of a 2 MiB range; and each document
-   placement is advised at most once every 2 s (a lossy direct-mapped
-   filter with a per-slot timestamp), because on a warm re-read the advice
-   walk costs more than the read — unfiltered it took warm `view` from
-   261 k to 68 k gets/s. The filter decays rather than remembering forever:
-   a KV tier is normally larger than RAM, so a block that was advised,
-   evicted and read cold again is the common case and must get its hint
-   back. `CacheStats::readahead_hints_issued` counts the hints that reach
-   the kernel.
-
-   **`MADV_WILLNEED` is not portable in cost — the macOS finding.** The
-   first version of this used `madvise(MADV_WILLNEED)` everywhere, which is
-   right on Linux and wrong on Darwin. Darwin's `MADV_WILLNEED` is not a
-   queue-and-return: it walks and populates the range under the shared VM
-   object's lock, so it is expensive per call *and* serialises across every
-   process mapping the volume. A standalone probe on an M5 — one 2 MiB
-   range of a `MAP_SHARED` read-write mapping whose pages are in the buffer
-   cache but not yet in the caller's page tables — measured
-   `MADV_WILLNEED` in 512 KiB chunks at **50 µs** with one process and
-   **305 µs** with four concurrent ones, against **5 µs / 10 µs** for
-   `fcntl(F_RDADVISE)`, Darwin's native asynchronous readahead. Against
-   phase 5 (four reader processes) that is the whole story: the madvise
-   hint cost macOS **86 %** of `multiprocess_read view`, **85 %** of
-   `copy`, and **29 %** of `restart`. The read path therefore picks by
-   platform — `F_RDADVISE` on the volume fd on Darwin,
-   `madvise(MADV_WILLNEED)` on Linux, `PrefetchVirtualMemory` on Windows —
-   via `MappedFile::supports_advise_readahead()`. With `F_RDADVISE` every
-   macOS phase is back inside noise of no hint at all, and the cold-read
-   win survives where the page cache is genuinely cold.
-
-   Linux, 2 MiB blocks, 1 thread, `--seconds 5`, caches dropped before the
-   cold phases; median of three runs:
-
-   | phase | before | after | |
-   |---|---:|---:|---:|
-   | `get_first_touch` | 57.4 gets/s, 0.120 GB/s, p99 24.2 ms | 212.9 gets/s, 0.446 GB/s, p99 5.3 ms | **3.7×** |
-   | `restart` | 57.9 gets/s, 0.121 GB/s, p99 24.3 ms | 209.5 gets/s, 0.439 GB/s, p99 5.5 ms | **3.6×** |
-   | `get_first_touch`, `--no-verify` | 85.5 gets/s, 0.179 GB/s, p99 18.5 ms | 1109.7 gets/s, 2.327 GB/s, p99 1.5 ms | **13.0×** |
-   | `put` | 132.0 puts/s, 0.277 GB/s | 131.7 puts/s, 0.276 GB/s | — |
-   | `get_warm` view | 271.6 k gets/s, p99 4.8 µs | 265.5 k gets/s, p99 5.0 µs | 98 % |
-   | `get_warm` copy | 5350 gets/s, 11.22 GB/s | 4990 gets/s, 10.47 GB/s | 93 % |
-   | `multiprocess_read` view | 8379 gets/s, 17.57 GB/s | 8287 gets/s, 17.38 GB/s | 99 % |
-   | `multiprocess_read` copy | 3508 gets/s, 7.36 GB/s | 3588 gets/s, 7.52 GB/s | 102 % |
-
-   Four children re-advising is 4× the hint traffic, so phase 5 is the case
-   that had to be checked: on Linux it is unchanged, because the 2 s
-   re-advise filter caps the traffic and `MADV_WILLNEED` returns without
-   blocking anyone else.
-
-   macOS (M5, 16 GB, APFS/NVMe), same command, median of three runs. No
-   `drop_caches` equivalent exists, so the "cold" phases here run against a
-   partly warm page cache and sit on the 0.55 GB/s software-CRC32 ceiling
-   rather than on I/O — which is exactly why the *cost* of the hint is what
-   this table is for:
-
-   | phase | stock | `MADV_WILLNEED` | `F_RDADVISE` |
-   |---|---:|---:|---:|
-   | `put` | 198.0 puts/s, 0.415 GB/s | 198.7, 0.417 | 205.6, 0.431 |
-   | `get_first_touch` | 277.6 gets/s, 0.582 GB/s | 240.4, 0.504 (87 %) | 284.4, 0.597 (**102 %**) |
-   | `restart` | 280.4 gets/s, 0.588 GB/s | 200.3, 0.420 (71 %) | 280.7, 0.589 (**100 %**) |
-   | `get_warm` view | 685.7 k gets/s | 679.5 k (99 %) | 684.4 k (100 %) |
-   | `get_warm` copy | 33.9 k gets/s, 71.09 GB/s | 33.7 k, 70.64 (99 %) | 33.3 k, 69.81 (98 %) |
-   | `multiprocess_read` view | 15502 gets/s, 32.51 GB/s | 2094, 4.39 (**14 %**) | 14743, 30.92 (95 %) |
-   | `multiprocess_read` copy | 10526 gets/s, 22.07 GB/s | 1596, 3.35 (**15 %**) | 10329, 21.66 (98 %) |
-
-   The one run in the set that started with a genuinely cold page cache is
-   the only macOS sample where readahead has anything to do: there stock
-   managed 118.4 gets/s (0.248 GB/s) on `get_first_touch` and `F_RDADVISE`
-   225.9 (0.474 GB/s). Apple Silicon's 16 KiB base page and Darwin's own
-   clustered pagein are why the upside is smaller than on Linux to begin
-   with — a cold 2 MiB read is ~128 faults there, not ~512.
-
-   The `--no-verify` row is the honest ceiling of the I/O fix: **2.33 GB/s,
-   past LMDB (2.15) and file-per-block (1.76)**. With verification on, the
-   cold path is now bounded by the 0.55 GB/s software CRC32, which is item
-   2 below — readahead has taken the I/O out of the picture and handed the
-   remaining gap to the checksum. `MADV_POPULATE_READ` (Linux ≥ 5.14) was
-   measured on top of the chunked `WILLNEED` and did not help (2.25 vs 2.33
-   GB/s), so it is not used: `WILLNEED` already queues the large reads, and
-   populating the PTEs up front only moves the per-page work.
-2. **Fast CRC32** — ✅ **done** (then `src/core/crc32.{hpp,cpp}`; renamed
-   to `crc32c.{hpp,cpp}` by the follow-up below). The byte-wise
-   table routine was replaced by slice-by-16 tables plus an ARMv8
-   `crc32b/w/x` path, selected once through a function pointer. The on-disk
-   convention is untouched (reflected `0xEDB88320`, init/xorout
-   `0xFFFFFFFF`), so existing cache files keep verifying. Measured with
-   `./build-rel/crc32_bench`, 2 MiB buffer:
-
-   | | byte-wise (was) | slice-by-16 | ARMv8 crc32 |
-   |---|---:|---:|---:|
-   | Apple M5 (clang, Release) | 0.61 GB/s | 3.44 GB/s | **12.21 GB/s** |
-   | i7-8750H (clang-20, Release) | 0.50 GB/s | **2.83 GB/s** | n/a |
-
-   Both machines print the same checksum for the same buffer, and the unit
-   test pins every path against a verbatim copy of the old byte-wise
-   routine (then `tests/unit/test_crc32.cpp`).
-
-   End to end on the M5 (`kv_bench --block-size 2097152 --seconds 5
-   --threads 1 --skip-multiprocess`, warm page cache): restart
-   **0.558 → 8.54 GB/s** (15×), first touch 0.566 → 8.72 GB/s, put
-   0.421 → 1.38 GB/s. `performance_baseline --content-size 4096`
-   first-touch read **137 k → 1.12 M ops/s**. The restart floor is now the
-   page-cache/copy rate, not the checksum.
-
-   Follow-up — **CRC-32C, on-disk format v8** (✅ done). The note this item
-   used to carry said x86-64 had to stay on the table path because SSE4.2's
-   `crc32` instruction computes CRC-32**C**, a different polynomial. That
-   was the open decision, and it has been taken: the document checksum *is*
-   CRC-32C from format major v8 (reflected `0x82F63B78`, init/xorout
-   `0xFFFFFFFF`), which has a hardware path on x86-64 (SSE4.2 `crc32q`) as
-   well as on ARMv8 (`crc32cx`). Existing cache files are abandoned (not
-   deleted) on open — the format major is part of the fingerprinted
-   filename, so consumers take a cold cache, never a misparse, and the
-   superseded v7 file stays on disk until it is reclaimed. The files are now
-   `src/core/crc32c.{hpp,cpp}`, `tests/unit/test_crc32c.cpp` and
-   `./build-rel/crc32c_bench`. Both hardware paths run three interleaved CRC
-   registers (8192- then 256-byte blocks, recombined through
-   compile-time-generated GF(2) zero-shift operators), because the
-   instruction is latency- not throughput-bound:
-
-   | 2 MiB buffer | byte-wise | slice-by-16 | hw, 1 stream | hw, 3-way |
-   |---|---:|---:|---:|---:|
-   | Apple M5 (clang, Release) | 0.61 GB/s | 3.37 GB/s | 12.19 GB/s | **34.93 GB/s** |
-   | i7-8750H (clang-20, Release) | 0.50 GB/s | 2.82 GB/s | 10.41 GB/s | **26.51 GB/s** |
-   | i7-8750H (g++-13, Release) | — | 3.76 GB/s | 8.36 GB/s | 19.26 GB/s |
-
-   (Best of five `crc32c_bench --seconds 1` runs on an otherwise idle
-   machine; raw i7 output in
-   [`kv-cache-benchmark/crc32c/i7-8750H-crc32c_bench.txt`](kv-cache-benchmark/crc32c/i7-8750H-crc32c_bench.txt).
-   GCC schedules the same intrinsics less well than clang; the project's
-   reference toolchain is clang-20.)
-
-   **End to end on Linux (i7-8750H, Samsung 970 PRO, ext4, page cache
-   dropped before the cold phases).** Measured on round 3's tree with this
-   change merged in (readahead + CRC-32C), the same `kv_bench` invocation
-   and the same peers' numbers as round 3; raw data in
-   [`kv-cache-benchmark/crc32c/`](kv-cache-benchmark/crc32c/). Dirty-page
-   limits were left at the kernel defaults this time (round 3 had raised
-   them to 12 GiB, which is what hung the box after that sweep).
-
-   | 2 MiB blocks | round 3 | **+ CRC-32C** | filedir | lmdb |
-   |---|---:|---:|---:|---:|
-   | PUT, GB/s | 0.81 | **1.01** | 1.44 | 0.15 |
-   | Cold first-touch GET, GB/s | 1.62 | **2.17** | 1.76 | 2.15 |
-   | Cold restart GET, GB/s | 1.44 | **1.97** | 1.73 | 2.16 |
-   | Cold first-touch, verification off | 2.31 | 2.33 | — | — |
-   | Warm GET copy, 1 thread, GB/s | 10.5 | **13.1** | 6.5 | 12.9 |
-   | 4 reader processes, view, gets/s | 621 k | **755 k** | 26 k | 585 k |
-   | 4 reader processes, copy, GB/s | 9.8 | **12.3** | 11.8 | 10.9 |
-
-   Cold first-touch by block size, GB/s (restart in parentheses):
-
-   | | 512 KiB | 2 MiB | 8 MiB | 32 MiB |
-   |---|---:|---:|---:|---:|
-   | round 3 | 0.63 (0.55) | 1.62 (1.44) | 1.63 (1.53) | 1.28 (1.18) |
-   | **+ CRC-32C** | **1.19 (0.67)** | **2.17 (1.97)** | **3.03 (2.80)** | **3.40 (3.33)** |
-   | filedir | 0.94 | 1.76 | 2.51 | 2.60 |
-   | lmdb | 1.93 | 2.15 | 2.12 | 2.20 |
-
-   What it says: with verification on, the 2 MiB cold path now sits 7 %
-   under its own no-verify ceiling (2.17 vs 2.33 GB/s) instead of 30 %, and
-   level with LMDB. At 8 and 32 MiB, where readahead has the most to
-   queue, Cyclone reads cold faster than every peer. 512 KiB is still
-   per-get-overhead-bound (1.2 GB/s against LMDB's 1.9): the fix list's
-   remaining cold-path item is the verified state outliving the process.
-   Puts gain 10–40 % because the write path checksums too. The warm and
-   multi-process rows also moved, but round 3 was measured on a box carrying
-   a leaked dirty-page count and this round on a fresh boot, so treat gains
-   outside the cold phases as partly machine state; the cold phases, which
-   drop the page cache first, are the comparison this round is about. The
-   i7's CRC-32C rate is 9.4× its old slice-by-16 ceiling, so on x86 the
-   checksum has left the critical path.
-
-   Still open from this item: a way for the *verified state* to outlive the
-   process — the CRC-validation cache could live beside the mmap directory
-   so a restart and every peer process inherit it, removing the
-   re-verification entirely rather than making it cheap.
-3. **A `WriteHandle::reserve(n)` that hands back the destination span** so
-   the caller writes or DMAs straight into the record, collapsing three
-   copies to one; then revisit puts against file-per-block (4× today).
-4. **Zero-copy device transfer, measured.** `view` mode shows the zero-copy
-   path is the cheapest per-get of any store here (≈1.5 µs for a 2 MiB
-   block; LMDB the only peer in the same class), and the Metal section
-   below shows the payoff: wrap the volume mapping once and blit by
-   `content_file_offset()` for 1.9× over a staged copy. The API for the
-   winning form exists (`content()`, `content_file_offset()`,
-   `volume_files()`); what is missing is an entry point that hands an
-   embedder the mapping identity directly. The discrete-GPU half now agrees
-   and more strongly: over PCIe 3.0 ×16 on a GTX 1050,
-   `cudaHostRegister` accepts the volume mapping whole (7.56 GiB in one
-   call) and transferring from it reaches **12.79 GB/s — 99.8% of the
-   12.82 GB/s pinned-buffer bus ceiling — against 5.51 GB/s staged, 2.3×**,
-   while registering *per block* is a 21% **loss** against staging (see
-   [Device transfer: CUDA](#device-transfer-cuda-gtx-1050-pcie)).
-   GPUDirect Storage (`cuFileRead` at `content_file_offset()`, NVMe→GPU
-   with no host copy) needs a data-center GPU.
-5. Only then: a zero-copy C read entry point and a Python binding, which is
-   what a vLLM/SGLang connector would call.
-
-### Corrections to the first run
-
-Two methodology faults were found in the first sweep by review and
-retraction is the honest fix:
-
-- The peer harness wiped each block size's data only *before* that size
-  ran, so 2–6 GiB of earlier sizes stayed resident and squeezed the 16 GiB
-  page cache during the larger-block runs; `kv_bench` deletes its volume
-  per size, so Cyclone never paid that. Peer warm reads were depressed up to
-  100× (LMDB `view` 4 k → 513 k gets/s) and the first draft claimed a 5–20×
-  Cyclone read advantage that does not exist. Fixed in the harness; every
-  number above is from the corrected sweep.
-- The first headline table put a `view`-mode multi-process row under
-  `copy`-mode rows, inflating the multi-process story ~10×. Phase 5 now
-  runs both modes and only `copy` is compared.
-
-### Caveats
-
-- One laptop, one SSD, APFS, 16 GiB RAM, 10 s per point, single run. Treat
-  differences under ~20 % as noise; the multi-× differences are not.
-- The peers measure a `std::string` allocation and a SHA-256 inside their
-  warm-phase sample (≈1 µs); Cyclone hashes outside it. Irrelevant at
-  100 µs+ latencies, slightly flatters Cyclone at the µs scale.
-- The Linux run is one consumer laptop (dual-channel DDR4, one NVMe); a
-  server-class NVMe array and a data-center GPU would move the absolute
-  numbers, not the ordering.
-
-## Linux, cold page cache (Ubuntu 22.04, i7-8750H, Samsung 970 PRO)
+> **Cyclone rows superseded by rounds 3 and 3b; peer rows current.** Stock
+> tree, 2026-09-21, i7-8750H / Samsung 970 PRO. The `cyclone` column is the
+> cold-read baseline for rounds 3 and 3b.
 
 The same sweep on a Linux laptop with root, so `sync; echo 3 >
 /proc/sys/vm/drop_caches` runs before the first-touch and restart phases
@@ -458,16 +326,10 @@ the rest is the whole-volume mapping advised `MADV_RANDOM`: each 4 KiB page
 of the block is a separate fault and a separate NVMe round-trip, ≈512 per
 block, with no readahead. The file stores get per-file readahead on `open`,
 and LMDB's mapping has no such advice. This is the same mechanism the macOS
-run could only hint at (there the page cache was never cold) and it is now
-the top item in the fix list. It also explains why four Cyclone reader
+run could only hint at (there the page cache was never cold) and it became
+the first fix (round 3). It also explains why four Cyclone reader
 processes fall below one thread on both platforms: each process re-faults
 and re-verifies from scratch.
-
-> **Fixed since this run.** The table above is the pre-fix measurement and
-> is kept as the baseline. Per-document `MADV_WILLNEED` on the cold read
-> path (fix-list item 1, now landed) takes cold first-touch to 0.449 GB/s
-> with CRC on and 2.327 GB/s with it off — past LMDB. See item 1 below for
-> the full before/after.
 
 **Warm reads confirm the macOS picture on cheaper hardware.** Cyclone and
 LMDB are the same zero-syscall class (274 k vs 245 k gets/s `view`; 11.9 vs
@@ -476,13 +338,132 @@ LMDB are the same zero-syscall class (274 k vs 245 k gets/s `view`; 11.9 vs
 **Writes** are 0.25–0.35 GB/s here vs 1.3–1.4 for file-per-block — the
 same 4× gap as on macOS, from the same three copies + CRC.
 
-## Round 3: both fixes together (readahead + fast CRC32)
+## Round 3: readahead and a fast CRC32
 
-`round3` = the corrected sweep's Cyclone plus the two fixes above
-(platform-aware readahead for large documents, slice-by-16 / ARMv8 CRC32).
-Same harnesses, same peers' numbers as the corrected sweeps; raw data in
-[`doc/kv-cache-benchmark/round3/`](kv-cache-benchmark/round3/); full Linux
-tables in [Appendix C](#appendix-c--linux-round-3-generated-tables).
+Round 3 (2026-09-22) measures the first two fixes that rounds 1 and 2
+called for. It shows each fix alone, then both together. The checksum in
+this round is still CRC-32/ISO-HDLC at on-disk format v7; round 3b replaces
+it.
+
+### Readahead alone
+
+The whole volume mapping is advised `MADV_RANDOM`, which is right for 4 KB
+HTTP objects. For a cold 2 MiB read it meant about 512 serial NVMe faults.
+The read path now adds a readahead hint over exactly the document's byte
+range for documents of at least `CacheConfig::readahead_min_bytes` (default
+256 KiB). The hint is issued after the full-key check and before the
+checksum pass first touches the content. On Linux it is issued in 512 KiB
+chunks. Each placement is re-advised at most every 2 s, so warm re-reads do
+not pay for it. The mechanism and the reasons for each detail are in
+[architecture.md, Memory-Mapped I/O](architecture.md#memory-mapped-io).
+`CacheStats::readahead_hints_issued` counts the hints that reach the kernel.
+
+Linux, 2 MiB blocks, 1 thread, `--seconds 5`, caches dropped before the
+cold phases; median of three runs. The checksum is still the byte-wise
+CRC32 of the stock tree:
+
+| phase | before | after | |
+|---|---:|---:|---:|
+| `get_first_touch` | 57.4 gets/s, 0.120 GB/s, p99 24.2 ms | 212.9 gets/s, 0.446 GB/s, p99 5.3 ms | **3.7×** |
+| `restart` | 57.9 gets/s, 0.121 GB/s, p99 24.3 ms | 209.5 gets/s, 0.439 GB/s, p99 5.5 ms | **3.6×** |
+| `get_first_touch`, `--no-verify` | 85.5 gets/s, 0.179 GB/s, p99 18.5 ms | 1109.7 gets/s, 2.327 GB/s, p99 1.5 ms | **13.0×** |
+| `put` | 132.0 puts/s, 0.277 GB/s | 131.7 puts/s, 0.276 GB/s | — |
+| `get_warm` view | 271.6 k gets/s, p99 4.8 µs | 265.5 k gets/s, p99 5.0 µs | 98 % |
+| `get_warm` copy | 5350 gets/s, 11.22 GB/s | 4990 gets/s, 10.47 GB/s | 93 % |
+| `multiprocess_read` view | 8379 gets/s, 17.57 GB/s | 8287 gets/s, 17.38 GB/s | 99 % |
+| `multiprocess_read` copy | 3508 gets/s, 7.36 GB/s | 3588 gets/s, 7.52 GB/s | 102 % |
+
+The 0.120 GB/s baseline is from 5 s single-size runs, not the 10 s sweep
+that gave round 2's 0.06 GB/s.
+
+Four child processes re-advising cause 4× the hint traffic, so phase 5 is
+the case that had to be checked. On Linux it is unchanged: the 2 s
+re-advise filter caps the traffic, and `MADV_WILLNEED` returns without
+blocking any other process.
+
+**`MADV_WILLNEED` is not portable in cost — the macOS finding.** The first
+version of the hint used `madvise(MADV_WILLNEED)` on every platform. That is
+right on Linux and wrong on Darwin, where `MADV_WILLNEED` does not queue and
+return. It walks and populates the range under the shared VM object's lock,
+so each call is expensive *and* serialises across every process that maps
+the volume. A standalone probe on the M5 used one 2 MiB range of a
+`MAP_SHARED` read-write mapping whose pages were in the buffer cache but
+not yet in the caller's page tables. `MADV_WILLNEED` in 512 KiB chunks took
+**50 µs** with one process and **305 µs** with four concurrent ones.
+`fcntl(F_RDADVISE)`, Darwin's native asynchronous readahead, took
+**5 µs / 10 µs**. In phase 5 (four reader processes) the madvise hint cost
+macOS **86 %** of `multiprocess_read view`, **85 %** of `copy`, and **29 %**
+of `restart`. The read path therefore picks by platform:
+`F_RDADVISE` on the volume fd on Darwin, `madvise(MADV_WILLNEED)` on Linux,
+`PrefetchVirtualMemory` on Windows. With `F_RDADVISE`, every macOS phase is
+back within noise of no hint at all.
+
+macOS (M5, 16 GB, APFS/NVMe), same command, median of three runs. There is
+no `drop_caches` equivalent, so the "cold" phases ran against a partly warm
+page cache. They sat on the 0.55 GB/s ceiling of the byte-wise CRC32, not on
+I/O, so this table measures what the hint *costs*:
+
+| phase | stock | `MADV_WILLNEED` | `F_RDADVISE` |
+|---|---:|---:|---:|
+| `put` | 198.0 puts/s, 0.415 GB/s | 198.7, 0.417 | 205.6, 0.431 |
+| `get_first_touch` | 277.6 gets/s, 0.582 GB/s | 240.4, 0.504 (87 %) | 284.4, 0.597 (**102 %**) |
+| `restart` | 280.4 gets/s, 0.588 GB/s | 200.3, 0.420 (71 %) | 280.7, 0.589 (**100 %**) |
+| `get_warm` view | 685.7 k gets/s | 679.5 k (99 %) | 684.4 k (100 %) |
+| `get_warm` copy | 33.9 k gets/s, 71.09 GB/s | 33.7 k, 70.64 (99 %) | 33.3 k, 69.81 (98 %) |
+| `multiprocess_read` view | 15502 gets/s, 32.51 GB/s | 2094, 4.39 (**14 %**) | 14743, 30.92 (95 %) |
+| `multiprocess_read` copy | 10526 gets/s, 22.07 GB/s | 1596, 3.35 (**15 %**) | 10329, 21.66 (98 %) |
+
+The one run in the set that started with a genuinely cold page cache is
+the only macOS sample where readahead has anything to do: there stock
+managed 118.4 gets/s (0.248 GB/s) on `get_first_touch` and `F_RDADVISE`
+225.9 (0.474 GB/s). Apple Silicon's 16 KiB base page and Darwin's own
+clustered pagein are why the upside is smaller than on Linux to begin
+with — a cold 2 MiB read is ~128 faults there, not ~512.
+
+The `--no-verify` row in the Linux table is the ceiling of the I/O fix:
+**2.33 GB/s, past LMDB (2.15) and file-per-block (1.76)**. With verification
+on, the cold path was then bounded by the 0.55 GB/s byte-wise CRC32.
+Readahead took I/O out of the picture and left the remaining gap to the
+checksum, which is the next fix. `MADV_POPULATE_READ` (Linux ≥ 5.14) was
+measured on top of the chunked `WILLNEED` and did not help (2.25 vs
+2.33 GB/s), so it is not used. `WILLNEED` already queues the large reads, and
+populating the page-table entries up front only moves the per-page work.
+
+### Fast CRC32 alone
+
+The byte-wise table routine was replaced by slice-by-16 tables plus an ARMv8
+`crc32b/w/x` path, selected once through a function pointer. The checksum
+convention did not change (reflected `0xEDB88320`, init/xorout
+`0xFFFFFFFF`), so format-v7 cache files kept verifying. Measured with
+`crc32_bench`, 2 MiB buffer:
+
+| | byte-wise (was) | slice-by-16 | ARMv8 crc32 |
+|---|---:|---:|---:|
+| Apple M5 (clang, Release) | 0.61 GB/s | 3.44 GB/s | **12.21 GB/s** |
+| i7-8750H (clang-20, Release) | 0.50 GB/s | **2.83 GB/s** | n/a |
+
+Both machines print the same checksum for the same buffer. The unit test
+checked every path against a verbatim copy of the old byte-wise routine.
+Round 3b later renamed these files (`crc32c.{hpp,cpp}`, `test_crc32c.cpp`,
+`crc32c_bench`) when it changed the polynomial.
+
+End to end on the M5 (`kv_bench --block-size 2097152 --seconds 5
+--threads 1 --skip-multiprocess`, warm page cache): restart went from
+**0.558 to 8.54 GB/s** (15×), first touch from 0.566 to 8.72 GB/s, and put
+from 0.421 to 1.38 GB/s. `performance_baseline --content-size 4096`
+first-touch reads went from **137 k to 1.12 M ops/s**. After this change
+the restart floor on the M5 is the page-cache and copy rate, not the
+checksum.
+
+On x86-64 the ISO-HDLC polynomial has no hardware instruction (SSE4.2
+`crc32` computes CRC-32C), so the i7 stayed on slice-by-16 at 2.8 GB/s.
+
+### Both fixes together
+
+`round 3` = the stock tree plus both fixes. Same harnesses, and the peers'
+numbers are the round-1 and round-2 sweeps; raw data in
+[`doc/kv-cache-benchmark/round3/`](kv-cache-benchmark/round3/). Full Linux
+tables are in [Appendix C](#appendix-c--linux-round-3-generated-tables).
 
 ### Linux, page cache dropped before cold phases — 2 MiB blocks
 
@@ -497,7 +478,7 @@ tables in [Appendix C](#appendix-c--linux-round-3-generated-tables).
 | 4 reader processes, view, gets/s | 217 k | **621 k** | 26 k | 6.5 k | 585 k | n/a |
 | 4 reader processes, copy, GB/s | 9.3 | 9.8 | 11.8 | 7.8 | 10.9 | n/a |
 
-¹ fsync per put. Other sizes: cold first-touch 0.62 / 1.63 / 1.28 GB/s and
+¹ fsync per put. Other sizes: cold first-touch 0.63 / 1.63 / 1.28 GB/s and
 restart 0.55 / 1.53 / 1.18 at 512 KiB / 8 MiB / 32 MiB (stock: 0.07–0.16).
 
 ### macOS, Apple M5 — 2 MiB blocks (60 s writeback settle before warm)
@@ -513,41 +494,101 @@ restart 0.55 / 1.53 / 1.18 at 512 KiB / 8 MiB / 32 MiB (stock: 0.07–0.16).
 
 ### What round 3 says
 
-- **The cold-read loss is gone on Linux.** 27× on first-touch and 24× on
-  restart put Cyclone level with file-per-block (1.6 vs 1.7 GB/s) and
-  within 25–35 % of LMDB. With verification off it reads 2.31 GB/s, past
-  every peer, so the remaining gap to LMDB is the x86 slice-by-16 CRC32 at
-  2.8 GB/s (ARM gets the 12 GB/s hardware path; on x86 the next step is a
-  PCLMULQDQ path or the CRC-32C format decision).
-- **Multi-process readers now scale.** Four processes reach 621 k gets/s on
-  Linux (2.9× stock, ≈ LMDB) and 1.67 M on macOS (2.3×): each child's
-  re-verification and re-faulting is now cheap enough not to dominate its
-  window. Copy-mode phase 5 is DRAM-bound on both boxes, as for every store.
-- **Writes** improved 2.4–3× from the CRC alone (0.81 GB/s on Linux, 1.28 on
-  macOS) and are still 1.7× behind file-per-block; the three-copy write path
-  is the next item.
-- **Warm reads are unchanged** within noise on both platforms, including the
-  4 KB HTTP baseline.
+- **Cold reads on Linux improved 27× on first touch and 24× on restart.**
+  That put Cyclone level with file-per-block (1.6 vs 1.7 GB/s) and within
+  25–35 % of LMDB. With verification off it read 2.31 GB/s, past every peer.
+  The gap to LMDB was then the x86 slice-by-16 CRC32 at 2.8 GB/s: ARM had
+  the 12 GB/s hardware path, and the next step on x86 was a PCLMULQDQ path
+  or the CRC-32C format decision. (Since resolved: CRC-32C at format v8
+  takes this to 2.17 GB/s; see
+  [Round 3b](#round-3b-crc-32c-on-disk-format-v8).)
+- **Multi-process readers now scale.** Four processes reached 621 k gets/s
+  on Linux (2.9× stock, about LMDB's rate) and 1.67 M on macOS (2.3×). Each
+  child's re-verification and re-faulting became cheap enough not to
+  dominate its window. Copy-mode phase 5 is DRAM-bound on both machines, as
+  for every store.
+- **Writes** improved 2.4–3× from the checksum alone (0.81 GB/s on Linux,
+  1.28 on macOS). They were still 1.7× behind file-per-block. The three-copy
+  write path is the next item.
+- **Warm reads** stayed within noise on macOS and in the 4 KB HTTP baseline.
+  On Linux, warm `view` at 4 and 8 threads came out 11–17 % below stock
+  (Appendix C: 647 k vs 755 k and 663 k vs 800 k gets/s at 2 MiB). This was
+  not investigated. The Linux machine was in the degraded state described
+  under [History](#history-and-corrections) during this round. Round 3b ran
+  after a fresh boot and measured 807 k and 921 k.
 
-### Caveats specific to this round
+The caveats specific to this round (a macOS writeback artifact, one 512 KiB
+cell re-run, and the Linux machine's dirty-page state) are under
+[History and corrections](#history-and-corrections).
 
-- **A benchmark artifact, not a regression, and worth knowing about:** on
-  macOS the faster put + first-touch (≈6 s instead of ≈17 s for 4 GiB) meant
-  the warm phase started while the OS was still writing the dataset back,
-  and reads of in-flight pages measured writeback (2 MiB warm view: 23 k
-  gets/s, p99 250 µs). With the hint off it was worse (870 gets/s), and a
-  60 s settle (`kv_bench --pause-before-warm`) restores 615–700 k. Linux is
-  immune because `drop_caches` syncs first. The macOS table above is the
-  settled run.
-- The Linux box carried a leaked dirty-page count from an ext4 bug during
-  this round (writers throttled until reboot; measured with
-  `vm.dirty_bytes` raised for the runs). One cell — 512 KiB restart — came
-  out at 0.10 GB/s in the sweep and 0.55 GB/s in two clean re-runs with all
-  4096 readahead hints confirmed firing after the reopen (`kv_bench` now
-  prints `readahead_hints_issued` per phase); the table uses the clean
-  re-run and the raw file records both.
-- The peers were not re-run for round 3; their corrected-sweep numbers are
-  reused, taken on the same box before the dirty-page leak.
+## Round 3b: CRC-32C, on-disk format v8
+
+> **Current Cyclone read path.** 2026-09-22, i7-8750H / Samsung 970 PRO;
+> peer rows as in round 2. Raw data in
+> [`kv-cache-benchmark/crc32c/`](kv-cache-benchmark/crc32c/); full tables in
+> [Appendix D](#appendix-d--linux-round-3b-generated-tables).
+
+The document checksum is CRC-32C from format major v8 (reflected
+`0x82F63B78`, init/xorout `0xFFFFFFFF`). CRC-32C has a hardware path on
+x86-64 (SSE4.2 `crc32q`) as well as on ARMv8 (`crc32cx`). Opening an older
+cache file abandons it but does not delete it. The format major is part of
+the fingerprinted file name, so consumers get a cold cache, never a
+misparse, and the superseded v7 file stays on disk until something
+reclaims it. Both hardware paths run three interleaved CRC registers
+(8192-byte, then 256-byte blocks, recombined through GF(2) zero-shift
+operators generated at compile time), because the instruction is limited by
+latency, not throughput. Details are in
+[architecture.md, Document Format](architecture.md#document-format).
+
+| 2 MiB buffer | byte-wise | slice-by-16 | hw, 1 stream | hw, 3-way |
+|---|---:|---:|---:|---:|
+| Apple M5 (clang, Release) | 0.61 GB/s | 3.37 GB/s | 12.19 GB/s | **34.93 GB/s** |
+| i7-8750H (clang-20, Release) | 0.50 GB/s | 2.82 GB/s | 10.41 GB/s | **26.51 GB/s** |
+| i7-8750H (g++-13, Release) | — | 3.76 GB/s | 8.36 GB/s | 19.26 GB/s |
+
+These are the best of five `crc32c_bench --seconds 1` runs on an otherwise
+idle machine; the raw i7 output is in
+[`kv-cache-benchmark/crc32c/i7-8750H-crc32c_bench.txt`](kv-cache-benchmark/crc32c/i7-8750H-crc32c_bench.txt).
+GCC schedules the same intrinsics less well than clang; the project's
+reference toolchain is clang-20.
+
+**End to end on Linux**, page cache dropped before the cold phases. This is
+round 3's tree with the change merged in (readahead + CRC-32C), the same
+`kv_bench` invocation, and the same peer numbers as round 3. It ran after a
+fresh boot at kernel-default dirty-page limits.
+
+| 2 MiB blocks | round 3 | **+ CRC-32C** | filedir | lmdb |
+|---|---:|---:|---:|---:|
+| PUT, GB/s | 0.81 | **1.01** | 1.44 | 0.15 |
+| Cold first-touch GET, GB/s | 1.62 | **2.17** | 1.76 | 2.15 |
+| Cold restart GET, GB/s | 1.44 | **1.97** | 1.73 | 2.16 |
+| Cold first-touch, verification off | 2.31 | 2.33 | — | — |
+| Warm GET copy, 1 thread, GB/s | 10.5 | **13.1** | 6.5 | 12.9 |
+| 4 reader processes, view, gets/s | 621 k | **755 k** | 26 k | 585 k |
+| 4 reader processes, copy, GB/s | 9.8 | **12.3** | 11.8 | 10.9 |
+
+Cold first-touch by block size, GB/s (restart in parentheses):
+
+| | 512 KiB | 2 MiB | 8 MiB | 32 MiB |
+|---|---:|---:|---:|---:|
+| round 3 | 0.63 (0.55) | 1.62 (1.44) | 1.63 (1.53) | 1.28 (1.18) |
+| **+ CRC-32C** | **1.19 (0.67)** | **2.17 (1.97)** | **3.03 (2.80)** | **3.40 (3.33)** |
+| filedir | 0.94 | 1.76 | 2.51 | 2.60 |
+| lmdb | 1.93 | 2.15 | 2.12 | 2.20 |
+
+What it says: with verification on, the 2 MiB cold path now sits 7 % under
+its own no-verify ceiling (2.17 vs 2.33 GB/s), where round 3 was 30 % under,
+and it is level with LMDB. At 8 and 32 MiB, where readahead has the most to
+queue, Cyclone reads cold faster than every peer. 512 KiB is still limited
+by per-get overhead (1.2 GB/s against LMDB's 1.9). The open cold-path item
+is verified state that outlives the process (see
+[What to change](#what-to-change)). Puts gain 10–40 % because the write path
+computes the checksum too. The warm and multi-process rows also moved, but
+round 3 ran on a machine in a degraded state and this round on a fresh boot.
+Treat gains outside the cold phases as partly machine state. The cold
+phases drop the page cache first, and they are the comparison this round is
+about. The i7's CRC-32C rate is 9.4× its old slice-by-16 ceiling, so on x86
+the checksum is no longer on the critical path.
 
 ## Round 4: bounded capacity under churn
 
@@ -574,12 +615,12 @@ byte; no run failed the check. Both harnesses print identical stream heads
 - **Cyclone** (`benchmarks/kv_churn`, round 3 + CRC-32C tree): volume sized so
   the stripes' data areas sum to 17 179 873 216 B (1.0000 × C), 16 stripes of
   ~511 blocks, 65 536 directory entries per stripe (11 MiB of mmap directory
-  in total). Entries never ran out: tag-collision evictions stayed ≤ 7 per
-  run at 2 MiB and ≤ 246 at 512 KiB (whole-run totals, warm-up included;
+  in total). Entries never ran out: tag-collision evictions stayed ≤ 7 per run
+  at 2 MiB and ≤ 246 at 512 KiB (whole-run totals, warm-up included;
   `cy_tag_collision_evictions` in the recorded JSONL,
-  `cy_tag_collision_evictions_total` in the current harness). mmap directory on, checksum verified on
-  read, default readahead, no RAM tier, no fsync. Eviction is Cyclone's own;
-  the harness keeps no index.
+  `cy_tag_collision_evictions_total` in the current harness). mmap directory
+  on, checksum verified on read, default readahead, no RAM tier, no fsync.
+  Eviction is Cyclone's own; the harness keeps no index.
 - **LMDB 0.9.24**: `MDB_NOSYNC | MDB_NOMETASYNC | MDB_NOTLS`, map 1.5 × C.
   `MDB_WRITEMAP` was measured in the 2 GiB smoke run and dropped (28 % less
   served at T=1, equal at T=4). An in-memory LRU (mutex, `std::list` + hash
@@ -591,9 +632,10 @@ byte; no run failed the check. Both harnesses print identical stream heads
 - **filedir**: one file per block, same LRU, `unlink()` to evict, temp file +
   `rename()` to insert, `preadv(header, staging buffer)` on a hit, no fsync.
 
-Linux (i7-8750H, 970 PRO NVMe, ext4, kernel 5.15), one run per point, with
-the 2 MiB T=4 points run twice. Background load was present: the 1-minute
-load at run start was 1.1–4.7 on 12 threads, recorded per run. Raw data: [`doc/kv-cache-benchmark/churn/`](kv-cache-benchmark/churn/).
+Linux (i7-8750H, 970 PRO NVMe, ext4, kernel 5.15), one run per point, with the
+2 MiB T=4 points run twice. Background load was present: the 1-minute load at
+run start was 1.1–4.7 on 12 threads, recorded per run. Raw data:
+[`doc/kv-cache-benchmark/churn/`](kv-cache-benchmark/churn/).
 
 ### Headline, 2 MiB blocks
 
@@ -623,11 +665,11 @@ first 10 000 Zipf gets after close + reopen.
 | 4 | lmdb | 0.726 | 0.98 / 0.95 | 342 / 73 066 | 8 497 / 68 670 | 1.003 | 16.06 GiB | 0.810 |
 | 4 | filedir | 0.726 | 1.18 / 1.14 | 455 / 36 954 | 3 396 / 66 227 | 1.006 | 16.03 GiB | 0.806 |
 
-T=4 served is "first run / repeat"; the latencies are from the first run
-(hit p99 in the repeat, `zipf` / `zipf+scan`: Cyclone 23.7 / 21.4 ms, LMDB
-82.2 / 82.9 ms, filedir 38.0 / 38.4 ms). Peak cgroup memory was 4.00 GiB for every store;
-peak RSS was 3.3–3.7 GiB for the two mmap stores (resident file pages) and
-under 30 MiB for filedir.
+T=4 served is "first run / repeat"; the latencies are from the first run (hit
+p99 in the repeat, `zipf` / `zipf+scan`: Cyclone 23.7 / 21.4 ms, LMDB 82.2 /
+82.9 ms, filedir 38.0 / 38.4 ms). Peak cgroup memory was 4.00 GiB for every
+store; peak RSS was 3.3–3.7 GiB for the two mmap stores (resident file pages)
+and under 30 MiB for filedir.
 
 ### Verdict against the decision criteria
 
@@ -650,16 +692,17 @@ point.
 ### Why: the hit ratio, and where it comes from
 
 Cyclone's hit ratio is 8–9 points below the LRU stores on both patterns
-(9.2–9.4 on `zipf`, 8.4–8.9 on `zipf+scan`). That is a real cost of Cyclone's eviction, and it is the main reason for the
-served-throughput gap at T=1. The per-hit cost is the same (hit p50 191 vs
-178 µs); Cyclone simply has fewer hits and more slow misses. The gap is
-larger than "FIFO vs LRU". On a wrap, Cyclone toggles the stripe's directory
-phase (`Volume::evict_if_needed`), and every entry of the previous pass stops
-resolving at once, although most of those blocks are still intact on disk
-ahead of the write cursor. Each stripe therefore restarts empty on every wrap
-and holds roughly half its capacity on average. Replaying the same streams
-through the policies alone (`benchmarks/kv_churn_policy`, no I/O, keys
-routed to stripes by `segment_hash()` as `Volume::select_stripe` does;
+(9.2–9.4 on `zipf`, 8.4–8.9 on `zipf+scan`). That is a real cost of Cyclone's
+eviction, and it is the main reason for the served-throughput gap at T=1. The
+per-hit cost is the same (hit p50 191 vs 178 µs); Cyclone simply has fewer
+hits and more slow misses. The gap is larger than "FIFO vs LRU". On a wrap,
+Cyclone toggles the stripe's directory phase (`Volume::evict_if_needed`), and
+every entry of the previous pass stops resolving at once, although most of
+those blocks are still intact on disk ahead of the write cursor. Each stripe
+therefore restarts empty on every wrap and holds roughly half its capacity on
+average. Replaying the same streams through the policies alone
+(`benchmarks/kv_churn_policy`, no I/O, keys routed to stripes by
+`segment_hash()` as `Volume::select_stripe` does;
 [`policy-replay.txt`](kv-cache-benchmark/churn/policy-replay.txt)) reproduces
 the measured numbers to within 0.6 points:
 
@@ -685,8 +728,8 @@ one write txn (miss+insert p50 5.6–8.5 ms at T=4), and that is where LMDB's
 throughput stops scaling, while Cyclone's writers run per stripe. The cause
 of LMDB's 80 ms hit tail was not profiled. Cyclone's own inserts are slow:
 miss+insert p50 is 4.0 ms at T=1 against 1.4–1.6 ms for the peers. That is
-consistent with the three-copy write path already on the fix list, but it
-was not profiled in this round.
+consistent with the three-copy write path already on the list in
+[What to change](#what-to-change), but it was not profiled in this round.
 
 ### 512 KiB blocks (supplementary; not part of the criteria)
 
@@ -710,8 +753,9 @@ per-insert cost that dominates the 2 MiB case.
   2 MiB blocks, 4.8 MiB at 512 KiB). It is lost on restart and rebuilt by a
   cursor scan (1–7 ms here), and the recency order is lost with it. LMDB also
   needed a map size chosen up front, and `MDB_NOSYNC`: without it every
-  insert is an fsync, and round 1 measured about 10× less write throughput
-  that way. It is single-writer by design.
+  insert is an fsync (rounds 1 and 2 ran LMDB that way: 0.15–0.18 GB/s
+  for 2 MiB puts, the slowest writer in both). It is single-writer by
+  design.
 - **filedir** needed the same LRU, a temp-file + rename protocol, and unlinks
   under the LRU lock to stay correct against concurrent re-inserts. Its index
   is rebuilt from `readdir` (11–44 ms).
@@ -722,22 +766,10 @@ per-insert cost that dominates the 2 MiB case.
   dropped a few inserts at T=4 (`writes_dropped_by_lease`: 0–3 per run) when
   a wrap met a live reader lease; the peers dropped none.
 
-### Caveats
-
-- One run per point, except 2 MiB T=4 (two runs). T=4 served varied by up to
-  11 % between runs (Cyclone `zipf+scan`: 1.00 vs 0.89 GB/s). That is the
-  same size as the margin the only passing criterion rests on.
-- Background load on the box was not stopped. The load at run start is in
-  the logs; it was higher (3–4.7) during the repeat.
-- Write amplification is device sectors written (whole partition) over
-  payload inserted, including a final `syncfs`. It is about 1.00 for every
-  store, so it does not tell them apart here.
-- Only copy-mode consumption is measured; Cyclone's zero-copy `view` path is
-  not exercised by this workload.
-
 ## Device transfer: does zero-copy pay off? (Metal, Apple silicon)
 
-Item 4 above asks whether the zero-copy read pays off *end to end* — a KV
+The open question from rounds 1 and 2 is whether the zero-copy read pays
+off *end to end* — a KV
 connector only benefits if the device transfer can source from the mapping
 instead of staging through a pinned buffer. `benchmarks/kv_gpu_metal.mm`
 answers the Apple half of that question with a measurement. For a block that
@@ -894,15 +926,15 @@ registering *per block* instead is a **21% loss** against staging and 1.33×
 worse than not trying at all. The Metal 1.9× was the conservative end, as
 predicted.
 
-The Metal section above answers the Apple half of item 4 on unified memory,
-where there is no bus at all. `benchmarks/kv_gpu_cuda.cu` (plus its C++23
-host half, `benchmarks/kv_gpu_cuda_host.cpp`) asks the same question where
-there *is* one: a discrete GPU behind PCIe, on which the staged path really
-does pay a host copy that a mapping-sourced transfer does not. Same workload
-(`benchmarks/kv_workload.hpp`, so the blocks are bit-identical to
-`kv_bench`'s and the Metal run's), same Cyclone tuning, same N = 512 blocks
-of 2 MiB, same "already in the store, read once, every page touched before
-any timing" discipline.
+The Metal section above answers the Apple half of the zero-copy question on
+unified memory, where there is no bus at all. `benchmarks/kv_gpu_cuda.cu`
+(plus its C++23 host half, `benchmarks/kv_gpu_cuda_host.cpp`) asks the same
+question where there *is* one: a discrete GPU behind PCIe, on which the staged
+path really does pay a host copy that a mapping-sourced transfer does not.
+Same workload (`benchmarks/kv_workload.hpp`, so the blocks are bit-identical
+to `kv_bench`'s and the Metal run's), same Cyclone tuning, same N = 512 blocks
+of 2 MiB, same "already in the store, read once, every page touched before any
+timing" discipline.
 
 The paths, all landing the same bytes in the same `cudaMalloc` buffer:
 
@@ -1117,7 +1149,7 @@ mapping identity directly, instead of making the caller infer the span from
 the pointers reads happen to return.
 
 **8 MiB, partial.** An 8 MiB sweep was attempted and abandoned, but its
-Cyclone half completed before the box ran out of room and says the same
+Cyclone half completed before the machine ran out of memory and says the same
 thing: ceiling 13.07 GB/s, `zerocopy-persistent` **12.82 GB/s (98.1% of it)**
 against **5.60 GB/s** staged — **2.29×** — while per-block `zerocopy`
 collapses to 2.15 GB/s, a **61% loss** against staging rather than 2 MiB's
@@ -1168,31 +1200,124 @@ compiler in `kv_gpu_cuda_host.cpp`, and only the CUDA runtime calls go
 through nvcc in `kv_gpu_cuda.cu`, behind the plain-C seam in
 `kv_gpu_cuda.h`.
 
-## Reproducing
+## What to change
 
-```bash
-# Cyclone (this repository)
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DCYCLONE_USE_BUNDLED_SHA256=ON && cmake --build build -j
-./build/kv_bench --print-vectors                # must match the peer harness
-./build/kv_bench --seconds 10 --path /fast/ssd --output results/cyclone.jsonl
-./build/kv_bench --block-size 2097152 --no-mmap-dir --no-verify --output results/cyclone-noverify.jsonl
-```
+| Item | Status | Evidence |
+|---|---|---|
+| Readahead for large cold reads: a per-document hint, with a per-platform call | **Done** | [Round 3](#readahead-alone); mechanism in [architecture.md](architecture.md#memory-mapped-io) |
+| Fast document checksum: slice-by-16 / ARMv8 CRC32, then CRC-32C at format v8 | **Done** | [Round 3](#fast-crc32-alone), [Round 3b](#round-3b-crc-32c-on-disk-format-v8); [architecture.md](architecture.md#document-format) |
+| Verified state that outlives the process: keep the CRC-validation cache beside the mmap directory, so a restart and every peer process skip re-verification | Open | 512 KiB cold reads, [Round 3b](#round-3b-crc-32c-on-disk-format-v8) |
+| `WriteHandle::reserve(n)` that returns the destination span, so the caller writes or DMAs straight into the record (three copies become one) | Open; puts are 1.4× behind file-per-block (1.01 vs 1.44 GB/s) | [Round 3b](#round-3b-crc-32c-on-disk-format-v8), insert latency in [Round 4](#round-4-bounded-capacity-under-churn) |
+| An entry point that gives an embedder the mapping identity for one-time GPU registration, instead of inferring it from `content()` / `content_file_offset()` / `volume_files()` | Open | [Metal](#device-transfer-does-zero-copy-pay-off-metal-apple-silicon), [CUDA](#device-transfer-cuda-gtx-1050-pcie) |
+| A zero-copy C read entry point and a Python binding, which is what a vLLM/SGLang connector would call | Open | — |
+| Keep the previous lap resolvable until it is actually overwritten | In progress | [Round 4](#why-the-hit-ratio-and-where-it-comes-from): the phase flush costs 4–6 of the 8–9 hit-ratio points |
+| Profile insert latency (miss+insert p50 4.0 ms vs 1.4–1.6 ms for the peers) | Open | [Round 4](#round-4-bounded-capacity-under-churn) |
+| Scan resistance or admission control on the disk tier | Open | [Round 4](#why-the-hit-ratio-and-where-it-comes-from): a scan costs every store about 12 points |
 
-Round 4 (churn) runs one point per invocation, inside a 4 GiB memory
-cgroup:
+GPUDirect Storage (`cuFileRead` at `content_file_offset()`, NVMe to GPU with
+no host copy) needs a data-center GPU and was not measured.
 
-```bash
-./build/kv_churn --print-vectors                # must match kvchurn's
-doc/kv-cache-benchmark/churn/run-churn.sh cyclone zipf+scan 4 17179869184 120 churn.jsonl churn.txt
-./build/kv_churn_policy                         # eviction-policy replay, no I/O
-```
+## History and corrections
 
-The peer harness (file-per-block, LMDB, RocksDB adapters, `run_all.sh`,
-`report.py`) lives outside this repository so it carries no third-party
-dependencies here; it implements
-[`kv-workload-spec.md`](kv-cache-benchmark/kv-workload-spec.md) and prints
-the same reference vectors. Run each store's sizes with nothing else on the
-machine and delete each size's data before the next.
+The rounds above keep the numbers as measured. This section records what
+was withdrawn, what was superseded, and the incidents that affected
+specific runs.
+
+### Corrections to the first run
+
+Two methodology faults were found in the first sweep by review and
+retraction is the honest fix:
+
+- The peer harness wiped each block size's data only *before* that size ran,
+  so 2–6 GiB of earlier sizes stayed resident and squeezed the 16 GiB page
+  cache during the larger-block runs; `kv_bench` deletes its volume per size,
+  so Cyclone never paid that. Peer warm reads were depressed up to 100× (LMDB
+  `view` 4 k → 513 k gets/s) and the first draft claimed a 5–20× Cyclone read
+  advantage that does not exist. Fixed in the harness; every number above is
+  from the corrected sweep.
+- The first headline table put a `view`-mode multi-process row under
+  `copy`-mode rows, inflating the multi-process story ~10×. Phase 5 now
+  runs both modes and only `copy` is compared.
+
+### Superseded headline claims
+
+| Claim | Where | Superseded by |
+|---|---|---|
+| Cyclone reads 5–20× faster than the peers | First draft of round 1 | Withdrawn: harness fault (above) |
+| Multi-process read row about 10× better | First draft of round 1 | Withdrawn: `view` row under `copy` rows (above) |
+| Restart is Cyclone's clearest loss, 0.56 GB/s at every size | Round 1 | Round 3: 8.45 GB/s on macOS; Round 3b: 1.97 GB/s cold on Linux |
+| Cold reads are the real loss, 0.06 GB/s at 2 MiB | Round 2 | Round 3: 1.62 GB/s; Round 3b: 2.17 GB/s |
+| Multi-process readers scale worse than threads | Rounds 1 and 2 | Round 3: 621 k gets/s on Linux, 1.67 M on macOS |
+| Writes at a third of file-per-block | Rounds 1 and 2 | Round 3b: 1.4× behind (1.01 vs 1.44 GB/s) |
+| The remaining cold-read gap to LMDB is the x86 CRC32 | Round 3 | Round 3b: level with LMDB at 2 MiB |
+
+Earlier drafts quoted the readahead-alone result as 0.449 GB/s and as
+0.140 → 0.427 GB/s. The median-of-three table in
+[Round 3](#readahead-alone) is authoritative: 0.120 → 0.446 GB/s with the
+checksum verified.
+
+### Round 3: the macOS writeback artifact
+
+This was a benchmark artifact, not a regression. On macOS the faster put
+and first touch (about 6 s instead of about 17 s for 4 GiB) meant the warm
+phase started while the OS was still writing the dataset back. Reads of
+in-flight pages then measured writeback (2 MiB warm `view`: 23 k gets/s,
+p99 250 µs). With the hint off it was worse (870 gets/s). A 60 s settle
+(`kv_bench --pause-before-warm`) restores 615–700 k. Linux is immune,
+because `drop_caches` syncs first. The round-3 macOS table is the settled
+run.
+
+### Round 3: the 512 KiB restart re-run
+
+One cell, 512 KiB restart, came out at 0.10 GB/s in the Linux sweep and at
+0.55 GB/s in two clean re-runs. The re-runs confirmed all 4096 readahead
+hints firing after the reopen (`kv_bench` now prints
+`readahead_hints_issued` per phase). The table uses the clean re-run, and
+the raw file records both.
+
+### The Linux dirty-page incident
+
+During round 3 the Linux machine ran with `vm.dirty_bytes` raised to 12 GiB
+and its writers were throttled by a dirty-page accounting leak that
+persisted until reboot; later rounds ran after a fresh boot at
+kernel-default limits.
+
+## Caveats
+
+All rounds:
+
+- One laptop per platform, one SSD each, 10 s per point, one run per point
+  except where a table says "median of three" or round 4 lists a repeat.
+  Treat differences under about 20 % as noise; the multi-× differences are
+  not.
+- Consumer hardware: dual-channel DDR4 and one NVMe on Linux. A
+  server-class NVMe array and a data-center GPU would change the absolute
+  numbers, not the ordering.
+- Warm-phase GB/s is inflated for every store. With Zipf(0.99) over 2048
+  blocks the hot set is largely CPU-cache-resident, so read those rows as
+  per-get overhead plus copy cost, not as storage bandwidth.
+- The peers measure a `std::string` allocation and a SHA-256 inside their
+  warm-phase sample (about 1 µs); Cyclone hashes outside it. This does not
+  matter at latencies of 100 µs and more, and slightly flatters Cyclone at
+  the µs scale.
+
+Rounds 3 and 3b:
+
+- The peers were not re-run. Their numbers are from the round-1 and round-2
+  sweeps, taken on the same machines before the dirty-page incident.
+
+Round 4:
+
+- One run per point, except 2 MiB T=4 (two runs). T=4 served varied by up
+  to 11 % between runs (Cyclone `zipf+scan`: 1.00 vs 0.89 GB/s). That is
+  the same size as the margin the only passing criterion rests on.
+- Background load was not stopped. The load at run start is in the logs; it
+  was higher (3–4.7) during the repeat.
+- Write amplification is device sectors written (whole partition) over
+  payload inserted, including a final `syncfs`. It is about 1.00 for every
+  store, so it does not tell them apart here.
+- Only copy-mode consumption is measured; Cyclone's zero-copy `view` path is
+  not exercised by this workload.
 
 ## Appendix A — macOS generated tables
 
@@ -1501,14 +1626,14 @@ Cells: gets/s / GB/s.
 
 ## Appendix C — Linux round-3 generated tables
 
-`cyclone` = round 3; `cyclone-v2` = stock from the corrected sweep; peers as
-in Appendix B. Cells as in Appendix A.
+`cyclone` = round 3; `stock` = the stock tree from the round-2 sweep; peers
+as in Appendix B. Cells as in Appendix A.
 
 ### Phase 1 - PUT (single writer, sequential)
 
 Cells: ops/s / GB/s / p99 us.
 
-| block size | cyclone | cyclone-noverify | cyclone-v2 | filedir | filedir-read | lmdb | rocksdb |
+| block size | cyclone | cyclone-noverify | stock | filedir | filedir-read | lmdb | rocksdb |
 |---|---|---|---|---|---|---|---|
 | 512 KiB | 1.2k / 0.61 / 847 | - | 579.0 / 0.30 / 1888 | 2.6k / 1.38 / 330 | 2.6k / 1.37 / 351 | 115.6 / 0.06 / 12651 | 1.1k / 0.59 / 1469 |
 | 2 MiB | 386.3 / 0.81 / 3413 | 230.7 / 0.48 / 5814 | 163.8 / 0.34 / 13113 | 686.5 / 1.44 / 1092 | 660.7 / 1.39 / 1134 | 72.1 / 0.15 / 20484 | 291.9 / 0.61 / 39055 |
@@ -1519,7 +1644,7 @@ Cells: ops/s / GB/s / p99 us.
 
 Cells: ops/s / GB/s / p99 us.
 
-| block size | cyclone | cyclone-noverify | cyclone-v2 | filedir | filedir-read | lmdb | rocksdb |
+| block size | cyclone | cyclone-noverify | stock | filedir | filedir-read | lmdb | rocksdb |
 |---|---|---|---|---|---|---|---|
 | 512 KiB | 1.2k / 0.63 / 1445 | - | 137.0 / 0.07 / 13232 | 1.8k / 0.94 / 879 | 2.3k / 1.20 / 798 | 3.7k / 1.93 / 1417 | 1.7k / 0.87 / 982 |
 | 2 MiB | 771.4 / 1.62 / 1868 | 1.1k / 2.31 / 1551 | 30.5 / 0.06 / 59454 | 838.8 / 1.76 / 2356 | 621.5 / 1.30 / 2548 | 1.0k / 2.15 / 3917 | 390.2 / 0.82 / 4571 |
@@ -1532,7 +1657,7 @@ Cells: ops/s / GB/s / p99 us.
 
 Cells: gets/s / GB/s / p99 us.
 
-| block size | cyclone | cyclone-noverify | cyclone-v2 | filedir | filedir-read | lmdb | rocksdb |
+| block size | cyclone | cyclone-noverify | stock | filedir | filedir-read | lmdb | rocksdb |
 |---|---|---|---|---|---|---|---|
 | 512 KiB | 757.7k / 397.26 / 7 | - | 854.7k / 448.13 / 2 | 25.4k / 13.33 / 57 | 21.5k / 11.29 / 73 | 678.9k / 355.95 / 2 | 9.5k / 5.01 / 138 |
 | 2 MiB | 265.1k / 555.97 / 5 | 266.1k / 558.13 / 5 | 274.4k / 575.37 / 5 | 7.0k / 14.73 / 195 | 5.3k / 11.17 / 258 | 244.6k / 512.96 / 5 | 1.8k / 3.87 / 620 |
@@ -1543,7 +1668,7 @@ Cells: gets/s / GB/s / p99 us.
 
 Cells: gets/s / GB/s / p99 us.
 
-| block size | cyclone | cyclone-noverify | cyclone-v2 | filedir | filedir-read | lmdb | rocksdb |
+| block size | cyclone | cyclone-noverify | stock | filedir | filedir-read | lmdb | rocksdb |
 |---|---|---|---|---|---|---|---|
 | 512 KiB | 31.1k / 16.32 / 48 | - | 33.1k / 17.36 / 46 | 13.9k / 7.28 / 106 | 16.4k / 8.58 / 94 | 31.4k / 16.48 / 46 | 7.8k / 4.07 / 148 |
 | 2 MiB | 5.0k / 10.48 / 263 | 5.2k / 10.96 / 259 | 5.7k / 11.91 / 235 | 3.1k / 6.49 / 400 | 3.8k / 8.03 / 328 | 6.1k / 12.85 / 224 | 1.4k / 2.99 / 767 |
@@ -1554,7 +1679,7 @@ Cells: gets/s / GB/s / p99 us.
 
 Cells: gets/s / GB/s / p99 us.
 
-| block size | cyclone | cyclone-noverify | cyclone-v2 | filedir | filedir-read | lmdb | rocksdb |
+| block size | cyclone | cyclone-noverify | stock | filedir | filedir-read | lmdb | rocksdb |
 |---|---|---|---|---|---|---|---|
 | 512 KiB | 2.71M / 1422.80 / 8 | - | 2.97M / 1556.56 / 2 | 27.3k / 14.32 / 332 | 52.8k / 27.66 / 104 | 2.13M / 1117.56 / 3 | 24.0k / 12.57 / 225 |
 | 2 MiB | 646.8k / 1356.52 / 10 | 647.2k / 1357.20 / 10 | 754.9k / 1583.13 / 9 | 11.1k / 23.31 / 772 | 6.4k / 13.43 / 710 | 624.9k / 1310.58 / 9 | 1.7k / 3.63 / 2843 |
@@ -1565,7 +1690,7 @@ Cells: gets/s / GB/s / p99 us.
 
 Cells: gets/s / GB/s / p99 us.
 
-| block size | cyclone | cyclone-noverify | cyclone-v2 | filedir | filedir-read | lmdb | rocksdb |
+| block size | cyclone | cyclone-noverify | stock | filedir | filedir-read | lmdb | rocksdb |
 |---|---|---|---|---|---|---|---|
 | 512 KiB | 50.8k / 26.63 / 128 | - | 59.1k / 30.96 / 106 | 27.5k / 14.44 / 223 | 41.7k / 21.88 / 122 | 60.1k / 31.53 / 110 | 13.5k / 7.09 / 343 |
 | 2 MiB | 4.7k / 9.86 / 1019 | 5.4k / 11.38 / 952 | 5.6k / 11.64 / 864 | 4.8k / 10.00 / 1087 | 3.8k / 7.95 / 1154 | 5.7k / 11.86 / 836 | 1.4k / 2.86 / 3174 |
@@ -1576,7 +1701,7 @@ Cells: gets/s / GB/s / p99 us.
 
 Cells: gets/s / GB/s / p99 us.
 
-| block size | cyclone | cyclone-noverify | cyclone-v2 | filedir | filedir-read | lmdb | rocksdb |
+| block size | cyclone | cyclone-noverify | stock | filedir | filedir-read | lmdb | rocksdb |
 |---|---|---|---|---|---|---|---|
 | 512 KiB | 3.76M / 1973.14 / 11 | - | 4.26M / 2233.45 / 4 | 28.7k / 15.05 / 721 | 48.3k / 25.30 / 266 | 2.77M / 1452.10 / 6 | 10.0k / 5.24 / 1667 |
 | 2 MiB | 662.9k / 1390.24 / 25 | 636.6k / 1335.11 / 25 | 799.9k / 1677.44 / 21 | 10.2k / 21.38 / 1717 | 5.0k / 10.50 / 2431 | 649.2k / 1361.45 / 21 | 1.6k / 3.40 / 7254 |
@@ -1587,7 +1712,7 @@ Cells: gets/s / GB/s / p99 us.
 
 Cells: gets/s / GB/s / p99 us.
 
-| block size | cyclone | cyclone-noverify | cyclone-v2 | filedir | filedir-read | lmdb | rocksdb |
+| block size | cyclone | cyclone-noverify | stock | filedir | filedir-read | lmdb | rocksdb |
 |---|---|---|---|---|---|---|---|
 | 512 KiB | 42.6k / 22.33 / 319 | - | 51.5k / 27.02 / 264 | 25.2k / 13.19 / 503 | 24.2k / 12.67 / 614 | 47.0k / 24.63 / 287 | 6.1k / 3.19 / 2396 |
 | 2 MiB | 4.6k / 9.57 / 2543 | 5.2k / 10.91 / 2515 | 5.5k / 11.61 / 2363 | 4.4k / 9.32 / 2581 | 2.9k / 6.05 / 4107 | 5.4k / 11.42 / 2073 | 1.3k / 2.64 / 9224 |
@@ -1598,7 +1723,7 @@ Cells: gets/s / GB/s / p99 us.
 
 Cells: ops/s / GB/s / p99 us / hit fraction.
 
-| block size | cyclone | cyclone-noverify | cyclone-v2 | filedir | filedir-read | lmdb | rocksdb |
+| block size | cyclone | cyclone-noverify | stock | filedir | filedir-read | lmdb | rocksdb |
 |---|---|---|---|---|---|---|---|
 | 512 KiB | 1.1k / 0.55 / 1524 / 1.000 | - | 144.6 / 0.08 / 12856 / 1.000 | 1.8k / 0.94 / 935 / 1.000 | 2.0k / 1.03 / 751 / 1.000 | 3.7k / 1.92 / 1390 / 1.000 | 1.8k / 0.92 / 857 / 1.000 |
 | 2 MiB | 686.8 / 1.44 / 2226 / 1.000 | 0.0 / 0.00 / 1 / 0.000 | 30.9 / 0.06 / 56714 / 1.000 | 823.0 / 1.73 / 2440 / 1.000 | 624.8 / 1.31 / 2537 / 1.000 | 1.0k / 2.16 / 3628 / 1.000 | 390.6 / 0.82 / 4361 / 1.000 |
@@ -1611,7 +1736,7 @@ Cells: ops/s / GB/s / p99 us / hit fraction.
 
 Cells: ops/s / GB/s / hit fraction.
 
-| block size | cyclone | cyclone-noverify | cyclone-v2 | filedir | filedir-read | lmdb | rocksdb |
+| block size | cyclone | cyclone-noverify | stock | filedir | filedir-read | lmdb | rocksdb |
 |---|---|---|---|---|---|---|---|
 | 512 KiB | 2.49M / 1304.35 / 1.000 | - | 2.17M / 1138.23 | 85.6k / 44.90 / 1.000 | 51.8k / 27.15 / 1.000 | 2.09M / 1097.54 / 1.000 | - |
 | 2 MiB | 620.7k / 1301.69 / 1.000 | - | 216.8k / 454.73 | 26.0k / 54.53 / 1.000 | 6.5k / 13.54 / 1.000 | 585.0k / 1226.91 / 1.000 | - |
@@ -1622,7 +1747,7 @@ Cells: ops/s / GB/s / hit fraction.
 
 Cells: ops/s / GB/s / hit fraction.
 
-| block size | cyclone | cyclone-noverify | cyclone-v2 | filedir | filedir-read | lmdb | rocksdb |
+| block size | cyclone | cyclone-noverify | stock | filedir | filedir-read | lmdb | rocksdb |
 |---|---|---|---|---|---|---|---|
 | 512 KiB | 49.5k / 25.94 / 1.000 | - | 50.7k / 26.56 | 40.5k / 21.25 / 1.000 | 39.9k / 20.90 / 1.000 | 61.9k / 32.44 / 1.000 | - |
 | 2 MiB | 4.7k / 9.82 / 1.000 | - | 4.4k / 9.29 | 5.6k / 11.84 / 1.000 | 3.7k / 7.77 / 1.000 | 5.2k / 10.89 / 1.000 | - |
@@ -1635,7 +1760,7 @@ Cells: ops/s / GB/s / hit fraction.
 
 Cells: gets/s / GB/s.
 
-| threads | cyclone | cyclone-noverify | cyclone-v2 | filedir | filedir-read | lmdb | rocksdb |
+| threads | cyclone | cyclone-noverify | stock | filedir | filedir-read | lmdb | rocksdb |
 |---|---|---|---|---|---|---|---|
 | 1 | 265.1k / 555.97 | 266.1k / 558.13 | 274.4k / 575.37 | 7.0k / 14.73 | 5.3k / 11.17 | 244.6k / 512.96 | 1.8k / 3.87 |
 | 4 | 646.8k / 1356.52 | 647.2k / 1357.20 | 754.9k / 1583.13 | 11.1k / 23.31 | 6.4k / 13.43 | 624.9k / 1310.58 | 1.7k / 3.63 |
@@ -1645,8 +1770,142 @@ Cells: gets/s / GB/s.
 
 Cells: gets/s / GB/s.
 
-| threads | cyclone | cyclone-noverify | cyclone-v2 | filedir | filedir-read | lmdb | rocksdb |
+| threads | cyclone | cyclone-noverify | stock | filedir | filedir-read | lmdb | rocksdb |
 |---|---|---|---|---|---|---|---|
 | 1 | 5.0k / 10.48 | 5.2k / 10.96 | 5.7k / 11.91 | 3.1k / 6.49 | 3.8k / 8.03 | 6.1k / 12.85 | 1.4k / 2.99 |
 | 4 | 4.7k / 9.86 | 5.4k / 11.38 | 5.6k / 11.64 | 4.8k / 10.00 | 3.8k / 7.95 | 5.7k / 11.86 | 1.4k / 2.86 |
 | 8 | 4.6k / 9.57 | 5.2k / 10.91 | 5.5k / 11.61 | 4.4k / 9.32 | 2.9k / 6.05 | 5.4k / 11.42 | 1.3k / 2.64 |
+
+## Appendix D — Linux round-3b generated tables
+
+`crc32c` = round 3b (readahead + CRC-32C); `crc32c-noverify` = the same
+tree with `--no-mmap-dir --no-verify` (2 MiB only); `round3` = round 3, for
+comparison. Peers are in Appendix B. Generated from
+[`kv-cache-benchmark/crc32c/`](kv-cache-benchmark/crc32c/) and
+[`kv-cache-benchmark/round3/`](kv-cache-benchmark/round3/). Cells as in
+Appendix A.
+
+### Phase 1 - PUT (single writer, sequential)
+
+Cells: ops/s / GB/s / p99 us.
+
+| block size | crc32c | crc32c-noverify | round3 |
+|---|---|---|---|
+| 512 KiB | 1.3k / 0.69 / 908 | - | 1.2k / 0.61 / 847 |
+| 2 MiB | 483.9 / 1.01 / 7764 | 230.7 / 0.48 / 5744 | 386.3 / 0.81 / 3413 |
+| 8 MiB | 129.9 / 1.09 / 10597 | - | 90.1 / 0.76 / 13970 |
+| 32 MiB | 14.6 / 0.49 / 65649 | - | 11.7 / 0.39 / 80314 |
+
+### Phase 2 - GET first touch (single thread, view)
+
+Cells: ops/s / GB/s / p99 us.
+
+| block size | crc32c | crc32c-noverify | round3 |
+|---|---|---|---|
+| 512 KiB | 2.3k / 1.19 / 671 | - | 1.2k / 0.63 / 1445 |
+| 2 MiB | 1.0k / 2.17 / 1555 | 1.1k / 2.33 / 1076 | 771.4 / 1.62 / 1868 |
+| 8 MiB | 360.8 / 3.03 / 3337 | - | 194.8 / 1.63 / 5310 |
+| 32 MiB | 101.5 / 3.40 / 10511 | - | 38.2 / 1.28 / 30223 |
+
+### Phase 3 - GET warm, Zipf(0.99)
+
+#### view, T = 1
+
+Cells: gets/s / GB/s / p99 us.
+
+| block size | crc32c | crc32c-noverify | round3 |
+|---|---|---|---|
+| 512 KiB | 647.1k / 339.25 / 8 | - | 757.7k / 397.26 / 7 |
+| 2 MiB | 266.5k / 558.97 / 5 | 211.9k / 444.38 / 8 | 265.1k / 555.97 / 5 |
+| 8 MiB | 67.6k / 567.07 / 20 | - | 68.2k / 572.34 / 20 |
+| 32 MiB | 16.8k / 562.99 / 95 | - | 17.2k / 576.47 / 92 |
+
+#### copy, T = 1
+
+Cells: gets/s / GB/s / p99 us.
+
+| block size | crc32c | crc32c-noverify | round3 |
+|---|---|---|---|
+| 512 KiB | 33.1k / 17.34 / 45 | - | 31.1k / 16.32 / 48 |
+| 2 MiB | 6.2k / 13.05 / 213 | 5.9k / 12.28 / 265 | 5.0k / 10.48 / 263 |
+| 8 MiB | 1.5k / 12.49 / 785 | - | 1.2k / 10.18 / 937 |
+| 32 MiB | 363.5 / 12.20 / 3143 | - | 328.9 / 11.04 / 3413 |
+
+#### view, T = 4
+
+Cells: gets/s / GB/s / p99 us.
+
+| block size | crc32c | crc32c-noverify | round3 |
+|---|---|---|---|
+| 512 KiB | 2.26M / 1182.88 / 9 | - | 2.71M / 1422.80 / 8 |
+| 2 MiB | 807.1k / 1692.66 / 7 | 766.3k / 1607.11 / 8 | 646.8k / 1356.52 / 10 |
+| 8 MiB | 179.1k / 1502.05 / 30 | - | 131.6k / 1103.53 / 53 |
+| 32 MiB | 43.3k / 1453.38 / 110 | - | 32.4k / 1086.91 / 171 |
+
+#### copy, T = 4
+
+Cells: gets/s / GB/s / p99 us.
+
+| block size | crc32c | crc32c-noverify | round3 |
+|---|---|---|---|
+| 512 KiB | 68.3k / 35.83 / 97 | - | 50.8k / 26.63 / 128 |
+| 2 MiB | 6.1k / 12.82 / 798 | 5.9k / 12.42 / 856 | 4.7k / 9.86 / 1019 |
+| 8 MiB | 1.5k / 12.41 / 2981 | - | 1.1k / 9.63 / 3799 |
+| 32 MiB | 356.9 / 11.97 / 12526 | - | 323.9 / 10.87 / 13947 |
+
+#### view, T = 8
+
+Cells: gets/s / GB/s / p99 us.
+
+| block size | crc32c | crc32c-noverify | round3 |
+|---|---|---|---|
+| 512 KiB | 3.88M / 2033.26 / 12 | - | 3.76M / 1973.14 / 11 |
+| 2 MiB | 920.8k / 1931.01 / 17 | 849.0k / 1780.53 / 18 | 662.9k / 1390.24 / 25 |
+| 8 MiB | 184.2k / 1545.46 / 74 | - | 130.9k / 1098.19 / 105 |
+| 32 MiB | 44.7k / 1500.75 / 295 | - | 32.8k / 1100.70 / 408 |
+
+#### copy, T = 8
+
+Cells: gets/s / GB/s / p99 us.
+
+| block size | crc32c | crc32c-noverify | round3 |
+|---|---|---|---|
+| 512 KiB | 60.0k / 31.48 / 223 | - | 42.6k / 22.33 / 319 |
+| 2 MiB | 5.8k / 12.20 / 2024 | 5.8k / 12.12 / 2061 | 4.6k / 9.57 / 2543 |
+| 8 MiB | 1.4k / 11.95 / 7937 | - | 1.1k / 9.38 / 11333 |
+| 32 MiB | 348.1 / 11.68 / 36925 | - | 316.9 / 10.63 / 37391 |
+
+### Phase 4 - RESTART (close, reopen, GET all N)
+
+Cells: ops/s / GB/s / p99 us / hit fraction.
+
+| block size | crc32c | crc32c-noverify | round3 |
+|---|---|---|---|
+| 512 KiB | 1.3k / 0.67 / 1240 / 1.000 | - | 1.1k / 0.55 / 1524 / 1.000 |
+| 2 MiB | 937.6 / 1.97 / 2102 / 1.000 | 0.0 / 0.00 / 0 / 0.000 | 686.8 / 1.44 / 2226 / 1.000 |
+| 8 MiB | 333.2 / 2.80 / 4508 / 1.000 | - | 182.7 / 1.53 / 5769 / 1.000 |
+| 32 MiB | 99.3 / 3.33 / 10930 / 1.000 | - | 35.0 / 1.18 / 35343 / 1.000 |
+
+### Phase 5 - MULTI-PROCESS READ (P=4 processes, T=1)
+
+#### view
+
+Cells: ops/s / GB/s.
+
+| block size | crc32c | crc32c-noverify | round3 |
+|---|---|---|---|
+| 512 KiB | 2.49M / 1305.78 | - | 2.49M / 1304.35 |
+| 2 MiB | 755.2k / 1583.76 | - | 620.7k / 1301.69 |
+| 8 MiB | 170.9k / 1433.93 | - | 127.5k / 1069.91 |
+| 32 MiB | 38.1k / 1277.25 | - | 31.1k / 1043.57 |
+
+#### copy
+
+Cells: ops/s / GB/s.
+
+| block size | crc32c | crc32c-noverify | round3 |
+|---|---|---|---|
+| 512 KiB | 68.1k / 35.72 | - | 49.5k / 25.94 |
+| 2 MiB | 5.9k / 12.32 | - | 4.7k / 9.82 |
+| 8 MiB | 1.4k / 12.10 | - | 1.3k / 10.54 |
+| 32 MiB | 329.9 / 11.07 | - | 315.6 / 10.59 |

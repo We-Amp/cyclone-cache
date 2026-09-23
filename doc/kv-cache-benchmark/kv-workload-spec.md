@@ -64,3 +64,15 @@ table printed at the end.
   report (e.g. Cyclone: `max_object_size = 0`, `stripe_size` > largest block,
   `ram_cache_size = 0`, mmap directory on for phase 4/5; LMDB: `MDB_NORDAHEAD`
   off, map size 16 GiB; RocksDB: BlobDB on, block cache 0).
+
+## v1.1 note: Linux and a cold page cache
+
+The "internal SSD" rule above describes the macOS machine of round 1. On
+Linux the rules are unchanged except for the device: put the store on the
+NVMe device under test. Both harnesses also accept `--drop-caches-cmd`, a
+shell command run before phases 2 and 4, for example
+`sync; echo 3 > /proc/sys/vm/drop_caches` (needs root). With it, phase 2 no
+longer starts with the page cache warm from the write: it measures a cold
+read, and phase 4 measures a cold restart. A report says which variant ran.
+Nothing else in v1 changes, so v1 and v1.1 numbers are comparable phase by
+phase apart from that.
