@@ -670,7 +670,8 @@ Plain FIFO would cost about 3 points against LRU; the phase flush costs
 about 6 more. No store here has scan resistance: the scan stream costs every
 store about 12 points. Keeping the previous pass resolvable until it is
 actually overwritten would recover the FIFO number. This round
-does not try that.
+does not try that; the design for it, with its own replay numbers, is
+[`design/wrap-retention.md`](design/wrap-retention.md).
 
 Cyclone is better at the tail under concurrency. At T=4 its hit p99 is
 3.5–4× lower than LMDB's (19–24 ms vs 73–84 ms) and lower than filedir's
