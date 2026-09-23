@@ -16,10 +16,13 @@
 //     The project's stock flags do NOT include -msse4.2 -- downstream
 //     consumers (Bazel, vendored copies) must keep building with unchanged
 //     flags -- so on GCC/Clang only this one function carries
-//     __attribute__((target("sse4.2"))) and the path is selected at run time
-//     from __builtin_cpu_supports("sse4.2").  MSVC needs neither: its
-//     intrinsics are always available, and the runtime probe is __cpuid leaf
-//     1, ECX bit 20.
+//     __attribute__((target("sse4.2,crc32"))) and the path is selected at run
+//     time from CPUID leaf 1, ECX bit 20 (SSE4.2).  The probe is __cpuid from
+//     <intrin.h> wherever _MSC_VER is defined (MSVC and clang-cl) and
+//     __get_cpuid from <cpuid.h> elsewhere -- NOT __builtin_cpu_supports,
+//     which needs the compiler runtime's __cpu_model and so fails to link
+//     under zig's toolchain and clang-cl.  MSVC proper has no per-function
+//     target attribute and needs none: its intrinsics are always available.
 //   * ARMv8: the `crc32cb/crc32cw/crc32cx` instruction group.  Three
 //     flavours.  A GCC/Clang toolchain that already targets a CPU with the
 //     extension (__ARM_FEATURE_CRC32 -- every Apple silicon build, any
@@ -46,13 +49,20 @@
 
 #if defined(CYCLONE_CRC32C_X86)
 #include <nmmintrin.h>
-#if defined(_MSC_VER) && !defined(__clang__)
+#if defined(_MSC_VER)
 #include <intrin.h>
+#else
+#include <cpuid.h>
+#endif
+#if defined(_MSC_VER) && !defined(__clang__)
 // MSVC has no per-function target attribute; the intrinsics are always
 // emittable and the runtime probe below decides whether they are used.
 #define CYCLONE_CRC32C_SSE42_TARGET
 #else
-#define CYCLONE_CRC32C_SSE42_TARGET __attribute__((target("sse4.2")))
+// "crc32" is named explicitly: clang gates _mm_crc32_* on its own `crc32`
+// feature, which "sse4.2" only implies -- a build with that feature switched
+// off (-mno-crc32) would otherwise reject the intrinsics.
+#define CYCLONE_CRC32C_SSE42_TARGET __attribute__((target("sse4.2,crc32")))
 #endif
 #endif
 
@@ -74,6 +84,14 @@
 
 #if defined(CYCLONE_CRC32C_ARM_ALWAYS) || defined(CYCLONE_CRC32C_ARM_RUNTIME)
 #define CYCLONE_CRC32C_ARM_HW 1
+#endif
+
+// Any hardware path at all.  Targets without one (32-bit x86, aarch64 under a
+// toolchain with neither the ACLE intrinsics nor the Linux HWCAP probe, ...)
+// compile only the slice-by-16 path, and the helpers the hardware paths share
+// are guarded by this so a consumer's -Werror sees no unused declarations.
+#if defined(CYCLONE_CRC32C_X86) || defined(CYCLONE_CRC32C_ARM_HW)
+#define CYCLONE_CRC32C_HW 1
 #endif
 
 namespace cyclone {
@@ -135,6 +153,7 @@ inline uint32_t load_le32(const uint8_t* p) noexcept {
   return v;
 }
 
+#if defined(CYCLONE_CRC32C_HW)
 inline uint64_t load_le64(const uint8_t* p) noexcept {
   uint64_t v = 0;
   std::memcpy(&v, p, sizeof(v));
@@ -143,10 +162,13 @@ inline uint64_t load_le64(const uint8_t* p) noexcept {
   }
   return v;
 }
+#endif
 
 inline uint32_t crc_byte(uint32_t crc, uint8_t b) noexcept {
   return kSlice[0][(crc ^ b) & 0xFFU] ^ (crc >> 8);
 }
+
+#if defined(CYCLONE_CRC32C_HW)
 
 // --- GF(2) "advance by N zero bytes" operators -----------------------------
 //
@@ -253,6 +275,8 @@ inline uint32_t shift_crc(const ShiftTable& t, uint32_t crc) noexcept {
          t[2][(crc >> 16) & 0xFFU] ^ t[3][(crc >> 24) & 0xFFU];
 }
 
+#endif  // CYCLONE_CRC32C_HW
+
 // All the *_impl functions below take and return the INTERNAL (complemented)
 // CRC register; crc32c_update() applies the 0xFFFFFFFF init/xorout around
 // them.
@@ -303,13 +327,23 @@ uint32_t slice_by_16_impl(uint32_t crc, const uint8_t* p, size_t len) noexcept {
 
 #if defined(CYCLONE_CRC32C_X86)
 
+// CPUID leaf 1, ECX bit 20: SSE4.2, which carries the crc32 instruction.
+constexpr unsigned int kCpuidSse42Bit = 1U << 20;
+
 bool sse42_usable() noexcept {
-#if defined(_MSC_VER) && !defined(__clang__)
+#if defined(_MSC_VER)
   int regs[4] = {0, 0, 0, 0};
   __cpuid(regs, 1);
-  return (static_cast<unsigned int>(regs[2]) & (1U << 20)) != 0U;
+  return (static_cast<unsigned int>(regs[2]) & kCpuidSse42Bit) != 0U;
 #else
-  return __builtin_cpu_supports("sse4.2") != 0;
+  unsigned int eax = 0;
+  unsigned int ebx = 0;
+  unsigned int ecx = 0;
+  unsigned int edx = 0;
+  if (__get_cpuid(1, &eax, &ebx, &ecx, &edx) == 0) {
+    return false;
+  }
+  return (ecx & kCpuidSse42Bit) != 0U;
 #endif
 }
 
