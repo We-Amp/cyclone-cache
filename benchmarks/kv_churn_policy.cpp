@@ -164,7 +164,7 @@ class FrontierRetain {
   size_t _f = 0;
 };
 
-constexpr std::array<size_t, 3> kRetainChunks = {16, 64, 256};
+constexpr std::array<size_t, 4> kRetainChunks = {16, 32, 64, 256};
 
 void run(size_t block, size_t capacity, size_t universe, bool scan) {
   const size_t lru_blocks = capacity / (block + kMetaSize);

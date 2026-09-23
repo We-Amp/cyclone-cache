@@ -1,69 +1,110 @@
 # Wrap retention: keep the previous pass readable until it is overwritten
 
-**Status:** proposed design (phase 1). No production code has changed. The
-only code in this change is the policy-replay extension in
-`benchmarks/kv_churn_policy.cpp` (the `retain/N` columns).
+**Status:** design, amended after adversarial review. Verdict: implement as
+amended, no redesign. No production code has changed yet. The only code so
+far is the policy-replay extension in `benchmarks/kv_churn_policy.cpp` (the
+`retain/N` columns).
 
-**Scope:** the eviction behaviour of a stripe's circular data area, i.e. what
-happens to directory entries when the write cursor wraps and then advances
-over the previous pass. The key-to-stripe mapping, the document format
-(except one header field that was never set before), the RAM tier, and the
-alternate-selection plugins do not change.
+**Scope:** what a stripe's circular data area does with directory entries
+when the write cursor wraps and then advances over the previous pass. Out of
+scope and unchanged:
+
+- key-to-stripe mapping
+- document layout (one header field that has always been 0 gets a meaning)
+- the RAM tier
+- alternate-selection plugins
 
 Anchors below are function, type and comment-marker names, not line numbers.
-They are all in `src/core/volume.{hpp,cpp}`, `src/core/directory.{hpp,cpp}`
-and `src/core/mmap_directory.{hpp,cpp}` unless stated otherwise.
+They are in `src/core/volume.{hpp,cpp}`, `src/core/directory.{hpp,cpp}` and
+`src/core/mmap_directory.{hpp,cpp}` unless stated otherwise.
+
+---
+
+## 0. Decisions (lead, after review)
+
+| # | Decision | Rationale |
+|---|---|---|
+| D1 | **Default ON in v8**, but only if the acceptance tests in section 11, `kv_churn`, PageSpeed `cache_burst_test` and TSan all pass in both modes. Otherwise v8 ships with it off. | v8 already forces a cold cache on upgrade, so turning retention on in the same release costs no extra cold start. A later flip would cost one (the mode is persisted per volume, section 4.2). |
+| D2 | **64 chunks with a 1 MiB minimum chunk.** `Q = max(1 MiB, round_up(A/64, 8))`, `N = clamp(ceil(A/Q), 1, 64)`, with `N` persisted. `N = 1` behaves like flush. The earlier idea "chunk ≥ largest document" is dropped. | Tying `Q` to the largest document would collapse `N` to 1 under HTTP defaults (a 64 MiB `max_object_size` against 32 MiB stripes). It is not needed for correctness either, because a multi-chunk advance is still a single gated step. The 1 MiB floor keeps a stripe of about 32 MiB from running the gate every few writes. |
+| D3 | **Mixed modes are refused**, through the `VolumeHeader` and not the filename (B5, section 4.13). | Mixing is unsafe in both directions. The filename does not reliably carry the mode. |
+| D4 | **Per-chunk borrow counting is in scope**, together with the per-region exposure check (B1). | Without it, a borrow of any document on the stripe blocks every advance, and every advance tears every borrow. |
+| D5 | **No cross-pass alternate links.** Retained chains remain walkable downward (retained → retained). | This removes the self-loop and duplicate hazards (B2). Retained PageSpeed chains still resolve past their head. |
+| D6–D8 | Out of scope: evacuation / second chance, hardening against forged in-payload headers, directory sizing. | Separate designs. |
+| D9 | **The stuck-intent fix is in scope, as its own commit**, with the S5 refinements. | It is a pre-existing gap: a crash inside the wrap window leaves every read of that stripe missing for a whole pass. |
 
 ---
 
 ## 1. Summary
 
-Today a wrap toggles the stripe's 1-bit directory phase. Every entry written
-in the pass that just ended stops resolving at once, although nearly all of
-those documents are still intact on disk, ahead of the write cursor. Each
-stripe starts empty again on every wrap and holds on average about half its
+Today a wrap toggles the stripe's 1-bit directory phase. Every entry of the
+pass that just ended then stops resolving at once, even though nearly all of
+those documents are still intact on disk ahead of the write cursor. Each
+stripe restarts empty on every wrap and holds on average about half of its
 capacity.
 
-This design keeps the previous pass readable until the bytes it points at are
-about to be overwritten. A per-stripe **clean frontier** `F` runs ahead of the
-write cursor `W` in fixed chunks. The region `[W, F)` is the cleaned runway
-the writer fills. The previous pass is readable in `[F, E)`. Moving `F` is the
-only operation that exposes live bytes to the forward fill. It runs the same
-reader-exclusion handshake a wrap runs today (wrap intent, borrow count, read
-lease, Dekker ordering), once per chunk instead of once per pass. The stripe's
-pass number is stamped into each document (`Document::write_serial`, which no
-code has set so far). An entry is served only if four things agree: its
-phase, its position relative to `W` and `F`, the pass stamp in its document,
-and its full key and CRC. The stamp is what rules out a two-wraps-old entry
-exactly, instead of by position alone.
+This design keeps the previous pass readable until its bytes are about to be
+overwritten. It has five parts:
 
-The policy replay predicts a hit ratio of **0.815 on `zipf`** (today 0.761
-replayed and 0.757 measured; plain per-stripe FIFO 0.817) and **0.685 on
-`zipf+scan`** (today 0.644 replayed and 0.638 to 0.642 measured; FIFO 0.687).
-That recovers about 5.4 and 4.1 points of the 8 to 9 point gap to LRU. The
-rest of the gap is FIFO against LRU, which this design does not address.
+1. **Clean frontier.** A per-stripe clean frontier `F` runs ahead of the
+   write cursor `W`, in `N` fixed chunks.
+   - `[W, F)` is cleaned runway that the writer fills.
+   - `[F, E)` is the previous pass. It stays readable.
+2. **Gated advance.** Moving `F` forward is the only step that exposes
+   readable bytes to the forward fill. It runs the reader-exclusion handshake
+   (intent → borrow counts + lease → publish), gated only by borrows in the
+   chunks it is about to expose.
+3. **Exposure generation `G`.** One monotone 64-bit word per stripe:
+   `G = P·(N+1) + f`, where `P` is the pass number and `f` is the frontier
+   index. A borrow of a document from pass `p` whose first byte is in chunk
+   `c` is **exposed** iff `G > (p+1)·(N+1) + c`. Borrows, lease renewals and
+   strict renewals check their own document's exposure instead of comparing
+   the whole epoch. A wrap or an advance elsewhere in the stripe therefore
+   tears nothing.
+4. **Pass stamp.** Each document carries its pass number in
+   `Document::write_serial`, which has always been 0 until now. The stamp is
+   what makes "one pass old" exact, and it supplies `p` for the exposure
+   check.
+5. **Admission.** An entry is served only when its phase and position
+   (against a `G` snapshot), its stamp, its exposure, and its full key and
+   CRC all agree. One `admit()` helper enforces this at every site that
+   resolves a directory entry or a chain hop.
+
+The policy replay predicts:
+
+| Pattern | Retention | Today (replayed) | Today (measured) | Plain per-stripe FIFO |
+|---|---:|---:|---:|---:|
+| `zipf` | **0.815** | 0.761 | 0.757 | 0.817 |
+| `zipf+scan` | **0.685** | 0.644 | 0.638–0.642 | 0.687 |
+
+That recovers 5.4 and 4.1 points of the 8–9 point gap to LRU. The rest is
+FIFO versus LRU.
 
 ---
 
 ## 2. The problem, with numbers
 
 Round 4 of [the KV benchmark](../kv-cache-benchmark.md#round-4-bounded-capacity-under-churn)
-ran a bounded tier under get-or-insert churn: 2 MiB blocks, C = 16 GiB,
-16 stripes of about 511 blocks each, Zipf(0.99), key universe 3 × C.
+used this setup:
+
+- 2 MiB blocks, C = 16 GiB, 16 stripes of about 511 blocks each
+- Zipf(0.99), key universe 3 × C
+- get-or-insert
 
 | 2 MiB, C = 16 GiB | LRU | FIFO | FIFO per stripe | wrap flush (replay) | measured Cyclone |
 |---|---:|---:|---:|---:|---:|
 | `zipf` | 0.850 | 0.818 | 0.817 | 0.761 | 0.757 |
 | `zipf+scan` | 0.725 | 0.687 | 0.687 | 0.644 | 0.638–0.642 |
 
-The replay (`benchmarks/kv_churn_policy`, no I/O) matches the measured
-numbers within 0.006. So the loss comes from the policy, not from the
-implementation. Plain FIFO costs about 3 points against LRU. The wrap flush
-costs about 6 more. The HTTP product (mod_pagespeed and the PageSpeed
-optimizer, several nginx workers sharing one mmap directory) loses capacity
-the same way. Its stripes are smaller: 32 MiB with the auto geometry, so
-512 MiB gives 16 stripes. They wrap more often, and every wrap is a cliff for
-that stripe.
+The policy-only replay (`benchmarks/kv_churn_policy`) matches the measured
+result within 0.006. The loss is therefore policy, not implementation:
+
+- plain FIFO costs about 3 points against LRU;
+- the wrap flush costs about 6 more.
+
+The HTTP product has the same problem, in some ways worse. That is
+mod_pagespeed and the PageSpeed optimizer: several nginx workers sharing one
+mmap directory. Its stripes are smaller (32 MiB under the auto geometry), so
+they wrap more often.
 
 ---
 
@@ -71,421 +112,510 @@ that stripe.
 
 ### 3.1 Write side
 
-`Volume::commit_write` and `Volume::commit_alternate_write` take the stripe's
-exclusive `mutex` and call `Volume::allocate_write_slot`. In multi-process
-mode that call also takes the cross-process `write_lock` in the
-`MmapDirectory` header. It holds the lock across the pwrite (F6) and releases
-it in `Volume::commit_write_slot`. When the document does not fit in
-`[write_pos, stripe end)`:
+`Volume::commit_write` and `Volume::commit_alternate_write` hold the stripe
+`mutex` and call `Volume::allocate_write_slot`. In multi-process mode that
+call also holds the cross-process `write_lock` across the pwrite (F6) until
+`Volume::commit_write_slot` releases it.
 
-1. `set_wrap_intent(true)` (seq_cst).
-2. `Volume::lease_permits_wrap` loads the borrow count and the lease expiry.
-   If a borrow is outstanding and its lease is live, the wrap is **deferred**:
-   the intent is cleared, the fill is dropped (`NoSpace`), and
-   `writes_dropped_by_lease` is incremented. After `lease_wrap_ceiling` of
-   continuous deferral the wrap is forced and the borrow slot is reset.
-3. `Volume::evict_if_needed` calls `toggle_phase()` on the `Directory` or the
-   `MmapDirectory`. This is the O(1) flush.
-4. `write_pos = data_offset`, then `Volume::record_wrap` increments the wrap
-   count. That count and the phase form the **wrap epoch**.
-5. `set_wrap_intent(false)`. The order matters: the toggle and the epoch
-   increment must be program-ordered before this store.
+When the document does not fit, the writer does this:
 
-The Dekker proof lives at the intent-set site in `allocate_write_slot`. The
-full statement is in [architecture.md](../architecture.md#lease-based-region-pinning).
+1. It calls `set_wrap_intent(true)`.
+2. `Volume::lease_permits_wrap` loads the borrow count and the lease.
+   - If a borrow is outstanding and its lease is live, the write is
+     **deferred**: the intent is cleared and the fill is dropped with
+     `NoSpace`.
+   - The ceiling forces a wrap after `lease_wrap_ceiling`.
+3. `Volume::evict_if_needed` toggles the phase. This is the O(1) flush.
+4. The cursor resets and `Volume::record_wrap` bumps the wrap count. The
+   wrap epoch is (count, phase).
+5. It calls `set_wrap_intent(false)`, strictly after steps 3 and 4.
+
+The Dekker proof lives at the intent-set site in `allocate_write_slot`.
 
 ### 3.2 Read side
 
-`Volume::read_sync` works as follows. It captures `wrap_epoch()`. It runs
-`Stripe::probe_each`, a seqlock probe that yields only current-phase entries
-and passes each through `Stripe::is_behind_write_cursor`, so offsets at or
-ahead of the cursor are rejected. Then it maps the document, checks
-`is_valid()` and `first_key` against the requested key, and verifies the CRC
-(or hits the CRC-validation cache). It then calls `acquire_borrow` and
-`stamp_read_lease`, and finally `borrow_still_valid` (intent loaded first,
-then the epoch). Chain hops (`next_alternate_offset`) go through
-`is_valid_chain_offset`, which applies the same positional predicate. That is
-the hop leg of invariant 9.
+`Volume::read_sync` does the following, in order:
+
+1. Capture `wrap_epoch()`.
+2. Run `Stripe::probe_each`. It yields only current-phase entries, and its
+   positional guard (`Stripe::is_behind_write_cursor`) rejects any offset at
+   or ahead of the cursor.
+3. Map the region, check `is_valid()`, the full `first_key`, and the CRC (or
+   the CRC-validation cache).
+4. Call `acquire_borrow` and `stamp_read_lease`.
+5. Call `borrow_still_valid`: load the intent first, then check that the
+   whole epoch is unchanged.
+
+Chain hops go through `is_valid_chain_offset`, which applies the same
+positional predicate. That predicate is also used today on
+*directory-sourced* offsets by `remove_sync`, by the `commit_write` election
+and by `update_hit_count_sync` (B2c).
 
 ### 3.3 Where the reader-exclusion state lives
 
-| State | Single-process (`Directory`) | Multi-process (`MmapDirectory::Header`, shared by every process that maps the file) |
+| State | Single-process | Multi-process (`MmapDirectory::Header`, shared by every mapping process) |
 |---|---|---|
 | phase | `Directory::_current_phase` | `current_phase`, offset 16 |
-| wrap count (epoch) | `Stripe::local_wrap_count` | `shared_wrap_count`, offset 40 |
+| wrap count | `Stripe::local_wrap_count` | `shared_wrap_count`, offset 40 |
 | write cursor | `Stripe::write_pos` | `shared_write_pos`, offset 24 (absolute) |
 | wrap intent | `Stripe::local_wrap_intent` | `wrap_intent`, offset 33 |
-| borrow count | `Stripe::local_borrow_shards` (64 per-thread shards) | `stripe_borrow_slot`, offset 34 (a **single** slot, not sharded) |
+| borrow count | `Stripe::local_borrow_shards` (64 per-thread shards) | `stripe_borrow_slot`, offset 34 (single slot) |
 | read lease | `Stripe::local_lease_expiry_ns` | `stripe_lease_expiry_ns`, offset 56 |
-| force-wrap deadline | `Stripe::local_wrap_deferred_deadline_ms` | `shared_wrap_deferred_deadline_ms`, offset 36 |
+| force deadline | `Stripe::local_wrap_deferred_deadline_ms` | `shared_wrap_deferred_deadline_ms`, offset 36 |
 
-A reader in another process therefore keeps its borrow and its lease in the
-shared header of the stripe it reads. The writer's gate sees them there. Some
-state is process-local: read anchors, the CRC-validation cache, the readahead
-filter, and the `BorrowToken` a handle keeps for its release. The 64-byte
-header is fully used (see the `kFixedFieldsSize` static_assert), with one
-exception: `reserved` at offset 6, a `uint16_t` that `MmapDirectory::init`
-zeroes and that nothing reads. `VolumeHeader` still has 24 zero-filled
-`reserved` bytes.
+A reader in another process keeps its borrow and lease in the shared header.
+Anything else it needs is process-local: read anchors, the CRC-validation
+cache, the readahead filter and `BorrowToken`.
+
+The 64-byte header is fully spent (see the `kFixedFieldsSize` static_assert).
+There is room after it, though. With 16 384 buckets the directory needs
+720 960 bytes, while `data_offset` rounds that up to 177 pages (724 992
+bytes). That leaves **4 032 bytes of slack** after the entries (section
+4.2).
 
 ### 3.4 Why the flush exists
 
-The phase is one bit. An entry that survives two wraps reads as current again.
-Invariant 9 rejects every entry at or ahead of the cursor because such an
-entry can point at bytes that are intact now but will be overwritten in place
-by the ordinary forward fill. No wrap event, lease check or epoch change
-covers that fill. So today "ahead of the cursor" means "not yours". The
-flush makes the whole previous pass unreachable, and that is simply the
-cheapest way to satisfy that rule.
+The phase is only 1 bit, so an entry that survives two wraps reads as
+current again. Invariant 9 therefore rejects every entry at or ahead of the
+cursor: the ordinary forward fill overwrites those bytes in place, and no
+wrap gate protects that. Flushing the whole previous pass is the cheapest
+way to honour that rule.
 
 ---
 
-## 4. Proposed mechanism
+## 4. Mechanism
 
-### 4.1 Vocabulary
+### 4.1 Vocabulary and geometry
 
 Per stripe:
 
-- `S`, `E`: the start and end of the data area (`data_offset`,
-  `offset + size`).
-- `P`: the **pass number**, the existing wrap count (`shared_wrap_count` or
-  `local_wrap_count`). In retention mode the phase is *derived* as
-  `phase = P & 1` and stored, not toggled. A double wrap, such as the
-  usurpation case noted in `allocate_write_slot`, then cannot leave the phase
-  and the pass number out of step.
-- `W`: the write cursor. It is unchanged, including F6: it is advanced only
-  after the fill is durable.
-- `N`: chunks per stripe. `Q = round_up(ceil((E - S) / N), 8)`. Proposed
-  `N = 64`.
-- `f`: the **frontier index**, 0..N. The frontier is `F = min(S + f·Q, E)`.
-  The invariant is `W <= F`.
-- **Current region** `[S, W)`: this pass. **Runway** `[W, F)`: cleaned and
-  not yet written. No admissible entry points into it. **Retained region**
-  `[F, E)`: the previous pass, still readable.
-- **Epoch** `Σ = (P, phase, f)`. It extends today's `(wrap_count, phase)`.
+- `S`, `E`: start and end of the data area. `A = E − S`.
+- `Q = max(1 MiB, round_up(ceil(A / 64), 8))` and
+  `N = clamp(ceil(A / Q), 1, 64)` (D2). Both are pure functions of the
+  stripe's own `A`. They do **not** depend on `max_object_size` or any
+  per-process config, so every process computes the same values (test 15).
+  - `N = 1` (a stripe of 1 MiB or less) is flush behaviour: the first advance
+    after a wrap exposes the whole ring at once.
+  - A 32 MiB auto-geometry stripe gets `Q = 1 MiB`, `N = 32`.
+  - A 1 GiB stripe gets `Q = 16 MiB`, `N = 64`.
+- `P`: the pass number (the wrap count).
+- `f ∈ [0, N]`: the frontier index. `F = min(S + f·Q, E)`. The chunk of an
+  offset `o` is `c(o) = (o − S) / Q`, clamped to `N − 1`.
+- **`G = P·(N+1) + f`**: a single monotone 64-bit word. It is the only
+  published epoch in retention mode. `P = G / (N+1)`, `f = G mod (N+1)`, and
+  the phase is **derived on the reader** as `φ = P & 1` (S3). A reader never
+  uses the directory's own phase load (S8).
+- `W`: the write cursor. It is unchanged, including F6 (it is published only
+  after the fill is durable). B3 is assumed: on a wrap, `shared_write_pos` is
+  published as `data_area_start` inside the intent window.
+- Regions:
+  - **current** `[S, W)`: this pass;
+  - **runway** `[W, F)`: cleaned, not yet written;
+  - **retained** `[F, E)`: the previous pass.
 
-A fresh stripe starts with `P = 0` and `f = N`. There is no previous pass, so
-the first pass needs no advances.
+A freshly initialised directory has `G = 0`, which means `P = 0` and `f = 0`.
+`MmapDirectory::init` zeroes everything, so the first pass advances through
+empty space. Those gates are trivially clear.
 
-### 4.2 New state
+### 4.2 New state and layout
 
-| What | Single-process | Multi-process | Format note |
-|---|---|---|---|
-| frontier index `f` | new `std::atomic<uint16_t>` in `Stripe`, next to `local_wrap_count` | `MmapDirectory::Header::reserved` (offset 6), renamed `retain_frontier`, accessed through `std::atomic_ref<uint16_t>` | Zero-initialized by every `init()` so far and never validated. Header stays 64 B, `MmapDirectory::kVersion` stays 1 |
-| pass stamp | `Document::write_serial` = `P` mod 2^32 at allocation | same | Field exists at v8 and was always 0 |
-| retention mode + `N` | `VolumeHeader` `reserved` bytes: `uint16_t retain_chunks` (0 = flush mode, today's behaviour) | same | Zero means today's semantics, so existing v8 files are flush-mode volumes |
+| What | Single-process | Multi-process |
+|---|---|---|
+| `G` | `std::atomic<uint64_t>` in `Stripe`, next to `local_wrap_count` | new **retention region** in the directory slack, 8-byte aligned |
+| per-chunk borrow slots | each of the 64 `BorrowShard`s holds 64 × `uint16_t {gen:8, count:8}` slots, one per chunk (128 B per shard, exactly `kShardPad`; same 8 KiB per stripe as today) | retention region: 64 × `uint32_t {gen:8, count:24}`, one per chunk |
+| pass stamp | `Document::write_serial = P mod 2^32` | same |
+| mode | `VolumeHeader` reserved bytes: `uint16_t retain_chunks`. 0 = flush; otherwise this volume's base `N`. Authoritative. | same |
 
-The mode is a **property of the volume**, not of a process. A reader has to
-know whether the *writer* of a stripe retains. A retaining reader facing a
-flushing writer would admit entries that the writer's forward fill overwrites
-without a gate. So the mode is decided when the volume is created, persisted,
-and mixed into the fingerprint geohash in `fingerprint_cache_path` as a sixth
-field, emitted only when retention is on. That gives two properties:
+**Retention region (mmap).** It holds `G` (8 B) plus 64 per-chunk slots. It
+sits after the entries, 8-byte aligned.
 
-- Flush-mode filenames do not change. Users who leave the flag off take no
-  cold cache.
-- Processes configured differently resolve to *different files*. A retaining
-  process and a flushing process (or an older v8 development build) can never
-  share a ring. `open_locked` also compares the persisted `retain_chunks` as
-  a backstop, like `stripe_count`.
+We use u32 slots rather than the u16 slots the review sized for. That is a
+recommendation (S4). It closes today's saturate-at-255 hole, where a borrow
+acquired at saturation "rides along" uncounted and becomes unprotected once
+the counted holders drain. The size grows from 136 B to 264 B, and it still
+fits:
+
+- `required_size` goes from 720 960 to 721 224 bytes (it would be 721 096
+  with u16 slots);
+- `data_offset` stays at 177 pages (724 992);
+- a static_assert pins both numbers.
+
+**Which slot is used where.** The retention region is used in **both
+modes**:
+
+- The stripe-wide `stripe_borrow_slot` is replaced by the per-chunk slots. In
+  flush mode the gate checks all chunks, which is equivalent to today.
+- The lease slot, the intent flag, the force deadline and the wrap-count
+  telemetry stay where they are.
+
+**Version and fingerprint.** Because the layout and the borrow slot's meaning
+change:
+
+- `MmapDirectory::kVersion` goes from 1 to 2;
+- `kVersion` is **mixed into the fingerprint geohash**, so old and new
+  binaries resolve to different files (B5);
+- `init_stripes` **never** calls `init()` over a directory with valid magic
+  and the wrong version unless it holds the exclusive lifetime lock. Without
+  that rule an old opener's failed `open()` would zero a live peer's header.
+
+The in-memory `Stripe::write_serial` and `Stripe::sync_serial` fields are
+deleted, so no one can stamp a per-process value by mistake (nit).
 
 ### 4.3 Writer: allocation in retention mode
 
-All of this runs inside `Volume::allocate_write_slot`, under the stripe
-`mutex` and, in multi-process mode, the `write_lock`, exactly where the wrap
-runs today. It covers both commit sites.
+All of the following runs in `Volume::allocate_write_slot`, under the stripe
+`mutex` and, in multi-process mode, the `write_lock`, on both commit sites.
 
 ```
-adopt shared W (as today) and shared f
-if wrap_intent is set: clear it              // stale: see 4.12; nobody else can
-                                             // be in the window, we hold write_lock
-if doc > E - W:                              // WRAP: exposes no bytes, so no gate
+adopt shared W (as today) and shared G              // never a process-local copy (S3)
+if doc > E - W:                                     // WRAP: exposes no bytes, not gated
     set_intent(true)
-    P += 1; phase := P & 1                   // record_wrap + plain store
-    W := S; f := 0                           // F = S: the whole ring is the previous pass
+    publish shared_write_pos := S                   // B3: inside the intent window
+    phase := (P+1) & 1  (seq_cst, under phase_lock) // derived, not toggled
+    store G := (P+1)·(N+1)                          // P+1, f = 0; seq_cst
+    record_wrap telemetry (shared_wrap_count, time)
     set_intent(false)
 need := W + doc
-if need > F:                                 // ADVANCE (mandatory)
-    if !advance(chunk_index_ceil(need + Q/2)): drop the fill (NoSpace), as today
-elif F < E and F - need < Q/2:               // ADVANCE (early, best effort)
-    advance(chunk_index_ceil(need + Q/2))    // failure is ignored: the doc fits
-patch write_serial := P into the document buffer (outside the CRC)
-reserve [W, W + doc)                         // F6 unchanged: W published after the fill
+if need > F:                                        // MANDATORY advance (S2)
+    t := chunk_index_ceil(need)                     // exactly what this doc needs
+    if !advance(t, episode=true):
+        drop the fill (NoSpace)                     // shared cursor stays where it is (B3)
+if F < E and F - need < Q/2:                        // EARLY advance (S1): optional
+    advance(chunk_index_ceil(need + Q/2), episode=false)   // failure is silent
+patch write_serial := P into the document buffer    // outside the CRC
+reserve [W, W + doc)                                // F6 unchanged
 
-advance(target):
-    set_intent(true)                         // seq_cst, BEFORE the gate loads
-    if !lease_permits_wrap(stripe):          // same gate, same ceiling, same counters
-        set_intent(false); return false      // zero side effects
-    f := target                              // seq_cst store; part of the epoch
-    set_intent(false)                        // AFTER the epoch store (Dekker leg)
+advance(t, episode):
+    t := max(t, shared f)                           // f is monotone within a pass (S3)
+    set_intent(true)                                // seq_cst, BEFORE the gate loads
+    clear := lease inactive OR every per-chunk count in [f, t) is 0   // seq_cst loads
+    if !clear and episode:
+        lease_permits_wrap episode logic: deferral clock, published force deadline,
+        and on the ceiling: force, reset ALL chunk slots (gen+1), then clear := true
+    if !clear: set_intent(false); return false      // zero side effects
+    store G := P·(N+1) + t                          // seq_cst; exposes chunks [f, t)
+    set_intent(false)                               // AFTER the G store
     return true
 ```
 
-A few details:
+Notes on the procedure:
 
-- **The wrap is no longer gated.** It overwrites nothing. It turns the
-  current pass into the retained region and orphans only the remainder of
-  the previous pass in `[F, E)`, which is at most about one chunk plus one
-  document. Those bytes stay intact until the *next* pass's frontier reaches
-  them, and that frontier move is gated. The wrap still brackets its epoch
-  change with the intent flag, so a reader racing it retries instead of
-  classifying against a half-published state.
-- **The gate is today's `lease_permits_wrap`, unchanged.** It keeps the
-  stripe-wide borrow count, the lease, the anti-starvation ceiling, the
-  published force deadline, and `borrow_force_reset`. What changes is how
-  often it runs: once per advance, so about N plus a few times per pass
-  instead of once. See section 10 and risk 1 in section 12.
-- **Early advance.** The writer keeps at least `Q/2` of runway ahead of the
-  document it places. A refused early advance costs nothing. So a borrow burst
-  shorter than the time needed to write `Q/2` bytes into the stripe never
-  drops a write. The cost is dead capacity of about one chunk on average
-  (about 1.6 % at `N = 64`). The replay includes it.
-- **The stamp** is written into the already-built document buffer after the
-  allocation has fixed `P`. This is the same pattern the wrap-frontier link
-  refusal uses when it zeroes `next_alternate_offset` in the buffer.
-  `write_serial` is outside the CRC (the CRC covers header data and content
-  only), so nothing is recomputed.
-- **No directory mutation.** The advance does not scan or clear entries. Stale
-  entries are made inadmissible by the predicate in 4.4 and reclaimed lazily
-  by `insert` (4.7). Section 8 covers the eager-clean variant and why it is
-  not the default.
+- **The wrap is not gated.** It overwrites nothing. It does make the tail of
+  the previous pass (chunks `≥ f`) unreachable, and by the exposure formula
+  that tail counts as exposed from that moment. A borrow held there sees
+  `kTorn` on its next renew even though its bytes stay intact until the next
+  pass's frontier reaches that chunk; that frontier move still waits for the
+  chunk's count. This conservative early `kTorn` is limited to about one
+  chunk per pass. Current-class borrows are **not** exposed by a wrap: their
+  threshold is `(P+1)(N+1) + c ≥` the new `G` (test 2).
+- **A deferred first advance after a wrap** leaves `shared_write_pos = S`
+  (B3). The next writer finds the document fits in `[S, E)` and retries the
+  advance. It does not wrap again, and `shared_wrap_count` moves exactly once
+  (test 1).
+- **Mandatory versus early.**
+  - The mandatory target is exactly `ceil(need)` (S2). Only the mandatory
+    advance runs `lease_permits_wrap`'s episode machinery: the deferral
+    clock, the published force deadline, and the ceiling-forced reset.
+  - The early advance adds a `Q/2` runway margin. It is a pure gate check
+    with no side effects (S1, test 8). A borrow burst shorter than the time
+    it takes to write `Q/2` bytes therefore never drops a write.
+- **Forced advance.** It resets **all** chunk slots (generation + 1, count
+  0), not only the exposed range (S4). One ceiling episode therefore clears
+  every leaked count (test 7). `ns_until_forced_wrap` stays stripe-wide
+  (nit).
+- **Large documents.** `chunk_index_ceil(need)` can move `f` across many
+  chunks in one gated step. That is why D2 does not need a chunk size tied to
+  the largest document.
 
-### 4.4 The validity predicate: what makes an entry valid
+### 4.4 Admission: what makes an entry valid
 
-A reader first loads the snapshot `Σ = (P, φ, f)`, which gives `F_Σ`. It
-loads `W` fresh from `current_write_cursor()`. A tag-matched directory entry
-`e` for key `K` is **admitted** as
+A reader first loads the snapshot `G_Σ` (seq_cst), which gives `P_Σ`,
+`φ_Σ = P_Σ & 1` and `F_Σ`. It then loads `W` (acquire), **in that order**
+(S3, test 17).
 
-| class | phase leg | position leg (against Σ, before mapping) | stamp leg (document header) |
-|---|---|---|---|
-| current | `e.phase == φ` | `S <= e.off < W` | `write_serial == P` |
-| retained | `e.phase != φ` | `F_Σ <= e.off < E` | `write_serial == P - 1` (mod 2^32) |
+`Stripe::probe_each` returns entries of **both** phases in retention mode
+(S8). `admit(entry, Σ)` decides.
 
-Anything else is rejected before the region is mapped: runway offsets, a
-current-phase entry at or ahead of `W`, a previous-phase entry behind `F_Σ`.
-After admission the existing gauntlet runs unchanged: header `is_valid()` and
-length bounds, **full 256-bit `first_key == K`** (invariant 8), CRC or the
-CRC-validation cache, `acquire_borrow`, `stamp_read_lease`, then
-**revalidation**: `wrap_intent == 0` loaded first, then `epoch() == Σ` over all
-three fields.
+**Before mapping** (position):
 
-In flush mode the retained row is disabled and the stamp is not checked. The
-predicate then reduces exactly to today's.
+| class | condition |
+|---|---|
+| current | `e.phase == φ_Σ` and `S ≤ o < W` |
+| retained | `e.phase != φ_Σ` and `F_Σ ≤ o < E` |
+| anything else | reject |
 
-Each leg has one job:
+**After mapping the header:**
 
-- **Position against Σ** keeps readers out of the runway, the only place the
-  forward fill writes. It must use the frontier *from the snapshot*, not a
-  fresh load. If `F` moves after Σ was taken, the revalidation fails because
-  `f` is part of the epoch. If it moved before, the snapshot already holds
-  the new value. A stale-low `W` only widens rejection, as today.
-- **Phase** selects which stamp to expect and splits the two classes cheaply
-  before any mapping.
-- **Stamp** is what makes "one pass old" exact. It rejects two-wraps-old
-  survivors whose bytes are still intact (the trailing-gap case), which
-  position and phase alone cannot do once the retained region reaches ahead
-  of the cursor.
-- **Full key and CRC** are unchanged. They reject aliasing into reused space
-  and torn or unsynced bytes.
-- **Epoch revalidation** is unchanged in shape, with more fields. It is what
-  makes an admitted borrow safe against *future* frontier moves (5.3).
+1. `is_valid()` and the length bounds hold.
+2. Stamp: `p = write_serial` must equal `P_Σ` for the current class and
+   `P_Σ − 1` for the retained class.
+3. Full `first_key == K` (invariant 8).
+4. **Not exposed:** `G_Σ ≤ (p+1)(N+1) + c(o)`.
+5. CRC, or the CRC-validation cache.
 
-### 4.5 Chain hops and alternate links
+**Borrow (B1).**
 
-A hop follows `next_alternate_offset` from a node `s` whose class is known to
-a target `t`. The rule replaces the positional check in
-`is_valid_chain_offset`, which today is "t is behind W":
+1. Increment the per-chunk slot of `c(o)`, the chunk of the node actually
+   served (S4, which matters for `read_alternate_sync`).
+2. `stamp_read_lease`.
+3. Load `intent`: if it is set, release and retry.
+4. Load `G` and check `G ≤ (p+1)(N+1) + c(o)`.
+
+**Renew.**
+
+- `renew_read_lease`: acquire fence, then check exposure against a fresh `G`.
+- `renew_read_lease_strict`: stamp the lease, load the intent, load `G`.
+  - exposed → `kTorn`;
+  - intent set but not exposed → `kCopyNow`;
+  - otherwise → `kOk`.
+
+`borrow_still_valid` becomes this check. `epoch_start` in
+`VolumeReadHandleImpl` becomes `{p, c}`, the document's pass and chunk.
+
+What each leg does:
+
+- **Position** keeps readers out of the runway and out of
+  reserved-but-unwritten bytes (F6). `F_Σ` comes from the snapshot. A stale-low
+  `W` only widens rejection.
+- **Stamp** makes "one pass old" exact, and it is what supplies `p`. Exposure
+  is computed from the document's *own* pass, so a class misjudged from a
+  snapshot that straddled a wrap still yields the correct exposure verdict
+  (5.4).
+- **Exposure** replaces whole-epoch equality. Only the advance that crosses
+  this document's chunk can tear it. A wrap, or an advance elsewhere, leaves
+  it `kOk` (test 6). The retry storm from the first draft is gone, and so is
+  the proposed "class-aware revalidation" follow-up.
+- **Key and CRC** are unchanged. They reject aliasing into reused space, and
+  torn or unsynced bytes.
+
+In flush mode `admit` reduces to today's predicate, and it still uses the
+per-chunk slots with a gate that checks every chunk.
+
+### 4.5 Chain hops (D5)
+
+`admit(hop, Σ)` replaces `is_valid_chain_offset` for hops. `s` is the source
+node, `t` the target.
 
 | source class | admitted target | target class |
 |---|---|---|
-| current | `t < s` | current (same pass, older) |
-| current | `t > s` and `t >= F_Σ` | retained (a cross-pass link) |
-| retained | `F_Σ <= t < s` | retained |
+| current | `S ≤ t < s` | current (stamp `P_Σ`) |
+| retained | `F_Σ ≤ t < s` | retained (stamp `P_Σ − 1`) |
 
-Every other target is rejected, including any upward hop from a retained node
-and any upward hop into `[s, W)`. Then the stamp, key, CRC and borrow legs
-run exactly as for the directory probe.
+Anything else is rejected, and that includes **every upward hop**. Within a
+pass, documents lie in write order and links never cross a pass (see below),
+so a live link always points downward into the same pass.
 
-This is sound because documents in one pass are laid out in write order. A
-link written when `s` was committed points either down into the same pass or
-up into the then-retained region. An upward target is live only while the
-frontier has not reached it, and `t >= F_Σ` checks exactly that. Once `s`
-itself is retained, anything above it belongs to a pass at least two back and
-has been overwritten. Anything below it is live only while it is still ahead
-of the frontier.
+The retained → retained downward hop is what keeps a retained PageSpeed chain
+(for example Brotli → Gzip → Original) walkable past its head. Without it
+every retained chain would collapse to its head. The stamp, exposure, key,
+CRC and borrow legs then apply per node, and the borrow is registered on the
+**served** node's chunk.
 
-The **wrap-frontier link refusal** in `commit_alternate_write` compares
-`wrap_epoch` before and after the allocation. In retention mode that would
-also fire on every advance. It is replaced by an exact liveness check under
-the lock after the allocation. The planned link `t` may be stamped only if
-`t >= F_new`, or if no wrap happened and `t < write_offset`. Otherwise the
-field is zeroed, as today. Chains can therefore span one pass boundary. An
-alternate generated in the background for a retained Original keeps the
-Original reachable until the frontier reaches it. Splices through
-`repoint_chain_link` keep the downward or upward relation of the link they
-replace, so they stay admissible under the same table.
+**Alternate writes** (`commit_alternate_write`, B2a/b, S6):
 
-### 4.6 Uniqueness: one resolvable entry per key per stripe
+- The planned link `next = old head` is refused (zeroed in the buffer, as
+  today) when either:
+  - the allocation wrapped, which is checked by comparing **`P` only**, never
+    `f`; or
+  - the old head is not in the current class (a retained head), re-checked
+    under the lock after the allocation.
+- In both cases the verified head entry is **updated in place** to the new
+  document, including when the link is refused, and never inserted with
+  `kNoVerifiedEntry`. No retained duplicate can survive.
+- Because a retained head is never linked, a fixed-size new head that lands
+  on the old head's offset cannot form a self-loop (test 9).
 
-Retention makes the previous pass visible, so a key can now have a retained
-entry when it is written again. Two rules keep "at most one admissible entry
-per key per stripe":
+**Header RMW and splices.** `commit_header_rmw` and `repoint_chain_link`
+defer on a wrap race by comparing **`P`** (S6). They re-run `admit` on their
+target under the lock, which also catches an advance, because advances run
+under the same locks.
 
-1. The **full-key election** in both commit paths (`stripe->probe_each` plus
-   `map_document` plus the `first_key` compare) must see retained entries too.
-   It uses the same predicate and the same stamp check. A rewrite of `K` then
-   updates `K`'s retained entry in place (new offset, current phase) instead
-   of adding a second one.
-2. The election already maps every same-tag candidate. While doing so it
-   records any *other* same-key entry and any inadmissible one, and `insert`
-   clears them inside the same seqlock bracket. Same-tag candidates are rare,
-   so this costs nothing measurable.
+**Removal on a retained chain removes the whole entry** (S7). This covers
+`remove_alternate_sync`, which does not splice retained headers.
 
-Without rule 2, a key that lands at exactly the offset of its own stale entry
-could leave two entries. The first one the reader meets might be the older
-version. With fixed-size KV blocks every pass lays documents out at the same
-offsets, so this is not negligible. Today the same case is avoided only
-because `insert` prefers reusing a stale slot in the key's own bucket.
+### 4.6 Uniqueness: one resolvable entry per key per stripe (B2)
+
+These sites all go through `admit`, never through `is_valid_chain_offset`, so
+retained entries are visible to them (B2c):
+
+- the `commit_write` and `commit_alternate_write` elections;
+- `remove_sync`;
+- `update_hit_count_sync`.
+
+**Rule 1: elect.** A rewrite of `K` updates `K`'s admitted entry, current or
+retained, in place.
+
+**Rule 2: clean up.** Both commit paths already map every same-tag candidate.
+Any *other* same-key entry, and any candidate that fails `admit`, is cleared
+inside the same seqlock bracket as the insert.
+
+**`remove_sync`** removes **all** same-key entries (B2d), not only the first.
+Each clear decrements `entry_count`, so `count()` stays exact (nit).
 
 ### 4.7 Directory `insert` victim order
 
-`Directory::insert` and `MmapDirectory::insert` take the retention boundaries
-(`W`, `F`, `φ`) as extra parameters. The victim order becomes:
+`Directory::insert` and `MmapDirectory::insert` load `W` and `G` **inside
+their seqlock bracket**, under `phase_lock` for the mmap directory. The
+reason is that in multi-process mode `commit_write_slot` releases the
+`write_lock` before the insert runs, so an independently opened writer can
+wrap or advance in between (S9). The victim order is:
 
-1. the verified same-key entry (in-place update, unchanged)
-2. an empty slot
-3. an **inadmissible** slot: runway, previous phase behind `F`, current phase
-   at or ahead of `W`. This replaces today's "stale" (previous-phase), which
-   is now live.
-4. a tag collider (unchanged, counted)
-5. the **oldest admissible** entry. That is the retained entry nearest `F`
-   (lowest offset at or above `F`), and only if there is none, the current
-   entry with the lowest offset. Today's "nearest to clobber" means the same
-   thing, and the new boundaries make it exact rather than approximate.
+1. verified same-key entry (in place);
+2. empty slot;
+3. inadmissible slot (runway; previous phase behind `F`; current phase at or
+   ahead of `W`);
+4. tag collider (counted);
+5. oldest admissible: the retained entry nearest `F` if there is one,
+   otherwise the lowest-offset current entry.
 
-Retention roughly **doubles directory occupancy**, because about a full
-stripe of documents resolves instead of about half. See section 10 for when
-that matters.
+Retention roughly doubles the number of entries that resolve (section 10).
 
 ### 4.8 Other paths
 
-- `exists_sync` stays a directory-only probe. It applies the phase and
-  position legs but not the stamp. So, like today's tag collisions, it can
-  return a false "yes" for a stamp-dead entry. Its contract is already
-  probabilistic.
-- `remove_sync`, `remove_alternate_sync`, `update_hit_count_sync` and
-  `commit_header_rmw` verify their target with the same helper, including the
-  stamp. They already recheck `wrap_epoch` under the lock before the pwrite.
-  With `f` in the epoch that recheck also covers an advance, which runs under
-  the same locks.
-- `renew_read_lease` and `renew_read_lease_strict` compare the three-field
-  epoch. Their premise comment ("any overwrite of a borrowed region is a
-  wrap") becomes "any overwrite of a borrowed region is preceded by a gated
-  epoch change (a wrap or a frontier advance)".
-- The RAM tier and `cross_process_ram_coherence` do not change. An advance
-  changes no `DirEntry`, so no bucket version moves. The same reasoning as for
-  the phase toggle in [multi-process.md](../multi-process.md#cross-process-ram-coherence)
-  applies: a RAM copy of a document the ring later evicts is still correct
-  content.
+- `exists_sync` stays a directory-only probe, applying the position leg only.
+  It can return a false "yes" for a stamp-dead entry, the same class of error
+  as its existing tag-collision false positives.
+- **RAM tier and `cross_process_ram_coherence`: unchanged.** An advance
+  mutates no `DirEntry`, so no bucket version moves. A RAM copy of a document
+  the ring later evicts is still correct content, as with the phase toggle in
+  [multi-process.md](../multi-process.md#cross-process-ram-coherence).
 
 ### 4.9 Multi-process
 
-- **Ownership (invariant 7).** Only the owner writes, so only the owner moves
-  `f`, under the `write_lock`, inside `allocate_write_slot`. Any process that
-  writes the stripe adopts the shared `f` together with `shared_write_pos`,
-  under the lock. That covers a process-count change, a restart, or the
-  forked-writers layout that `test_multiprocess_writers.cpp` covers.
-- **Readers in other processes** load `P`, `phase` and `f` from the shared
-  header for Σ and `shared_write_pos` for `W`. They register their borrow in
-  `stripe_borrow_slot` and stamp `stripe_lease_expiry_ns`, both in the same
-  header, which the owner's gate reads. This is exactly how cross-process
-  wraps are gated today (`test_multiprocess_writers.cpp`, "A borrow held in
-  one process defers another process's wrap").
-- **Cache lines.** `retain_frontier` (offset 6) sits in the same 64-byte
-  header line as the phase, the wrap count and the intent. The reader's
-  snapshot is one line, as today.
+**Ownership (invariant 7).** Only a `write_lock` holder moves `G`, and it is
+the owner. Any process that writes a stripe adopts the shared `G` and the
+shared `W` under the lock; it never publishes from a local copy (S3). This
+covers:
 
-### 4.10 In-memory `Directory` compared with `MmapDirectory`
+- a process-count change;
+- a restart;
+- forked writers;
+- **independently opened writers** (`test_multiprocess_writers.cpp`, S9).
 
-The protocol is the same in both. The differences are only where the state
-lives (table 4.2) and its lifetime. A single-process volume rebuilds an empty
-`Directory` and restarts at `W = S` on every open, so it retains nothing
-across a restart. It gains exactly what the replay shows while it runs. The
-local gate sums the 64 borrow shards (`Stripe::local_borrow_shards`). The
-mmap gate reads the single shared slot. Both are unchanged.
+**Readers in other processes** use the shared state directly:
 
-### 4.11 Document sizes, and why there is no aggregation buffer
+- they load `G` from the retention region and `shared_write_pos` from the
+  header;
+- they register borrows in the shared per-chunk slots;
+- they stamp the shared lease.
 
-Cyclone has no ATS-style aggregation buffer. `WriteBuffer` is a per-handle
-staging buffer, and every commit is one pwrite of one document. So an advance
-happens per document, not per aggregation flush, and a document larger than
-the runway advances by as many chunks as it needs in **one** gated step.
-`chunk_index_ceil(need + Q/2)` can jump from `f` to any index up to `N`.
-Consequences:
+The owner's gate reads exactly those.
 
-- A 32 MiB document in a large stripe evicts the retained documents under its
-  span and nothing else.
-- A document that does not fit in `[W, E)` wraps first, then advances from
-  `S`. That matches today, where it lands at `S`.
-- A document larger than the data area is still `NoSpace`, and one over
-  `max_object_size` is still `ObjectTooLarge`.
-- In small stripes, where the default auto geometry gives about 32 MiB, a
-  2 MiB document needs 4 or 5 chunks per write. So nearly every KV write
-  advances. That costs the gate (a handful of loads and two stores) per write
-  and a higher epoch-change rate for readers. Open question 2 asks whether
-  `Q` should have a floor.
+### 4.10 In-memory `Directory` versus `MmapDirectory`
+
+The protocol is identical. They differ only in where the state lives and how
+long it lives: a single-process volume rebuilds an empty `Directory` on every
+open, so it retains nothing across a restart.
+
+On the single-process read path a borrow is a CAS on one `uint16_t` in *this
+thread's* shard line, so invariant 6 holds. The gate sums the 64 shards'
+slots for the exposed chunks. That is the same 64 lines it sums today.
+
+### 4.11 Document sizes
+
+Cyclone has no aggregation buffer. Each commit is one pwrite of one
+document, so advances happen per document, and a document larger than the
+runway advances by as many chunks as it needs in one gated step. Otherwise
+behaviour is unchanged:
+
+- documents larger than the data area still get `NoSpace`;
+- documents over `max_object_size` still get `ObjectTooLarge`.
+
+With the 1 MiB floor, a 32 MiB stripe of 2 MiB KV blocks advances about two
+chunks per write. That costs a handful of loads and two stores per write. It
+no longer triggers reader retries, because exposure is per chunk.
 
 ### 4.12 Crash, restart and power loss
 
-**Process crash (no power loss).** The mmap directory and the data share the
-page cache, so a crash leaves exactly the state at the instruction where it
-happened. The possible stopping points:
+**The open path never writes retention state (B4).** `init_stripes` runs in
+every opener, including while peers are live. It does not sanitise `G`, `W`
+or the slots.
 
-| crash point | state left | outcome |
-|---|---|---|
-| inside the advance window, `wrap_intent = 1` | intent stuck at 1, `f` old | Readers of the stripe fail revalidation until the flag clears. The next writer that takes the `write_lock` clears it, because only a `write_lock` holder ever sets it, so an observed 1 under the lock is stale. **This is a pre-existing gap**: today a crash inside the wrap window leaves the flag set until the stripe's *next wrap*, a whole pass of misses. This design fixes it on the first allocation. |
-| after the `f` store, before the intent clear | new `f`, intent stuck | as above |
-| after the advance, mid-pwrite | torn bytes in the runway, `W` not advanced (F6) | No admissible entry points into the runway. The next writer reuses the span. |
-| after the pwrite, before the insert | a document in `[W_old, W_new)` with no entry | Unreachable, overwritten next pass. Same as today. |
+- Readers clamp instead: `F = min(S + f·Q, E)`; `f > N` is treated as `N`; a
+  misaligned or out-of-range `W` is already rejected by the existing
+  recovery guard.
+- Any repair happens as an ordinary gated advance, by a writer, under the
+  `write_lock`.
+- The only exception is the **exclusive open**, when this process holds the
+  exclusive lifetime lock and so has no live peers. Only then are the borrow
+  slots, the lease and the intent zeroed, and the phase re-derived as `P & 1`
+  (S4, S5).
 
-**Power loss.** With `sync_on_write = false`, the default, the
-`DirectorySyncer` fsyncs data and then msyncs the directory every
-`directory_sync_interval`. Between syncs, data pages, directory pages and the
-header page can each be durable independently. On reboot the header (`P`,
-phase, `W`, `f`) may be older or newer than the data. The legs cover every
+**Stuck intent (D9, S5).** A writer that dies inside the intent window
+leaves `wrap_intent = 1`. Today that makes every read of the stripe miss for
+a whole pass. The flag is cleared, and the phase re-derived from `P`, in two
+cases only:
+
+- on a **proven-dead `forced_release`** of the `write_lock` (`kill(pid,0)`
+  confirmed the holder is gone);
+- on an exclusive open.
+
+It is **not** cleared on `escalated_takeover`: that holder may still be alive
+and inside its window (test 13). This fix ships as its own commit, and it
+applies in both modes.
+
+**Process crash, other points:**
+
+- A crash after the `G` store but before the intent clear is covered by the
+  above.
+- Torn bytes from an interrupted pwrite in the runway are harmless: no entry
+  can admit them.
+- A committed document whose insert was lost is simply unreachable.
+
+**Power loss** (default `sync_on_write = false`). Header, directory, data and
+retention region can each be persisted independently. The legs cover every
 combination:
 
-- Data written after the persisted `F` (the header was lost, the data made
-  it). Previous-phase entries there point at new documents whose stamp is
-  `P`, or at the middle of one. The stamp or the magic rejects them.
-- Data written after the persisted `W`. Current-phase entries at or ahead of
-  `W` are rejected by position, as today.
-- The header was lost across a whole wrap. Entries of the "previous" pass are
-  then two passes old relative to the documents that overwrote them. The
-  stamp rejects them.
-- An inconsistent header (`W > F`, `f > N`, `W` misaligned). `init_stripes`
-  already sanitizes `W`. It also sets `f := N`, meaning no retained region for
-  that pass: a miss spike, never a wrong serve.
+| What was lost | How it is caught |
+|---|---|
+| Data persisted past the persisted `F`. Old entries now point at newer documents. | Stamp `P` against expected `P−1`, or bad magic |
+| Data persisted past `W` | Position (as today) |
+| The header or `G` was lost across a whole wrap | Stamp |
 
-With `sync_on_write = true` there is a new ordering rule that mirrors
-invariant 2. The header page holding the new `f` is msynced **before** the
-first pwrite into the new runway, so a persisted entry never points into
-bytes that a persisted fill overwrote. It is one msync per advance, amortized
-over `Q` bytes.
+The first draft's msync of `f` before the fill is **dropped** (nit). `G` sits
+in a single 64-byte-aligned write unit, and the legs above already turn
+reordered persistence into a miss.
 
-### 4.13 On-disk format
+**Lost timeline.** After the next wrap, documents from a lost timeline whose
+stamp coincides with the new pass can be admitted as genuine. Each is a real,
+CRC-valid document of that key, possibly an older version (test 16). We
+accept this. It is the same class of outcome as today's power-loss contract.
 
-- There is **no change to the format major.** v8 is unreleased. The design
-  uses bytes v8 already zeroes and never reads: `MmapDirectory::Header::reserved`,
-  `VolumeHeader::reserved`, and `Document::write_serial`. Zero in each means
-  today's behaviour. A v8 volume created before this lands is a flush-mode
-  volume and stays one.
-- The mode is isolated by filename (the fingerprint), not by version. So the
-  change needs no further bump as long as it ships in the same release as the
-  CRC-32C bump (v8). If it slips past a v8 release, it still needs no bump:
-  old binaries never resolve a retention volume's filename. It does need the
-  `open_locked` backstop, because an operator can hand-name a file. See the
-  known limitation in `fingerprint_cache_path`.
+### 4.13 Mode persistence and mismatch (D3, B5)
+
+The mode is **not** in the filename. Filenames are unreliable here for three
+reasons:
+
+- `resolve_unsized_cache_path` picks the newest file of the format major;
+- `fingerprint_cache_path` returns already-fingerprinted paths unchanged;
+- the C API accepts explicit paths.
+
+Instead:
+
+- `VolumeHeader::retain_chunks` is written at creation and is
+  **authoritative**. A mismatch between it and the opener's config sets
+  `needs_reset` in `Volume::open_locked` and goes through the existing
+  live-peer gate:
+  - **refuse** if a live peer holds the file;
+  - **cold reset** if no peer does;
+  - return **`IncompatibleVersion`** if `auto_reset_on_incompatible` is off.
+
+  So a retaining process and a flushing process never run on one ring
+  (test 14).
+- Old binaries are kept off new files by the version rather than the mode:
+  `MmapDirectory::kVersion = 2`, mixed into the fingerprint, plus the
+  lifetime-lock rule in 4.2.
+- **No format-major bump** is needed. v8 is unreleased, and the new header
+  bytes and `write_serial` are zero in every v8 file. Zero means flush.
+
+**C API (S11):** add a trailing field `disable_wrap_retention`, a *negative*
+flag, so a zero-initialised `CycloneCacheConfig` gets the default. It carries
+the same trailing-field ABI note as `small_tier_percent` in `cyclone_c.h`:
+there is no mixed-version ABI safety. A caller compiled against an older
+header passes a smaller struct, and the library would read garbage from the
+new field. Callers must recompile against the new header when adopting it.
+The C++ API adds `CacheConfig::wrap_retention`, which defaults to `true`
+under D1.
 
 ---
 
@@ -493,111 +623,109 @@ over `Q` bytes.
 
 ### 5.1 Invariant by invariant
 
-1. **Readers take no stripe lock.** New read-side work is loads only: `f` in
-   the snapshot, `W` as today, and a 4-byte compare of `write_serial` in a
-   header the path already maps. There is no new lock and no new RMW.
-   `read_sync` keeps the "Lock-free read" shape.
-2. **Commit ordering.** For inserts it is unchanged: data durable before the
-   directory insert, and the stamp travels in the same pwrite as the
-   document. There is a new counterpart for advances (4.12): with
-   `sync_on_write`, `f` is durable before the runway is written. Without it,
-   the stamp, position, key and CRC legs downgrade a reordered persist to a
-   miss, which is the same contract as today.
-3. **Dekker handshake.** The shape is unchanged: the writer stores the intent
-   and then loads the borrow count and the lease; the reader stamps the
-   borrow and the lease and then loads the intent and then the epoch; all
-   seq_cst. What changes is the set of events that run it (every frontier
-   advance, plus each wrap) and the epoch, which is now `(P, phase, f)`, with
-   every epoch store program-ordered before the intent clear. The proof at
-   the intent-set site in `allocate_write_slot` carries over by replacing
-   "wrap-count publish" with "epoch publish". Borrows are still released on
-   handle close.
-4. **Per-bucket seqlock.** The advance does not mutate the directory. `insert`
-   changes only which slot it picks. Every mutation is still odd→even under
-   the stripe mutex, with `acquire_writer`/`release_writer` in the mmap case.
-5. **HitTracker is a leaf lock.** It is not touched. The advance runs inside
-   `allocate_write_slot` and never calls `record_hit()`.
-6. **Per-thread sharding.** There is no new shared RMW line on the read path.
-   The frontier is read from a line the reader already loads.
-7. **Multi-process ownership.** Only a `write_lock` holder moves `f`, and it
-   is always the owner. Non-owners read it (4.9). Per-write fsync stays
-   opt-in.
-8. **Full-key re-verification.** It is kept on both classes and at every
-   election. It is extended by uniqueness (4.6) and by the stamp, which
-   closes the one alias the key check cannot see: the key's own older
-   document at a reused offset.
-9. **Phase-ABA positional guard at both choke points.** It is generalized,
-   not removed. The probe leg rejects runway offsets, current-phase entries at
-   or ahead of `W`, and previous-phase entries behind `F_Σ`. The hop leg uses
-   the direction table in 4.5. The guard's purpose, "no borrow can alias
-   bytes the forward fill will overwrite without a gate", now holds because
-   the forward fill writes only into `[W, F)` and every move of `F` is gated
-   (5.3). It no longer holds because everything ahead of `W` is off limits.
+1. **No reader lock.** Reads add loads only (`G`, `W`), plus a per-chunk CAS
+   that replaces the existing borrow CAS one for one. The stamp is a 4-byte
+   compare on a header the reader already maps.
+2. **Commit ordering.** Unchanged. The stamp travels in the same pwrite as
+   the document. Reordered persistence of `G` and the fill downgrades to a
+   miss (4.12).
+3. **Dekker.** Same shape, quantified per chunk.
+   - Writer: `intent := 1` → load the counts of chunks `[f, t)` and the
+     lease → store `G` → `intent := 0`.
+   - Reader: increment chunk `c` → stamp the lease → load `intent` → load
+     `G`.
+   - All operations are seq_cst.
+   - If the writer's load of chunk `c` missed the reader's increment, the
+     reader's intent load comes later in the order `S`. It then sees either
+     the intent, or (if the intent was already cleared) the new `G`, because
+     the `G` store is program-ordered before the clear. The new `G` exposes
+     `c`, so the reader backs off.
+   - Borrows are released on close.
+4. **Seqlock.** An advance does not touch entries. The rule-2 clears and
+   `remove_sync` use the normal odd → even brackets under the stripe mutex.
+5. **HitTracker.** Untouched. An advance never calls `record_hit()`.
+6. **Sharding.** No new shared line. Single-process chunk slots live inside
+   each thread's own shard line. The mmap borrow is the same one-slot CAS as
+   today, but on a per-chunk slot, which is less contended than today's
+   single stripe slot.
+7. **Ownership.** Only a `write_lock` holder moves `G`. Non-owners read it.
+8. **Full-key re-verify.** Kept on every candidate. It is extended by the
+   stamp and by the uniqueness rules (4.6).
+9. **Positional guard at both choke points.** Generalised to the tables in
+   4.4 and 4.5. Its purpose still holds: no admitted borrow aliases bytes
+   that the forward fill writes without a gate. The fill writes only
+   `[W, F)`, and every move of `F` is gated per chunk (5.3).
 
 ### 5.2 A stale entry from two or more passes back is never served
 
-Let `e` be a directory entry for key `K` at offset `o`, with phase bit `b`,
-created in pass `Q <= P - 2`. Look at what is at `o` when a reader admits `e`:
+Take an entry `e` for key `K` at offset `o`, created in pass `≤ P_Σ − 2`.
+Consider what now sits at `o`:
 
-- **The original document `D` is intact.** This is the trailing-gap survivor.
-  Its stamp is `Q`, and `Q` is neither `P` nor `P - 1`. The stamp leg rejects
-  it whatever the phase or position legs say.
-- **A newer document `D'` starts at `o`**, written in pass `R` in `{P - 1, P}`.
-  The stamp is `R`. Admission needs the class implied by `b` to expect `R`.
-  If it does not, `e` is rejected. If it does, the key leg compares
-  `D'.first_key` with `K`. A different key is rejected. The same key means
-  `D'` is a genuine document of `K` from the live window, and uniqueness
-  (4.6) means `e` is the one entry that resolves `K`. So a stale entry can
-  only ever resolve to `K`'s live document, never to an older one.
-- **`o` falls inside a document or in padding.** The magic and length checks
-  reject it, then the key, then the CRC. An attacker who can store content
-  could forge a document header inside a payload. That is a **pre-existing**
-  exposure of any aliasing entry, not something this design introduces (open
-  question 7).
-- **`D` was written in pass `P - 2^32`.** The 32-bit stamp would alias. That
-  needs an entry to survive 4.29 × 10^9 wraps of one stripe untouched, which
-  is about 13 years at 10 wraps/s on a single stripe. We accept it.
+- **The original, intact document.** Its stamp is `≤ P_Σ − 2`, which is
+  never `P_Σ` or `P_Σ − 1`, so it is rejected.
+- **A newer document starting at `o`,** written in pass `R ∈ {P_Σ − 1, P_Σ}`.
+  - If the class implied by `e`'s phase does not expect `R`, it is rejected.
+  - If it does, the key check applies. A different key is rejected. The same
+    key means the document is a genuine document of `K` from the live window,
+    and uniqueness (4.6) makes `e` the single entry that resolves `K`.
+- **The middle of a document, or padding.** Rejected by the magic, length,
+  key and CRC checks. Forged in-payload headers are a pre-existing exposure,
+  out of scope (D7).
+- **A 32-bit stamp alias.** It would need an entry to survive 2^32 wraps of
+  one stripe, which we accept.
 
-So every document the predicate admits is a genuine, intact, CRC-verified
-document of `K`, written in pass `P` or `P - 1`.
+So every admitted document is a genuine, CRC-verified document of `K` from
+pass `P_Σ` or `P_Σ − 1`.
 
 ### 5.3 The forward fill never tears an admitted borrow
 
-**Claim.** While a borrow `B` of document `D = [o, o+len)` is outstanding and
-its lease is live, no pwrite overwrites any byte of `D`. The exception is a
-ceiling-forced advance, which is unchanged from today and documented.
+**Claim.** Let `B` be a borrow of a document from pass `p`, starting at `o`
+in chunk `c`, admitted with `G ≤ T = (p+1)(N+1) + c` after its increment.
+While `B` holds its slot and its lease is live, no pwrite touches the
+document's bytes. The exception is a ceiling-forced advance, as documented
+today.
 
-**Proof.** Pwrites land only in `[W, W + doc)`, which is inside the runway
-`[W, F)` as it stands when the slot is allocated. The writer holds the stripe
-mutex (and the `write_lock`) from allocation to commit, so no advance or wrap
-interleaves with one fill. `B` was admitted with snapshot `Σ` and revalidated
-with `intent == 0` and `epoch == Σ`.
+**Proof.**
 
-- **Current class** (`o + len <= W`): these bytes are in `[S, W)`. They can be
-  rewritten only after a wrap (so `P` changes) and then an advance over them.
-- **Retained class** (`o >= F_Σ`): the runway at revalidation time is
-  `[W, F_Σ)`, because the epoch is unchanged, so `f` is unchanged. It is
-  disjoint from `D`. Any later write into `D` needs `F` to move past `o` first.
+1. Pwrites land only in `[W, W + doc)`, which lies inside the runway as it
+   was at allocation.
+2. The runway only ever covers chunks already exposed by an advance, that is,
+   chunks for which `G` has passed their threshold.
+3. The document's first byte, in chunk `c`, is overwritten only after some
+   advance publishes `G > T`. Advances cover whole chunks from `f` upward, so
+   crossing `c` means crossing it for exactly this pass `p + 1`.
+4. That advance loads chunk `c`'s count after its intent store. By 5.1(3),
+   either the advance sees `B`'s increment and defers, or `B`'s own check saw
+   the intent or `G > T` and `B` was never admitted.
+5. After admission, `B`'s count stays in chunk `c`'s slot until the handle
+   closes, so every later advance across `c` sees it.
 
-In both cases some gated epoch change must come first. That change runs
-`set_intent(true)` and then the gate loads, and `B` runs its stamp and then
-`intent`/`epoch` loads. By the existing Dekker argument, either the gate
-observes `B`'s borrow and defers, or `B`'s revalidation observes the intent or
-the moved epoch. The second case contradicts `B` being admitted. Once `B` is
-admitted its count stays in the slot until the handle closes, so every later
-gate sees it. ∎
+Two loose ends:
 
-Two notes on the proof:
+- **Bytes in chunks after `c`.** They could only be written after chunk `c`
+  itself, since the fill moves forward.
+- **The wrap.** It is ungated but writes no bytes.
 
-- The **wrap** is not gated, and that is safe. It writes no bytes, and it
-  changes the epoch inside an intent window. A borrow that raced it retries.
-  A borrow that was already admitted keeps its intact bytes until the next
-  gated advance reaches them.
-- **Pwrites in flight** when Σ was taken target a runway allocated no later
-  than Σ in the same pass. The frontier only grows within a pass, so that
-  runway is below `F_Σ`. Across a wrap the stripe mutex serializes them. The
-  escalated-takeover residual in `commit_write_slot` is unchanged and still
-  detectable only.
+∎
+
+### 5.4 Torn snapshot
+
+`G` is a single word, so `(P, f, φ)` cannot tear. The only multi-word read is
+`(G, W)`, with `G` loaded first and `W` after (test 17). Two cases can
+straddle:
+
+- **A wrap between the two loads.** `W` reads low: `S` plus the new pass's
+  fill.
+  - An entry with `o < W_new` points at a document of the new pass, stamped
+    `P_Σ + 1`. It is rejected, because admission needs `P_Σ` or `P_Σ − 1`.
+  - A current-class document of pass `P_Σ` with `o ≥ W_new` is rejected by
+    position. That is a spurious miss, never a wrong serve.
+- **An advance between the two loads.** `W` can only move up inside the
+  runway, which holds nothing admissible, and `F_Σ` is used as-is.
+
+In every case, exposure is evaluated against the document's own stamp `p`
+using a fresh `G` at borrow time, so a class misjudged from a straddled
+snapshot still gets the exact verdict.
 
 ---
 
@@ -605,106 +733,89 @@ Two notes on the proof:
 
 | # | Failure mode | Handled by |
 |---|---|---|
-| F1 | A reader classifies with a stale `F` and borrows bytes the writer is about to fill | Position uses `F_Σ` from the snapshot; `f` is in the epoch; revalidation (5.3) |
-| F2 | A two-wraps-old entry with intact bytes (trailing gap) | Stamp (5.2) |
-| F3 | A same key at the same offset leaves duplicate entries, and the older version is served | Election plus dedupe (4.6) |
-| F4 | A chain pointer into a region the frontier has passed | Direction table (4.5); upward hops from retained nodes are rejected |
-| F5 | A link from a new head to a retained node that is cleaned before commit | Liveness check under the lock replaces the epoch-based link refusal (4.5) |
-| F6 | A writer crashes with the intent set | Cleared by the next `write_lock` holder (4.12); also fixes the pre-existing wrap-window gap |
-| F7 | Header, directory and data persist out of order at power loss | Stamp, position, key and CRC; `f := N` sanitize; `sync_on_write` ordering (4.12) |
-| F8 | A retaining reader and a flushing writer on one ring | Mode is per volume and fingerprinted; `open_locked` backstop (4.2) |
-| F9 | Phase and pass count diverge after a double wrap (usurpation) | `phase := P & 1` is derived, not toggled (4.1) |
-| F10 | A long-held zero-copy borrow blocks advances, and writes drop sooner than today | Early advance; ceiling unchanged; counters; region-scoped borrows as follow-up (section 12, open question 4) |
-| F11 | Directory pressure doubles and bucket-full evictions eat the gain | Victim order (4.7); `bucket_full_evictions` telemetry; sizing (section 10) |
-| F12 | The CRC-validation cache holds a verdict for bytes the fill has since replaced | As today: every document the directory can reach was fully written before its entry was published, and old entries into the runway are inadmissible (5.3). The same argument as `test_wrap_phase_aba.cpp` case (B) |
-| F13 | A forced advance under the ceiling | Same semantics and counters as a forced wrap; holders see `kTorn` on renew |
+| F1 | Reader classifies with a stale `F` | `F_Σ` from the snapshot; exposure check against a fresh `G` (5.3) |
+| F2 | Two-wrap trailing-gap survivor | Stamp (5.2) |
+| F3 | Duplicate entries after a rewrite, or an alternate write whose allocation wrapped | In-place update of the verified head; rule-2 cleanup (4.6, B2a) |
+| F4 | Self-loop: a fixed-size new head lands on a retained old head's offset | No links to retained heads (4.5, B2b) |
+| F5 | Purge misses retained entries | `admit` at every site; `remove_sync` removes all (B2c/d) |
+| F6 | Every borrow torn by any wrap or advance | Per-region exposure `G` (B1) |
+| F7 | Deferred first advance leaves the cursor high | `W := S` inside the wrap intent window (B3) |
+| F8 | Opener writes shared frontier state beside live peers | Open never writes; readers clamp (B4) |
+| F9 | Mixed modes, or an old binary zeroing a live header | `VolumeHeader` mode check plus the reset gate; `kVersion` in the fingerprint; no `init()` over a wrong-version directory without the exclusive lock (B5) |
+| F10 | Writer crash leaves the intent stuck | Cleared on a proven-dead release or an exclusive open; not on escalation (S5) |
+| F11 | Phase and `P` drift apart | `φ = P & 1` derived on the reader; stored seq_cst under `phase_lock` at the wrap |
+| F12 | Early advance starts or forces a deferral episode | Early advance is a gate check only (S1) |
+| F13 | Leaked counts across chunks after a crash | A forced reset clears all chunks; an exclusive open zeroes them (S4) |
+| F14 | Borrow saturation at 255 | u32 mmap slots with a 24-bit count (S4) |
+| F15 | Long zero-copy holds block advances | Only in the holder's own chunk (D4); early advance; ceiling unchanged |
+| F16 | Doubled directory pressure | Victim order (4.7); `bucket_full_evictions` telemetry |
 
 ---
 
 ## 7. How ATS does it, and where we deliberately differ
 
-This is based on our reading of the ATS `iocore/cache` sources (9.x/10.x).
-Check the exact call sites before citing this section elsewhere.
+This is from our reading of ATS `iocore/cache` (9.x/10.x). Verify the call
+sites before citing any of this elsewhere.
 
-- **Validity is positional.** An ATS directory entry also carries one phase
-  bit. `dir_valid()` accepts an in-phase entry only if it lies behind the
-  write position (plus the pending aggregation buffer). It accepts an
-  out-of-phase entry only if it lies ahead of the region the next
-  aggregation write will cover. So ATS keeps the previous pass readable until
-  the write head reaches it. That is the behaviour this design adopts.
-- **Cleaning is bulk, and eager where it matters.** Entries that became
-  invalid are swept out of the directory in bulk (`dir_clean_vol()` and
-  `dir_clean_segment()` when the stripe wraps, `dir_clean_range_interval()`
-  for a range). On recovery ATS clears the range written since the last
-  directory sync (`dir_clear_range()`), using the documents' `sync_serial` and
-  `write_serial` to tell what was written after the checkpoint.
-- **Evacuation.** Before the aggregation write overwrites a region, ATS copies
-  selected documents forward (`evac_range()` and evacuation blocks). These are
-  pinned documents, and documents with an open reader, which register in the
-  evacuation block. ATS moves the *document* out of the writer's way. It does
-  not hold the writer back.
-- **Readers copy.** ATS looks up the directory under the stripe mutex, reads
-  the document into an IOBuffer, and re-checks the document key after the
-  read. A reader never aliases live disk bytes, so ATS needs no borrow or
-  lease protocol.
+**How ATS works:**
 
-Where Cyclone differs:
+- **Positional validity.** `dir_valid()` treats an in-phase entry as valid
+  only if it is behind the write position (plus the aggregation buffer). An
+  out-of-phase entry is valid only if it is ahead of the next aggregation
+  write.
+- **Bulk sweeps.** `dir_clean_vol()` / `dir_clean_segment()` run at the wrap,
+  and `dir_clean_range_interval()` handles ranges. Recovery clears what was
+  written since the last directory sync (`dir_clear_range()`), using
+  `sync_serial` / `write_serial`.
+- **Evacuation.** `evac_range()` copies pinned documents, and documents with
+  registered readers, forward, ahead of the write.
+- **Copying readers.** Readers look up the directory under the stripe mutex,
+  read into an IOBuffer, and re-check the key afterwards. No borrow or lease
+  is involved.
 
-1. **Zero-copy borrows gate the frontier instead of evacuating.** Cyclone
-   hands out views into the live mapping, so a document under a borrow cannot
-   be moved. It has to be protected in place. Copying forward (evacuation) is
-   a possible second step for hot retained documents, at a cost in write
-   amplification (open question 6).
-2. **Lock-free, multi-process readers.** ATS readers serialize on the stripe
-   mutex. Cyclone readers take no lock and may live in another process. So
-   validity is evaluated against an epoch snapshot and closed with the Dekker
-   revalidation, instead of under a lock.
-3. **No aggregation buffer.** The frontier moves in fixed chunks, and
-   early, instead of per aggregation write.
-4. **The pass stamp is a read-time check.** ATS uses serials for recovery.
-   Here `write_serial` is compared on every read, which removes the need for
-   an eager sweep to kill phase-ABA survivors.
-5. **No eager directory sweep in v1.** Position plus stamp make stale entries
-   inadmissible, and `insert` reclaims them. Section 8 has the measured cost
-   of sweeping.
+**Where we differ:**
+
+1. Zero-copy borrows **gate the frontier per chunk** instead of evacuating.
+   Evacuation (D6) is a possible later second-chance mechanism.
+2. Readers are lock-free and may be in other processes. We use a `G`
+   snapshot, per-document exposure, and per-chunk Dekker instead of the
+   stripe mutex.
+3. There is no aggregation buffer. The frontier moves in fixed chunks, and
+   early.
+4. The pass stamp is checked on **every read**, not only in recovery, so no
+   eager sweep is needed to kill phase-ABA survivors.
+5. There is no directory sweep in v1 (see section 8 for the cost of one).
 
 ---
 
 ## 8. Alternatives considered
 
-- **Eager clean-ahead: scan the directory and clear the entries in
-  `[F, F')` at each advance.** This is the literal ATS analogue. A full scan
-  of one stripe's 65 536 entries measured **about 130 µs** on an Apple M5
-  (Release build, 44 536 occupied entries, through the out-of-line `DirEntry`
-  accessors). At 4 KB documents and `Q = 512 KiB` (a 32 MiB stripe with
-  `N = 64`) that is about 1 µs per write, roughly 10 % of today's 10.1 µs
-  write p50. It also moves bucket versions, which spuriously invalidates peer
-  RAM copies under `cross_process_ram_coherence`. It is not needed for
-  correctness (5.2, 5.3). A **binned** variant is kept in reserve in case
-  directory hygiene turns out to matter. It builds per-chunk lists of
-  `(bucket, slot)` once per pass, or incrementally on insert, and clears only
-  those entries, so it costs O(entries cleaned).
-- **Widen the phase to 2 bits (use `DirEntry`'s reserved bit).** That pushes
-  the ABA out to four wraps, but it still needs the stamp or a sweep. The
-  stamp is free because the header is read anyway, so the wider phase buys
-  nothing.
-- **No stamp, sweep at every wrap (ATS style).** This is correct but costs an
-  O(directory) spike under the lock on every wrap, plus bucket-version churn.
-  The stamp does the same job for a 4-byte compare.
-- **Evacuate hot retained documents (a second chance).** This would move
-  Cyclone from FIFO toward CLOCK and could close part of the remaining 3-point
-  gap to LRU. It is out of scope here (open question 6).
-- **Region-scoped borrow counts (one counter per chunk).** This lets an
-  advance defer only for borrows inside the chunk it is about to expose. It
-  is the fix for risk 1. It needs header space the mmap layout does not have,
-  so it would be a v8-internal layout change (open question 4).
+- **Eager clean-ahead** (scan the directory and clear entries in `[F, F')`).
+  A full scan of a stripe's 65 536 entries measured about 130 µs on an Apple
+  M5. At 4 KB documents and `Q = 1 MiB` that is about 0.5 µs per write,
+  roughly 5 % of the write p50. It also moves bucket versions and churns peer
+  RAM tiers. It is not needed for correctness. A binned, O(cleaned) variant
+  is held in reserve.
+- **Whole-epoch revalidation** (the first draft). Rejected (B1): it tears
+  every borrow on the stripe at every advance and every wrap.
+- **Stripe-wide borrow count** (the first draft). Rejected (D4): one long
+  zero-copy hold anywhere on the stripe blocks every advance.
+- **Mode carried in the filename** (the first draft). Rejected (B5).
+- **Cross-pass alternate links** (the first draft). Rejected (D5): they allow
+  self-loops and duplicates, for a small gain.
+- **A 2-bit phase.** It still needs the stamp or a sweep. It buys nothing.
 
 ---
 
 ## 9. Expected hit-ratio effect (policy replay)
 
-`kv_churn_policy` now has `retain/N` columns: per stripe, a frontier of `N`
-chunks with the early advance described in 4.3. Commands:
+`kv_churn_policy` reports `retain/N` for `N ∈ {16, 32, 64, 256}`. The
+existing columns reproduce `doc/kv-cache-benchmark/churn/policy-replay.txt`
+digit for digit. The **bold** column is the `N` that D2 gives each
+configuration:
+
+- 1 GiB and 128 MiB stripes → `N = 64`;
+- 32 MiB stripes → `Q = 1 MiB`, `N = 32`.
 
 ```bash
 ./build/kv_churn_policy                         # 2 MiB, C = 16 GiB (round 4)
@@ -713,259 +824,254 @@ chunks with the early advance described in 4.3. Commands:
 ./build/kv_churn_policy 4096 536870912          # 4 KB, C = 512 MiB (HTTP-shaped)
 ```
 
-The existing columns reproduce `doc/kv-cache-benchmark/churn/policy-replay.txt`
-digit for digit.
-
-| workload | LRU | stripe FIFO | wrap flush (today) | retain/16 | **retain/64** | retain/256 |
-|---|---:|---:|---:|---:|---:|---:|
-| `zipf`, 2 MiB, 16 GiB | 0.8498 | 0.8174 | 0.7608 | 0.8086 | **0.8150** | 0.8166 |
-| `zipf+scan`, 2 MiB, 16 GiB | 0.7251 | 0.6865 | 0.6437 | 0.6802 | **0.6848** | 0.6860 |
-| `zipf`, 2 MiB, 2 GiB (63 blocks/stripe) | 0.8154 | 0.7754 | 0.7058 | 0.7629 | **0.7724** | 0.7724 |
-| `zipf+scan`, 2 MiB, 2 GiB | 0.6935 | 0.6463 | 0.5929 | 0.6371 | **0.6444** | 0.6444 |
-| `zipf`, 512 KiB, 16 GiB | 0.8667 | 0.8383 | 0.7887 | 0.8309 | **0.8366** | 0.8379 |
-| `zipf+scan`, 512 KiB, 16 GiB | 0.7405 | 0.7052 | 0.6678 | 0.7002 | **0.7040** | 0.7049 |
-| `zipf`, 4 KB, 512 MiB | 0.8756 | 0.8476 | 0.7758 | 0.8424 | **0.8470** | 0.8475 |
-| `zipf+scan`, 4 KB, 512 MiB | 0.7507 | 0.7151 | 0.6810 | 0.7099 | **0.7138** | 0.7148 |
+| workload | LRU | stripe FIFO | flush (today) | retain/16 | retain/32 | retain/64 | retain/256 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `zipf`, 2 MiB, 16 GiB | 0.8498 | 0.8174 | 0.7608 | 0.8086 | 0.8128 | **0.8150** | 0.8166 |
+| `zipf+scan`, 2 MiB, 16 GiB | 0.7251 | 0.6865 | 0.6437 | 0.6802 | 0.6833 | **0.6848** | 0.6860 |
+| `zipf`, 2 MiB, 2 GiB | 0.8154 | 0.7754 | 0.7058 | 0.7629 | 0.7683 | **0.7724** | 0.7724 |
+| `zipf+scan`, 2 MiB, 2 GiB | 0.6935 | 0.6463 | 0.5929 | 0.6371 | 0.6412 | **0.6444** | 0.6444 |
+| `zipf`, 512 KiB, 16 GiB | 0.8667 | 0.8383 | 0.7887 | 0.8309 | 0.8346 | **0.8366** | 0.8379 |
+| `zipf+scan`, 512 KiB, 16 GiB | 0.7405 | 0.7052 | 0.6678 | 0.7002 | 0.7027 | **0.7040** | 0.7049 |
+| `zipf`, 4 KB, 512 MiB | 0.8756 | 0.8476 | 0.7758 | 0.8424 | **0.8456** | 0.8470 | 0.8475 |
+| `zipf+scan`, 4 KB, 512 MiB | 0.7507 | 0.7151 | 0.6810 | 0.7099 | **0.7124** | 0.7138 | 0.7148 |
 
 What the table says:
 
-- At `N = 64` retention recovers 90 to 97 % of the flush cost on every
-  workload. It lands within 0.003 of per-stripe FIFO, and the residual is the
-  roughly one chunk of dead runway. `N = 16` leaves about 0.6 points on the
-  table. `N = 256` buys less than 0.2 points over 64 while running the gate
-  four times as often.
-- **Predicted round-4 result:** `zipf` 0.815 (from 0.757), `zipf+scan` 0.685
-  (from 0.638 to 0.642). The replay tracked the measured value within 0.006
-  before, so we expect measured values of about 0.81 and 0.68.
-- **Served throughput (a model, not a measurement):** weighting round 4's
-  T=1 per-operation latencies (hit 191 µs, miss+insert 4 064 µs) by the new
-  hit ratio gives about 1.34× the hits per second at T=1. That is roughly
-  0.84× LMDB instead of 0.62×. The FIFO-versus-LRU gap remains.
-- The HTTP-shaped row (4 KB documents, 16 stripes of 32 MiB) gains 7.1
-  points. It assumes the directory holds every live document: about 7 700
-  per stripe against 65 536 entries, so it does (section 10).
+- Retention recovers 92–97 % of the flush cost at the D2 geometry.
+- **Round-4 prediction:** `zipf` 0.815 (from 0.757) and `zipf+scan` 0.685
+  (from 0.638–0.642). The replay matched measurements within 0.006 last time.
+- **Served throughput (a model, not a measurement):** weighting T=1 latencies
+  (hit 191 µs, miss+insert 4 064 µs) gives about 1.34× the hits/s, roughly
+  0.84× LMDB instead of 0.62×.
+- **HTTP-shaped** (4 KB, 32 MiB stripes, `N = 32`): +7.0 points. This assumes
+  the directory holds every live document, and it does here: about 7 700 per
+  stripe against 65 536 entries.
 
 ---
 
 ## 10. Performance
 
-**Read path.** One extra load of `f` in the same header line (mmap) or the
-same stripe-local line (in-memory). One 4-byte compare of `write_serial`.
-Revalidation compares three fields instead of two. No new RMW and no new
-shared line (invariants 1 and 6). The effect should be in the noise of the
-warm-read p50 of 0.33 µs. The new cost is **spurious retries**: every advance
-changes the epoch, so a reader whose probe-to-revalidate window straddles an
-advance retries. For the round-4 KV load (about 28 MB/s inserted per stripe,
-`Q` = 16 MiB, so about 1.7 advances/s per stripe), a cold 2 MiB read with a
-5 ms window retries about 1 % of the time. With the default one retry, a
-false miss happens about 10^-4 of the time. A class-aware revalidation, where
-a current-class borrow ignores intent and `f` changes that come from an
-advance, removes most of these retries. It is a follow-up.
+**Read path.** Four changes, all cheap:
 
-**Write path.** For each write, one compare of `W + doc` against `F`. For
-each advance: the intent store, the gate (lease plus borrow-count loads; the
-in-memory gate sums 64 shards), the `f` store and the intent clear. That is
-about 1 to 2 µs at most, amortized over `Q` bytes. For 4 KB documents and
-`Q` = 512 KiB it is one advance per about 125 writes, under 0.02 µs per
-write. The wrap stays O(1) and loses its gate. There is no directory scan
-anywhere (section 8 has the cost of one).
+- One more `G` load, from the same line as `W` in mmap mode, or next to it
+  locally.
+- A 4-byte stamp compare.
+- The exposure compare.
+- The borrow CAS moves to a per-chunk slot.
 
-**HTTP small objects (`performance_baseline`, 4 KB).** The documented run
-(`--cache-size 512 --entries 5000 --content-size 4096`) writes 20 MB into
-512 MiB and **never wraps**. A fresh stripe starts at `f = N`, so that run
-exercises no advance at all. Only the read-path loads change. Acceptance:
-write p50 and p99 and warm-read p50 within run-to-run noise (±3 %) of the
-current baseline table. A churning variant (for example
-`--cache-size 64 --entries 50000`) must be added to cover the advance path,
-and must report `frontier_advances` and `advances_deferred_by_lease`.
+There is no new RMW. Reader retries now happen only inside a short intent
+window, or on real exposure of the reader's own chunk, so the first draft's
+"about 1 % spurious retries" is gone. Warm-read p50 (0.33 µs) should stay
+within noise.
 
-**Directory sizing.** Retention roughly doubles the entries that resolve.
-Each stripe has 65 536 entries in buckets of 4. That is ample for KV blocks
-(511 per stripe) and for 4 KB documents in 32 MiB stripes (about 7 700 per
-stripe). With the auto geometry on large volumes, for example 16 GiB giving
-1 GiB stripes, 4 KB documents number about 250 000 per stripe. There the
-directory, not the ring, bounds capacity **today already**. Retention cannot
-retain what the directory cannot hold, and bucket-full evictions will rise
-(risk 3, open question 8).
+**Write path.** Every write does one compare of `need` against `F`. Each
+advance does:
+
+- the intent store;
+- lease + count loads for the exposed chunks, summed over 64 shards locally
+  (the same 64 lines today's gate sums);
+- the `G` store and the intent clear.
+
+That is at most about 1–2 µs, amortised over a chunk: at 4 KB documents with
+`Q = 1 MiB` it is about 250 writes per advance, under 0.01 µs per write.
+
+The wrap is still O(1) and is no longer gated. No directory scan happens
+anywhere.
+
+**`performance_baseline` (4 KB).** The documented run (5 000 × 4 KB into
+512 MiB) never wraps. Its first pass does advance through empty chunks
+(`G = 0`): 20 MB over 16 stripes is about two 1 MiB chunks per stripe,
+with nothing to wait on.
+
+- Acceptance: write p50/p99 and warm-read p50 within ±3 % of the baseline
+  table.
+- Add a churning variant (for example `--cache-size 64 --entries 50000`) that
+  reports `frontier_advances` and `advances_deferred_by_lease`.
+
+**Directory sizing.** About twice as many entries resolve.
+
+- That is ample for KV blocks and for 4 KB documents in 32 MiB stripes.
+- On large-stripe, small-object volumes the 65 536-entry directory already
+  bounds capacity today (D8, out of scope).
 
 ---
 
 ## 11. Test plan
 
-### 11.1 Existing guards that must stay green, in both modes
+### 11.1 New tests (`tests/integration/test_wrap_retention.cpp`, tag `[retention]`, plus the listed extensions)
 
-The test suite runs twice: as today, and with retention forced on through a
-test-only default. Expected results are identical except for the tests in
-11.2.
+1. **F6-E in mmap mode (flush and retention), plus a deferred first advance
+   under a borrow.** `shared_wrap_count` moves by exactly 1, and the shared
+   cursor is `S`, not high (B3).
+2. **The ungated wrap keeps current-class borrows `kOk`** until the frontier
+   crosses the borrow's own chunk.
+3. **Advance Dekker, writer paused after the intent is set.** Both orders:
+   reader increments before the gate load, and after it.
+4. **Writer paused after the `G` store, before the intent clear.** Readers
+   see exposure (for exposed chunks) or `kCopyNow`.
+5. **Reader paused between the CRC and `acquire_borrow`** while the writer
+   advances over its chunk and pwrites. The reader must reject.
+6. **Per-chunk gating, including a forced advance.** `kTorn` only in exposed
+   chunks; borrows in other chunks stay `kOk`.
+7. **One ceiling episode clears all leaked chunks** (fork, kill -9 the
+   holder).
+8. **Early advance never forces.** No deferral clock, no deadline, no reset.
+9. **Uniqueness.** Same-offset rewrites with fixed-size documents, and
+   `commit_alternate_write` with retained and wrap-raced heads: exactly one
+   resolving entry, no self-loop.
+10. **Purge of a retained key,** including `remove_alternate_sync` on a
+    retained chain (the whole entry goes, S7).
+11. **Retained chain hops.** Downward retained → retained works. Upward hops
+    and targets below `F_Σ` are rejected. The borrow sits on the served
+    node's chunk.
+12. **A peer open never writes the shared frontier state** (B4).
+13. **Crash at every writer seam** (fork, `_exit`). A `forced_release` clears
+    the intent and re-derives the phase; an escalated takeover does not
+    (S5).
+14. **Mode and layout mismatch:** refused with a live peer, cold reset
+    without one, `IncompatibleVersion` when auto-reset is off. A `kVersion 1`
+    peer resolves to a different file, and a wrong-version directory is never
+    `init()`-ed without the exclusive lock.
+15. **`Q` and `N` are identical across processes with different
+    `max_object_size`,** and `N` is clamped for small stripes (`N = 1`
+    behaves like flush).
+16. **Lost-timeline power loss.** Documents admitted after the next wrap are
+    genuine and CRC-valid; there is never a wrong-key or torn serve.
+17. **Snapshot load order** (`G` then `W`) across a wrap and an advance
+    (5.4).
+18. **The full suite in both modes,** plus TSan hammer variants of tests 3–6
+    and PageSpeed `cache_burst_test` with retention on.
 
-| Invariant | Guard |
+### 11.2 Seams
+
+**Writer seams** (test-only hooks in the style of
+`s_write_tear_gate_for_test`):
+
+- after the intent is set;
+- after the gate passes;
+- after the `G` store;
+- inside the wrap, between the `P` store and the `f` reset. With a single
+  `G` word this seam sits between the `shared_write_pos := S` publish and the
+  `G` store.
+
+**Reader seams,** compile-time only behind `CYCLONE_TEST_SEAMS` so the hot
+path carries nothing in release builds (S10):
+
+- between the CRC and `acquire_borrow`;
+- between the borrow and the intent / `G` loads.
+
+### 11.3 Existing guards that must stay green in both modes
+
+| Invariant | Guards |
 |---|---|
-| 1 | `tests/integration/test_lockfree_read_races.cpp` |
-| 2 | `tests/integration/test_power_loss.cpp` |
-| 3 | `tests/integration/test_lease_pinning.cpp` (every case; in retention mode "wrap pressure" becomes "advance pressure") |
-| 4 | `tests/unit/test_directory.cpp`, `tests/unit/test_mmap_directory.cpp` |
-| 5 | `tests/unit/test_hit_tracker.cpp` |
-| 6 | `concurrent_read_bench` scaling rows (no regression) |
-| 7 | `tests/unit/multi_process_test.cpp`, `tests/integration/test_multiprocess_writers.cpp` |
-| 8 | `tests/integration/test_wrap_phase_aba.cpp` (A), (B); `tests/integration/test_tag_collision.cpp` |
-| 9 | `tests/integration/test_wrap_phase_aba.cpp` (C) to (F), F6-A to F6-F |
-| other | `test_alternate_chain_bound.cpp`, `test_header_rmw_races.cpp`, `test_ram_coherence_cross_process.cpp`, `test_wrap_telemetry.cpp`, `test_fingerprint_filenames.cpp` |
+| 1 | `test_lockfree_read_races.cpp` |
+| 2 | `test_power_loss.cpp` |
+| 3 | `test_lease_pinning.cpp` |
+| 4 | `test_directory.cpp` and `test_mmap_directory.cpp` |
+| 5 | `test_hit_tracker.cpp` |
+| 6 | `concurrent_read_bench` rows |
+| 7 | `multi_process_test.cpp` and `test_multiprocess_writers.cpp` |
+| 8 | `test_wrap_phase_aba.cpp` (A), (B); `test_tag_collision.cpp` |
+| 9 | `test_wrap_phase_aba.cpp` (C)–(F) and F6-A…F |
 
-### 11.2 Expectations that change in retention mode (parameterize, don't delete)
+**Parameterised expectations in retention mode:**
 
-- `test_eviction.cpp` "Stale entries invisible after wraparound". In
-  retention mode, previous-pass entries stay visible until the frontier
-  passes them.
-- `test_eviction.cpp` "Insert succeeds after phase-based eviction frees stale
-  slots". Slots are reclaimed as inadmissible (4.7), not as stale.
-- `test_wrap_phase_aba.cpp` (C) and (D). The trailing-gap survivor is
-  rejected by the **stamp** rather than by position, and the test asserts
-  which leg fired.
-- `test_wrap_phase_aba.cpp` (E) and "An alternate write whose allocation
-  wraps starts a fresh chain". A link to a still-retained old head is now
-  *kept*. A link to a node behind the new frontier is still refused.
+- `test_eviction.cpp`: stale entries stay visible until the frontier passes
+  them; slots are reclaimed as inadmissible.
+- `test_wrap_phase_aba.cpp` (C)/(D): the trailing-gap survivor is rejected by
+  the stamp.
+- `test_wrap_phase_aba.cpp` (E) and the "fresh chain" case: links to retained
+  heads are refused (D5).
 
-### 11.3 New tests (`tests/integration/test_wrap_retention.cpp`, tag `[retention]`)
+### 11.4 Benchmark acceptance (gates D1)
 
-1. **Deterministic retention.** One stripe with small fixed documents. Fill
-   one pass, wrap, and write `k` documents. Assert that every previous-pass
-   key at or above `F` hits, every key in `[S, F)` misses, and each advance
-   evicts exactly the keys in the chunk it crossed. Rewrite a retained key
-   and assert the new version is served and only one entry resolves
-   (uniqueness).
-2. **Reader against forward fill under TSan.** N reader threads take
-   zero-copy borrows of retained documents near `F` and verify content
-   derived from the key after `renew_read_lease_strict`. M writer threads
-   force advances. Add seams in the style of `s_write_tear_gate_for_test` that
-   freeze the writer (a) between `set_intent` and the gate, (b) between the
-   `f` store and the intent clear, and (c) inside the runway pwrite. Each
-   Dekker leg is then hit deterministically. Assert no torn content, borrows
-   either valid or reported `kTorn`/`kCopyNow`, and a TSan-clean run with
-   `tools/tsan_suppressions.txt`.
-3. **Two-wrap ABA.** Build, as case (A) and (C) do, an entry that survives
-   two wraps in a cold bucket, in three variants: intact trailing-gap bytes
-   with stamp `P-2`, which must miss; offset reused by another key, which
-   must miss; offset reused by the *same* key, which must serve the new
-   version with no duplicate left behind.
-4. **Multi-process.** In forked processes: (a) a reader borrows a retained
-   document and holds it, the owner's advance is deferred, and it proceeds
-   after the close; (b) a non-owner reader classifies with the shared `f`;
-   (c) the writer is killed at each seam from test 2 and the next writer
-   clears the stale intent and resumes; (d) ownership moves between processes
-   and the new owner adopts `f`.
-5. **Reopen and power loss.** Reopen a wrapped retention mmap volume.
-   Retained and current entries serve, and runway entries miss. Corrupt the
-   header (`W > F`, `f > N`), which must sanitize to "no retained region"
-   with no wrong serve. With `sync_on_write`, check the msync-before-fill
-   ordering through a seam.
-6. **Chains across the pass boundary.** A head in the current pass with a
-   retained tail enumerates both until the frontier passes the tail, then
-   truncates. An upward hop from a retained node is rejected. A stale
-   pointer below `F` is rejected before any map.
-7. **Victim order.** `Directory` and `MmapDirectory` unit tests for the order
-   in 4.7, including "oldest admissible" when the bucket is full.
-8. **Fingerprint.** Retention on and off resolve to different filenames, and
-   the flush-mode filename is byte-identical to today's.
-
-### 11.4 Benchmarks as acceptance
-
-- `kv_churn` round-4 configuration (2 MiB, T=1 and T=4, both patterns):
-  measured hit ratio at least 0.80 on `zipf` and at least 0.67 on
-  `zipf+scan`; `writes_dropped_by_lease` at most 10× today's 0 to 3 per run.
-- `performance_baseline` as in section 10, plus the churning variant.
-- `concurrent_read_bench 20000 512 2 0 512 ramoff`: the 1/4/16-thread rows
-  stay within noise.
-- Sanitizers: the full suite under ASan+UBSan and TSan in both modes.
-- Downstream: `bazel test //test/lib/cache:cache_burst_test` in the
-  PageSpeed consumer (cross-process stress) with retention on.
+- `kv_churn`, round-4 configuration:
+  - measured hit ratio ≥ 0.80 on `zipf` and ≥ 0.67 on `zipf+scan`;
+  - `writes_dropped_by_lease` ≤ 10× today's 0–3 per run.
+- `performance_baseline` as in section 10.
+- `concurrent_read_bench` within noise.
+- ASan/UBSan and TSan clean in both modes.
 
 ---
 
-## 12. Rollout, risks and telemetry
+## 12. Rollout, telemetry and risks
 
-**Flag.** `CacheConfig::wrap_retention` (bool) and
-`CycloneCacheConfig::wrap_retention` in the C API. It is applied when a volume
-is **created** and persisted as `retain_chunks`. It is part of the filename
-fingerprint, so flipping it means a new file and a cold cache, never an
-in-place conversion.
+**Flag.**
 
-**Default.** Off in the first release that ships it. Flip it to on after:
-
-1. `kv_churn` meets 11.4;
-2. a PageSpeed soak with retention on shows `advances_deferred_by_lease` and
-   `writes_dropped_by_lease` within budget under real zero-copy send
-   durations;
-3. both sanitizer runs are clean.
-
-v8 already forces a cold cache on upgrade. So if the maintainers want it on
-from the start, turning it on *in the same release as v8* costs users no
-extra cold start (open question 1).
+- C++: `CacheConfig::wrap_retention`, default `true` under D1.
+- C API: `disable_wrap_retention`, zero meaning the default (S11).
+- It applies at volume **creation**. On a mismatch the persisted mode wins
+  through the reset gate (4.13).
+- **Fallback:** if D1's gates fail, ship v8 with the default `false`. The
+  persisted zero means flush, so nothing else changes.
 
 **New counters** in `VolumeStats`/`CacheStats` and the C API:
-`frontier_advances`, `advances_deferred_by_lease` (a subset of the existing
-`wraps_deferred_by_lease`, or a sibling of it), `retained_hits` (hits served
-from the previous pass: the direct measure of the benefit), and
-`stamp_rejections`.
 
-**The three biggest risks**
+- `frontier_advances`
+- `advances_deferred_by_lease`
+- `early_advances_skipped`
+- `retained_hits`, the direct measure of the benefit
+- `stamp_rejections`
 
-1. **The gate runs about 64× as often.** A long-held zero-copy borrow, such
-   as a large body sent to a slow client through the PageSpeed nginx module,
-   blocks the stripe's writer once the runway (`Q/2` to `3Q/2`) is used,
-   instead of once the pass is full. The borrow count is stripe-wide, not
-   region-scoped, so a borrow of a *current* document blocks advances too.
-   Expect `writes_dropped_by_lease` to rise under that traffic. Mitigations:
-   early advance, copy-out on `ns_until_forced_wrap`, and region-scoped
-   borrow counts (open question 4).
-2. **The correctness surface widens.** One predicate, "phase plus a
-   positional check against the cursor", becomes four legs evaluated against
-   a snapshot. They are applied at the probe, the hop, the election, both
-   remove paths, the header-RMW sites and the renew paths. One site that
-   loads a fresh `F` instead of `F_Σ`, or skips the stamp, reopens the
-   forward-fill tear. Mitigation: a single `Stripe::admit(entry_or_hop, Σ)`
-   helper with no bypass, plus the seam-driven tests in 11.3.
-3. **Directory pressure and the size of the HTTP win.** About twice as many
-   entries resolve. On large-stripe, small-object volumes the directory
-   already bounds capacity, so the gain is smaller than the replay shows, and
-   bucket-full evictions rise. There are also more spurious reader retries,
-   because the epoch changes per chunk, not per pass.
+**Risks after the amendment:**
+
+1. **Correctness surface.** A four-leg admission at every resolving site. One
+   bypass reopens a tear. Mitigation: `admit()` is the single entry point,
+   built in its own no-behaviour-change commit first; seams 3–5; TSan
+   hammers.
+2. **Long zero-copy holds.** These still block advances into the holder's own
+   chunk, now **only** that chunk. A slow client sending a large body from
+   the next chunk to be exposed stalls that stripe's writer after the runway
+   is used, as today at a wrap, but more often. Watch
+   `advances_deferred_by_lease` in the PageSpeed soak.
+3. **Directory pressure.** About twice as many entries resolve, so there are
+   more bucket-full evictions on large-stripe, small-object volumes. The gain
+   there is smaller than the replay shows (D8).
 
 ---
 
-## 13. Open questions for the maintainers
+## 13. Implementation plan
 
-1. **Default.** Ship off and flip later (the conservative choice, but a
-   second cold cache for adopters, since the mode is fingerprinted)? Or on,
-   inside the v8 release that already forces a cold cache?
-2. **Chunk count and floor.** `N = 64` fixed, or
-   `N = clamp(data_area / 1 MiB, 4, 64)`, so small stripes holding large
-   documents do not advance on every write? Whichever it is gets persisted
-   and fingerprinted.
-3. **Mode mismatch between processes.** Filename isolation (the proposal)
-   means differently configured workers silently use *different rings*.
-   Should `Cache::start` refuse to start instead when it finds an existing
-   sibling file of the other mode?
-4. **Region-scoped borrow accounting.** Ship v1 with the stripe-wide count
-   (simple, and the proof is unchanged)? Or grow the `MmapDirectory` header
-   by a per-chunk borrow-count line (a v8-internal layout change, which bumps
-   `MmapDirectory::kVersion` and needs an argument that is exact per chunk)
-   before turning retention on by default for the HTTP product?
-5. **Cross-pass alternate links.** Keep them (4.5, better alternate
-   retention for background-optimized variants)? Or keep today's
-   refuse-on-any-epoch-change rule and accept that retained Originals are
-   orphaned when a new alternate is written?
-6. **Evacuation or second chance.** Should a hot retained document be copied
-   forward when the frontier reaches it (ATS-style, CLOCK-like, closing part
-   of the 3-point FIFO-versus-LRU gap), at a cost in write amplification? It
-   would be a separate design.
-7. **Forged in-payload headers (pre-existing).** Any aliasing entry or
-   pointer that lands inside a payload can meet a forged header with a valid
-   CRC. Harden this, for example by stamping the document's own offset into
-   the unused `sync_serial` and checking it on read? Or accept it as today?
-8. **Directory sizing for HTTP on large volumes.** 65 536 entries per stripe
-   caps small-object capacity on 1 GiB stripes today. Scale
-   `kDirectoryEntriesPerSegment` with stripe size (a layout-constant change),
-   or leave it?
-9. **Fix the stuck `wrap_intent` after a writer crash** (4.12) in this change
-   or separately? It is pre-existing, cheap to fix, and a whole pass of
-   misses on the affected stripe today.
+Ordered commits. **Each one builds and passes the full suite** in every mode
+that exists at that point.
+
+1. **Stuck-intent fix** (D9, S5). Clear `wrap_intent` and re-derive the
+   phase on a proven-dead `forced_release` and on an exclusive open, never on
+   `escalated_takeover`. Includes test 13 (flush-mode part). Independent of
+   everything else.
+2. **`admit()` refactor, no behaviour change.**
+   - One helper replaces `probe_each`'s positional guard and
+     `is_valid_chain_offset` for directory-sourced offsets.
+   - Epoch handling moves behind a `{p, c}` token.
+   - In flush mode it computes exactly today's predicate.
+   - The existing suite is the proof.
+3. **`G` word and per-chunk borrow layout,** retention still off.
+   - The retention region is placed in the directory slack (static_assert on
+     721 224 bytes and 177 pages).
+   - `MmapDirectory::kVersion = 2` and mixed into the fingerprint.
+   - No `init()` over a wrong-version directory without the exclusive lock.
+   - Per-chunk local shard slots.
+   - Borrow, renew and strict-renew move to the exposure check. In flush
+     mode `N = 1`, so this equals today's semantics.
+   - Delete `Stripe::write_serial` / `sync_serial`.
+   - Tests 6, 7, 12, 14 and 15.
+4. **Frontier, advance and stamp,** behind the flag (default off).
+   - Wrap and advance in `allocate_write_slot`, mandatory and early advances.
+   - Stamp patch.
+   - `VolumeHeader::retain_chunks` and the mode check.
+   - Seams.
+   - Tests 1–5, 8, 16 and 17.
+5. **Uniqueness, remove and alternates.**
+   - Rule-2 cleanup.
+   - `remove_sync` removes all.
+   - Link refusal compares `P` and refuses retained heads.
+   - In-place head update.
+   - Retained downward hops.
+   - S7.
+   - The insert victim order, with boundaries loaded inside the bracket.
+   - Tests 9–11.
+6. **Flip the default** (D1). Only after section 11.4, `cache_burst_test` and
+   TSan pass in both modes. Includes the C API flag and counters.
+7. **Docs.** Update `doc/architecture.md` (Glossary: frontier, pass stamp,
+   `G`; the lease section) and `doc/multi-process.md` (retention region,
+   mode mismatch), and move this record to "design record for shipped work".
