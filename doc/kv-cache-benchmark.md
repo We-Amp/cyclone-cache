@@ -1,8 +1,8 @@
 # Cyclone as an LLM KV-cache storage tier — benchmark
 
-**Status:** three rounds on two laptops (macOS/Apple silicon and Linux/NVMe
+**Status:** four rounds on two laptops (macOS/Apple silicon and Linux/NVMe
 with a quiesced page cache); round 3 measures the first two fixes the earlier
-rounds called for. Treat every number as an instrument reading rather than a
+rounds called for, and round 4 a bounded-capacity tier under churn. Treat every number as an instrument reading rather than a
 marketing number. The point of this round is to find out where Cyclone
 stands against the storage backends that LLM serving stacks put behind their
 KV connectors today, and to measure — not guess — which of its known
@@ -549,6 +549,188 @@ restart 0.55 / 1.53 / 1.18 at 512 KiB / 8 MiB / 32 MiB (stock: 0.07–0.16).
 - The peers were not re-run for round 3; their corrected-sweep numbers are
   reused, taken on the same box before the dirty-page leak.
 
+## Round 4: bounded capacity under churn
+
+Rounds 1–3 measured stores that never fill. A real KV tier is bounded,
+larger than RAM, and full: every miss inserts and something has to go. This
+round measures that case against LMDB and file-per-block, with the decision
+criteria fixed in the spec before any run.
+
+**Workload** ([`kv-churn-spec.md`](kv-cache-benchmark/kv-churn-spec.md)):
+get-or-insert (hit → memcpy of the block into a per-thread staging buffer;
+miss → generate and put), capacity C = 16 GiB of payload, key universe 3 × C
+(24 576 keys at 2 MiB), Zipf(0.99) over a fixed permutation, and a second
+pattern `zipf+scan` where 10 % of operations are never-seen keys. Every store
+runs in a memory cgroup with `memory.max = 4 GiB` (RAM : tier = 1 : 4;
+verified: page cache is charged to the scope, and `memory.current` peaked at
+4.00 GiB in every run). Per point: fresh store, caches dropped, warm-up until
+2 × C has been inserted, `syncfs`, 120 s measured, `syncfs`, then close +
+reopen and 10 000 get-only Zipf reads. One hit in 64 is checked byte for
+byte; no run failed the check. Both harnesses print identical stream heads
+(`kv_churn --print-vectors` / `kvchurn --print-vectors`).
+
+**Stores and tuning** (printed by each run):
+
+- **Cyclone** (`benchmarks/kv_churn`, round 3 + CRC-32C tree): volume sized so
+  the stripes' data areas sum to 17 179 873 216 B (1.0000 × C), 16 stripes of
+  ~511 blocks, 65 536 directory entries per stripe (11 MiB of mmap directory
+  in total). Entries never ran out: `tag_collision_evictions` stayed ≤ 7 per
+  run at 2 MiB and ≤ 246 at 512 KiB. mmap directory on, checksum verified on
+  read, default readahead, no RAM tier, no fsync. Eviction is Cyclone's own;
+  the harness keeps no index.
+- **LMDB 0.9.24**: `MDB_NOSYNC | MDB_NOMETASYNC | MDB_NOTLS`, map 1.5 × C.
+  `MDB_WRITEMAP` was measured in the 2 GiB smoke run and dropped (28 % less
+  served at T=1, equal at T=4). An in-memory LRU (mutex, `std::list` + hash
+  map) is updated on every hit and insert; an insert `mdb_del`s the LRU
+  victims in the same write txn as its `mdb_put(MDB_RESERVE)`. No
+  `MDB_MAP_FULL` in any run: the high-water mark stayed at 16.04–16.13 GiB
+  with ≤ 14 freelist records, so 1.5 × C was enough and the 2 × C retry was
+  not needed.
+- **filedir**: one file per block, same LRU, `unlink()` to evict, temp file +
+  `rename()` to insert, `preadv(header, staging buffer)` on a hit, no fsync.
+
+Linux (i7-8750H, 970 PRO NVMe, ext4, kernel 5.15), one run per point, with
+the 2 MiB T=4 points run twice. The box also hosts CI runners: the 1-minute
+load at the start of a run was 1.1–4.7 on 12 threads, recorded per run in
+the logs. Raw data: [`doc/kv-cache-benchmark/churn/`](kv-cache-benchmark/churn/).
+
+### Headline, 2 MiB blocks
+
+Served = hits × block / s. Latencies are in µs; hit = get + copy, miss =
+failed get + put (block generation excluded). Reopen = hit ratio of the
+first 10 000 Zipf gets after close + reopen.
+
+**`zipf`**
+
+| T | store | hit ratio | served GB/s | hit p50 / p99 | miss+insert p50 / p99 | write amp | footprint | reopen |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| 1 | cyclone | 0.757 | 1.03 | 191 / 4 550 | 4 064 / 21 697 | 1.004 | 15.98 GiB | 0.721 |
+| 1 | lmdb | 0.850 | 1.65 | 178 / 4 124 | 1 631 / 11 320 | 1.004 | 16.04 GiB | 0.847 |
+| 1 | filedir | 0.851 | 1.72 | 215 / 14 019 | 1 429 / 6 254 | 1.008 | 16.03 GiB | 0.848 |
+| 4 | cyclone | 0.757 | 1.41 / 1.40 | 360 / 23 812 | 7 457 / 74 378 | 1.003 | 15.98 GiB | 0.761 |
+| 4 | lmdb | 0.849 | 1.61 / 1.59 | 387 / 83 660 | 5 639 / 44 421 | 1.004 | 16.05 GiB | 0.853 |
+| 4 | filedir | 0.849 | 1.83 / 1.70 | 487 / 35 178 | 2 819 / 8 753 | 1.008 | 16.03 GiB | 0.853 |
+
+**`zipf+scan`**
+
+| T | store | hit ratio | served GB/s | hit p50 / p99 | miss+insert p50 / p99 | write amp | footprint | reopen |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| 1 | cyclone | 0.638 | 0.63 | 194 / 6 239 | 3 951 / 22 984 | 1.003 | 15.98 GiB | 0.691 |
+| 1 | lmdb | 0.727 | 0.99 | 184 / 29 803 | 1 573 / 17 034 | 1.003 | 16.04 GiB | 0.804 |
+| 1 | filedir | 0.727 | 1.08 | 234 / 19 830 | 1 437 / 6 253 | 1.007 | 16.03 GiB | 0.804 |
+| 4 | cyclone | 0.642 | 1.00 / 0.89 | 354 / 18 662 | 6 774 / 69 121 | 1.003 | 15.98 GiB | 0.759 |
+| 4 | lmdb | 0.726 | 0.98 / 0.95 | 342 / 73 066 | 8 497 / 68 670 | 1.003 | 16.06 GiB | 0.810 |
+| 4 | filedir | 0.726 | 1.18 / 1.14 | 455 / 36 954 | 3 396 / 66 227 | 1.006 | 16.03 GiB | 0.806 |
+
+T=4 served is "first run / repeat"; the latencies are from the first run
+(hit p99 in the repeat: Cyclone 23.7 / 21.4 ms, LMDB 82.2 / 82.9 ms,
+filedir 38.0 / 38.4 ms). Peak cgroup memory was 4.00 GiB for every store;
+peak RSS was 3.3–3.7 GiB for the two mmap stores (resident file pages) and
+under 30 MiB for filedir.
+
+### Verdict against the decision criteria
+
+Ratios Cyclone / LMDB, 2 MiB, 4 GiB cgroup (T=4: first run / repeat):
+
+| pattern | T | served | hit p99 | criterion met? |
+|---|---:|---:|---:|---|
+| `zipf` | 4 | 0.87× / 0.88× | 0.28× / 0.29× | **no**: p99 is below half, but served < 0.9× |
+| `zipf+scan` | 4 | 1.02× / 0.94× | 0.26× / 0.26× | yes, second clause (p99 ≤ 0.5× at ≥ 0.9× served) |
+| `zipf` | 1 | 0.62× | 1.10× | no |
+| `zipf+scan` | 1 | 0.64× | 0.21× | no (served < 0.9×) |
+
+**Verdict: partial. Cyclone is not "significantly better" than LMDB here.**
+It meets the bar on one pattern (`zipf+scan`), at T=4 only. There it passes
+only the latency clause, with served ratios (1.02× and 0.94×) just above the
+0.9× floor. On plain Zipf it serves 12–13 % less than LMDB at T=4 and 38 %
+less at T=1. File-per-block with an LRU serves more than both at every 2 MiB
+point.
+
+### Why: the hit ratio, and where it comes from
+
+Cyclone's hit ratio is 8–9 points below the LRU stores on both patterns.
+That is a real cost of Cyclone's eviction, and it is the main reason for the
+served-throughput gap at T=1. The per-hit cost is the same (hit p50 191 vs
+178 µs); Cyclone simply has fewer hits and more slow misses. The gap is
+larger than "FIFO vs LRU". On a wrap, Cyclone toggles the stripe's directory
+phase (`Volume::evict_if_needed`), and every entry of the previous pass stops
+resolving at once, although most of those blocks are still intact on disk
+ahead of the write cursor. Each stripe therefore restarts empty on every wrap
+and holds roughly half its capacity on average. Replaying the same streams
+through the policies alone (`benchmarks/kv_churn_policy`, no I/O;
+[`policy-replay.txt`](kv-cache-benchmark/churn/policy-replay.txt)) reproduces
+the measured numbers:
+
+| 2 MiB, C = 16 GiB | LRU | FIFO | FIFO per stripe | wrap flush (Cyclone) | measured Cyclone |
+|---|---:|---:|---:|---:|---:|
+| `zipf` | 0.850 | 0.818 | 0.817 | 0.761 | 0.757 |
+| `zipf+scan` | 0.725 | 0.687 | 0.687 | 0.644 | 0.638–0.642 |
+
+Plain FIFO would cost about 3 points against LRU; the phase flush costs
+about 6 more. No store here has scan resistance: the scan stream costs every
+store about 12 points. Keeping the previous pass resolvable until it is
+actually overwritten would recover the FIFO number. This round
+does not try that.
+
+Cyclone is better at the tail under concurrency. At T=4 its hit p99 is
+3.5–4× lower than LMDB's (19–24 ms vs 73–84 ms) and lower than filedir's
+(35–38 ms). Two effects are measured but not separated. First, a lower hit
+ratio means Cyclone's hits skew to hotter, more often cached blocks, which
+flatters its hit tail. Second, LMDB has a single writer: inserts serialise on
+one write txn (miss+insert p50 5.6–8.5 ms at T=4), and that is where LMDB's
+throughput stops scaling, while Cyclone's writers run per stripe. The cause
+of LMDB's 80 ms hit tail was not profiled. Cyclone's own inserts are slow:
+miss+insert p50 is 4.0 ms at T=1 against 1.4–1.6 ms for the peers. That is
+consistent with the three-copy write path already on the fix list, but it
+was not profiled in this round.
+
+### 512 KiB blocks (supplementary; not part of the criteria)
+
+| pattern, T | cyclone: hit / served / hit p99 | lmdb | filedir |
+|---|---|---|---|
+| `zipf`, 1 | 0.784 / 1.05 GB/s / 0.8 ms | 0.867 / 1.23 / 1.8 ms | 0.867 / 1.44 / 4.8 ms |
+| `zipf`, 4 | 0.782 / **1.68** / **3.5 ms** | 0.866 / 1.45 / 21.2 ms | 0.866 / 1.67 / 17.1 ms |
+| `zipf+scan`, 1 | 0.659 / 0.67 / 0.8 ms | 0.739 / 0.88 / 1.9 ms | 0.740 / 0.98 / 7.0 ms |
+| `zipf+scan`, 4 | 0.667 / **1.12** / **2.7 ms** | 0.743 / 0.87 / 13.1 ms | 0.743 / 1.14 / 18.9 ms |
+
+At 512 KiB and T=4, Cyclone would pass on both patterns (1.16× and 1.30×
+LMDB's served GB/s, hit p99 0.17× and 0.21×), and it ties file-per-block on
+throughput. At T=1 it is still behind on served GB/s. Smaller blocks cut the
+per-insert cost that dominates the 2 MiB case.
+
+### What each store needed
+
+- **LMDB** needed an eviction layer in the application, which the harness
+  had to write: an LRU list + hash map behind a mutex taken on every hit, and
+  victim deletes inside the write txn. That index is volatile (1.2 MiB at
+  2 MiB blocks, 4.8 MiB at 512 KiB). It is lost on restart and rebuilt by a
+  cursor scan (1–7 ms here), and the recency order is lost with it. LMDB also
+  needed a map size chosen up front, and `MDB_NOSYNC`: without it every
+  insert is an fsync, and round 1 measured about 10× less write throughput
+  that way. It is single-writer by design.
+- **filedir** needed the same LRU, a temp-file + rename protocol, and unlinks
+  under the LRU lock to stay correct against concurrent re-inserts. Its index
+  is rebuilt from `readdir` (11–44 ms).
+- **Cyclone** needed nothing on top. Capacity is the volume size, eviction
+  and its state are persistent (the reopen hit ratio is about the
+  steady-state hit ratio, with no rebuild step), and writers run per stripe.
+  In exchange it gives up hit ratio (above) and insert latency. It also
+  dropped a few inserts at T=4 (`writes_dropped_by_lease`: 0–3 per run) when
+  a wrap met a live reader lease; the peers dropped none.
+
+### Caveats
+
+- One run per point, except 2 MiB T=4 (two runs). T=4 served varied by up to
+  11 % between runs (Cyclone `zipf+scan`: 1.00 vs 0.89 GB/s). That is the
+  same size as the margin the only passing criterion rests on.
+- The CI runners on the box were not stopped. The load at run start is in
+  the logs; it was higher (3–4.7) during the repeat.
+- Write amplification is device sectors written (whole partition) over
+  payload inserted, including a final `syncfs`. It is about 1.00 for every
+  store, so it does not tell them apart here.
+- Only copy-mode consumption is measured; Cyclone's zero-copy `view` path is
+  not exercised by this workload.
+
 ## Device transfer: does zero-copy pay off? (Metal, Apple silicon)
 
 Item 4 above asks whether the zero-copy read pays off *end to end* — a KV
@@ -990,6 +1172,15 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DCYCLONE_USE_BUNDLED_SHA256=ON && cma
 ./build/kv_bench --print-vectors                # must match the peer harness
 ./build/kv_bench --seconds 10 --path /fast/ssd --output results/cyclone.jsonl
 ./build/kv_bench --block-size 2097152 --no-mmap-dir --no-verify --output results/cyclone-noverify.jsonl
+```
+
+Round 4 (churn) runs one point per invocation, inside a 4 GiB memory
+cgroup:
+
+```bash
+./build/kv_churn --print-vectors                # must match kvchurn's
+doc/kv-cache-benchmark/churn/run-churn.sh cyclone zipf+scan 4 17179869184 120 churn.jsonl churn.txt
+./build/kv_churn_policy                         # eviction-policy replay, no I/O
 ```
 
 The peer harness (file-per-block, LMDB, RocksDB adapters, `run_all.sh`,
