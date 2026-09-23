@@ -695,10 +695,11 @@ Cyclone's hit ratio is 8–9 points below the LRU stores on both patterns
 (9.2–9.4 on `zipf`, 8.4–8.9 on `zipf+scan`). That is a real cost of Cyclone's
 eviction, and it is the main reason for the served-throughput gap at T=1. The
 per-hit cost is the same (hit p50 191 vs 178 µs); Cyclone simply has fewer
-hits and more slow misses. The gap is larger than "FIFO vs LRU". On a wrap,
-Cyclone toggles the stripe's directory phase (`Volume::evict_if_needed`), and
-every entry of the previous pass stops resolving at once, although most of
-those blocks are still intact on disk ahead of the write cursor. Each stripe
+hits and more slow misses. The gap is larger than "FIFO vs LRU". On a wrap
+in the default flush mode, Cyclone flips the stripe's directory phase
+(`Volume::publish_wrap_phase`), and every entry of the previous pass stops
+resolving at once, although most of those blocks are still intact on disk
+ahead of the write cursor. Each stripe
 therefore restarts empty on every wrap and holds roughly half its capacity on
 average. Replaying the same streams through the policies alone
 (`benchmarks/kv_churn_policy`, no I/O, keys routed to stripes by
@@ -716,9 +717,17 @@ Plain FIFO would cost 3.2 points against LRU on `zipf` and 3.8 on
 flush). So FIFO explains about 3–4 of the 8–9 points and the flush the
 rest. No store here has scan resistance: the scan stream costs every store
 about 12 points. Keeping the previous pass resolvable until it is
-actually overwritten would recover the FIFO number. This round
-does not try that; the design for it, with its own replay numbers, is
+actually overwritten would recover the FIFO number. This round does not try
+that; the design for it, with its own replay numbers, is
 [`design/wrap-retention.md`](design/wrap-retention.md).
+
+That design has since been implemented as `CacheConfig::wrap_retention`, off
+by default (see the [CHANGELOG](../CHANGELOG.md)). A later Linux run used a
+smaller tier than the table above: 2 MiB blocks, C = 4 GiB, T=4,
+`memory.max = 1 GiB` (the same 1 : 4 ratio). There, turning retention on moved the
+measured hit ratio from 0.726 to 0.788 on `zipf` and from 0.614 to 0.660 on
+`zipf+scan`, each within 0.002 of its policy replay (flush 0.726 / 0.612,
+retention 0.788 / 0.659). The round-4 numbers above are all flush mode.
 
 Cyclone is better at the tail under concurrency. At T=4 its hit p99 is
 3.5–4× lower than LMDB's (19–24 ms vs 73–84 ms) and lower than filedir's
@@ -1211,7 +1220,7 @@ through nvcc in `kv_gpu_cuda.cu`, behind the plain-C seam in
 | `WriteHandle::reserve(n)` that returns the destination span, so the caller writes or DMAs straight into the record (three copies become one) | Open; puts are 1.4× behind file-per-block (1.01 vs 1.44 GB/s) | [Round 3b](#round-3b-crc-32c-on-disk-format-v8), insert latency in [Round 4](#round-4-bounded-capacity-under-churn) |
 | An entry point that gives an embedder the mapping identity for one-time GPU registration, instead of inferring it from `content()` / `content_file_offset()` / `volume_files()` | Open | [Metal](#device-transfer-does-zero-copy-pay-off-metal-apple-silicon), [CUDA](#device-transfer-cuda-gtx-1050-pcie) |
 | A zero-copy C read entry point and a Python binding, which is what a vLLM/SGLang connector would call | Open | — |
-| Keep the previous lap resolvable until it is actually overwritten | In progress | [Round 4](#why-the-hit-ratio-and-where-it-comes-from): the phase flush costs 4–6 of the 8–9 hit-ratio points |
+| Keep the previous lap resolvable until it is actually overwritten ([design](design/wrap-retention.md)) | Implemented, off by default; see [CHANGELOG](../CHANGELOG.md) | [Round 4](#why-the-hit-ratio-and-where-it-comes-from): the phase flush costs 4–6 of the 8–9 hit-ratio points; retention measured 0.726 → 0.788 (`zipf`), 0.614 → 0.660 (`zipf+scan`) at 4 GiB, T=4 |
 | Profile insert latency (miss+insert p50 4.0 ms vs 1.4–1.6 ms for the peers) | Open | [Round 4](#round-4-bounded-capacity-under-churn) |
 | Scan resistance or admission control on the disk tier | Open | [Round 4](#why-the-hit-ratio-and-where-it-comes-from): a scan costs every store about 12 points |
 

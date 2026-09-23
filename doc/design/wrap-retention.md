@@ -1,9 +1,12 @@
 # Wrap retention: keep the previous pass readable until it is overwritten
 
-**Status:** design, amended after adversarial review. Verdict: implement as
-amended, no redesign. No production code has changed yet. The only code so
-far is the policy-replay extension in `benchmarks/kv_churn_policy.cpp` (the
-`retain/N` columns).
+**Status:** implemented, default off (`CacheConfig::wrap_retention = false`;
+C API `disable_wrap_retention`). All 18 tests of section 11 are in
+`tests/integration/test_wrap_retention.cpp` and pass in both modes. The
+default was not flipped because D1's last gate, the PageSpeed
+`cache_burst_test`, could not be run against this tree (see section 14).
+Deviations from the design as written are listed in section 14. Sections 0-13
+are kept as the design record.
 
 **Scope:** what a stripe's circular data area does with directory entries
 when the write cursor wraps and then advances over the previous pass. Out of

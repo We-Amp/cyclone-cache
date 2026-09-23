@@ -26,7 +26,11 @@ as a C++ API and a C ABI.
 | **Seqlock** | Lock-free directory read: read a per-bucket even/odd version counter, read entries, re-read the counter; retry on mismatch (`kMaxReadRetries = 100`). Used by BOTH the in-memory `Directory` and the mmap `MmapDirectory`. | `directory.hpp`, `mmap_directory.hpp`, `doc/multi-process.md` |
 | **Lease / borrow** | Process-local mechanism that makes a zero-copy read aliasing live mmap bytes safe against a concurrent circular-buffer wrap. A reader **borrows** a region and **stamps a lease**; a writer wanting to **wrap** defers while a valid borrow is outstanding. | `volume.cpp`, `doc/multi-process.md`, "Concurrency Model" |
 | **Read anchor** | Per-thread strong `shared_ptr` to the Volume + MappedFile, plus a `torn` latch, that keeps the mapping alive for the life of a `ReadHandle` without an RMW on a process-global control block. 64 shards/volume. | `volume.hpp` (`VolumeReadAnchor`) |
-| **Phase** | 1-bit directory flag used for O(1) phase-based garbage collection; cross-process toggle is CAS-guarded (`phase_lock`). | `directory.hpp`, `mmap_directory.hpp` |
+| **Phase** | 1-bit directory flag used for O(1) phase-based garbage collection. It is derived from the pass (`phase = P & 1`, `Volume::publish_wrap_phase`), never toggled on its own; the cross-process publish is CAS-guarded (`phase_lock`). | `directory.hpp`, `mmap_directory.hpp` |
+| **Pass (P)** | How many times a stripe's write cursor has wrapped. Every document is stamped with the pass that wrote it (`Document::write_serial`, header offset 92, outside the CRC). | `volume.hpp` (`StripeSnapshot`), `document.hpp` |
+| **Chunk (N, Q)** | The stripe's data area is cut into `N` chunks of `Q` bytes: `Q = max(1 MiB, round_up(ceil(A / 64), 8))`, `N = clamp(ceil(A / Q), 1, 64)` (`retention_geometry`). Borrows are counted per chunk. Flush mode uses `N = 1`, `Q = A`. | `volume.hpp` (`FrontierGeometry`) |
+| **Frontier (F)** | Wrap retention: the boundary between the clean runway ahead of the write cursor and the still-readable previous pass. It advances one chunk at a time, gated on the borrows in the chunks it crosses. | `volume.cpp` (`advance_frontier`), "Eviction and Wrap Retention" |
+| **Exposure generation (G)** | The single `seq_cst` word per stripe that encodes pass and frontier: `G = P * (N + 1) + f`. A borrow of a document from pass `p` in chunk `c` is exposed once `G > (p + 1) * (N + 1) + c`. Replaces the former wrap epoch. | `volume.hpp` (`Stripe::exposure_gen`), `mmap_directory.hpp` (retention region) |
 | **HitTracker** | Deferred, striped hit-recording component. 4096 padded stripes keyed by key hash; flushed periodically to `Document.hit_count`. | `src/core/hit_tracker.hpp` |
 | **CRC-validation cache** | Per-volume heap-backed table (65536 slots, 512 KB) that skips re-CRC of an already-verified `{offset, checksum}` pair. Not the overwrite guard — that is the lease/epoch protocol. | `volume.hpp` (`kChecksumCacheSize`) |
 
@@ -118,6 +122,67 @@ atomics in an mmap directory SIGBUS on arm64 — enforced by page-flooring.
 The volume header persists the authoritative `stripe_count` (`VolumeHeader::stripe_count`,
 a field introduced in format v5), so a volume always re-opens with the geometry
 it was created with.
+
+### Eviction and Wrap Retention
+
+A stripe's data area is a circular log: `write_pos` fills forward and wraps to
+the start when a document no longer fits. Eviction is what the wrap does to the
+previous pass, and there are two modes (`CacheConfig::wrap_retention`, default
+off; design record: [design/wrap-retention.md](design/wrap-retention.md)).
+
+- **Flush (default).** The wrap bumps the pass. The phase bit that new entries
+  carry flips, and every entry of the previous pass stops resolving at once.
+  The wrap is gated on all borrows in the stripe (one chunk, `N = 1`). A stripe
+  holds on average about half its capacity.
+- **Retention.** The previous pass stays readable until its bytes are needed.
+  A clean **frontier** runs ahead of the write cursor. The wrap itself is
+  ungated because it overwrites nothing. Before a document is written, the
+  frontier must cover it, so the **mandatory advance** moves `F` to
+  `ceil(need)`. That advance is gated only on borrows in the chunks it crosses.
+  It runs the deferral episode (deadline, ceiling force), and a deferral drops
+  the fill. An **early advance** then tries to keep `Q/2` of clean runway. It
+  is a pure gate check: skipped under a borrow, and never a force.
+
+```mermaid
+graph LR
+    S["S<br/>data start"] --- CUR["current pass P<br/>[S, W)<br/>stamp P"]
+    CUR --- W["W<br/>write cursor"]
+    W --- RUN["clean runway<br/>[W, F)<br/>unreadable"]
+    RUN --- F["F<br/>frontier"]
+    F --- RET["retained pass P-1<br/>[F, E)<br/>stamp P-1"]
+    RET --- E["E<br/>stripe end"]
+```
+
+Admission (`Stripe::admit_position`, `Volume::admit_document`) classifies
+every directory entry against one `StripeSnapshot` (`G` loaded first, then
+`W`):
+
+| Class | Position | Required stamp |
+|-------|----------|----------------|
+| current | entry phase == `P & 1` and `S <= o < W` | `P` |
+| retained | entry phase != `P & 1`, `P > 0` and `o >= F` | `P - 1` |
+| anything else | rejected | — |
+
+The **pass stamp** closes the phase-bit ABA for good. An entry that survives
+two or more wraps carries a stamp of `P - 2` or older and never resolves,
+whatever its position (counted in `stamp_rejections`). Chain hops go downward
+only, and never across a pass (`Stripe::admit_hop`). A write over a retained
+head starts a fresh chain, and removing one alternate from a retained chain
+removes the whole entry (`alternate_wrap_refusals`).
+
+**One entry per key.** Under retention two passes resolve at once, so the
+directory must not hold a retained entry and a current entry for the same key.
+Insert elects its victim by full key across both passes. It takes over a
+same-offset stale entry in place. `remove_at` / `remove_sync` clear every
+matching entry (`Directory::choose_insert_slot`, `InsertAdmission`).
+
+The mode is persisted in `VolumeHeader::retain_chunks` (offset 40; 0 means
+flush). An open whose mode disagrees resets through the live-peer gate, like a
+format change. Every process sharing a volume must use the same mode. The
+counters in `CacheStats` (`frontier_advances`, `advances_deferred_by_lease`,
+`early_advances_skipped`, `retained_hits`, `stamp_rejections`) observe it. On
+the KV-churn workload (2 MiB blocks, 4 GiB tier, Zipf, 4 threads, Linux) the
+hit ratio rose from 0.726 to 0.788. The policy replay predicted 0.7875.
 
 ### Directory
 
@@ -470,7 +535,7 @@ graph TB
 | Teardown gate (brlock) | 16 | reader-count line on a single `shared_mutex` | `cache.cpp` (`GateShard`, `GateExclusive`) |
 | Read anchors | 64/volume | 2 per-read `weak_ptr` locks on the global Volume+MappedFile control blocks | `volume.hpp` (`VolumeReadAnchor`) |
 | Per-volume read counter | 64 | shared read counter increment | `volume.hpp` (`ReadCounterShard`) |
-| Borrow shards | 64/stripe | 2 `seq_cst` CAS on one stripe-global borrow slot | `volume.hpp` (`BorrowShard`) |
+| Borrow shards | 64/stripe, each a 128 B line of 64 per-chunk `u16` slots | 2 `seq_cst` CAS on one stripe-global borrow slot | `volume.hpp` (`BorrowShard`) |
 | HitTracker | 4096 | shared line on `record_hit()` | `hit_tracker.hpp` (`kNumStripes`, `stripe_index`) |
 | CLFUS segments | ≤64 | shared-mutex reader-count line on the RAM tier | `clfus.cpp` (`pick_segment_count`) |
 | Directory | per-bucket seqlock | the reader-side stripe/shared lock entirely | `directory.hpp`, `mmap_directory.hpp` |
@@ -532,25 +597,26 @@ sequenceDiagram
 
     Note over Rd,Wr: Both operate lock-free on one stripe; ordering is seq_cst.
 
-    Rd->>St: capture wrap_epoch (probe start)
-    Rd->>St: locate + CRC-verify document
-    Rd->>St: acquire_borrow  (count+1 on THIS thread's borrow shard)
+    Rd->>St: snapshot: load G FIRST, then the write cursor W
+    Rd->>St: admit: position class + pass stamp + exposure threshold T(p, c)
+    Rd->>St: CRC-verify document
+    Rd->>St: acquire_borrow(chunk c)  (count+1 in THIS thread's shard, slot c)
     Rd->>St: stamp_read_lease (CAS-max now+T; skip if already covers now+3T/4)
-    Rd->>St: borrow_still_valid: load wrap_intent FIRST, then re-check epoch
-    alt intent set OR epoch moved
+    Rd->>St: borrow_still_valid: load wrap_intent FIRST, then G <= T(p, c)?
+    alt intent set OR G past the threshold
         Rd->>St: release borrow, unmap, RETRY
     else clear
         Rd-->>Rd: build ReadHandle (pins via read anchor)
     end
 
-    Note over Wr: writer wants to wrap the region
+    Note over Wr: writer must expose chunks [lo, hi)<br/>(flush: the wrap, all of [0, 1);<br/>retention: a frontier advance)
     Wr->>St: set_wrap_intent(true)   (BEFORE any gate load)
-    Wr->>St: lease_permits_wrap: sum ALL borrow shards + load lease expiry
+    Wr->>St: lease_gate: sum chunks [lo, hi) over ALL borrow shards + load lease expiry
     alt borrow_count != 0 AND lease active
-        Wr-->>Wr: DEFER wrap (drop the fill; zero side effects)
-        Note over Wr: anti-starvation ceiling (default 60s):<br/>a continuously-deferred wrap is eventually FORCED —<br/>wraps_forced_past_lease++, borrow_force_reset (generation+1)
-    else no live borrow
-        Wr->>St: evict_if_needed (toggle_phase, O(1)) + record_wrap + set_wrap_intent(false)
+        Wr-->>Wr: DEFER (drop the fill; zero side effects)
+        Note over Wr: anti-starvation ceiling (default 60s):<br/>a continuously-deferred step is eventually FORCED —<br/>wraps_forced_past_lease++, every chunk slot reset (generation+1)
+    else no live borrow in those chunks
+        Wr->>St: publish: store G (flush: publish_wrap_phase + G := (P+1)(N+1)+N) + set_wrap_intent(false)
     end
 ```
 
@@ -558,9 +624,11 @@ Key properties:
 
 - **Borrow released on handle close**, not on lease expiry (`~VolumeReadHandleImpl`, `volume.cpp`) — closing a read returns write capacity immediately (the write-starvation fix). `BorrowToken` records the generation + shard so the release lands on the acquiring slot.
 - **Write-avoidance** — `stamp_read_lease` skips the CAS if the lease already covers `now + 3T/4`, so back-to-back reads of a hot region don't hammer the lease slot.
-- **Crash safety** — `borrow_force_reset` bumps a generation so a crashed holder's leaked borrow count costs at most one ceiling episode.
+- **Crash safety** — a forced step resets every chunk slot (`borrow_slot::force_reset`, `MmapDirectory::chunk_borrows_force_reset_all`) and bumps each slot's generation so a crashed holder's leaked borrow count costs at most one ceiling episode.
 - **Zero-copy pacing** — a client streaming directly out of the mapping renews with `renew_read_lease` (epoch-only) or `renew_read_lease_strict` (Dekker-ordered; returns `LeaseRenewal{kOk, kCopyNow, kTorn, kLeasesOff}`), and `ns_until_forced_wrap` gives the copy-before-force deadline (`LeaseRenewal` and `ns_until_forced_wrap`, `handle.hpp`). Renewing alone is **not** sufficient: the anti-starvation ceiling is a per-stripe-**episode** bound, not a per-hold budget — a borrow taken late in a deferral episode may have far less than the full ceiling before a forced wrap, so aliased consumers must poll the deadline and copy out in time.
 - **Header bytes are volatile** — in-place metadata pwrites (hit-count / last-access updates, alternate chain-repoint) mutate `[0, Document::kHeaderSize)` **without** moving the wrap epoch, so lease/epoch protection covers only the content bytes past `kHeaderSize`. A consumer replicating the whole document must snapshot the header once or re-derive it (`handle.hpp`, mapped-view contract).
+- **Per-chunk gating** — the gate sums only the borrow slots of the chunks the step exposes, and a reader revalidates against its own document's exposure threshold. Under retention a borrow is therefore torn only by the step that exposes its own chunk. That step is normally the one advance that crosses the chunk. The wrap also exposes the tail of the retained pass that the frontier never reached, and there the verdict is conservative because the bytes are still intact. In flush mode there is one chunk and the behaviour is the classic stripe-wide wrap gate.
+- **Stuck-intent repair** — a writer that dies inside the intent window leaves `wrap_intent` set, which would make every read of the stripe retry. A proven-dead `forced_release` and an exclusive open (no live peer) clear it (`Volume::repair_wrap_state`). An escalated takeover never does, because the old holder may still be running.
 - **Phase-ABA positional guard** — a stale directory entry or chain pointer can survive two wraps and point at intact bytes **ahead of the write cursor**; the ordinary forward fill would overwrite them in place with no wrap event (so no lease gate, no intent/epoch revalidation). Both read choke points — the directory probe and the alternate-chain hop — therefore reject at/ahead-of-cursor offsets before a borrow is taken (multi-process compares against `shared_write_pos`). This is what preserves the lease protocol's "any overwrite of a borrowed region is a wrap" premise. Guard: `tests/integration/test_wrap_phase_aba.cpp`.
 
 ### Striped teardown gate (big-reader lock)
@@ -591,8 +659,8 @@ directory.
 1. Take **one gate shard shared**, check `running`, route to the volume (`segment_hash`).
 2. `select_stripe` (`segment_hash % stripe_count`).
 3. **RAM check first** — CLFUS `get` on the key's segment; on hit, build a RAM `ReadHandle` (owns a copied buffer), `record_hit`, return. No borrow/lease.
-4. **Disk probe** — capture `wrap_epoch`; run the directory **seqlock read** (no stripe lock). For each tag match: `map_region`, validate the `Document`, **verify `first_key`**, **CRC-verify** unless already in the CRC-validation cache.
-5. **Borrow + lease** — `acquire_borrow` (this thread's shard) + `stamp_read_lease` + `borrow_still_valid` (intent-then-epoch). On failure, release + retry.
+4. **Disk probe** — take a `StripeSnapshot` (`G`, then `W`); run the directory **seqlock read** (no stripe lock), admitting each tag match by position class against the snapshot. For each admitted match: `map_region`, validate the `Document`, **verify `first_key`**, check the **pass stamp** and exposure threshold (`admit_document`), **CRC-verify** unless already in the CRC-validation cache.
+5. **Borrow + lease** — `acquire_borrow` (this thread's shard, the document's chunk slot) + `stamp_read_lease` + `borrow_still_valid` (intent, then `G` against the threshold). On failure, release + retry.
 6. Build the disk `ReadHandle` pinned by **this thread's read anchor**; `record_hit`; return.
 
 Cache lines touched: 1 gate shard, 1 CLFUS segment, 1 directory bucket (seqlock, no lock), 1 borrow shard, 1 lease slot, 1 HitTracker stripe, 1 read-anchor shard, 1 read-counter shard — **all thread-affine or per-bucket, none globally shared.**
@@ -619,7 +687,7 @@ sequenceDiagram
     WH->>St: build Document (+CRC)
     WH->>St: acquire stripe->mutex EXCLUSIVE  (the only stripe lock)
     WH->>St: allocate_write_slot
-    Note over St: if wrap needed: set_wrap_intent → lease gate →<br/>DEFER (NoSpace) or evict (toggle_phase, O(1)) + record_wrap
+    Note over St: flush: if wrap needed: set_wrap_intent → lease gate →<br/>DEFER (NoSpace) or publish_wrap_phase (O(1)) + store G<br/>retention: ungated wrap, then gated frontier advance(s)
     WH->>St: pwrite data (outside write_lock)
     Note over St: INVARIANT: data durable BEFORE directory insert
     WH->>St: in-place-update election (full-key verify each candidate)

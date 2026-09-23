@@ -531,7 +531,7 @@ design record for shipped work (background, not a task list);
 | [doc/kv-cache-benchmark.md](doc/kv-cache-benchmark.md) | LLM KV-cache tier benchmark vs LMDB, RocksDB, file-per-block; results by round, what to change | Current (Summary); rounds are dated records |
 | [doc/kv-cache-benchmark/kv-workload-spec.md](doc/kv-cache-benchmark/kv-workload-spec.md) | Workload spec for rounds 1–3b | Current (v1.1) |
 | [doc/kv-cache-benchmark/kv-churn-spec.md](doc/kv-cache-benchmark/kv-churn-spec.md) | Bounded-capacity churn spec and decision criteria (round 4) | Current (v1) |
-| [doc/design/wrap-retention.md](doc/design/wrap-retention.md) | Keep the previous pass readable past a wrap (clean frontier, pass stamp) | Design/plan — proposed, not implemented |
+| [doc/design/wrap-retention.md](doc/design/wrap-retention.md) | Keep the previous pass readable past a wrap (clean frontier, pass stamp) | Design/plan — implemented, default off |
 
 Historical fix-logs are archived separately from the living docs — they record
 completed work and are not current spec.
