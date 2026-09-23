@@ -272,7 +272,7 @@ All of the following runs in `Volume::allocate_write_slot`, under the stripe
 ```
 adopt shared W (as today) and shared G              // never a process-local copy (S3)
 if doc > E - W:                                     // WRAP: exposes no bytes, not gated
-    set_intent(true)
+    set_intent(WRAP to P+1)                         // 2 + ((P+1) & 1): committed (R1)
     publish shared_write_pos := S                   // B3: inside the intent window
     phase := (P+1) & 1  (seq_cst, under phase_lock) // derived, not toggled
     store G := (P+1)·(N+1)                          // P+1, f = 0; seq_cst
@@ -299,6 +299,9 @@ advance(t, episode):
     store G := P·(N+1) + t                          // seq_cst; exposes chunks [f, t)
     set_intent(false)                               // AFTER the G store
     return true
+
+on every granted slot (either mode):
+    end the deferral episode: clock := 0, published deadline := 0   // R3
 ```
 
 Notes on the procedure:
@@ -325,7 +328,15 @@ Notes on the procedure:
 - **Forced advance.** It resets **all** chunk slots (generation + 1, count
   0), not only the exposed range (S4). One ceiling episode therefore clears
   every leaked count (test 7). `ns_until_forced_wrap` stays stripe-wide
-  (nit).
+  (nit). A live borrow outside the exposed range keeps a valid `G` verdict
+  but has lost its count, so the later normal advance over its chunk would
+  not defer for it. Both renews and the read-time revalidation therefore
+  also compare the borrow's generation with its slot's current one and
+  report `kTorn` / false on a mismatch (R2, section 14).
+- **Episode end.** The deferral episode bounds *continuous* starvation. Any
+  write that gets its slot ends it, in both modes: a passing mandatory or
+  early advance, a wrap, or a document that fits the tail or the runway
+  without the deferred step (R3, section 14).
 - **Large documents.** `chunk_index_ceil(need)` can move `f` across many
   chunks in one gated step. That is why D2 does not need a chunk size tied to
   the largest document.
@@ -545,8 +556,8 @@ or the slots.
   (S4, S5).
 
 **Stuck intent (D9, S5).** A writer that dies inside the intent window
-leaves `wrap_intent = 1`. Today that makes every read of the stripe miss for
-a whole pass. The flag is cleared, and the phase re-derived from `P`, in two
+leaves `wrap_intent` set. Today that makes every read of the stripe miss for
+a whole pass. The flag is repaired, and the phase re-derived from `P`, in two
 cases only:
 
 - on a **proven-dead `forced_release`** of the `write_lock` (`kill(pid,0)`
@@ -556,6 +567,25 @@ cases only:
 It is **not** cleared on `escalated_takeover`: that holder may still be alive
 and inside its window (test 13). This fix ships as its own commit, and it
 applies in both modes.
+
+**Committed wraps are completed, not cleared (R1).** The intent byte
+carries a value, not a flag. `1` marks a gate decision or an advance: the
+only irreversible store is `G` itself, so clearing is the whole repair. A
+wrap stores `2 + ((P+1) & 1)` **before** its first irreversible store (the
+cursor drop to `S`): in flush mode right after the gate passes, in retention
+mode at the start of the ungated wrap. A writer that dies after that point
+can leave `W = S` with `G` still in pass `P` (and, in retention, `F = E`).
+Clearing alone would then let the next writer fill the *current* pass from
+`S`, over documents whose borrows still renew `kOk` because no `G` store
+ever exposed them. Recovery therefore completes the wrap, in the writer's
+own order and still inside the intent window: `W := S`, then phase :=
+`(P+1) & 1`, then `G := (P+1)(N+1)` (flush: `+ N`), then `record_wrap`,
+then the clear. `G` moves at most one pass per wrap under the write lock,
+so the parity in the intent value says whether the dead writer had already
+published `G`; with equal parity only the cursor, the phase and the clear
+remain. A completed retention wrap leaves `f = 0`, so the next write's
+mandatory advance is gated over chunk 0 as usual and defers for any borrow
+there (test "Retention review R1").
 
 **Process crash, other points:**
 
@@ -1165,9 +1195,68 @@ that introduced it.
   moved during that read. A forced step is the documented unprotected case,
   and the test reports those reads separately. Any other mismatch fails the
   test.
+- *R4, recorded as an open item.*  Writing an alternate onto a key whose
+  head is retained starts a fresh chain (D5: links never cross a pass), so
+  the retained alternates of that key stop resolving at once even though
+  their bytes stay readable until the frontier reaches them. For the
+  PageSpeed shape (Original first, optimized alternates added later by the
+  optimization engine) this drops Original, Gzip and WebP when an AVIF
+  lands after a wrap. The behaviour stays as is for now; it is counted in
+  `alternate_wrap_refusals`, and the retained reads that did happen in
+  `retained_hits`. It is a known gap before the default can flip.
 - *No hardware divide on the read path.*  The snapshot splits `G` by
   `N + 1`, and the chunk of a document is `(o - S) / Q`. Both divisors are
   fixed at open, so `Stripe` holds a reciprocal (`FastDivU64`) for each. A
   64-bit `DIV` on the i7-8750H made single-thread reads about 11 % slower
   than before this work, in both modes. With the reciprocal the gap is
   2-4 %.
+
+**Review fixes (after step 7).**  An independent review reproduced three
+bugs; each is now a test in `test_wrap_retention.cpp` ("Retention review
+R1/R2/R3").
+
+- *R1 -- crash inside a committed wrap.*  See "Committed wraps are
+  completed, not cleared" in 4.12. The intent values live in
+  `MmapDirectory` (`kIntentStep`, `kIntentWrapEven`, `kIntentWrapOdd`);
+  readers still only test for non-zero. The process-local intent uses the
+  same values, but it dies with its process, so only the mmap path ever
+  repairs.
+- *R2 -- a forced reset uncounts far borrows.*  Two fixes were possible:
+  reset only the exposed range `[f, t)`, or make every borrow notice the
+  reset. The implementation does the second. Renew, strict renew and the
+  read-time revalidation compare the token's generation with its chunk
+  slot's current generation (one `seq_cst` load) and report `kTorn` /
+  false on a mismatch. Resetting only `[f, t)` was rejected because it
+  gives up S4: a count leaked by a crashed holder in a chunk the force did
+  not cross would keep deferring every later advance over that chunk, one
+  ceiling episode per chunk instead of one per stripe. With the generation
+  check the reset still clears every leak in one episode, and a live
+  holder elsewhere learns at once that it is no longer protected, while
+  its bytes are still intact. The cost is a conservative `kTorn` for
+  borrows far from the forced chunk. That only happens after a hold has
+  already outlived the ceiling somewhere on the stripe. Test 6 now pins
+  it: the far borrow `h2` reads `kTorn` with its bytes intact, and a fresh
+  read of the same document is `kOk` again.
+- *R3 -- a stale deferral episode (both modes, pre-existing).*  The clock
+  was reset only by a passing mandatory gate or a force. A document that fit
+  the tail (flush) or the runway (retention), or a passing early advance,
+  left it running, so the next first contact with a fresh borrow was forced
+  immediately and the published deadline stayed stale (`ns_until_forced_wrap`
+  near 0, so embedders copied needlessly). Every granted slot now ends the
+  episode (`Volume::end_deferral_episode`), and so does any passing gate.
+- *Nits.*
+  - N1: when the verified entry wins the insert election, a dead same-tag
+    entry at the offset just written is cleared in the same bracket.
+  - N2: the commit election clears a candidate only for a validated bad
+    header, not for a transient mapping failure.
+  - N3: a write whose link to a retained head will be refused no longer
+    runs the old chain's `TooManyAlternates` and truncation checks.
+  - N4: `FastDivU64` falls back to 32 x 32 partial products where neither
+    `__umulh` nor `unsigned __int128` exists.
+  - N5: the process-local per-chunk slots are `u32 {generation:8,
+    count:24}`, like the shared ones. A saturated 8-bit count was not safe
+    for every holder: a ride-along acquired at saturation is uncounted, and
+    once the counted holders close the slot reads 0 under it. A shard is now
+    two 128-byte lines (16 KiB per stripe).
+  - N6: the comment on the conditional exclusive-lock probe now describes
+    both of its uses.

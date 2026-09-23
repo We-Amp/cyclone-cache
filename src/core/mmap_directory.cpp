@@ -388,9 +388,19 @@ bool MmapDirectory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
       }
       std::memcpy(&bucket[choice.slot], &new_entry, sizeof(DirEntry));
       // Uniqueness cleanup (rule 2), in the same bracket as the insert.
+      // A same-tag entry already at the offset just written is dead too:
+      // its bytes are the ones the new document replaced.  The chooser
+      // takes such an entry over when nothing better wins, but when the
+      // verified entry wins it would survive beside the new one (review
+      // N1), so it is cleared here in the same bracket.
       for (size_t i = 0; i < kEntriesPerBucket; ++i) {
         if (static_cast<int>(i) == choice.slot || bucket[i].is_empty() ||
             bucket[i].tag() != tag) {
+          continue;
+        }
+        if (bucket[i].offset() == offset) {
+          bucket[i].clear();
+          ++cleared;
           continue;
         }
         for (uint64_t off : clear_offsets) {
@@ -1181,11 +1191,23 @@ bool MmapDirectory::wrap_intent() const {
 }
 
 void MmapDirectory::set_wrap_intent(bool active) {
+  set_wrap_intent_value(active ? kIntentStep : 0);
+}
+
+uint8_t MmapDirectory::wrap_intent_value() const {
+  if (_header == nullptr) {
+    return 0;
+  }
+  return std::atomic_ref<uint8_t>(const_cast<uint8_t &>(_header->wrap_intent))
+      .load(std::memory_order_seq_cst);
+}
+
+void MmapDirectory::set_wrap_intent_value(uint8_t value) {
   if (_header == nullptr) {
     return;
   }
   std::atomic_ref<uint8_t>(_header->wrap_intent)
-      .store(active ? 1 : 0, std::memory_order_seq_cst);
+      .store(value, std::memory_order_seq_cst);
 }
 
 uint32_t MmapDirectory::wrap_deferred_deadline_ms() const {

@@ -484,10 +484,12 @@ returning soon-to-be-overwritten bytes. The intent-flag pairing makes this
 detection exact within the lease window (a hard guarantee), not best-effort.
 
 A writer that dies inside that window leaves the intent flag set, and every
-read of the stripe would then retry. The flag is cleared by the next
+read of the stripe would then retry. The flag is repaired by the next
 `forced_release` that proves the holder dead, or by an open that holds the
-exclusive lifetime lock. It is never cleared on an escalated takeover of a
-holder that may still be running.
+exclusive lifetime lock. It is never repaired on an escalated takeover of a
+holder that may still be running. A wrap marks the intent byte with its
+target pass (`2`/`3`) before it lowers the shared cursor, and recovery
+completes such a wrap (cursor, phase, `G`) rather than just clearing it.
 
 **Eviction mode must match across processes.** `CacheConfig::wrap_retention`
 is persisted in the volume header (`VolumeHeader::retain_chunks`, offset 40;

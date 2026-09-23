@@ -603,6 +603,24 @@ class MmapDirectory {
   /// the wrap decision completes (defer or publish).
   void set_wrap_intent(bool active);
 
+  /// Wrap-intent VALUES.  Readers only test != 0.  The value tells crash
+  /// recovery how far a dead writer got (Volume::repair_wrap_state):
+  ///   kIntentStep       a gate decision or a frontier advance is in
+  ///                     flight; nothing irreversible has happened yet,
+  ///                     or the step's only store is G itself -- clearing
+  ///                     is the whole repair;
+  ///   kIntentWrapEven/  a wrap is COMMITTED to pass P' (P' even / odd):
+  ///   kIntentWrapOdd    stored before the cursor drops to S, so the
+  ///                     cursor, phase and G may be anywhere between the
+  ///                     old pass and P'.  Recovery must COMPLETE the wrap
+  ///                     (cursor := S, phase := P' & 1, G := P'), never
+  ///                     just clear the flag.
+  static constexpr uint8_t kIntentStep = 1;
+  static constexpr uint8_t kIntentWrapEven = 2;
+  static constexpr uint8_t kIntentWrapOdd = 3;
+  [[nodiscard]] uint8_t wrap_intent_value() const;
+  void set_wrap_intent_value(uint8_t value);
+
   /// Lease-protocol STEP-3: the published cross-process force-wrap deadline
   /// (steady-clock ms; 0 = no deferred wrap).  Set by the deferring
   /// writer; read by a zero-copy embedder to copy-out before the force.
