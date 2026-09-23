@@ -182,7 +182,7 @@ format change. Every process sharing a volume must use the same mode. The
 counters in `CacheStats` (`frontier_advances`, `advances_deferred_by_lease`,
 `early_advances_skipped`, `retained_hits`, `stamp_rejections`) observe it. On
 the KV-churn workload (2 MiB blocks, 4 GiB tier, Zipf, 4 threads, Linux) the
-hit ratio rose from 0.726 to 0.788. The policy replay predicted 0.7875.
+hit ratio rose from 0.726 to 0.788. The policy replay predicts 0.7876.
 
 ### Directory
 
@@ -535,7 +535,7 @@ graph TB
 | Teardown gate (brlock) | 16 | reader-count line on a single `shared_mutex` | `cache.cpp` (`GateShard`, `GateExclusive`) |
 | Read anchors | 64/volume | 2 per-read `weak_ptr` locks on the global Volume+MappedFile control blocks | `volume.hpp` (`VolumeReadAnchor`) |
 | Per-volume read counter | 64 | shared read counter increment | `volume.hpp` (`ReadCounterShard`) |
-| Borrow shards | 64/stripe, each a 128 B line of 64 per-chunk `u16` slots | 2 `seq_cst` CAS on one stripe-global borrow slot | `volume.hpp` (`BorrowShard`) |
+| Borrow shards | 64/stripe, each two 128 B lines of 64 per-chunk `u32` slots | 2 `seq_cst` CAS on one stripe-global borrow slot | `volume.hpp` (`BorrowShard`) |
 | HitTracker | 4096 | shared line on `record_hit()` | `hit_tracker.hpp` (`kNumStripes`, `stripe_index`) |
 | CLFUS segments | ≤64 | shared-mutex reader-count line on the RAM tier | `clfus.cpp` (`pick_segment_count`) |
 | Directory | per-bucket seqlock | the reader-side stripe/shared lock entirely | `directory.hpp`, `mmap_directory.hpp` |
@@ -626,7 +626,7 @@ Key properties:
 - **Write-avoidance** — `stamp_read_lease` skips the CAS if the lease already covers `now + 3T/4`, so back-to-back reads of a hot region don't hammer the lease slot.
 - **Crash safety** — a forced step resets every chunk slot (`borrow_slot::force_reset`, `MmapDirectory::chunk_borrows_force_reset_all`) and bumps each slot's generation so a crashed holder's leaked borrow count costs at most one ceiling episode.
 - **Zero-copy pacing** — a client streaming directly out of the mapping renews with `renew_read_lease` (epoch-only) or `renew_read_lease_strict` (Dekker-ordered; returns `LeaseRenewal{kOk, kCopyNow, kTorn, kLeasesOff}`), and `ns_until_forced_wrap` gives the copy-before-force deadline (`LeaseRenewal` and `ns_until_forced_wrap`, `handle.hpp`). Renewing alone is **not** sufficient: the anti-starvation ceiling is a per-stripe-**episode** bound, not a per-hold budget — a borrow taken late in a deferral episode may have far less than the full ceiling before a forced wrap, so aliased consumers must poll the deadline and copy out in time.
-- **Header bytes are volatile** — in-place metadata pwrites (hit-count / last-access updates, alternate chain-repoint) mutate `[0, Document::kHeaderSize)` **without** moving the wrap epoch, so lease/epoch protection covers only the content bytes past `kHeaderSize`. A consumer replicating the whole document must snapshot the header once or re-derive it (`handle.hpp`, mapped-view contract).
+- **Header bytes are volatile** — in-place metadata pwrites (hit-count / last-access updates, alternate chain-repoint) mutate `[0, Document::kHeaderSize)` **without** moving the exposure generation `G`, so lease/`G` protection covers only the content bytes past `kHeaderSize`. A consumer replicating the whole document must snapshot the header once or re-derive it (`handle.hpp`, mapped-view contract).
 - **Per-chunk gating** — the gate sums only the borrow slots of the chunks the step exposes, and a reader revalidates against its own document's exposure threshold. Under retention a borrow is therefore torn only by the step that exposes its own chunk. That step is normally the one advance that crosses the chunk. The wrap also exposes the tail of the retained pass that the frontier never reached, and there the verdict is conservative because the bytes are still intact. In flush mode there is one chunk and the behaviour is the classic stripe-wide wrap gate.
 - **Stuck-intent repair** — a writer that dies inside the intent window leaves `wrap_intent` set, which would make every read of the stripe retry. A proven-dead `forced_release` and an exclusive open (no live peer) repair it (`Volume::repair_wrap_state`). An escalated takeover never does, because the old holder may still be running. The intent byte is a value: `1` for a gate or an advance (clearing is the repair), `2`/`3` for a wrap committed to an even/odd pass, stored before the cursor drops. Recovery *completes* such a wrap (cursor, phase, `G`) instead of clearing it, so the next writer never fills the current pass from the start under live borrows.
 - **Forced steps uncount everyone** — a ceiling-forced step resets every chunk slot of the stripe. A borrow whose slot generation moved is reported torn by both renews and by the read-time revalidation, even when its own chunk was not exposed.

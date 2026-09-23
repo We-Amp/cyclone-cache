@@ -843,8 +843,12 @@ sites before citing any of this elsewhere.
 ## 9. Expected hit-ratio effect (policy replay)
 
 `kv_churn_policy` reports `retain/N` for `N ∈ {16, 32, 64, 256}`. The
-existing columns reproduce `doc/kv-cache-benchmark/churn/policy-replay.txt`
-digit for digit. The **bold** column is the `N` that D2 gives each
+table below is from the replay as it now stands, with keys routed to stripes
+by `segment_hash()` exactly as `Volume::select_stripe` does; its existing
+columns reproduce `doc/kv-cache-benchmark/churn/policy-replay.txt` digit for
+digit. (The first version of this table used the replay's earlier fixed
+routing; the switch moved no cell by more than 0.003 and changed no
+conclusion.) The **bold** column is the `N` that D2 gives each
 configuration:
 
 - 1 GiB and 128 MiB stripes → `N = 64`;
@@ -853,24 +857,27 @@ configuration:
 ```bash
 ./build/kv_churn_policy                         # 2 MiB, C = 16 GiB (round 4)
 ./build/kv_churn_policy 2097152 2147483648      # 2 MiB, C = 2 GiB
+./build/kv_churn_policy 2097152 4294967296      # 2 MiB, C = 4 GiB (section 14 run)
 ./build/kv_churn_policy 524288                  # 512 KiB, C = 16 GiB
 ./build/kv_churn_policy 4096 536870912          # 4 KB, C = 512 MiB (HTTP-shaped)
 ```
 
 | workload | LRU | stripe FIFO | flush (today) | retain/16 | retain/32 | retain/64 | retain/256 |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `zipf`, 2 MiB, 16 GiB | 0.8498 | 0.8174 | 0.7608 | 0.8086 | 0.8128 | **0.8150** | 0.8166 |
-| `zipf+scan`, 2 MiB, 16 GiB | 0.7251 | 0.6865 | 0.6437 | 0.6802 | 0.6833 | **0.6848** | 0.6860 |
-| `zipf`, 2 MiB, 2 GiB | 0.8154 | 0.7754 | 0.7058 | 0.7629 | 0.7683 | **0.7724** | 0.7724 |
-| `zipf+scan`, 2 MiB, 2 GiB | 0.6935 | 0.6463 | 0.5929 | 0.6371 | 0.6412 | **0.6444** | 0.6444 |
-| `zipf`, 512 KiB, 16 GiB | 0.8667 | 0.8383 | 0.7887 | 0.8309 | 0.8346 | **0.8366** | 0.8379 |
-| `zipf+scan`, 512 KiB, 16 GiB | 0.7405 | 0.7052 | 0.6678 | 0.7002 | 0.7027 | **0.7040** | 0.7049 |
-| `zipf`, 4 KB, 512 MiB | 0.8756 | 0.8476 | 0.7758 | 0.8424 | **0.8456** | 0.8470 | 0.8475 |
-| `zipf+scan`, 4 KB, 512 MiB | 0.7507 | 0.7151 | 0.6810 | 0.7099 | **0.7124** | 0.7138 | 0.7148 |
+| `zipf`, 2 MiB, 16 GiB | 0.8498 | 0.8172 | 0.7605 | 0.8086 | 0.8127 | **0.8150** | 0.8165 |
+| `zipf+scan`, 2 MiB, 16 GiB | 0.7251 | 0.6867 | 0.6438 | 0.6803 | 0.6834 | **0.6850** | 0.6862 |
+| `zipf`, 2 MiB, 2 GiB | 0.8154 | 0.7726 | 0.7029 | 0.7604 | 0.7658 | **0.7698** | 0.7698 |
+| `zipf+scan`, 2 MiB, 2 GiB | 0.6935 | 0.6444 | 0.5902 | 0.6352 | 0.6393 | **0.6422** | 0.6422 |
+| `zipf`, 2 MiB, 4 GiB | 0.8279 | 0.7913 | 0.7263 | 0.7801 | 0.7851 | **0.7876** | 0.7898 |
+| `zipf+scan`, 2 MiB, 4 GiB | 0.7052 | 0.6612 | 0.6123 | 0.6533 | 0.6568 | **0.6587** | 0.6601 |
+| `zipf`, 512 KiB, 16 GiB | 0.8667 | 0.8385 | 0.7883 | 0.8310 | 0.8347 | **0.8366** | 0.8380 |
+| `zipf+scan`, 512 KiB, 16 GiB | 0.7405 | 0.7051 | 0.6680 | 0.7000 | 0.7027 | **0.7039** | 0.7048 |
+| `zipf`, 4 KB, 512 MiB | 0.8756 | 0.8475 | 0.7758 | 0.8428 | **0.8460** | 0.8469 | 0.8473 |
+| `zipf+scan`, 4 KB, 512 MiB | 0.7507 | 0.7150 | 0.6809 | 0.7098 | **0.7125** | 0.7138 | 0.7147 |
 
 What the table says:
 
-- Retention recovers 92–97 % of the flush cost at the D2 geometry.
+- Retention recovers 93–98 % of the flush cost at the D2 geometry.
 - **Round-4 prediction:** `zipf` 0.815 (from 0.757) and `zipf+scan` 0.685
   (from 0.638–0.642). The replay matched measurements within 0.006 last time.
 - **Served throughput (a model, not a measurement):** weighting T=1 latencies

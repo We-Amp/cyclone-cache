@@ -48,11 +48,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     (default `OFF`, not supported on Windows): the same experiment over
     PCIe with `cudaHostRegister`.
 - **Wrap retention** (`CacheConfig::wrap_retention`, default `false`; C API
-  `disable_wrap_retention`). Retention is off by default. Known gaps before
-  it can default on: the PageSpeed `cache_burst_test` has not been run
-  against it, and writing an alternate onto a key whose head is retained
-  drops that key's retained chain (R4; counted in `alternate_wrap_refusals`,
-  see `doc/design/wrap-retention.md` section 14). Normally a stripe's wrap drops its whole
+  `disable_wrap_retention`). Normally a stripe's wrap drops its whole
   previous pass at once. With retention on, the previous pass stays readable
   until its bytes are needed: a clean frontier moves ahead of the write
   cursor one chunk at a time. A frontier advance waits only for live borrows
@@ -67,9 +63,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `advances_deferred_by_lease`, `early_advances_skipped`, `retained_hits`,
   `stamp_rejections`. See `doc/api-reference.md#wrap-retention` and
   `doc/design/wrap-retention.md`.
+  Retention is off by default. Known gaps before it can default on:
+  - the PageSpeed `cache_burst_test` has not been run against it;
+  - writing an alternate onto a key whose head is retained drops that key's
+    retained chain (R4; counted in `alternate_wrap_refusals`, see
+    `doc/design/wrap-retention.md` section 14).
 - `performance_baseline --wrap-retention on|off`, a `retain|flush` argument
   for `concurrent_read_bench`, and `kv_churn --wrap-retention on|off`, which
-  adds the retention counters to its JSON.
+  adds the retention counters to its JSON. `kv_churn_policy` gains
+  `retain/16`, `retain/32`, `retain/64` and `retain/256` columns, the
+  retention policy replayed without I/O.
 
 ### Changed
 
@@ -80,8 +83,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   fingerprinted filename of mmap volumes, so **multi-process caches start
   cold** after the upgrade. The old file is left on disk. The data offset
   does not move (177 pages at the default 16384 buckets).
-- Borrows are counted per frontier chunk: 64 `u16` slots per thread shard
-  locally, 64 `u32` slots in the mmap directory. In flush mode the stripe is
+- Borrows are counted per frontier chunk: 64 `u32` slots per thread shard
+  locally (two 128-byte lines), 64 `u32` slots in the mmap directory. In flush mode the stripe is
   one chunk, so the lease gate behaves as before.
 - The GC phase is derived from the pass (`P & 1`) rather than toggled. The
   writer stamps every document with its pass in both modes
@@ -89,7 +92,6 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `CycloneCacheConfig` gains a trailing `int disable_wrap_retention`. As with
   earlier trailing fields, callers must be recompiled against the new
   header.
-
 - **On-disk format v8 (was v7): the document checksum is CRC-32C
   (Castagnoli, reflected poly `0x82F63B78`) instead of CRC-32/ISO-HDLC.**
   The checksum used to be a byte-at-a-time ISO-HDLC table inside
@@ -151,7 +153,6 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   once the counted holders closed.
 - An alternate write over a retained head no longer fails with
   `TooManyAlternates` because of the old chain it will not link to.
-
 - A writer that died inside the wrap-intent window left the intent flag set,
   and every read of that stripe retried until it missed. The flag is now
   cleared by a `forced_release` that proves the holder dead and by an open
@@ -167,7 +168,6 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   link always points downward, into the same pass, so an upward link can
   only be stale. Such hops are now rejected. As a consequence, a corrupt
   cyclic chain is never followed at all.
-
 - Multi-process: a wrap now lowers the shared write cursor to the data-area
   start inside the wrap-intent window instead of when its first write commits.
   Before, for the whole reservation-to-pwrite window of a wrapping write, a

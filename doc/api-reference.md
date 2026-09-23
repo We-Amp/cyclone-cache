@@ -754,7 +754,7 @@ when the write cursor wraps is the eviction policy, chosen by
   or more passes back can never resolve.
 
 In the policy replay of the KV-churn workload (`benchmarks/kv_churn_policy`)
-retention recovers 90-97 % of the gap between flush and a plain per-stripe
+retention recovers 93-98 % of the gap between flush and a plain per-stripe
 FIFO; measured on Linux (2 MiB blocks, 4 GiB tier, Zipf, 4 threads) the hit
 ratio went from 0.726 to 0.788, matching the replay within 0.001.  See
 `doc/design/wrap-retention.md` for the mechanism and the correctness argument.
