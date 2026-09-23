@@ -363,7 +363,17 @@ class MmapDirectory {
   /// Iterate over all matching entries without allocation
   /// Callback returns false to stop iteration
   template <typename Callback>
-  void probe_each(const CacheKey &key, Callback &&callback) const;
+  void probe_each(const CacheKey &key, Callback &&callback) const {
+    probe_each_impl<true>(key, std::forward<Callback>(callback));
+  }
+
+  /// As probe_each, but yields tag matches of BOTH phases; the caller
+  /// classifies each entry against its own stripe snapshot (see
+  /// Directory::probe_each_all_phases).
+  template <typename Callback>
+  void probe_each_all_phases(const CacheKey &key, Callback &&callback) const {
+    probe_each_impl<false>(key, std::forward<Callback>(callback));
+  }
 
   /// Sentinels for insert()'s verified_offset parameter — shared semantics
   /// with the in-memory directory (see the discussion on Directory).
@@ -608,6 +618,9 @@ class MmapDirectory {
         _num_buckets(0) {}
 
  private:
+  template <bool kFilterPhase, typename Callback>
+  void probe_each_impl(const CacheKey &key, Callback &&callback) const;
+
   MmapDirectory(Header *header, uint32_t *versions, DirEntry *entries,
                 size_t num_buckets);
 
@@ -650,8 +663,9 @@ class MmapDirectory {
 };
 
 // Template implementation
-template <typename Callback>
-void MmapDirectory::probe_each(const CacheKey &key, Callback &&callback) const {
+template <bool kFilterPhase, typename Callback>
+void MmapDirectory::probe_each_impl(const CacheKey &key,
+                                    Callback &&callback) const {
   if (!_header) {
     return;
   }
@@ -704,7 +718,7 @@ void MmapDirectory::probe_each(const CacheKey &key, Callback &&callback) const {
         continue;
       }
       // Skip stale entries from a previous GC phase
-      if (entry.phase() != cur_phase) {
+      if (kFilterPhase && entry.phase() != cur_phase) {
         continue;
       }
       if (entry.tag() == target_tag) {

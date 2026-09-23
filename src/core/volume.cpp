@@ -566,58 +566,6 @@ StripeGeometry compute_stripe_geometry(size_t volume_size,
   return {num_stripes, base_stripe_size, stripe_remainder};
 }
 
-// Validate that a relative offset within a stripe is within bounds AND live.
-// Returns true if the offset is valid for reading a document header.
-// A valid offset must:
-// - Be non-zero (0 means end of chain)
-// - Be within the stripe's data area (after directory, before stripe end)
-// - Leave enough space for at least a document header
-// - Sit strictly BEHIND the stripe's write cursor (the phase-ABA positional
-//   guard's HOP leg — see below)
-bool is_valid_chain_offset(const Stripe* stripe, uint64_t relative_offset) {
-  if (relative_offset == 0) {
-    return false;  // 0 means end of chain, not an error but not valid to follow
-  }
-
-  // Calculate data area bounds using data_offset (accounts for both directory
-  // types)
-  uint64_t data_area_start = stripe->data_offset - stripe->offset;
-  uint64_t data_area_end = stripe->size;
-
-  // Check offset is within data area and has room for at least a header
-  if (relative_offset < data_area_start || relative_offset >= data_area_end) {
-    return false;
-  }
-
-  // Ensure there's room for at least a document header
-  if (relative_offset + Document::kHeaderSize > data_area_end) {
-    return false;
-  }
-
-  // Phase-ABA positional guard, HOP leg (probe leg + full argument at
-  // Stripe::is_behind_write_cursor / probe_each).  Chain hops consume
-  // next_alternate_offset values from document headers, bypassing the
-  // directory probe entirely — and a SAME-KEY dark node passes both the
-  // bounds checks above and the walks' cross-key guard.  Reachable with ONE
-  // wrap: commit_alternate_write probes the old head H (behind the pre-wrap
-  // cursor: passes), stamps next = H into the new document, then
-  // allocate_write_slot WRAPS and lands the new head L at the data-area
-  // start — leaving L.next pointing at an intact, ahead-of-cursor node the
-  // ordinary forward fill will overwrite with no wrap event.  Reject the hop
-  // here so no walk (read_alternate_sync, list_alternates_sync,
-  // commit_alternate_write's counter, remove_alternate_sync,
-  // update_hit_count_sync) ever reaches — let alone borrows, repoints to, or
-  // pwrites — a dark node.  Same >= rejection boundary and same
-  // shared-vs-local cursor source as the probe leg.  Directory-derived
-  // offsets re-checked through here already passed the probe leg, so the
-  // predicate never fires for them.
-  if (!stripe->is_behind_write_cursor(relative_offset)) {
-    return false;
-  }
-
-  return true;
-}
-
 // Helper function to build AlternateInfo from a document
 // Extracts common code from chain traversal lambdas
 AlternateInfo build_alternate_info(const DocumentReader& reader,
@@ -708,7 +656,7 @@ class VolumeReadHandleImpl : public ReadHandleImpl {
   // embedder copies/aborts) iff it moved.
   std::weak_ptr<Volume> volume_weak;
   Stripe* stripe = nullptr;
-  std::pair<uint64_t, bool> epoch_start{};
+  BorrowEpoch epoch_start{};
   // receipt for this borrow's entry in the stripe's
   // outstanding-borrow slot; surrendered below so that CLOSING the handle
   // (not lease expiry) is what returns write capacity to the stripe.
@@ -2429,11 +2377,13 @@ std::expected<ReadHandle, CacheError> Volume::read_sync(const CacheKey& key) {
     bool checksum_failed = false;  // Track if we had a checksum failure
     bool epoch_changed = false;    // wrap raced the read
 
-    // Capture the wrap epoch at probe start for the reader's
-    // stamp-then-revalidate protocol (disk borrows only).
-    const auto epoch_start = wrap_epoch(stripe);
+    // Snapshot the stripe at probe start: every candidate is admitted
+    // against it, and a borrow revalidates against its epoch
+    // (stamp-then-revalidate; disk borrows only).
+    const StripeSnapshot snap = snapshot(stripe);
+    const BorrowEpoch epoch_start = borrow_epoch(snap);
 
-    stripe->probe_each(key, [&](const DirEntry& dir_entry) {
+    stripe->probe_each(key, snap, [&](const DirEntry& dir_entry, AdmitClass) {
       if (found) {
         return false;  // Already found, stop iteration
       }
@@ -2644,7 +2594,8 @@ std::expected<void, CacheError> Volume::remove_sync(const CacheKey& key) {
   std::array<Candidate, Directory::kEntriesPerBucket> candidates;
   size_t num_candidates = 0;
 
-  stripe->probe_each(key, [&](const DirEntry& dir_entry) {
+  const StripeSnapshot snap = snapshot(stripe);
+  stripe->probe_each(key, snap, [&](const DirEntry& dir_entry, AdmitClass) {
     if (num_candidates < candidates.size()) {
       candidates[num_candidates++] = {dir_entry.offset(),
                                       dir_entry.approx_size()};
@@ -2656,11 +2607,6 @@ std::expected<void, CacheError> Volume::remove_sync(const CacheKey& key) {
   // key (not just the 12-bit tag), then remove the correct entry precisely.
   for (size_t ci = 0; ci < num_candidates; ++ci) {
     const auto& candidate = candidates[ci];
-
-    // Bounds check: skip entries with offsets outside the stripe's data area
-    if (!is_valid_chain_offset(stripe, candidate.dir_offset)) {
-      continue;
-    }
 
     uint64_t doc_offset = stripe->offset + candidate.dir_offset;
 
@@ -2761,7 +2707,7 @@ std::expected<bool, CacheError> Volume::exists_sync(const CacheKey& key) {
   // Lock-free read — pure directory probe (no borrow escapes), covered by
   // the directory's own synchronization; see the note in read_sync().
   bool found = false;
-  stripe->probe_each(key, [&](const DirEntry&) {
+  stripe->probe_each(key, snapshot(stripe), [&](const DirEntry&, AdmitClass) {
     found = true;
     return false;  // Stop iteration
   });
@@ -2998,8 +2944,8 @@ bool Volume::wrap_intent_set(const Stripe* stripe) const {
   return stripe->local_wrap_intent.load(std::memory_order_seq_cst) != 0;
 }
 
-bool Volume::borrow_still_valid(
-    const Stripe* stripe, const std::pair<uint64_t, bool>& epoch_start) const {
+bool Volume::borrow_still_valid(const Stripe* stripe,
+                                const BorrowEpoch& epoch_start) const {
   // Order is load-bearing (see the Dekker proof in allocate_write_slot):
   // the intent flag is loaded FIRST.  If intent == 0 was read from a
   // completed wrap's clear, that clear is seq_cst-after the wrap-count
@@ -3010,11 +2956,21 @@ bool Volume::borrow_still_valid(
   if (wrap_intent_set(stripe)) {
     return false;  // A wrap decision is in flight — discard and retry.
   }
-  return wrap_epoch(stripe) == epoch_start;
+  const auto now = wrap_epoch(stripe);
+  return BorrowEpoch{now.first, now.second} == epoch_start;
 }
 
-bool Volume::renew_read_lease(Stripe* stripe,
-                              const std::pair<uint64_t, bool>& epoch_start) {
+StripeSnapshot Volume::snapshot(const Stripe* stripe) const {
+  StripeSnapshot snap;
+  // Epoch FIRST (seq_cst), cursor after (acquire) -- see the declaration.
+  const auto epoch = wrap_epoch(stripe);
+  snap.pass = epoch.first;
+  snap.phase = epoch.second;
+  snap.cursor_rel = stripe->current_write_cursor() - stripe->offset;
+  return snap;
+}
+
+bool Volume::renew_read_lease(Stripe* stripe, const BorrowEpoch& epoch_start) {
   if (_lease_t_ns == 0) {
     // Leases disabled: no protection to extend.  The embedder treats a
     // false renew as "cannot prove this borrow still safe" and copies.
@@ -3051,15 +3007,16 @@ bool Volume::renew_read_lease(Stripe* stripe,
   // hot leased stripe (every writer attempt sets-then-clears intent).  An
   // in-flight wrap that actually commits moves the epoch and is caught on
   // the next renew or by the embedder's pre-write revalidation.
-  if (wrap_epoch(stripe) != epoch_start) {
+  const auto now = wrap_epoch(stripe);
+  if (BorrowEpoch{now.first, now.second} != epoch_start) {
     return false;
   }
   stamp_read_lease(stripe);  // Still valid — extend the lease.
   return true;
 }
 
-LeaseRenewal Volume::renew_read_lease_strict(
-    Stripe* stripe, const std::pair<uint64_t, bool>& epoch_start) {
+LeaseRenewal Volume::renew_read_lease_strict(Stripe* stripe,
+                                             const BorrowEpoch& epoch_start) {
   // Lease amendment (2026-07-07): the ALIASED zero-copy path's per-send
   // validation.  Unlike renew_read_lease (epoch-only, safe only for
   // copy-then-verify where the read is observable), an aliased writev's read
@@ -3099,13 +3056,14 @@ LeaseRenewal Volume::renew_read_lease_strict(
   // still in its pre-record_wrap decision window: the region is intact but a
   // commit may land during the aliased send, so de-alias by copying.
   const bool intent = wrap_intent_set(stripe);  // load intent FIRST
-  const bool epoch_moved = wrap_epoch(stripe) != epoch_start;  // then epoch
+  const auto now = wrap_epoch(stripe);          // then epoch
+  const bool epoch_moved = BorrowEpoch{now.first, now.second} != epoch_start;
   // PREMISE (restored): "any overwrite of a borrowed region is a wrap" holds
   // for every borrow this protocol can hand out, because a borrow is only
   // ever taken through a node BEHIND the write cursor — the phase-ABA
   // positional guard rejects at/ahead-of-cursor nodes on BOTH paths that can
   // yield a borrow target: directory probes (Stripe::probe_each) and
-  // alternate-chain hops (is_valid_chain_offset).  A before-the-cursor
+  // alternate-chain hops (Stripe::admit_hop).  A before-the-cursor
   // region is only ever revisited by WRAPPING back to it, and a wrap always
   // record_wrap()s (epoch++) before its pwrite; the ORDINARY forward fill
   // only advances INTO not-yet-borrowable ahead-of-cursor space, so it can
@@ -3819,10 +3777,8 @@ std::expected<void, CacheError> Volume::commit_write(
   // 132-byte header map per same-tag candidate on the write path only —
   // the read path was already full-key-verified.
   uint64_t verified_offset = Directory::kNoVerifiedEntry;
-  stripe->probe_each(key, [&](const DirEntry& dir_entry) {
-    if (!is_valid_chain_offset(stripe, dir_entry.offset())) {
-      return true;  // Continue to next candidate
-    }
+  const StripeSnapshot snap = snapshot(stripe);
+  stripe->probe_each(key, snap, [&](const DirEntry& dir_entry, AdmitClass) {
     auto mdoc = map_document(*_mapped_file, stripe->offset + dir_entry.offset(),
                              Document::kHeaderSize, stripe->size, false);
     if (!mdoc) {
@@ -3989,7 +3945,7 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
   // allocation, and the splice below could then store into freshly recycled
   // bytes.  The same sample fences the wrap-frontier link refusal further
   // down.  Never re-sample.
-  const auto epoch_start = wrap_epoch(stripe);
+  const StripeSnapshot snap = snapshot(stripe);
 
   // Find the current head document offset
   uint64_t head_relative_offset = 0;
@@ -4017,7 +3973,7 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
   std::array<ChainNode, Document::kMaxChainTraversalDepth> nodes;
   size_t node_count = 0;
 
-  stripe->probe_each(key, [&](const DirEntry& dir_entry) {
+  stripe->probe_each(key, snap, [&](const DirEntry& dir_entry, AdmitClass) {
     // Directory::probe_each may re-invoke a callback for the same entry when
     // a version change retries the scan, so every piece of state this
     // callback accumulates is reset on entry.  Carrying a stale predecessor
@@ -4093,7 +4049,7 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
         chain_fully_walked = true;
         break;
       }
-      if (!is_valid_chain_offset(stripe, next_offset)) break;
+      if (!stripe->admit_hop(next_offset, snap)) break;
       current_rel = next_offset;
       current_offset = stripe->offset + next_offset;
     }
@@ -4219,7 +4175,7 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
         // walk did; it passed moments ago under this lock and the cursor has
         // not moved, so a failure here means something is wrong and we fall
         // back to today's plain prepend.
-        if (is_valid_chain_offset(stripe, nodes[first_keeper].rel_offset)) {
+        if (stripe->admit_hop(nodes[first_keeper].rel_offset, snap)) {
           new_next_offset = nodes[first_keeper].rel_offset;
           shadows_unlinked_at_publish = first_keeper;
         } else {
@@ -4325,7 +4281,7 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
   // NOT gated by the unlink kill switch: this is a safety guard, and the
   // unlink makes its precondition MORE likely (a spliced head points further
   // back, i.e. at the bytes a wrap recycles first).  The two ship together.
-  const bool wrap_raced_write = (wrap_epoch(stripe) != epoch_start);
+  const bool wrap_raced_write = wrapped_since(stripe, snap);
   // A refusal is only COUNTED when the stamped link was actually live
   //: new_next_offset is still the value the planner stamped into the
   // document, and it is already 0 when there was no pre-wrap chain to orphan
@@ -4457,7 +4413,7 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
     const PendingRepoint& r = repoints[i];
     auto res = repoint_chain_link(stripe, stripe->offset + r.pred_rel,
                                   static_cast<AlternateId>(r.pred_id), key,
-                                  r.new_next, epoch_start, /*blocking=*/false);
+                                  r.new_next, snap, /*blocking=*/false);
     if (res.has_value()) {
       shadows_unlinked_at_publish += r.shadow_count;
     } else {
@@ -4589,7 +4545,7 @@ Volume::list_alternates_sync(const CacheKey& key) {
     // detected.  This walk takes no borrow/lease (no handle escapes), so
     // without the check a mid-walk overwrite could yield AlternateInfo
     // built from freshly overwritten regions.
-    const auto epoch_start = wrap_epoch(stripe);
+    const StripeSnapshot snap = snapshot(stripe);
 
     std::vector<AlternateInfo> alternates;
     std::expected<std::vector<AlternateInfo>, CacheError> result =
@@ -4599,7 +4555,7 @@ Volume::list_alternates_sync(const CacheKey& key) {
     bool chain_incomplete = false;
 
     // First, find the head document via directory probe
-    stripe->probe_each(key, [&](const DirEntry& dir_entry) {
+    stripe->probe_each(key, snap, [&](const DirEntry& dir_entry, AdmitClass) {
       if (found_head) {
         return false;  // Already processing, stop iteration
       }
@@ -4679,7 +4635,7 @@ Volume::list_alternates_sync(const CacheKey& key) {
         _mapped_file->unmap_region(doc->region);
 
         if (next_offset == 0) break;
-        if (!is_valid_chain_offset(stripe, next_offset)) break;
+        if (!stripe->admit_hop(next_offset, snap)) break;
         ++chain_depth;
         current_offset = stripe->offset + next_offset;
       }
@@ -4710,7 +4666,7 @@ Volume::list_alternates_sync(const CacheKey& key) {
     // takes no borrow, so no seq_cst RMW interposes between those copies
     // and this verdict — pin the copy loads ahead of the epoch load.
     std::atomic_thread_fence(std::memory_order_acquire);
-    if (result.has_value() && wrap_epoch(stripe) != epoch_start) {
+    if (result.has_value() && wrapped_since(stripe, snap)) {
       result = make_unexpected(CacheError::NotFound);
       checksum_failed = true;
     }
@@ -4774,9 +4730,9 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
     bool chain_incomplete = false;
     bool epoch_changed = false;  // wrap raced the read
 
-    // Capture the wrap epoch at probe start for the reader's
-    // stamp-then-revalidate protocol (disk borrows only).
-    const auto epoch_start = wrap_epoch(stripe);
+    // Snapshot the stripe at probe start (see read_sync).
+    const StripeSnapshot snap = snapshot(stripe);
+    const BorrowEpoch epoch_start = borrow_epoch(snap);
     // Resurrection guard (see Stripe::remove_epoch): captured before the
     // probe, re-checked in the RAM-cache put's predicate below and
     // once more after a put that inserted.
@@ -4793,7 +4749,7 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
     const uint32_t bucket_version_start =
         ram_coherence ? stripe->bucket_version(key) : 0;
 
-    stripe->probe_each(key, [&](const DirEntry& dir_entry) {
+    stripe->probe_each(key, snap, [&](const DirEntry& dir_entry, AdmitClass) {
       if (found_head) {
         return false;
       }
@@ -4884,7 +4840,7 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
         _mapped_file->unmap_region(doc->region);
 
         if (next_offset == 0) break;
-        if (!is_valid_chain_offset(stripe, next_offset)) break;
+        if (!stripe->admit_hop(next_offset, snap)) break;
         ++chain_depth;
         current_offset = stripe->offset + next_offset;
       }
@@ -5185,8 +5141,8 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
 
 std::expected<void, CacheError> Volume::commit_header_rmw(
     Stripe* stripe, std::byte* header, const CacheKey& expected_key,
-    AlternateId expected_alt, std::pair<uint64_t, bool> epoch_start,
-    bool blocking, const std::function<void()>& apply) {
+    AlternateId expected_alt, const StripeSnapshot& snap_start, bool blocking,
+    const std::function<void()>& apply) {
   // Cross-process-safe in-place mutation of a LIVE published document's fixed
   // header.  The two RMW sites -- the hit-count bump and the middle/tail chain
   // repoint -- are the only writers that mutate a published document's fixed
@@ -5244,7 +5200,7 @@ std::expected<void, CacheError> Volume::commit_header_rmw(
     // In-memory directory => single process; the caller's stripe->mutex
     // already serializes every writer, so no cross-process lock exists or is
     // needed.  Honor the fence + identity for symmetry with the mmap path.
-    if (wrap_epoch(stripe) != epoch_start || !identity_ok()) {
+    if (wrapped_since(stripe, snap_start) || !identity_ok()) {
       return make_unexpected(CacheError::Busy);
     }
     apply();
@@ -5262,7 +5218,7 @@ std::expected<void, CacheError> Volume::commit_header_rmw(
     repair_after_forced_release(stripe, token);  // see allocate_write_slot
   }
   const bool ok = dir.revalidate_write_lock(token) &&
-                  wrap_epoch(stripe) == epoch_start && identity_ok();
+                  !wrapped_since(stripe, snap_start) && identity_ok();
   if (ok) {
     apply();  // pure std::atomic_ref stores -- no syscalls under the lock
   }
@@ -5276,8 +5232,7 @@ std::expected<void, CacheError> Volume::commit_header_rmw(
 std::expected<void, CacheError> Volume::repoint_chain_link(
     Stripe* stripe, uint64_t pred_absolute_offset,
     AlternateId pred_alternate_id, const CacheKey& key,
-    uint64_t new_next_offset, std::pair<uint64_t, bool> epoch_start,
-    bool blocking) {
+    uint64_t new_next_offset, const StripeSnapshot& snap_start, bool blocking) {
   // The fixed header is outside the document checksum, so this store must run
   // under the write lock + the wrap-epoch fence (commit_header_rmw) or a
   // peer's wrap could turn it into a silent chain corruption / wrong-variant
@@ -5299,7 +5254,7 @@ std::expected<void, CacheError> Volume::repoint_chain_link(
   };
 
   auto res = commit_header_rmw(stripe, header, key, pred_alternate_id,
-                               epoch_start, blocking, apply);
+                               snap_start, blocking, apply);
   if (res.has_value() && _config.sync_on_write) {
     _mapped_file->sync(*region, MappedFile::SyncMode::Sync);
   }
@@ -5329,14 +5284,14 @@ std::expected<void, CacheError> Volume::remove_alternate_sync(
   // never a silent drop, which would RESURRECT the removed alternate.
   constexpr int kMaxRepointRetries = 8;
   for (int attempt = 0; attempt < kMaxRepointRetries; ++attempt) {
-    // Sample the wrap epoch BEFORE resolving (the fence needs it unchanged).
-    const auto epoch_start = wrap_epoch(stripe);
+    // Snapshot BEFORE resolving (the fence needs its epoch unchanged).
+    const StripeSnapshot snap = snapshot(stripe);
 
     // Find the head document
     uint64_t head_relative_offset = 0;
     bool found_head = false;
 
-    stripe->probe_each(key, [&](const DirEntry& dir_entry) {
+    stripe->probe_each(key, snap, [&](const DirEntry& dir_entry, AdmitClass) {
       if (found_head) {
         return false;
       }
@@ -5408,7 +5363,7 @@ std::expected<void, CacheError> Volume::remove_alternate_sync(
       }
 
       // Validate offset before following (security)
-      if (!is_valid_chain_offset(stripe, next_offset)) {
+      if (!stripe->admit_hop(next_offset, snap)) {
         return make_unexpected(CacheError::ChainCorrupted);
       }
 
@@ -5430,7 +5385,7 @@ std::expected<void, CacheError> Volume::remove_alternate_sync(
         stripe->remove_entry_at(key, head_relative_offset);
       } else {
         // Validate target_next_offset before following (security)
-        if (!is_valid_chain_offset(stripe, target_next_offset)) {
+        if (!stripe->admit_hop(target_next_offset, snap)) {
           return make_unexpected(CacheError::ChainCorrupted);
         }
 
@@ -5480,7 +5435,7 @@ std::expected<void, CacheError> Volume::remove_alternate_sync(
     // next_alternate_offset in place (shared helper; see repoint_chain_link).
     auto res =
         repoint_chain_link(stripe, prev_absolute_offset, prev_alternate_id, key,
-                           target_next_offset, epoch_start, /*blocking=*/true);
+                           target_next_offset, snap, /*blocking=*/true);
 
     if (res.has_value()) {
       if (_config.sync_on_write) {
@@ -5544,18 +5499,13 @@ std::expected<void, CacheError> Volume::update_hit_count_sync(
 
   // Sample the wrap epoch BEFORE resolving the target offset -- the fence in
   // commit_header_rmw requires it unchanged at store time (see there).
-  const auto epoch_start = wrap_epoch(stripe);
+  const StripeSnapshot snap = snapshot(stripe);
 
   // Find the document with the matching alternate_id
   uint64_t target_offset = 0;
 
-  stripe->probe_each(key, [&](const DirEntry& dir_entry) {
+  stripe->probe_each(key, snap, [&](const DirEntry& dir_entry, AdmitClass) {
     uint64_t doc_offset = stripe->offset + dir_entry.offset();
-
-    // Validate initial offset from directory entry
-    if (!is_valid_chain_offset(stripe, dir_entry.offset())) {
-      return true;  // Continue to next candidate
-    }
 
     auto mapped = _mapped_file->map_region(doc_offset, dir_entry.approx_size(),
                                            MappedFile::MapMode::ReadOnly);
@@ -5600,7 +5550,7 @@ std::expected<void, CacheError> Volume::update_hit_count_sync(
       _mapped_file->unmap_region(mdoc->region);
 
       if (next_offset == 0) break;
-      if (!is_valid_chain_offset(stripe, next_offset)) break;
+      if (!stripe->admit_hop(next_offset, snap)) break;
       current_offset = stripe->offset + next_offset;
       ++chain_depth;
     }
@@ -5648,8 +5598,8 @@ std::expected<void, CacheError> Volume::update_hit_count_sync(
         .store(last_access_ms, std::memory_order_release);
   };
 
-  auto result = commit_header_rmw(stripe, header, key, alternate_id,
-                                  epoch_start, /*blocking=*/false, apply);
+  auto result = commit_header_rmw(stripe, header, key, alternate_id, snap,
+                                  /*blocking=*/false, apply);
   _mapped_file->unmap_region(*region);  // AFTER the lock is released (M1)
 
   // Note: no fsync here (write amplification).  Hit counts are best-effort and

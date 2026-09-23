@@ -56,7 +56,7 @@
 //       serve/reject pair.
 //
 //   (E) ONE-wrap dark chain tail: the guard's chain-HOP leg
-//       (is_valid_chain_offset).  A head committed across a wrap keeps
+//       (Stripe::admit_hop).  A head committed across a wrap keeps
 //       next_alternate_offset pointing at the pre-wrap old head — a same-key,
 //       intact, ahead-of-cursor node the probe leg never sees (hops bypass
 //       the directory).  Walks must never enumerate/select/borrow it.
