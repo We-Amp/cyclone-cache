@@ -31,15 +31,32 @@
 //                                 mapped peer.  The path here is the actual
 //                                 on-disk (fingerprinted) file, not the raw
 //                                 add_volume path.
+//   seam <raw-path> <size-bytes> <seam> <crash|hang> <content-bytes>
+//                                 open a Cache (multi-process, leases off)
+//                                 and write <content-bytes> documents until
+//                                 the writer reaches Volume::WriterSeam
+//                                 number <seam> for the first time; there it
+//                                 either _exit(kSeamCrashExit)s (a writer
+//                                 killed inside its wrap window, holding the
+//                                 cross-process write lock) or says READY and
+//                                 blocks until released, then _exit()s
+//                                 WITHOUT leaving the window (a live holder
+//                                 stalled inside it).  Exit 1 if the seam was
+//                                 never reached.
 
 #include <cerrno>
+#include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
+#include "core/volume.hpp"
 #include "cyclone/cache.hpp"
 #include "cyclone/config.hpp"
+#include "cyclone/key.hpp"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -155,15 +172,79 @@ int run_hold(const char* file_path) {
   return 0;
 }
 
+// Distinct exit code for "died at the seam" so the parent can tell a seam
+// crash from any other failure.
+constexpr int kSeamCrashExit = 42;
+
+int run_seam(const char* path, unsigned long long size, int seam, bool crash,
+             unsigned long long content_bytes) {
+  cyclone::CacheConfig config;
+  config.set_multi_process(0, 1);
+  config.set_ram_cache_size(0);
+  config.read_lease_duration = std::chrono::milliseconds(0);
+  config.lease_wrap_ceiling = std::chrono::milliseconds(0);
+
+  auto cache = cyclone::Cache::create(config);
+  if (!cache.has_value()) {
+    say("ERR " + std::to_string(static_cast<int>(cache.error())));
+    return 1;
+  }
+  if (auto added = (*cache)->add_volume(path, static_cast<size_t>(size));
+      !added.has_value()) {
+    say("ERR " + std::to_string(static_cast<int>(added.error())));
+    return 1;
+  }
+  if (auto started = (*cache)->start(); !started.has_value()) {
+    say("ERR " + std::to_string(static_cast<int>(started.error())));
+    return 1;
+  }
+
+  const auto target = static_cast<cyclone::Volume::WriterSeam>(seam);
+  cyclone::Volume::s_writer_seam_for_test =
+      [target, crash](cyclone::Volume::WriterSeam at) {
+        if (at != target) {
+          return;
+        }
+        if (crash) {
+          std::_Exit(kSeamCrashExit);  // no teardown: lock + intent leak
+        }
+        say("READY");
+        wait_for_release();
+        std::_Exit(0);  // never leaves the window
+      };
+
+  std::vector<std::byte> content(static_cast<size_t>(content_bytes),
+                                 std::byte{0x5A});
+  const size_t max_writes = static_cast<size_t>(size / content_bytes) * 4 + 8;
+  for (size_t i = 0; i < max_writes; ++i) {
+    const cyclone::CacheKey key("seam-peer-" + std::to_string(i));
+    auto wh = (*cache)->write_sync(key, content.size());
+    if (!wh.has_value()) {
+      continue;
+    }
+    (void)wh->write_sync(content);
+    (void)wh->close_sync();
+  }
+  cyclone::Volume::s_writer_seam_for_test = nullptr;
+  say("ERR seam never reached");
+  return 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc >= 7 && std::strcmp(argv[1], "seam") == 0) {
+    return run_seam(argv[2], std::strtoull(argv[3], nullptr, 10),
+                    std::atoi(argv[4]), std::strcmp(argv[5], "crash") == 0,
+                    std::strtoull(argv[6], nullptr, 10));
+  }
   if (argc >= 4 && std::strcmp(argv[1], "open") == 0) {
     return run_open(argv[2], std::strtoull(argv[3], nullptr, 10));
   }
   if (argc >= 3 && std::strcmp(argv[1], "hold") == 0) {
     return run_hold(argv[2]);
   }
-  say("ERR usage: cyclone-test-peer open <path> <size> | hold <file>");
+  say("ERR usage: cyclone-test-peer open <path> <size> | hold <file> | seam "
+      "<path> <size> <seam> <crash|hang> <content-bytes>");
   return 2;
 }

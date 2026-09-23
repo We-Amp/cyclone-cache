@@ -642,6 +642,30 @@ void MmapDirectory::toggle_phase() {
   release_phase_lock();
 }
 
+void MmapDirectory::set_current_phase(bool phase) {
+  if (_header == nullptr) {
+    return;
+  }
+  // Same lock and ordering as toggle_phase: an insert that read the phase
+  // under phase_lock must not have it change underneath its entry store.
+  acquire_phase_lock();
+  std::atomic_ref<uint8_t>(_header->current_phase)
+      .store(phase ? 1 : 0, std::memory_order_seq_cst);
+  release_phase_lock();
+}
+
+void MmapDirectory::reset_reader_state_exclusive() {
+  if (_header == nullptr) {
+    return;
+  }
+  std::atomic_ref<uint16_t>(_header->stripe_borrow_slot)
+      .store(0, std::memory_order_seq_cst);
+  std::atomic_ref<uint64_t>(_header->stripe_lease_expiry_ns)
+      .store(0, std::memory_order_seq_cst);
+  std::atomic_ref<uint32_t>(_header->shared_wrap_deferred_deadline_ms)
+      .store(0, std::memory_order_seq_cst);
+}
+
 void MmapDirectory::acquire_phase_lock() {
   auto ref = std::atomic_ref<uint8_t>(_header->phase_lock);
   // Bounded spin: if the holder crashed (SIGKILL) while holding the lock,
