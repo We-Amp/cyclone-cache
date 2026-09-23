@@ -1,0 +1,240 @@
+=== 2026-09-23T07:20:04+02:00 cyclone zipf T=1 C=17179869184 s=120 --block-size 2097152 --max-warmup-seconds 1800
+load: 1.10 2.38 1.62 1/735 88280
+universe U = 24576 keys
+stream zipf t0: 7700/c2a3658d 13615/2358d785 15692/f5863216 4926/54e0669b 10997/c6add4fa 23573/677bbff9 23573/677bbff9 22519/01a05535 10549/d01ed625 16656/03258f4e 6506/1525ef69 3338/f3d62629
+stream zipf t1: 12554/1ecaeb65 13478/ec6073a9 22844/19799a46 7190/072f0877 16279/258fda28 8277/acdf06e1 5305/7df2fd1f 23573/677bbff9 14761/ef5e0531 12242/8c3cbd7d 9396/4f79cd21 7700/c2a3658d
+stream zipf+scan t0: 7700/c2a3658d 13615/2358d785 15692/f5863216 4926/54e0669b 10997/c6add4fa 23573/677bbff9 23573/677bbff9 1099511627776/6fdf167b 22519/01a05535 10549/d01ed625 16656/03258f4e 1099511627777/f11f5dc2
+stream zipf+scan t1: 12554/1ecaeb65 13478/ec6073a9 22844/19799a46 7190/072f0877 16279/258fda28 8277/acdf06e1 5305/7df2fd1f 23573/677bbff9 14761/ef5e0531 1103806595072/5cb8bfa5 1103806595073/dafeb106 1103806595074/bf4b5300
+Cyclone KV churn (kv-churn-spec v1)
+  cpu        :  Intel(R) Core(TM) i7-8750H CPU @ 2.20GHz
+  os         : Linux 5.15.0-191-generic
+  commit     : unknown
+  device     : nvme0n1p1
+  cgroup     : /sys/fs/cgroup/system.slice/run-r2e9016e04e2f4c99b4e7a0896eda855a.scope memory.max=4294967296
+  load       :  07:20:04 up 13:38,  0 users,  load average: 1,01, 2,34, 1,62
+  pattern    : zipf, threads 1, block 2097152, capacity 17179869184, seconds 120
+  dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+Cyclone tuning:
+  volume size             = 17191473152 B, 16 stripes, 724992 B mmap directory each (65536 entries/stripe)
+  usable data area        = 17179873216 B (1.0000 x C), ~511 blocks/stripe
+  mmap directory ON, checksum ON + verify on read, readahead default, max_object_size 0, ram_cache_size 0, sync_on_write false, hit tracking/optimization/dir sync off
+  eviction                = FIFO by stripe wrap (no app index)
+  warm-up: 113.0 s, inserted 34359738368 B
+{"store":"cyclone","bench":"churn","pattern":"zipf","block_size":2097152,"capacity":17179869184,"universe":24576,"threads":1,"seconds":120.02,"ops_per_s":647.07,"hit_ratio":0.7572,"served_gb_per_s":1.0275,"inserted_gb_per_s":0.3294,"hit_p50_us":190.6,"hit_p99_us":4549.7,"hit_p999_us":24230.4,"miss_p50_us":4064.4,"miss_p99_us":21697.4,"miss_p999_us":46551.1,"hits":54754,"misses":17555,"inserts":17555,"put_failures":0,"read_errors":0,"verified":855,"write_amp":1.004,"device_write_bytes":36956061696,"device_read_bytes":13769342976,"footprint_bytes":17159581696,"apparent_bytes":17191473152,"peak_rss_kib":3830148,"cgroup_mem_peak":4294967296,"cgroup_file_end":4171005952,"cgroup_anon_end":6578176,"warmup_s":112.980,"warmup_inserted_bytes":34359738368,"warmup_capped":false,"reopen_hit_ratio":0.721,"reopen_open_s":0.001,"data_area_bytes":17179873216,"cy_evictions":38,"cy_wraps":38,"cy_writes_dropped_by_lease":0,"cy_wraps_deferred_by_lease":0,"cy_tag_collision_evictions":1,"cy_entries":33088,"cy_readahead_hints":41277,"failed":false}
+rc=0 load-after: 1.31 1.76 1.54 1/733 88356
+=== 2026-09-23T07:24:01+02:00 lmdb zipf T=1 C=17179869184 s=120 --block-size 2097152 --max-warmup-seconds 1800
+load: 1.31 1.76 1.54 1/733 88362
+universe U = 24576 keys
+stream zipf t0: 7700/c2a3658d 13615/2358d785 15692/f5863216 4926/54e0669b 10997/c6add4fa 23573/677bbff9 23573/677bbff9 22519/01a05535 10549/d01ed625 16656/03258f4e 6506/1525ef69 3338/f3d62629
+stream zipf t1: 12554/1ecaeb65 13478/ec6073a9 22844/19799a46 7190/072f0877 16279/258fda28 8277/acdf06e1 5305/7df2fd1f 23573/677bbff9 14761/ef5e0531 12242/8c3cbd7d 9396/4f79cd21 7700/c2a3658d
+stream zipf+scan t0: 7700/c2a3658d 13615/2358d785 15692/f5863216 4926/54e0669b 10997/c6add4fa 23573/677bbff9 23573/677bbff9 1099511627776/6fdf167b 22519/01a05535 10549/d01ed625 16656/03258f4e 1099511627777/f11f5dc2
+stream zipf+scan t1: 12554/1ecaeb65 13478/ec6073a9 22844/19799a46 7190/072f0877 16279/258fda28 8277/acdf06e1 5305/7df2fd1f 23573/677bbff9 14761/ef5e0531 1103806595072/5cb8bfa5 1103806595073/dafeb106 1103806595074/bf4b5300
+kvchurn (kv-churn-spec v1)
+  store      : lmdb
+  os         : Linux 5.15.0-191-generic
+  cgroup     : /sys/fs/cgroup/system.slice/run-r8348ca70ee364e6e814a814ce1941b7c.scope memory.max=4294967296
+  load       :  07:24:01 up 13:42,  0 users,  load average: 1,31, 1,76, 1,54
+  pattern    : zipf, threads 1, block 2097152, capacity 17179869184, seconds 120
+  tuning     : LMDB LMDB 0.9.24: (July 24, 2019); map size 25769803776 B; env flags MDB_NOSYNC|MDB_NOMETASYNC|MDB_NOTLS (no fsync: page-cache durability only); get = per-thread RDONLY txn reset/renew + memcpy of the value into the staging buffer; put = one write txn: LRU victims mdb_del + mdb_put(MDB_RESERVE) + commit; eviction = in-memory LRU (volatile)
+  dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  warm-up: 102.3 s, inserted 34359738368 B
+{"store":"lmdb","bench":"churn","pattern":"zipf","block_size":2097152,"capacity":17179869184,"universe":24576,"threads":1,"seconds":120.00,"ops_per_s":926.69,"hit_ratio":0.8504,"served_gb_per_s":1.6527,"inserted_gb_per_s":0.2907,"hit_p50_us":177.7,"hit_p99_us":4123.7,"hit_p999_us":80816.3,"miss_p50_us":1630.8,"miss_p99_us":11320.0,"miss_p999_us":24536.1,"hits":88375,"misses":15545,"inserts":15545,"insert_raced":0,"put_failures":0,"map_full_puts":0,"verified":1380,"write_amp":1.004,"device_write_bytes":32731234304,"device_read_bytes":37403901952,"footprint_bytes":17218330624,"apparent_bytes":17218330752,"peak_rss_kib":3504212,"cgroup_mem_peak":4294967296,"cgroup_file_end":4187029504,"cgroup_anon_end":10510336,"warmup_s":102.348,"warmup_inserted_bytes":34359738368,"warmup_capped":false,"reopen_hit_ratio":0.847,"reopen_open_s":0.105,"reopen_rebuild_s":0.001,"lmdb_map_size":25769803776,"lmdb_writemap":false,"lmdb_high_water_bytes":17218314240,"lmdb_freelist_records":3,"lmdb_file_size":17218314240,"lmdb_entries":8191,"map_full":0,"lru_entries":8191,"lru_ram_bytes":1245032,"failed":false}
+rc=0 load-after: 1.36 1.56 1.51 1/735 88424
+=== 2026-09-23T07:27:49+02:00 filedir zipf T=1 C=17179869184 s=120 --block-size 2097152 --max-warmup-seconds 1800
+load: 1.36 1.56 1.51 1/735 88430
+universe U = 24576 keys
+stream zipf t0: 7700/c2a3658d 13615/2358d785 15692/f5863216 4926/54e0669b 10997/c6add4fa 23573/677bbff9 23573/677bbff9 22519/01a05535 10549/d01ed625 16656/03258f4e 6506/1525ef69 3338/f3d62629
+stream zipf t1: 12554/1ecaeb65 13478/ec6073a9 22844/19799a46 7190/072f0877 16279/258fda28 8277/acdf06e1 5305/7df2fd1f 23573/677bbff9 14761/ef5e0531 12242/8c3cbd7d 9396/4f79cd21 7700/c2a3658d
+stream zipf+scan t0: 7700/c2a3658d 13615/2358d785 15692/f5863216 4926/54e0669b 10997/c6add4fa 23573/677bbff9 23573/677bbff9 1099511627776/6fdf167b 22519/01a05535 10549/d01ed625 16656/03258f4e 1099511627777/f11f5dc2
+stream zipf+scan t1: 12554/1ecaeb65 13478/ec6073a9 22844/19799a46 7190/072f0877 16279/258fda28 8277/acdf06e1 5305/7df2fd1f 23573/677bbff9 14761/ef5e0531 1103806595072/5cb8bfa5 1103806595073/dafeb106 1103806595074/bf4b5300
+kvchurn (kv-churn-spec v1)
+  store      : filedir
+  os         : Linux 5.15.0-191-generic
+  cgroup     : /sys/fs/cgroup/system.slice/run-r0b8ea25349834529a459481376f82bcd.scope memory.max=4294967296
+  load       :  07:27:49 up 13:46,  0 users,  load average: 1,36, 1,56, 1,51
+  pattern    : zipf, threads 1, block 2097152, capacity 17179869184, seconds 120
+  tuning     : one file per block (hex digest), record = 64 B header + value; get = open + preadv(header, staging buffer) + close; put = open(tmp) + writev + close + rename, NO fsync; eviction = in-memory LRU, unlink() under the LRU lock
+  dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  warm-up: 99.2 s, inserted 34359738368 B
+{"store":"filedir","bench":"churn","pattern":"zipf","block_size":2097152,"capacity":17179869184,"universe":24576,"threads":1,"seconds":120.01,"ops_per_s":964.10,"hit_ratio":0.8505,"served_gb_per_s":1.7195,"inserted_gb_per_s":0.3024,"hit_p50_us":215.3,"hit_p99_us":14018.9,"hit_p999_us":40619.7,"miss_p50_us":1429.0,"miss_p99_us":6253.7,"miss_p999_us":6806.2,"hits":90514,"misses":15916,"inserts":15916,"insert_raced":0,"put_failures":0,"map_full_puts":0,"verified":1414,"write_amp":1.008,"device_write_bytes":33654173696,"device_read_bytes":31031681024,"footprint_bytes":17214488576,"apparent_bytes":17178296256,"peak_rss_kib":16364,"cgroup_mem_peak":4294967296,"cgroup_file_end":4204695552,"cgroup_anon_end":7544832,"warmup_s":99.231,"warmup_inserted_bytes":34359738368,"warmup_capped":false,"reopen_hit_ratio":0.848,"reopen_open_s":0.011,"reopen_rebuild_s":0.011,"lru_entries":8191,"lru_ram_bytes":1245032,"failed":false}
+rc=0 load-after: 1.70 1.60 1.54 2/732 88490
+=== 2026-09-23T07:31:34+02:00 cyclone zipf T=4 C=17179869184 s=120 --block-size 2097152 --max-warmup-seconds 1800
+load: 1.70 1.60 1.54 1/732 88496
+universe U = 24576 keys
+stream zipf t0: 7700/c2a3658d 13615/2358d785 15692/f5863216 4926/54e0669b 10997/c6add4fa 23573/677bbff9 23573/677bbff9 22519/01a05535 10549/d01ed625 16656/03258f4e 6506/1525ef69 3338/f3d62629
+stream zipf t1: 12554/1ecaeb65 13478/ec6073a9 22844/19799a46 7190/072f0877 16279/258fda28 8277/acdf06e1 5305/7df2fd1f 23573/677bbff9 14761/ef5e0531 12242/8c3cbd7d 9396/4f79cd21 7700/c2a3658d
+stream zipf+scan t0: 7700/c2a3658d 13615/2358d785 15692/f5863216 4926/54e0669b 10997/c6add4fa 23573/677bbff9 23573/677bbff9 1099511627776/6fdf167b 22519/01a05535 10549/d01ed625 16656/03258f4e 1099511627777/f11f5dc2
+stream zipf+scan t1: 12554/1ecaeb65 13478/ec6073a9 22844/19799a46 7190/072f0877 16279/258fda28 8277/acdf06e1 5305/7df2fd1f 23573/677bbff9 14761/ef5e0531 1103806595072/5cb8bfa5 1103806595073/dafeb106 1103806595074/bf4b5300
+Cyclone KV churn (kv-churn-spec v1)
+  cpu        :  Intel(R) Core(TM) i7-8750H CPU @ 2.20GHz
+  os         : Linux 5.15.0-191-generic
+  commit     : unknown
+  device     : nvme0n1p1
+  cgroup     : /sys/fs/cgroup/system.slice/run-r295af5900b6746818fa67a858d97f4f5.scope memory.max=4294967296
+  load       :  07:31:34 up 13:50,  0 users,  load average: 1,70, 1,60, 1,54
+  pattern    : zipf, threads 4, block 2097152, capacity 17179869184, seconds 120
+  dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+Cyclone tuning:
+  volume size             = 17191473152 B, 16 stripes, 724992 B mmap directory each (65536 entries/stripe)
+  usable data area        = 17179873216 B (1.0000 x C), ~511 blocks/stripe
+  mmap directory ON, checksum ON + verify on read, readahead default, max_object_size 0, ram_cache_size 0, sync_on_write false, hit tracking/optimization/dir sync off
+  eviction                = FIFO by stripe wrap (no app index)
+  warm-up: 86.2 s, inserted 34363932672 B
+{"store":"cyclone","bench":"churn","pattern":"zipf","block_size":2097152,"capacity":17179869184,"universe":24576,"threads":4,"seconds":120.03,"ops_per_s":885.74,"hit_ratio":0.7575,"served_gb_per_s":1.4070,"inserted_gb_per_s":0.4505,"hit_p50_us":359.8,"hit_p99_us":23812.5,"hit_p999_us":61614.3,"miss_p50_us":7456.8,"miss_p99_us":74378.4,"miss_p999_us":128923.4,"hits":77763,"misses":24899,"inserts":24899,"put_failures":0,"read_errors":0,"verified":1214,"write_amp":1.003,"device_write_bytes":52392087552,"device_read_bytes":19347824640,"footprint_bytes":17159577600,"apparent_bytes":17191473152,"peak_rss_kib":3702452,"cgroup_mem_peak":4294967296,"cgroup_file_end":4150931456,"cgroup_anon_end":20889600,"warmup_s":86.177,"warmup_inserted_bytes":34363932672,"warmup_capped":false,"reopen_hit_ratio":0.761,"reopen_open_s":0.001,"data_area_bytes":17179873216,"cy_evictions":50,"cy_wraps":50,"cy_writes_dropped_by_lease":0,"cy_wraps_deferred_by_lease":0,"cy_tag_collision_evictions":6,"cy_entries":38462,"cy_readahead_hints":46144,"failed":false}
+rc=0 load-after: 4.25 3.16 2.19 1/739 88583
+=== 2026-09-23T07:35:05+02:00 lmdb zipf T=4 C=17179869184 s=120 --block-size 2097152 --max-warmup-seconds 1800
+load: 4.25 3.16 2.19 1/739 88589
+universe U = 24576 keys
+stream zipf t0: 7700/c2a3658d 13615/2358d785 15692/f5863216 4926/54e0669b 10997/c6add4fa 23573/677bbff9 23573/677bbff9 22519/01a05535 10549/d01ed625 16656/03258f4e 6506/1525ef69 3338/f3d62629
+stream zipf t1: 12554/1ecaeb65 13478/ec6073a9 22844/19799a46 7190/072f0877 16279/258fda28 8277/acdf06e1 5305/7df2fd1f 23573/677bbff9 14761/ef5e0531 12242/8c3cbd7d 9396/4f79cd21 7700/c2a3658d
+stream zipf+scan t0: 7700/c2a3658d 13615/2358d785 15692/f5863216 4926/54e0669b 10997/c6add4fa 23573/677bbff9 23573/677bbff9 1099511627776/6fdf167b 22519/01a05535 10549/d01ed625 16656/03258f4e 1099511627777/f11f5dc2
+stream zipf+scan t1: 12554/1ecaeb65 13478/ec6073a9 22844/19799a46 7190/072f0877 16279/258fda28 8277/acdf06e1 5305/7df2fd1f 23573/677bbff9 14761/ef5e0531 1103806595072/5cb8bfa5 1103806595073/dafeb106 1103806595074/bf4b5300
+kvchurn (kv-churn-spec v1)
+  store      : lmdb
+  os         : Linux 5.15.0-191-generic
+  cgroup     : /sys/fs/cgroup/system.slice/run-r3195919a2b734a1caa87884fc1d84dc0.scope memory.max=4294967296
+  load       :  07:35:05 up 13:54,  0 users,  load average: 4,25, 3,16, 2,19
+  pattern    : zipf, threads 4, block 2097152, capacity 17179869184, seconds 120
+  tuning     : LMDB LMDB 0.9.24: (July 24, 2019); map size 25769803776 B; env flags MDB_NOSYNC|MDB_NOMETASYNC|MDB_NOTLS (no fsync: page-cache durability only); get = per-thread RDONLY txn reset/renew + memcpy of the value into the staging buffer; put = one write txn: LRU victims mdb_del + mdb_put(MDB_RESERVE) + commit; eviction = in-memory LRU (volatile)
+  dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  warm-up: 100.4 s, inserted 34363932672 B
+{"store":"lmdb","bench":"churn","pattern":"zipf","block_size":2097152,"capacity":17179869184,"universe":24576,"threads":4,"seconds":120.02,"ops_per_s":906.09,"hit_ratio":0.8494,"served_gb_per_s":1.6140,"inserted_gb_per_s":0.2862,"hit_p50_us":386.9,"hit_p99_us":83660.1,"hit_p999_us":153936.0,"miss_p50_us":5638.8,"miss_p99_us":44421.0,"miss_p999_us":98852.7,"hits":89739,"misses":15917,"inserts":15913,"insert_raced":4,"put_failures":0,"map_full_puts":0,"verified":1403,"write_amp":1.004,"device_write_bytes":33505505280,"device_read_bytes":39455920128,"footprint_bytes":17235202048,"apparent_bytes":17235202176,"peak_rss_kib":3739012,"cgroup_mem_peak":4294971392,"cgroup_file_end":4161929216,"cgroup_anon_end":31506432,"warmup_s":100.422,"warmup_inserted_bytes":34363932672,"warmup_capped":false,"reopen_hit_ratio":0.853,"reopen_open_s":0.118,"reopen_rebuild_s":0.001,"lmdb_map_size":25769803776,"lmdb_writemap":false,"lmdb_high_water_bytes":17235185664,"lmdb_freelist_records":11,"lmdb_file_size":17235185664,"lmdb_entries":8191,"map_full":0,"lru_entries":8191,"lru_ram_bytes":1245032,"failed":false}
+rc=0 load-after: 3.77 3.55 2.56 1/733 88704
+=== 2026-09-23T07:38:54+02:00 filedir zipf T=4 C=17179869184 s=120 --block-size 2097152 --max-warmup-seconds 1800
+load: 3.77 3.55 2.56 1/733 88710
+universe U = 24576 keys
+stream zipf t0: 7700/c2a3658d 13615/2358d785 15692/f5863216 4926/54e0669b 10997/c6add4fa 23573/677bbff9 23573/677bbff9 22519/01a05535 10549/d01ed625 16656/03258f4e 6506/1525ef69 3338/f3d62629
+stream zipf t1: 12554/1ecaeb65 13478/ec6073a9 22844/19799a46 7190/072f0877 16279/258fda28 8277/acdf06e1 5305/7df2fd1f 23573/677bbff9 14761/ef5e0531 12242/8c3cbd7d 9396/4f79cd21 7700/c2a3658d
+stream zipf+scan t0: 7700/c2a3658d 13615/2358d785 15692/f5863216 4926/54e0669b 10997/c6add4fa 23573/677bbff9 23573/677bbff9 1099511627776/6fdf167b 22519/01a05535 10549/d01ed625 16656/03258f4e 1099511627777/f11f5dc2
+stream zipf+scan t1: 12554/1ecaeb65 13478/ec6073a9 22844/19799a46 7190/072f0877 16279/258fda28 8277/acdf06e1 5305/7df2fd1f 23573/677bbff9 14761/ef5e0531 1103806595072/5cb8bfa5 1103806595073/dafeb106 1103806595074/bf4b5300
+kvchurn (kv-churn-spec v1)
+  store      : filedir
+  os         : Linux 5.15.0-191-generic
+  cgroup     : /sys/fs/cgroup/system.slice/run-r61307cb1cf9f43c5aa661aafc7a1fc5b.scope memory.max=4294967296
+  load       :  07:38:54 up 13:57,  0 users,  load average: 3,77, 3,55, 2,56
+  pattern    : zipf, threads 4, block 2097152, capacity 17179869184, seconds 120
+  tuning     : one file per block (hex digest), record = 64 B header + value; get = open + preadv(header, staging buffer) + close; put = open(tmp) + writev + close + rename, NO fsync; eviction = in-memory LRU, unlink() under the LRU lock
+  dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  warm-up: 100.3 s, inserted 34359738368 B
+{"store":"filedir","bench":"churn","pattern":"zipf","block_size":2097152,"capacity":17179869184,"universe":24576,"threads":4,"seconds":120.01,"ops_per_s":1029.60,"hit_ratio":0.8494,"served_gb_per_s":1.8341,"inserted_gb_per_s":0.3251,"hit_p50_us":486.7,"hit_p99_us":35177.9,"hit_p999_us":66914.0,"miss_p50_us":2819.0,"miss_p99_us":8753.2,"miss_p999_us":20742.4,"hits":100970,"misses":17899,"inserts":17898,"insert_raced":1,"put_failures":0,"map_full_puts":0,"verified":1578,"write_amp":1.008,"device_write_bytes":37817466880,"device_read_bytes":35568771072,"footprint_bytes":17214550016,"apparent_bytes":17178296256,"peak_rss_kib":29216,"cgroup_mem_peak":4295057408,"cgroup_file_end":4185882624,"cgroup_anon_end":20520960,"warmup_s":100.281,"warmup_inserted_bytes":34359738368,"warmup_capped":false,"reopen_hit_ratio":0.853,"reopen_open_s":0.011,"reopen_rebuild_s":0.011,"lru_entries":8191,"lru_ram_bytes":1245032,"failed":false}
+rc=0 load-after: 4.65 4.24 3.08 2/738 88787
+=== 2026-09-23T07:42:44+02:00 cyclone zipf+scan T=1 C=17179869184 s=120 --block-size 2097152 --max-warmup-seconds 1800
+load: 4.65 4.24 3.08 1/738 88793
+universe U = 24576 keys
+stream zipf t0: 7700/c2a3658d 13615/2358d785 15692/f5863216 4926/54e0669b 10997/c6add4fa 23573/677bbff9 23573/677bbff9 22519/01a05535 10549/d01ed625 16656/03258f4e 6506/1525ef69 3338/f3d62629
+stream zipf t1: 12554/1ecaeb65 13478/ec6073a9 22844/19799a46 7190/072f0877 16279/258fda28 8277/acdf06e1 5305/7df2fd1f 23573/677bbff9 14761/ef5e0531 12242/8c3cbd7d 9396/4f79cd21 7700/c2a3658d
+stream zipf+scan t0: 7700/c2a3658d 13615/2358d785 15692/f5863216 4926/54e0669b 10997/c6add4fa 23573/677bbff9 23573/677bbff9 1099511627776/6fdf167b 22519/01a05535 10549/d01ed625 16656/03258f4e 1099511627777/f11f5dc2
+stream zipf+scan t1: 12554/1ecaeb65 13478/ec6073a9 22844/19799a46 7190/072f0877 16279/258fda28 8277/acdf06e1 5305/7df2fd1f 23573/677bbff9 14761/ef5e0531 1103806595072/5cb8bfa5 1103806595073/dafeb106 1103806595074/bf4b5300
+Cyclone KV churn (kv-churn-spec v1)
+  cpu        :  Intel(R) Core(TM) i7-8750H CPU @ 2.20GHz
+  os         : Linux 5.15.0-191-generic
+  commit     : unknown
+  device     : nvme0n1p1
+  cgroup     : /sys/fs/cgroup/system.slice/run-r1d5a1a29d22140148a4b4d63696b48c4.scope memory.max=4294967296
+  load       :  07:42:44 up 14:01,  0 users,  load average: 4,65, 4,24, 3,08
+  pattern    : zipf+scan, threads 1, block 2097152, capacity 17179869184, seconds 120
+  dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+Cyclone tuning:
+  volume size             = 17191473152 B, 16 stripes, 724992 B mmap directory each (65536 entries/stripe)
+  usable data area        = 17179873216 B (1.0000 x C), ~511 blocks/stripe
+  mmap directory ON, checksum ON + verify on read, readahead default, max_object_size 0, ram_cache_size 0, sync_on_write false, hit tracking/optimization/dir sync off
+  eviction                = FIFO by stripe wrap (no app index)
+  warm-up: 105.8 s, inserted 34359738368 B
+{"store":"cyclone","bench":"churn","pattern":"zipf+scan","block_size":2097152,"capacity":17179869184,"universe":24576,"threads":1,"seconds":120.00,"ops_per_s":473.35,"hit_ratio":0.6380,"served_gb_per_s":0.6334,"inserted_gb_per_s":0.3593,"hit_p50_us":193.6,"hit_p99_us":6239.0,"hit_p999_us":28233.6,"miss_p50_us":3950.6,"miss_p99_us":22984.3,"miss_p999_us":46764.6,"hits":33573,"misses":19047,"inserts":19047,"put_failures":0,"read_errors":0,"verified":524,"write_amp":1.003,"device_write_bytes":40083210240,"device_read_bytes":7505715200,"footprint_bytes":17159585792,"apparent_bytes":17191473152,"peak_rss_kib":3660372,"cgroup_mem_peak":4294967296,"cgroup_file_end":4138737664,"cgroup_anon_end":6397952,"warmup_s":105.771,"warmup_inserted_bytes":34359738368,"warmup_capped":false,"reopen_hit_ratio":0.691,"reopen_open_s":0.001,"data_area_bytes":17179873216,"cy_evictions":40,"cy_wraps":40,"cy_writes_dropped_by_lease":0,"cy_wraps_deferred_by_lease":0,"cy_tag_collision_evictions":1,"cy_entries":34534,"cy_readahead_hints":25723,"failed":false}
+rc=0 load-after: 1.54 2.71 2.69 2/733 88857
+=== 2026-09-23T07:46:33+02:00 lmdb zipf+scan T=1 C=17179869184 s=120 --block-size 2097152 --max-warmup-seconds 1800
+load: 1.54 2.71 2.69 1/733 88863
+universe U = 24576 keys
+stream zipf t0: 7700/c2a3658d 13615/2358d785 15692/f5863216 4926/54e0669b 10997/c6add4fa 23573/677bbff9 23573/677bbff9 22519/01a05535 10549/d01ed625 16656/03258f4e 6506/1525ef69 3338/f3d62629
+stream zipf t1: 12554/1ecaeb65 13478/ec6073a9 22844/19799a46 7190/072f0877 16279/258fda28 8277/acdf06e1 5305/7df2fd1f 23573/677bbff9 14761/ef5e0531 12242/8c3cbd7d 9396/4f79cd21 7700/c2a3658d
+stream zipf+scan t0: 7700/c2a3658d 13615/2358d785 15692/f5863216 4926/54e0669b 10997/c6add4fa 23573/677bbff9 23573/677bbff9 1099511627776/6fdf167b 22519/01a05535 10549/d01ed625 16656/03258f4e 1099511627777/f11f5dc2
+stream zipf+scan t1: 12554/1ecaeb65 13478/ec6073a9 22844/19799a46 7190/072f0877 16279/258fda28 8277/acdf06e1 5305/7df2fd1f 23573/677bbff9 14761/ef5e0531 1103806595072/5cb8bfa5 1103806595073/dafeb106 1103806595074/bf4b5300
+kvchurn (kv-churn-spec v1)
+  store      : lmdb
+  os         : Linux 5.15.0-191-generic
+  cgroup     : /sys/fs/cgroup/system.slice/run-rd1553bad6dd245b4a4bd786c89f1d510.scope memory.max=4294967296
+  load       :  07:46:33 up 14:05,  0 users,  load average: 1,54, 2,71, 2,69
+  pattern    : zipf+scan, threads 1, block 2097152, capacity 17179869184, seconds 120
+  tuning     : LMDB LMDB 0.9.24: (July 24, 2019); map size 25769803776 B; env flags MDB_NOSYNC|MDB_NOMETASYNC|MDB_NOTLS (no fsync: page-cache durability only); get = per-thread RDONLY txn reset/renew + memcpy of the value into the staging buffer; put = one write txn: LRU victims mdb_del + mdb_put(MDB_RESERVE) + commit; eviction = in-memory LRU (volatile)
+  dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  warm-up: 94.5 s, inserted 34359738368 B
+{"store":"lmdb","bench":"churn","pattern":"zipf+scan","block_size":2097152,"capacity":17179869184,"universe":24576,"threads":1,"seconds":120.02,"ops_per_s":651.09,"hit_ratio":0.7271,"served_gb_per_s":0.9928,"inserted_gb_per_s":0.3726,"hit_p50_us":184.1,"hit_p99_us":29802.9,"hit_p999_us":113901.3,"miss_p50_us":1573.4,"miss_p99_us":17033.9,"miss_p999_us":51845.9,"hits":51912,"misses":19485,"inserts":19485,"insert_raced":0,"put_failures":0,"map_full_puts":0,"verified":811,"write_amp":1.003,"device_write_bytes":40996438016,"device_read_bytes":18433458176,"footprint_bytes":17218334720,"apparent_bytes":17218334848,"peak_rss_kib":3425472,"cgroup_mem_peak":4294967296,"cgroup_file_end":4173205504,"cgroup_anon_end":10063872,"warmup_s":94.481,"warmup_inserted_bytes":34359738368,"warmup_capped":false,"reopen_hit_ratio":0.804,"reopen_open_s":0.111,"reopen_rebuild_s":0.002,"lmdb_map_size":25769803776,"lmdb_writemap":false,"lmdb_high_water_bytes":17218318336,"lmdb_freelist_records":3,"lmdb_file_size":17218318336,"lmdb_entries":8191,"map_full":0,"lru_entries":8191,"lru_ram_bytes":1245032,"failed":false}
+rc=0 load-after: 1.52 2.12 2.46 1/737 88928
+=== 2026-09-23T07:50:13+02:00 filedir zipf+scan T=1 C=17179869184 s=120 --block-size 2097152 --max-warmup-seconds 1800
+load: 1.52 2.12 2.46 1/737 88934
+universe U = 24576 keys
+stream zipf t0: 7700/c2a3658d 13615/2358d785 15692/f5863216 4926/54e0669b 10997/c6add4fa 23573/677bbff9 23573/677bbff9 22519/01a05535 10549/d01ed625 16656/03258f4e 6506/1525ef69 3338/f3d62629
+stream zipf t1: 12554/1ecaeb65 13478/ec6073a9 22844/19799a46 7190/072f0877 16279/258fda28 8277/acdf06e1 5305/7df2fd1f 23573/677bbff9 14761/ef5e0531 12242/8c3cbd7d 9396/4f79cd21 7700/c2a3658d
+stream zipf+scan t0: 7700/c2a3658d 13615/2358d785 15692/f5863216 4926/54e0669b 10997/c6add4fa 23573/677bbff9 23573/677bbff9 1099511627776/6fdf167b 22519/01a05535 10549/d01ed625 16656/03258f4e 1099511627777/f11f5dc2
+stream zipf+scan t1: 12554/1ecaeb65 13478/ec6073a9 22844/19799a46 7190/072f0877 16279/258fda28 8277/acdf06e1 5305/7df2fd1f 23573/677bbff9 14761/ef5e0531 1103806595072/5cb8bfa5 1103806595073/dafeb106 1103806595074/bf4b5300
+kvchurn (kv-churn-spec v1)
+  store      : filedir
+  os         : Linux 5.15.0-191-generic
+  cgroup     : /sys/fs/cgroup/system.slice/run-r4aa6507a24dd4a2ca37ee14cedaca4d3.scope memory.max=4294967296
+  load       :  07:50:13 up 14:09,  0 users,  load average: 1,52, 2,12, 2,46
+  pattern    : zipf+scan, threads 1, block 2097152, capacity 17179869184, seconds 120
+  tuning     : one file per block (hex digest), record = 64 B header + value; get = open + preadv(header, staging buffer) + close; put = open(tmp) + writev + close + rename, NO fsync; eviction = in-memory LRU, unlink() under the LRU lock
+  dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  warm-up: 91.4 s, inserted 34359738368 B
+{"store":"filedir","bench":"churn","pattern":"zipf+scan","block_size":2097152,"capacity":17179869184,"universe":24576,"threads":1,"seconds":120.00,"ops_per_s":710.28,"hit_ratio":0.7267,"served_gb_per_s":1.0825,"inserted_gb_per_s":0.4071,"hit_p50_us":233.5,"hit_p99_us":19830.3,"hit_p999_us":59515.7,"miss_p50_us":1437.4,"miss_p99_us":6252.6,"miss_p999_us":7064.6,"hits":55505,"misses":20875,"inserts":20875,"insert_raced":0,"put_failures":0,"map_full_puts":0,"verified":867,"write_amp":1.007,"device_write_bytes":44072202240,"device_read_bytes":14852710400,"footprint_bytes":17213923328,"apparent_bytes":17178296256,"peak_rss_kib":16048,"cgroup_mem_peak":4294971392,"cgroup_file_end":4180697088,"cgroup_anon_end":7069696,"warmup_s":91.396,"warmup_inserted_bytes":34359738368,"warmup_capped":false,"reopen_hit_ratio":0.804,"reopen_open_s":0.012,"reopen_rebuild_s":0.012,"lru_entries":8191,"lru_ram_bytes":1245032,"failed":false}
+rc=0 load-after: 1.43 1.82 2.26 2/734 89007
+=== 2026-09-23T07:53:51+02:00 cyclone zipf+scan T=4 C=17179869184 s=120 --block-size 2097152 --max-warmup-seconds 1800
+load: 1.43 1.82 2.26 2/734 89013
+universe U = 24576 keys
+stream zipf t0: 7700/c2a3658d 13615/2358d785 15692/f5863216 4926/54e0669b 10997/c6add4fa 23573/677bbff9 23573/677bbff9 22519/01a05535 10549/d01ed625 16656/03258f4e 6506/1525ef69 3338/f3d62629
+stream zipf t1: 12554/1ecaeb65 13478/ec6073a9 22844/19799a46 7190/072f0877 16279/258fda28 8277/acdf06e1 5305/7df2fd1f 23573/677bbff9 14761/ef5e0531 12242/8c3cbd7d 9396/4f79cd21 7700/c2a3658d
+stream zipf+scan t0: 7700/c2a3658d 13615/2358d785 15692/f5863216 4926/54e0669b 10997/c6add4fa 23573/677bbff9 23573/677bbff9 1099511627776/6fdf167b 22519/01a05535 10549/d01ed625 16656/03258f4e 1099511627777/f11f5dc2
+stream zipf+scan t1: 12554/1ecaeb65 13478/ec6073a9 22844/19799a46 7190/072f0877 16279/258fda28 8277/acdf06e1 5305/7df2fd1f 23573/677bbff9 14761/ef5e0531 1103806595072/5cb8bfa5 1103806595073/dafeb106 1103806595074/bf4b5300
+Cyclone KV churn (kv-churn-spec v1)
+  cpu        :  Intel(R) Core(TM) i7-8750H CPU @ 2.20GHz
+  os         : Linux 5.15.0-191-generic
+  commit     : unknown
+  device     : nvme0n1p1
+  cgroup     : /sys/fs/cgroup/system.slice/run-r8edf3e99071a48b1b6a9e52d38082f46.scope memory.max=4294967296
+  load       :  07:53:51 up 14:12,  0 users,  load average: 1,43, 1,82, 2,26
+  pattern    : zipf+scan, threads 4, block 2097152, capacity 17179869184, seconds 120
+  dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+Cyclone tuning:
+  volume size             = 17191473152 B, 16 stripes, 724992 B mmap directory each (65536 entries/stripe)
+  usable data area        = 17179873216 B (1.0000 x C), ~511 blocks/stripe
+  mmap directory ON, checksum ON + verify on read, readahead default, max_object_size 0, ram_cache_size 0, sync_on_write false, hit tracking/optimization/dir sync off
+  eviction                = FIFO by stripe wrap (no app index)
+  warm-up: 73.6 s, inserted 34366029824 B
+{"store":"cyclone","bench":"churn","pattern":"zipf+scan","block_size":2097152,"capacity":17179869184,"universe":24576,"threads":4,"seconds":120.01,"ops_per_s":744.15,"hit_ratio":0.6416,"served_gb_per_s":1.0013,"inserted_gb_per_s":0.5593,"hit_p50_us":354.0,"hit_p99_us":18661.5,"hit_p999_us":51181.3,"miss_p50_us":6773.9,"miss_p99_us":69121.4,"miss_p999_us":101756.4,"hits":55088,"misses":30772,"inserts":30772,"put_failures":0,"read_errors":0,"verified":860,"write_amp":1.003,"device_write_bytes":64739274752,"device_read_bytes":12245086208,"footprint_bytes":17159577600,"apparent_bytes":17191473152,"peak_rss_kib":3511636,"cgroup_mem_peak":4294967296,"cgroup_file_end":4121858048,"cgroup_anon_end":20447232,"warmup_s":73.572,"warmup_inserted_bytes":34366029824,"warmup_capped":false,"reopen_hit_ratio":0.759,"reopen_open_s":0.015,"data_area_bytes":17179873216,"cy_evictions":59,"cy_wraps":59,"cy_writes_dropped_by_lease":0,"cy_wraps_deferred_by_lease":0,"cy_tag_collision_evictions":7,"cy_entries":44133,"cy_readahead_hints":30101,"failed":false}
+rc=0 load-after: 4.03 3.08 2.69 1/740 89083
+=== 2026-09-23T07:57:09+02:00 lmdb zipf+scan T=4 C=17179869184 s=120 --block-size 2097152 --max-warmup-seconds 1800
+load: 4.03 3.08 2.69 1/740 89089
+universe U = 24576 keys
+stream zipf t0: 7700/c2a3658d 13615/2358d785 15692/f5863216 4926/54e0669b 10997/c6add4fa 23573/677bbff9 23573/677bbff9 22519/01a05535 10549/d01ed625 16656/03258f4e 6506/1525ef69 3338/f3d62629
+stream zipf t1: 12554/1ecaeb65 13478/ec6073a9 22844/19799a46 7190/072f0877 16279/258fda28 8277/acdf06e1 5305/7df2fd1f 23573/677bbff9 14761/ef5e0531 12242/8c3cbd7d 9396/4f79cd21 7700/c2a3658d
+stream zipf+scan t0: 7700/c2a3658d 13615/2358d785 15692/f5863216 4926/54e0669b 10997/c6add4fa 23573/677bbff9 23573/677bbff9 1099511627776/6fdf167b 22519/01a05535 10549/d01ed625 16656/03258f4e 1099511627777/f11f5dc2
+stream zipf+scan t1: 12554/1ecaeb65 13478/ec6073a9 22844/19799a46 7190/072f0877 16279/258fda28 8277/acdf06e1 5305/7df2fd1f 23573/677bbff9 14761/ef5e0531 1103806595072/5cb8bfa5 1103806595073/dafeb106 1103806595074/bf4b5300
+kvchurn (kv-churn-spec v1)
+  store      : lmdb
+  os         : Linux 5.15.0-191-generic
+  cgroup     : /sys/fs/cgroup/system.slice/run-racec2034bac240c7a256cf7a001ecece.scope memory.max=4294967296
+  load       :  07:57:09 up 14:16,  0 users,  load average: 4,03, 3,08, 2,69
+  pattern    : zipf+scan, threads 4, block 2097152, capacity 17179869184, seconds 120
+  tuning     : LMDB LMDB 0.9.24: (July 24, 2019); map size 25769803776 B; env flags MDB_NOSYNC|MDB_NOMETASYNC|MDB_NOTLS (no fsync: page-cache durability only); get = per-thread RDONLY txn reset/renew + memcpy of the value into the staging buffer; put = one write txn: LRU victims mdb_del + mdb_put(MDB_RESERVE) + commit; eviction = in-memory LRU (volatile)
+  dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  warm-up: 91.6 s, inserted 34366029824 B
+{"store":"lmdb","bench":"churn","pattern":"zipf+scan","block_size":2097152,"capacity":17179869184,"universe":24576,"threads":4,"seconds":120.03,"ops_per_s":646.38,"hit_ratio":0.7262,"served_gb_per_s":0.9844,"inserted_gb_per_s":0.3712,"hit_p50_us":341.7,"hit_p99_us":73066.2,"hit_p999_us":161182.8,"miss_p50_us":8497.4,"miss_p99_us":68670.4,"miss_p999_us":135393.2,"hits":54059,"misses":20384,"inserts":20383,"insert_raced":1,"put_failures":0,"map_full_puts":0,"verified":845,"write_amp":1.003,"device_write_bytes":42894893056,"device_read_bytes":20847833088,"footprint_bytes":17241747456,"apparent_bytes":17241747584,"peak_rss_kib":3712008,"cgroup_mem_peak":4294967296,"cgroup_file_end":4145790976,"cgroup_anon_end":30642176,"warmup_s":91.608,"warmup_inserted_bytes":34366029824,"warmup_capped":false,"reopen_hit_ratio":0.810,"reopen_open_s":0.093,"reopen_rebuild_s":0.001,"lmdb_map_size":25769803776,"lmdb_writemap":false,"lmdb_high_water_bytes":17241731072,"lmdb_freelist_records":14,"lmdb_file_size":17241731072,"lmdb_entries":8191,"map_full":0,"lru_entries":8191,"lru_ram_bytes":1245032,"failed":false}
+rc=0 load-after: 2.65 2.94 2.73 2/734 89158
+=== 2026-09-23T08:00:47+02:00 filedir zipf+scan T=4 C=17179869184 s=120 --block-size 2097152 --max-warmup-seconds 1800
+load: 2.65 2.94 2.73 1/734 89164
+universe U = 24576 keys
+stream zipf t0: 7700/c2a3658d 13615/2358d785 15692/f5863216 4926/54e0669b 10997/c6add4fa 23573/677bbff9 23573/677bbff9 22519/01a05535 10549/d01ed625 16656/03258f4e 6506/1525ef69 3338/f3d62629
+stream zipf t1: 12554/1ecaeb65 13478/ec6073a9 22844/19799a46 7190/072f0877 16279/258fda28 8277/acdf06e1 5305/7df2fd1f 23573/677bbff9 14761/ef5e0531 12242/8c3cbd7d 9396/4f79cd21 7700/c2a3658d
+stream zipf+scan t0: 7700/c2a3658d 13615/2358d785 15692/f5863216 4926/54e0669b 10997/c6add4fa 23573/677bbff9 23573/677bbff9 1099511627776/6fdf167b 22519/01a05535 10549/d01ed625 16656/03258f4e 1099511627777/f11f5dc2
+stream zipf+scan t1: 12554/1ecaeb65 13478/ec6073a9 22844/19799a46 7190/072f0877 16279/258fda28 8277/acdf06e1 5305/7df2fd1f 23573/677bbff9 14761/ef5e0531 1103806595072/5cb8bfa5 1103806595073/dafeb106 1103806595074/bf4b5300
+kvchurn (kv-churn-spec v1)
+  store      : filedir
+  os         : Linux 5.15.0-191-generic
+  cgroup     : /sys/fs/cgroup/system.slice/run-rbcc62b3caeb540f3989c53280b81fab2.scope memory.max=4294967296
+  load       :  08:00:47 up 14:19,  0 users,  load average: 2,65, 2,94, 2,73
+  pattern    : zipf+scan, threads 4, block 2097152, capacity 17179869184, seconds 120
+  tuning     : one file per block (hex digest), record = 64 B header + value; get = open + preadv(header, staging buffer) + close; put = open(tmp) + writev + close + rename, NO fsync; eviction = in-memory LRU, unlink() under the LRU lock
+  dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  warm-up: 77.2 s, inserted 34363932672 B
+{"store":"filedir","bench":"churn","pattern":"zipf+scan","block_size":2097152,"capacity":17179869184,"universe":24576,"threads":4,"seconds":120.03,"ops_per_s":771.71,"hit_ratio":0.7263,"served_gb_per_s":1.1755,"inserted_gb_per_s":0.4429,"hit_p50_us":454.9,"hit_p99_us":36953.9,"hit_p999_us":78232.2,"miss_p50_us":3396.1,"miss_p99_us":66227.1,"miss_p999_us":207444.8,"hits":64058,"misses":24139,"inserts":24138,"insert_raced":1,"put_failures":0,"map_full_puts":0,"verified":1001,"write_amp":1.006,"device_write_bytes":50944282624,"device_read_bytes":18201313280,"footprint_bytes":17214095360,"apparent_bytes":17178296256,"peak_rss_kib":28468,"cgroup_mem_peak":4294967296,"cgroup_file_end":4165804032,"cgroup_anon_end":20127744,"warmup_s":77.167,"warmup_inserted_bytes":34363932672,"warmup_capped":false,"reopen_hit_ratio":0.806,"reopen_open_s":0.011,"reopen_rebuild_s":0.011,"lru_entries":8191,"lru_ram_bytes":1245032,"failed":false}
+rc=0 load-after: 4.58 3.86 3.15 2/740 89238
