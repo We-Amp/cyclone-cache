@@ -19,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <thread>
@@ -212,6 +213,12 @@ TEST_CASE("FastDivU64 matches hardware division for every divisor in use",
       const uint64_t n = (i % 2 == 0) ? x : x >> (x & 63U);
       CAPTURE(n);
       REQUIRE(div.quot(n) == n / d);
+#if defined(__SIZEOF_INT128__)
+      // The 32-bit-target fallback agrees with the 128-bit product.
+      __extension__ using U128 = unsigned __int128;
+      REQUIRE(cyclone::FastDivU64::mulhi_portable(n, d) ==
+              static_cast<uint64_t>((static_cast<U128>(n) * d) >> 64U));
+#endif
     }
   }
 }
@@ -768,7 +775,7 @@ struct RetentionVolume {
     }
     return std::move(*r);
   }
-  bool serves(uint64_t pass, uint64_t index) const {
+  [[nodiscard]] bool serves(uint64_t pass, uint64_t index) const {
     auto r = read(pass, index);
     return r.has_value() &&
            content_equals(r->content(), doc_content(pass, index));
@@ -1114,13 +1121,16 @@ TEST_CASE(
 }
 
 // ---------------------------------------------------------------------------
-// Test 6 -- per-chunk gating, including a forced advance: kTorn only for
-// borrows in the chunks the advance exposed; borrows elsewhere stay kOk.
+// Test 6 -- per-chunk gating, including a forced advance.  The force
+// exposes only the chunk it crosses (h2's bytes stay intact), but it resets
+// EVERY chunk's borrow slot, so every borrow it uncounted -- h2 included --
+// learns kTorn at once (review R2): nothing would defer the later advance
+// over h2's chunk any more.
 // ---------------------------------------------------------------------------
 
 TEST_CASE(
-    "Retention 6: per-chunk gating -- a forced advance tears only the "
-    "borrows in the chunks it exposes",
+    "Retention 6: per-chunk gating -- a forced advance exposes only its "
+    "chunk, and every borrow it uncounted learns kTorn",
     "[retention][lease]") {
   RetentionVolume v("ret6", true, std::chrono::milliseconds(600000),
                     std::chrono::milliseconds(300));
@@ -1148,11 +1158,18 @@ TEST_CASE(
   REQUIRE(v.cache->stats().wraps_forced_past_lease == 1);
   REQUIRE(h1->renew_lease_strict() == LeaseRenewal::kTorn);
   REQUIRE_FALSE(h1->renew_lease());
-  REQUIRE(h2->renew_lease_strict() == LeaseRenewal::kOk);  // chunk 8: intact
+  // Chunk 8 is not exposed: h2's bytes are intact and G alone would still
+  // say kOk.  But the force reset every chunk's slot (h2's count included),
+  // so h2 is no longer protected and must stop aliasing now.
   REQUIRE(content_equals(h2->content(), doc_content(0, c2 * v.per_chunk + 4)));
-  // The force reset every chunk's slot (h2's count included: a hold longer
-  // than the ceiling is unprotected, as documented).
+  REQUIRE(h2->renew_lease_strict() == LeaseRenewal::kTorn);
+  REQUIRE_FALSE(h2->renew_lease());
   REQUIRE(v.cache->stats().borrows_outstanding == 0);
+  // A fresh read of the same document is a new, counted borrow: kOk.
+  auto h3 = v.read(0, c2 * v.per_chunk + 4);
+  REQUIRE(h3.has_value());
+  REQUIRE(h3->renew_lease_strict() == LeaseRenewal::kOk);
+  h3.reset();
   h1.reset();
   h2.reset();
   v.cache->stop();
@@ -2114,4 +2131,494 @@ TEST_CASE(
   REQUIRE(result.served > 0);
   reader->stop();
   writer->stop();
+}
+
+// ---------------------------------------------------------------------------
+// Independent-review reproductions (R1-R3, and two guards that passed).
+// Each case reads the mode from the (env-overridable) config default, so a
+// run of the suite in each mode covers both; mode-specific cases SKIP in the
+// other mode.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::vector<std::byte> rv_fill(size_t tag, size_t n) {
+  std::vector<std::byte> v(n);
+  for (size_t j = 0; j < n; ++j)
+    v[j] = static_cast<std::byte>((tag * 131 + j * 7) & 0xFF);
+  return v;
+}
+bool rv_eq(std::span<const std::byte> a, std::span<const std::byte> b) {
+  return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size()) == 0;
+}
+bool rv_put(Cache &c, const std::string &k, std::span<const std::byte> v) {
+  auto wh = c.write_sync(CacheKey(k), v.size());
+  if (!wh) return false;
+  if (!wh->write_sync(v)) return false;
+  return wh->close_sync().has_value();
+}
+bool rv_put_alt(Cache &c, const std::string &k, AlternateId id,
+                std::span<const std::byte> v) {
+  auto wh = c.write_alternate_sync(CacheKey(k), id, v.size());
+  if (!wh) return false;
+  if (!wh->write_sync(v)) return false;
+  return wh->close_sync().has_value();
+}
+std::set<int> rv_ids(Cache &c, const std::string &k) {
+  std::set<int> s;
+  auto l = c.list_alternates_sync(CacheKey(k));
+  if (!l) return s;
+  for (auto &a : *l) s.insert(static_cast<int>(a.id));
+  return s;
+}
+bool rv_serves_alt(Cache &c, const std::string &k, AlternateId id,
+                   std::span<const std::byte> want) {
+  DefaultStorageSelector sel;
+  std::array<AlternateId, 1> acc{id};
+  AlternateSelectionContext ctx;
+  ctx.acceptable_alternates = acc;
+  auto r = c.read_alternate_sync(CacheKey(k), sel, ctx);
+  return r.has_value() && rv_eq(r->content(), want);
+}
+
+constexpr size_t kRvVol = size_t{16} * 1024 * 1024;  // one stripe
+
+std::unique_ptr<Cache> rv_open(const std::string &path, bool mp,
+                               std::chrono::milliseconds lease,
+                               std::chrono::milliseconds ceiling) {
+  CacheConfig cfg;
+  if (mp) cfg.set_multi_process(0, 1);
+  cfg.set_ram_cache_size(0);
+  cfg.read_lease_duration = lease;
+  cfg.lease_wrap_ceiling = ceiling;
+  auto c = Cache::create(cfg);
+  REQUIRE(c.has_value());
+  REQUIRE((*c)->add_volume(path, kRvVol).has_value());
+  REQUIRE((*c)->start().has_value());
+  return std::move(*c);
+}
+
+}  // namespace
+
+// PageSpeed shape: Original first, then optimized alternates written later
+// by the optimization engine, re-recorded, one removed, interleaved with
+// unrelated traffic.  Must survive everything short of the frontier
+// reaching it.  Run in both modes (CYCLONE_TEST_WRAP_RETENTION).
+TEST_CASE(
+    "Retention review: a PageSpeed-style alternate chain across churn and "
+    "one wrap",
+    "[retention][review][alternate]") {
+  for (bool mp : {false, true}) {
+    CAPTURE(mp);
+    TempCacheDir tmp(mp ? "rv-alt-mp" : "rv-alt");
+    auto c = rv_open(tmp.path(), mp, std::chrono::milliseconds(2000),
+                     std::chrono::milliseconds(200));
+    const bool retain = CacheConfig{}.wrap_retention;
+    REQUIRE(c->stats().stripe_count == 1);
+    const std::string K = "http://example.com/app.js";
+    auto orig = rv_fill(1, 30000);
+    auto gz = rv_fill(2, 9000);
+    auto br = rv_fill(3, 8000);
+    auto webp = rv_fill(4, 7000);
+    // Fillers early in the pass so K lands mid-stripe.
+    size_t fi = 0;
+    auto filler = rv_fill(99, 60000);
+    for (int i = 0; i < 20; ++i)
+      REQUIRE(rv_put(*c, "f" + std::to_string(fi++), filler));
+    REQUIRE(rv_put_alt(*c, K, AlternateId::Original, orig));
+    for (int i = 0; i < 5; ++i)
+      REQUIRE(rv_put(*c, "f" + std::to_string(fi++), filler));
+    REQUIRE(rv_put_alt(*c, K, AlternateId::Gzip, gz));
+    REQUIRE(rv_put_alt(*c, K, AlternateId::Brotli, br));
+    for (int i = 0; i < 5; ++i)
+      REQUIRE(rv_put(*c, "f" + std::to_string(fi++), filler));
+    REQUIRE(rv_put_alt(*c, K, AlternateId::WebP, webp));
+    // Re-record Gzip twice (supersede mid-chain), Original once (tail node).
+    auto gz2 = rv_fill(5, 9100);
+    REQUIRE(rv_put_alt(*c, K, AlternateId::Gzip, gz2));
+    auto gz3 = rv_fill(6, 9200);
+    REQUIRE(rv_put_alt(*c, K, AlternateId::Gzip, gz3));
+    auto orig2 = rv_fill(7, 30100);
+    REQUIRE(rv_put_alt(*c, K, AlternateId::Original, orig2));
+    REQUIRE(rv_ids(*c, K) == std::set<int>{0, 1, 3, 16});
+    REQUIRE(rv_serves_alt(*c, K, AlternateId::Original, orig2));
+    REQUIRE(rv_serves_alt(*c, K, AlternateId::Gzip, gz3));
+    REQUIRE(rv_serves_alt(*c, K, AlternateId::Brotli, br));
+    REQUIRE(rv_serves_alt(*c, K, AlternateId::WebP, webp));
+    REQUIRE(
+        c->remove_alternate_sync(CacheKey(K), AlternateId::Brotli).has_value());
+    REQUIRE(rv_ids(*c, K) == std::set<int>{0, 3, 16});
+    REQUIRE(rv_serves_alt(*c, K, AlternateId::Original, orig2));
+    const auto chain_depth = c->stats().alternate_max_chain_depth;
+    CAPTURE(chain_depth);
+
+    // Churn until exactly one wrap has happened and a bit more.
+    const uint64_t w0 = c->stats().write_buffer_wraps;
+    while (c->stats().write_buffer_wraps == w0) {
+      REQUIRE(rv_put(*c, "f" + std::to_string(fi++), filler));
+    }
+    for (int i = 0; i < 3; ++i)
+      (void)rv_put(*c, "g" + std::to_string(i), filler);
+    if (retain) {
+      // Retained: the whole chain must still resolve past its head.
+      CHECK(rv_ids(*c, K) == std::set<int>{0, 3, 16});
+      CHECK(rv_serves_alt(*c, K, AlternateId::Original, orig2));
+      CHECK(rv_serves_alt(*c, K, AlternateId::Gzip, gz3));
+      CHECK(rv_serves_alt(*c, K, AlternateId::WebP, webp));
+      // Optimization engine records a NEW alternate onto the retained key.
+      auto avif = rv_fill(8, 5000);
+      REQUIRE(rv_put_alt(*c, K, AlternateId::AVIF, avif));
+      const auto after = rv_ids(*c, K);
+      // D5: retained heads are never linked, so Original/Gzip/WebP stop
+      // resolving here (review R4, a recorded open item in the design doc,
+      // section 14).  Pinned as the CURRENT behaviour: a fix for R4 must
+      // update this expectation deliberately.
+      CHECK(after == std::set<int>{static_cast<int>(AlternateId::AVIF)});
+      CHECK(c->stats().alternate_wrap_refusals >= 1);
+      CHECK(rv_serves_alt(*c, K, AlternateId::AVIF, avif));
+    } else {
+      CHECK(rv_ids(*c, K).empty());  // flush: the whole pass is gone
+    }
+    c->stop();
+  }
+}
+
+// Retention: a borrow of a RETAINED document in the last chunk, held while
+// pass 1 fills (and advances, mandatory + early) through every lower chunk.
+// Strict renew must stay kOk and the bytes intact; the advance into its own
+// chunk must defer (not force) while the lease is live; closing unblocks.
+TEST_CASE(
+    "Retention review: a retained borrow in the last chunk survives every "
+    "lower advance with kOk",
+    "[retention][review][lease]") {
+  if (!CacheConfig{}.wrap_retention) {
+    SKIP("retention mode only");
+  }
+  for (bool mp : {false, true}) {
+    CAPTURE(mp);
+    TempCacheDir tmp(mp ? "rv-bor-mp" : "rv-bor");
+    auto c = rv_open(tmp.path(), mp, std::chrono::milliseconds(600000),
+                     std::chrono::milliseconds(600000));
+    REQUIRE(c->stats().stripe_count == 1);
+    constexpr size_t kContent = size_t{64} * 1024 - 132;
+    // Pass 0: fill until the next write would wrap.
+    std::vector<std::string> keys;
+    size_t i = 0;
+    for (;;) {
+      const auto st = c->stats();
+      if (st.current_bytes + (kContent + 132 + 7) / 8 * 8 > st.stripe_bytes)
+        break;
+      keys.push_back("p0-" + std::to_string(i));
+      REQUIRE(rv_put(*c, keys.back(), rv_fill(i, kContent)));
+      ++i;
+    }
+    REQUIRE(c->stats().write_buffer_wraps == 0);
+    // Last document of pass 0: in the last chunk.
+    const size_t held_idx = keys.size() - 1;
+    auto h = c->read_sync(CacheKey(keys[held_idx]));
+    REQUIRE(h.has_value());
+    REQUIRE(h->renew_lease_strict() == LeaseRenewal::kOk);
+    // A second borrow in the second-to-last chunk region, released early.
+    const auto adv0 = c->stats().frontier_advances;
+    size_t j = 0;
+    size_t renews = 0;
+    bool dropped = false;
+    for (; j < keys.size() * 2; ++j) {
+      if (!rv_put(*c, "p1-" + std::to_string(j),
+                  rv_fill(10000 + j, kContent))) {
+        dropped = true;
+        break;
+      }
+      REQUIRE(h->renew_lease_strict() == LeaseRenewal::kOk);
+      REQUIRE(h->renew_lease());
+      REQUIRE(rv_eq(h->content(), rv_fill(held_idx, kContent)));
+      ++renews;
+    }
+    const auto st = c->stats();
+    CAPTURE(j, renews, st.frontier_advances - adv0, st.early_advances_skipped,
+            st.advances_deferred_by_lease, st.wraps_forced_past_lease);
+    REQUIRE(dropped);
+    REQUIRE(st.write_buffer_wraps == 1);
+    REQUIRE(st.frontier_advances - adv0 >= 2);
+    REQUIRE(st.wraps_forced_past_lease == 0);
+    REQUIRE(st.advances_deferred_by_lease >= 1);
+    // Still readable, served from the retained pass.
+    auto again = c->read_sync(CacheKey(keys[held_idx]));
+    REQUIRE(again.has_value());
+    REQUIRE(rv_eq(again->content(), rv_fill(held_idx, kContent)));
+    again = make_unexpected(CacheError::NotFound);
+    h = make_unexpected(CacheError::NotFound);  // close
+    REQUIRE(rv_put(*c, "after-close", rv_fill(1, kContent)));
+    c->stop();
+  }
+}
+
+// Retention, multi-process: a writer that dies at kWrapAfterCursor (shared W
+// already lowered to S, G not yet bumped).  The next writer force-releases
+// the lock and repairs the intent -- and then writes at S in the SAME pass,
+// over current-class documents.  A live, lease-protected borrow of the
+// document at S must see a torn verdict (or keep intact bytes); it must
+// never read kOk over overwritten bytes.
+TEST_CASE(
+    "Retention review R1: a writer crash at kWrapAfterCursor, then a "
+    "forced-release repair, never tears a live borrow silently",
+    "[retention][review][crash][multiprocess]") {
+  if (!CacheConfig{}.wrap_retention) {
+    SKIP("retention mode only (flush wraps are gated before the W publish)");
+  }
+  constexpr size_t kPeerVol = size_t{4} * 1024 * 1024;
+  constexpr size_t kPeerContent = size_t{64} * 1024 - 132;
+  TempCacheDir tmp("rv-crash");
+  const std::string path = tmp.path();
+  CacheConfig cfg;
+  cfg.set_multi_process(0, 1);
+  cfg.set_ram_cache_size(0);
+  cfg.read_lease_duration = std::chrono::milliseconds(600000);
+  cfg.lease_wrap_ceiling = std::chrono::milliseconds(600000);
+  auto created = Cache::create(cfg);
+  REQUIRE(created.has_value());
+  auto view = std::move(*created);
+  REQUIRE(view->add_volume(path, kPeerVol).has_value());
+  REQUIRE(view->start().has_value());
+  REQUIRE(view->stats().stripe_count == 1);
+
+  const auto k0 = rv_fill(11, 4096);
+  REQUIRE(rv_put(*view, "k0", k0));  // lands at S
+  auto h = view->read_sync(CacheKey("k0"));
+  REQUIRE(h.has_value());
+  REQUIRE(h->renew_lease_strict() == LeaseRenewal::kOk);
+
+  SpawnedPeer peer;
+  std::vector<std::string> args = {
+      "seam",
+      path,
+      std::to_string(kPeerVol),
+      std::to_string(static_cast<int>(Volume::WriterSeam::kWrapAfterCursor)),
+      "crash",
+      std::to_string(kPeerContent),
+      "wrap"};
+  REQUIRE(peer.spawn(peer_exe(), args));
+  auto code = peer.wait_exit(std::chrono::milliseconds(60000));
+  REQUIRE(code.has_value());
+  REQUIRE(*code == 42);
+  // k0's bytes are intact at this point.
+  REQUIRE(rv_eq(h->content(), k0));
+
+  // Next write: proven-dead forced release -> repair -> allocation.  The
+  // repair COMPLETES the committed wrap (G enters the new pass with the
+  // frontier at S), so this write needs the advance over chunk 0, which
+  // defers for k0's live borrow: a dropped write, never an overwrite.
+  const uint64_t wraps0 = view->stats().write_buffer_wraps;
+  const auto k1 = rv_fill(12, 4096);
+  const bool wrote = rv_put(*view, "k1", k1);
+  const auto verdict = h->renew_lease_strict();
+  const bool intact = rv_eq(h->content(), k0);
+  CAPTURE(wrote, static_cast<int>(verdict), intact);
+  const auto st = view->stats();
+  CAPTURE(st.write_buffer_wraps, st.frontier_advances,
+          st.advances_deferred_by_lease);
+  // The safety property: never kOk over torn bytes.
+  CHECK((intact || verdict == LeaseRenewal::kTorn));
+  CHECK_FALSE(wrote);                          // deferred for the borrow
+  CHECK(verdict == LeaseRenewal::kOk);         // k0 intact and protected
+  CHECK(st.write_buffer_wraps == wraps0 + 1);  // the repair's completion
+  // Closing the borrow lets the advance, and the write, through.
+  h = make_unexpected(CacheError::NotFound);
+  CHECK(rv_put(*view, "k1", k1));
+  view->stop();
+}
+
+// Retention: a mandatory advance deferred at chunk c starts the episode
+// clock; the borrow goes away and an EARLY advance crosses c (no mandatory
+// advance ever passes, so the clock is never reset).  Much later a borrow
+// in chunk c' defers the next mandatory advance for the FIRST time -- it
+// must start a fresh episode, not be force-torn at once by the stale one.
+TEST_CASE(
+    "Retention review R3: a stale deferral episode does not force-tear a "
+    "fresh borrow",
+    "[retention][review][lease][episode]") {
+  if (!CacheConfig{}.wrap_retention) {
+    SKIP("retention mode only");
+  }
+  TempCacheDir tmp("rv-episode");
+  auto c = rv_open(tmp.path(), false, std::chrono::milliseconds(600000),
+                   std::chrono::milliseconds(300));
+  REQUIRE(c->stats().stripe_count == 1);
+  constexpr size_t kContent = 60000;
+  constexpr uint64_t kDocBytes = (kContent + 132 + 7) / 8 * 8;
+  constexpr uint64_t kQ = uint64_t{1} << 20;
+  std::vector<std::string> p0;
+  for (size_t i = 0;; ++i) {
+    const auto st = c->stats();
+    if (st.current_bytes + kDocBytes > st.stripe_bytes) break;
+    p0.push_back("e0-" + std::to_string(i));
+    REQUIRE(rv_put(*c, p0.back(), rv_fill(i, kContent)));
+  }
+  auto first_in_chunk = [&](uint64_t chunk) {
+    return static_cast<size_t>((chunk * kQ + kDocBytes - 1) / kDocBytes) + 1;
+  };
+  const size_t b1_idx = first_in_chunk(3);
+  const size_t b2_idx = first_in_chunk(6);
+  auto b1 = c->read_sync(CacheKey(p0[b1_idx]));
+  REQUIRE(b1.has_value());
+  // Pass 1 until the mandatory advance into chunk 3 is deferred.
+  size_t j = 0;
+  for (;; ++j) {
+    REQUIRE(j < p0.size());
+    if (!rv_put(*c, "e1-" + std::to_string(j), rv_fill(5000 + j, kContent)))
+      break;
+  }
+  REQUIRE(c->stats().advances_deferred_by_lease == 1);
+  b1 = make_unexpected(CacheError::NotFound);  // release B1
+  // A tiny document fits in the runway; its EARLY advance crosses chunk 3.
+  const auto adv_before = c->stats().frontier_advances;
+  REQUIRE(rv_put(*c, "tiny", rv_fill(1, 100)));
+  CAPTURE(c->stats().frontier_advances - adv_before);
+  std::this_thread::sleep_for(std::chrono::milliseconds(600));
+  auto b2 = c->read_sync(CacheKey(p0[b2_idx]));
+  REQUIRE(b2.has_value());
+  REQUIRE(b2->renew_lease_strict() == LeaseRenewal::kOk);
+  const auto forced0 = c->stats().wraps_forced_past_lease;
+  const auto def0 = c->stats().advances_deferred_by_lease;
+  // Fill until the first mandatory advance into chunk 6 is attempted.
+  for (++j;; ++j) {
+    REQUIRE(j < 4 * p0.size());
+    const auto st0 = c->stats();
+    const bool ok =
+        rv_put(*c, "e1-" + std::to_string(j), rv_fill(5000 + j, kContent));
+    const auto st1 = c->stats();
+    if (st1.wraps_forced_past_lease != st0.wraps_forced_past_lease ||
+        st1.advances_deferred_by_lease != st0.advances_deferred_by_lease ||
+        !ok) {
+      break;
+    }
+  }
+  const auto st = c->stats();
+  CAPTURE(st.wraps_forced_past_lease - forced0,
+          st.advances_deferred_by_lease - def0);
+  // Correct: the first contact defers (fresh episode), no force.
+  CHECK(st.wraps_forced_past_lease == forced0);
+  CHECK(b2->renew_lease_strict() == LeaseRenewal::kOk);
+  b2 = make_unexpected(CacheError::NotFound);
+  c->stop();
+}
+
+// Retention: a ceiling-forced advance at chunk c1 resets EVERY chunk's
+// borrow slot (S4).  A live borrow B in a far chunk c2 keeps renewing kOk
+// (its chunk is not exposed) but is no longer counted, so the later NORMAL
+// advance over c2 passes its gate and pwrites under B.  Correct: either B
+// learns at once (renew != kOk after the force), or the advance over c2
+// still defers for B.  Both mp and single-process.
+TEST_CASE(
+    "Retention review R2: after a ceiling-forced advance a far borrow is "
+    "either torn at once or still counted",
+    "[retention][review][lease][forced]") {
+  if (!CacheConfig{}.wrap_retention) {
+    SKIP("retention mode only");
+  }
+  for (bool mp : {false, true}) {
+    CAPTURE(mp);
+    TempCacheDir tmp(mp ? "rv-force-mp" : "rv-force");
+    auto c = rv_open(tmp.path(), mp, std::chrono::milliseconds(600000),
+                     std::chrono::milliseconds(200));
+    REQUIRE(c->stats().stripe_count == 1);
+    constexpr size_t kContent = 60000;
+    constexpr uint64_t kDocBytes = (kContent + 132 + 7) / 8 * 8;
+    constexpr uint64_t kQ = uint64_t{1} << 20;
+    std::vector<std::string> p0;
+    for (size_t i = 0;; ++i) {
+      const auto st = c->stats();
+      if (st.current_bytes + kDocBytes > st.stripe_bytes) break;
+      p0.push_back("x0-" + std::to_string(i));
+      REQUIRE(rv_put(*c, p0.back(), rv_fill(i, kContent)));
+    }
+    auto first_in_chunk = [&](uint64_t chunk) {
+      return static_cast<size_t>((chunk * kQ + kDocBytes - 1) / kDocBytes) + 1;
+    };
+    const size_t l_idx = first_in_chunk(2);
+    const size_t b_idx = first_in_chunk(8);
+    REQUIRE(b_idx < p0.size());
+    auto L = c->read_sync(CacheKey(p0[l_idx]));
+    auto B = c->read_sync(CacheKey(p0[b_idx]));
+    REQUIRE(L.has_value());
+    REQUIRE(B.has_value());
+    size_t j = 0;
+    for (;; ++j) {
+      REQUIRE(j < p0.size());
+      if (!rv_put(*c, "x1-" + std::to_string(j), rv_fill(7000 + j, kContent)))
+        break;
+    }
+    REQUIRE(c->stats().advances_deferred_by_lease >= 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    const auto forced0 = c->stats().wraps_forced_past_lease;
+    // Retry until the ceiling forces the advance over chunk 2.
+    for (int k = 0; k < 50 && c->stats().wraps_forced_past_lease == forced0;
+         ++k) {
+      (void)rv_put(*c, "x1-" + std::to_string(j), rv_fill(7000 + j, kContent));
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    REQUIRE(c->stats().wraps_forced_past_lease == forced0 + 1);
+    ++j;
+    const auto after_force = B->renew_lease_strict();
+    CAPTURE(static_cast<int>(after_force));
+    L = make_unexpected(CacheError::NotFound);
+    const auto def0 = c->stats().advances_deferred_by_lease;
+    const auto forced1 = c->stats().wraps_forced_past_lease;
+    bool deferred_for_b = false;
+    size_t written = 0;
+    for (; j < 4 * p0.size(); ++j) {
+      if (!rv_put(*c, "x1-" + std::to_string(j), rv_fill(7000 + j, kContent))) {
+        deferred_for_b = true;
+        break;
+      }
+      ++written;
+      if (!rv_eq(B->content(), rv_fill(b_idx, kContent))) break;  // overwritten
+    }
+    const bool intact = rv_eq(B->content(), rv_fill(b_idx, kContent));
+    const auto final_verdict = B->renew_lease_strict();
+    CAPTURE(written, deferred_for_b, intact, static_cast<int>(final_verdict),
+            c->stats().advances_deferred_by_lease - def0,
+            c->stats().wraps_forced_past_lease - forced1);
+    CHECK((after_force != LeaseRenewal::kOk || deferred_for_b));
+    B = make_unexpected(CacheError::NotFound);
+    c->stop();
+  }
+}
+
+// Flush-mode twin of the stale-episode case: the bug predates retention.
+TEST_CASE(
+    "Retention review R3 (flush): a stale wrap-deferral episode does not "
+    "force-tear a fresh borrow",
+    "[retention][review][lease][episode]") {
+  if (CacheConfig{}.wrap_retention) {
+    SKIP("flush mode only");
+  }
+  TempCacheDir tmp("rv-episode-fl");
+  auto c = rv_open(tmp.path(), false, std::chrono::milliseconds(600000),
+                   std::chrono::milliseconds(300));
+  REQUIRE(c->stats().stripe_count == 1);
+  constexpr size_t kContent = 60000;
+  constexpr uint64_t kDocBytes = (kContent + 132 + 7) / 8 * 8;
+  std::vector<std::string> p0;
+  for (size_t i = 0;; ++i) {
+    const auto st = c->stats();
+    if (st.current_bytes + kDocBytes > st.stripe_bytes) break;
+    p0.push_back("q0-" + std::to_string(i));
+    REQUIRE(rv_put(*c, p0.back(), rv_fill(i, kContent)));
+  }
+  auto b1 = c->read_sync(CacheKey(p0[3]));
+  REQUIRE(b1.has_value());
+  REQUIRE_FALSE(rv_put(*c, "big-1", rv_fill(1, kContent)));  // wrap deferred
+  REQUIRE(c->stats().wraps_deferred_by_lease == 1);
+  b1 = make_unexpected(CacheError::NotFound);
+  REQUIRE(rv_put(*c, "tiny", rv_fill(2, 100)));  // fits the tail, no wrap
+  std::this_thread::sleep_for(std::chrono::milliseconds(600));
+  auto b2 = c->read_sync(CacheKey(p0[5]));
+  REQUIRE(b2.has_value());
+  const auto forced0 = c->stats().wraps_forced_past_lease;
+  (void)rv_put(*c, "big-2", rv_fill(3, kContent));  // first contact with B2
+  CAPTURE(c->stats().wraps_forced_past_lease - forced0);
+  CHECK(c->stats().wraps_forced_past_lease == forced0);
+  b2 = make_unexpected(CacheError::NotFound);
+  c->stop();
 }

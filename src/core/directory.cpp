@@ -323,9 +323,19 @@ bool Directory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
       bucket[choice.slot] = new_entry;
     }
     // Uniqueness cleanup (rule 2), in the same bracket as the insert.
+    // A same-tag entry already at the offset just written is dead too:
+    // its bytes are the ones the new document replaced.  The chooser
+    // takes such an entry over when nothing better wins, but when the
+    // verified entry wins it would survive beside the new one (review
+    // N1), so it is cleared here in the same bracket.
     for (size_t i = 0; i < kEntriesPerBucket; ++i) {
       if (static_cast<int>(i) == choice.slot || bucket[i].is_empty() ||
           bucket[i].tag() != tag) {
+        continue;
+      }
+      if (bucket[i].offset() == offset) {
+        bucket[i].clear();
+        ++cleared;
         continue;
       }
       for (uint64_t off : clear_offsets) {

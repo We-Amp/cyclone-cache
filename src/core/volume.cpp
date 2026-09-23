@@ -152,11 +152,17 @@ namespace {
 //      inode's lock, and a new opener's O_CREAT gets a FRESH empty inode with
 //      no peer to protect, so it resets an empty file.
 //
-// Corollary (why the EX probe is CONDITIONAL on needs_reset): a process in the
-// same fork family that constructs a NEW Volume and open()s gets a FRESH OFD,
-// so its EX probe WOULD conflict with its own family's shared lock and it would
-// wrongly decline to reset.  Harmless only because a same-version,
-// same-geometry process never sets needs_reset and so never probes.
+// Corollary (the EX probe's two uses): a process in the same fork family that
+// constructs a NEW Volume and open()s gets a FRESH OFD, so its EX probe WOULD
+// conflict with its own family's shared lock.
+//   - The RESET gate probes only when needs_reset is set, and it REFUSES on a
+//     conflict.  Harmless because a same-version, same-geometry, same-mode
+//     process never sets needs_reset and so never takes that path.
+//   - The crash-REPAIR probe (see "Exclusive open" in open_locked) runs on
+//     every multi-process open that is not resetting, and a conflict there
+//     only skips the repair -- the open proceeds.  For a same-family opener
+//     that is the right answer: the family is live, so its wrap state is not
+//     a dead writer's.
 //
 // Windows has no fork and independent byte-range locks, so each process is
 // simply independent (correct for IIS overlapped recycle); the two locks sit on
@@ -746,13 +752,13 @@ class VolumeReadHandleImpl : public ReadHandleImpl {
       if (anchor->torn.load(std::memory_order_seq_cst)) {
         return false;  // this handle's stripe generation was torn down
       }
-      return anchor->volume->renew_read_lease(stripe, epoch_start);
+      return anchor->volume->renew_read_lease(stripe, epoch_start, borrow);
     }
     auto vol = volume_weak.lock();
     if (!vol) {
       return false;
     }
-    return vol->renew_read_lease(stripe, epoch_start);
+    return vol->renew_read_lease(stripe, epoch_start, borrow);
   }
 
   LeaseRenewal renew_lease_strict() override {
@@ -767,14 +773,15 @@ class VolumeReadHandleImpl : public ReadHandleImpl {
       if (anchor->torn.load(std::memory_order_seq_cst)) {
         return LeaseRenewal::kTorn;
       }
-      return anchor->volume->renew_read_lease_strict(stripe, epoch_start);
+      return anchor->volume->renew_read_lease_strict(stripe, epoch_start,
+                                                     borrow);
     }
     auto vol = volume_weak.lock();
     if (!vol) {
       return LeaseRenewal::kTorn;  // cache gone mid-drain: do not keep
                                    // aliasing.
     }
-    return vol->renew_read_lease_strict(stripe, epoch_start);
+    return vol->renew_read_lease_strict(stripe, epoch_start, borrow);
   }
 
   uint64_t ns_until_forced_wrap() const override {
@@ -2592,7 +2599,7 @@ std::expected<ReadHandle, CacheError> Volume::read_sync(const CacheKey& key) {
 #ifdef CYCLONE_TEST_SEAMS
           reader_seam(ReaderSeam::kAfterBorrow);
 #endif
-          if (!borrow_still_valid(stripe, epoch_start)) {
+          if (!borrow_still_valid(stripe, epoch_start, borrow)) {
             release_borrow(stripe, borrow);
             _mapped_file->unmap_region(*mapped);
             epoch_changed = true;
@@ -2899,6 +2906,34 @@ void Volume::repair_wrap_state(Stripe* stripe) {
     return;  // Process-local state dies with the process: nothing to repair.
   }
   MmapDirectory& dir = *stripe->mmap_directory;
+  const uint8_t intent = dir.wrap_intent_value();
+  uint64_t pass = stripe->pass_of(dir.exposure_gen());
+  if (intent == MmapDirectory::kIntentWrapEven ||
+      intent == MmapDirectory::kIntentWrapOdd) {
+    // The dead writer had COMMITTED a wrap to pass P' (parity in the intent
+    // value; review R1).  Its stores run cursor -> phase -> G, so it may
+    // have died with the cursor at S (or still high) and G in the old pass.
+    // Clearing the flag alone would let the next writer fill the CURRENT
+    // pass from S, over documents a live borrow still reads as kOk.
+    // Complete the wrap, in the writer's own order, still inside the intent
+    // window (readers keep retrying until the clear below):
+    //   cursor := S (release) -> phase := P' & 1 -> G := P' (seq_cst).
+    // G moves at most one pass per wrap under the write lock, so the parity
+    // tells whether G was already published: equal parity means P' is out.
+    const uint64_t target_parity =
+        intent == MmapDirectory::kIntentWrapOdd ? 1U : 0U;
+    stripe->write_pos = stripe->data_offset;
+    dir.set_shared_write_pos(stripe->data_offset);
+    if ((pass & 1U) != target_parity) {
+      ++pass;
+      publish_wrap_phase(stripe, pass);
+      // Retention: G := P'(N+1), frontier at chunk 0.  Flush: the frontier
+      // at N, the whole previous pass exposed (as the flush wrap stores).
+      const uint64_t n = stripe->chunks;
+      store_exposure_gen(stripe, pass * (n + 1) + (stripe->retain ? 0 : n));
+      record_wrap(stripe);
+    }
+  }
   // Phase FIRST, intent LAST: a writer that observes the cleared intent
   // must also observe the re-derived phase (both seq_cst, program order).
   // The pass P = G / (N + 1) is the authoritative epoch; the phase entries
@@ -2906,7 +2941,7 @@ void Volume::repair_wrap_state(Stripe* stripe) {
   // the phase store and the G store left the two disagreeing (new inserts
   // would carry the wrong class); re-deriving closes that drift.  Readers
   // derive the phase from G themselves, so they never saw the drift.
-  dir.set_current_phase((stripe->pass_of(dir.exposure_gen()) & 1U) != 0);
+  dir.set_current_phase((pass & 1U) != 0);
   dir.set_wrap_intent(false);
 }
 
@@ -3095,6 +3130,57 @@ bool Volume::borrow_still_valid(const Stripe* stripe,
   return stripe->exposure_gen() <= epoch_start.threshold;
 }
 
+bool Volume::borrow_still_valid(const Stripe* stripe,
+                                const BorrowEpoch& epoch_start,
+                                const BorrowToken& token) const {
+  // The count check comes AFTER the intent and G loads.  A forced step
+  // resets the slots inside its intent window, before its G store: if we
+  // read intent == 0 from that step's clear, the reset is seq_cst-before it
+  // and the load below sees the new generation.
+  return borrow_still_valid(stripe, epoch_start) &&
+         borrow_still_counted(stripe, token);
+}
+
+bool Volume::borrow_still_counted(const Stripe* stripe,
+                                  const BorrowToken& token) const {
+  if (!token.active) {
+    return true;  // RAM hit / leases off: nothing was counted.
+  }
+  // One seq_cst load of the borrow's own slot.  Generations only move on a
+  // forced reset (borrow_slot::force_reset) or an exclusive open, and a
+  // forced reset only bumps a slot whose count is nonzero -- ours is, while
+  // we are counted.  An uncounted ride-along (saturated slot) is checked
+  // the same way; it was never protected by the count either.
+  uint8_t current;
+  if (stripe->use_mmap_directory && stripe->mmap_directory) {
+    current = borrow_slot::generation_of<uint32_t>(
+        stripe->mmap_directory->chunk_borrow_raw(token.chunk));
+  } else {
+    current = borrow_slot::generation_of<uint32_t>(
+        stripe->local_borrow_shards[token.shard].slots[token.chunk].load(
+            std::memory_order_seq_cst));
+  }
+  return current == token.generation;
+}
+
+void Volume::mark_wrap_committed(Stripe* stripe, uint64_t new_pass) {
+  const uint8_t value = (new_pass & 1U) != 0 ? MmapDirectory::kIntentWrapOdd
+                                             : MmapDirectory::kIntentWrapEven;
+  if (stripe->use_mmap_directory && stripe->mmap_directory) {
+    stripe->mmap_directory->set_wrap_intent_value(value);
+  } else {
+    stripe->local_wrap_intent.store(value, std::memory_order_seq_cst);
+  }
+}
+
+void Volume::end_deferral_episode(Stripe* stripe) {
+  if (stripe->wrap_deferred_since_ns.load(std::memory_order_relaxed) == 0) {
+    return;  // No episode open: keep the shared deadline line untouched.
+  }
+  stripe->wrap_deferred_since_ns.store(0, std::memory_order_relaxed);
+  publish_wrap_deferred_deadline(stripe, 0);
+}
+
 StripeSnapshot Volume::snapshot(const Stripe* stripe) const {
   StripeSnapshot snap;
   // G FIRST (seq_cst), cursor after (acquire) -- see the declaration.
@@ -3113,7 +3199,8 @@ StripeSnapshot Volume::snapshot(const Stripe* stripe) const {
   return snap;
 }
 
-bool Volume::renew_read_lease(Stripe* stripe, const BorrowEpoch& epoch_start) {
+bool Volume::renew_read_lease(Stripe* stripe, const BorrowEpoch& epoch_start,
+                              const BorrowToken& token) {
   if (_lease_t_ns == 0) {
     // Leases disabled: no protection to extend.  The embedder treats a
     // false renew as "cannot prove this borrow still safe" and copies.
@@ -3157,12 +3244,19 @@ bool Volume::renew_read_lease(Stripe* stripe, const BorrowEpoch& epoch_start) {
   if (stripe->exposure_gen() > epoch_start.threshold) {
     return false;
   }
+  // A ceiling-forced step may have reset this borrow's slot without
+  // exposing its chunk: the bytes are intact NOW, but nothing defers the
+  // advance that will cross them (review R2).
+  if (!borrow_still_counted(stripe, token)) {
+    return false;
+  }
   stamp_read_lease(stripe);  // Still valid — extend the lease.
   return true;
 }
 
 LeaseRenewal Volume::renew_read_lease_strict(Stripe* stripe,
-                                             const BorrowEpoch& epoch_start) {
+                                             const BorrowEpoch& epoch_start,
+                                             const BorrowToken& token) {
   // Lease amendment (2026-07-07): the ALIASED zero-copy path's per-send
   // validation.  Unlike renew_read_lease (epoch-only, safe only for
   // copy-then-verify where the read is observable), an aliased writev's read
@@ -3222,6 +3316,13 @@ LeaseRenewal Volume::renew_read_lease_strict(Stripe* stripe,
   if (epoch_moved) {
     return LeaseRenewal::kTorn;
   }
+  // Uncounted since a ceiling-forced reset (review R2): the bytes are
+  // intact, but the next advance over this chunk will not defer for us, so
+  // the embedder must stop aliasing now.  kTorn, not kCopyNow: a copy made
+  // later is not protected either.
+  if (!borrow_still_counted(stripe, token)) {
+    return LeaseRenewal::kTorn;
+  }
   if (intent) {
     return LeaseRenewal::kCopyNow;
   }
@@ -3257,8 +3358,8 @@ bool Volume::lease_gate(Stripe* stripe, uint32_t chunk_lo, uint32_t chunk_hi,
     // the single-slot Dekker argument, quantified per shard and per chunk.
     for (const auto& shard : stripe->local_borrow_shards) {
       for (uint32_t c = chunk_lo; c < chunk_hi; ++c) {
-        borrow_count +=
-            borrow_slot::count(shard.slots[c].load(std::memory_order_seq_cst));
+        borrow_count += borrow_slot::count_of<uint32_t>(
+            shard.slots[c].load(std::memory_order_seq_cst));
       }
     }
   }
@@ -3276,11 +3377,10 @@ bool Volume::lease_gate(Stripe* stripe, uint32_t chunk_lo, uint32_t chunk_hi,
   // stopped renewing, or crashed) are unprotected exactly as before.
   bool borrows_outstanding = borrow_count != 0;
   if (!lease_active || !borrows_outstanding) {
-    if (episode) {
-      // Nothing to protect: end any continuous-deferral episode.
-      stripe->wrap_deferred_since_ns.store(0, std::memory_order_relaxed);
-      publish_wrap_deferred_deadline(stripe, 0);  // STEP-3: no force pending
-    }
+    // Nothing to protect: this step proceeds, which ends any
+    // continuous-deferral episode -- the early advance included (review
+    // R3; allocate_write_slot also ends it on every granted slot).
+    end_deferral_episode(stripe);
     return true;
   }
   if (!episode) {
@@ -3545,6 +3645,11 @@ std::expected<Volume::WriteSlot, CacheError> Volume::allocate_write_slot(
     // at publish/pwrite below.
     writer_seam(WriterSeam::kAfterGatePassed);
     const uint64_t pass = stripe->pass_of(stripe->exposure_gen());
+    // The wrap is decided: mark it COMMITTED before the first irreversible
+    // store (the cursor drop below), so a writer that dies from here on is
+    // completed, not merely un-flagged, by crash recovery (review R1; see
+    // repair_wrap_state).  Readers only test intent != 0.
+    mark_wrap_committed(stripe, pass + 1);
 
     // Wrap to beginning of data area
     stripe->write_pos = data_area_start;
@@ -3595,6 +3700,13 @@ std::expected<Volume::WriteSlot, CacheError> Volume::allocate_write_slot(
     // G store stays program-order BEFORE this store.
     set_wrap_intent(stripe, false);
   }
+
+  // The write proceeds: any continuous-deferral episode is over (review
+  // R3).  Without this a write that fit the tail (flush) or the runway
+  // (retention) left the clock running from an old deferral, and the next
+  // first contact with a FRESH borrow was forced at once -- while the stale
+  // published deadline told embedders a force was imminent.
+  end_deferral_episode(stripe);
 
   // Reserve the write offset.  F6: do NOT advance the guard-visible write
   // cursor here.  stripe->write_pos (the single-process guard cursor) is left
@@ -3780,7 +3892,7 @@ VolumeStats Volume::stats() const {
     } else {
       for (const auto& shard : stripe->local_borrow_shards) {
         for (uint32_t c = 0; c < stripe->chunks; ++c) {
-          result.borrows_outstanding += borrow_slot::count(
+          result.borrows_outstanding += borrow_slot::count_of<uint32_t>(
               shard.slots[c].load(std::memory_order_relaxed));
         }
       }
@@ -3998,21 +4110,27 @@ std::expected<void, CacheError> Volume::commit_write(
     if (dir_entry.offset() == verified_offset) {
       return true;  // a retried scan re-yields the elected entry
     }
-    auto mdoc = map_document(*_mapped_file, stripe->offset + dir_entry.offset(),
-                             Document::kHeaderSize, stripe->size, false);
-    if (!mdoc) {
-      // Bad magic / length: nothing any key can resolve through it.  (A
-      // mapping failure lands here too; clearing then costs at most one
-      // cache entry, never a wrong serve.)
+    auto region = _mapped_file->map_region(stripe->offset + dir_entry.offset(),
+                                           Document::kHeaderSize,
+                                           MappedFile::MapMode::ReadOnly);
+    if (!region) {
+      // A transient mapping failure proves nothing about the entry: keep it
+      // (review N2).  Only a header that was actually read and failed
+      // validation below is evidence that the entry is dead.
+      return true;
+    }
+    const DocumentReader reader(*region);
+    if (!reader.is_valid()) {
+      // Bad magic / length: nothing any key can resolve through it.
+      _mapped_file->unmap_region(*region);
       if (stripe->in_data_area(dir_entry.offset())) {
         add_clear(dir_entry.offset());
       }
       return true;
     }
-    CacheKey stored_key = mdoc->reader.first_key();
-    const bool stamp_ok =
-        stamp_admits(stripe, snap, cls, mdoc->reader.document());
-    _mapped_file->unmap_region(mdoc->region);
+    CacheKey stored_key = reader.first_key();
+    const bool stamp_ok = stamp_admits(stripe, snap, cls, reader.document());
+    _mapped_file->unmap_region(*region);
     if (!stamp_ok) {
       add_clear(dir_entry.offset());  // a stale survivor, whoever's key
       return true;
@@ -4244,7 +4362,13 @@ std::optional<uint64_t> Volume::retention_prepare(
     // while current-class borrows keep their thresholds, (P+1)(N+1)+c >=
     // the new G (test 2).  Still inside an intent window, so a reader
     // straddling it retries.
-    set_wrap_intent(stripe, true);
+    // COMMITTED from the start (review R1): the retention wrap is ungated,
+    // so the intent value names the target pass before the cursor drops.  A
+    // writer that dies anywhere in this window leaves W at S with G still in
+    // the old pass (F possibly at E) -- the next writer would then fill the
+    // CURRENT pass at S under live borrows whose G verdict never moves.
+    // Crash recovery completes the wrap instead (repair_wrap_state).
+    mark_wrap_committed(stripe, pass + 1);
     writer_seam(WriterSeam::kAfterIntentSet);
     stripe->write_pos = data_area_start;
     // B3: the shared cursor drops to S inside the intent window (see the
@@ -4570,13 +4694,20 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
     }
   }
 
+  // A retained head is never linked (S6, below): this write starts a fresh
+  // chain whatever the old one looks like, so the old chain's length and
+  // alternate count cannot make it fail (review N3).
+  const bool retained_head_refused =
+      key_exists && head_cls == AdmitClass::kRetained;
+
   // Reject if the chain was too long to fully traverse
-  if (chain_truncated) {
+  if (chain_truncated && !retained_head_refused) {
     return make_unexpected(CacheError::TooManyAlternates);
   }
 
   // Check unique alternate count limit
-  if (unique_alternate_ids.count() >= Document::kMaxAlternates) {
+  if (!retained_head_refused &&
+      unique_alternate_ids.count() >= Document::kMaxAlternates) {
     return make_unexpected(CacheError::TooManyAlternates);
   }
 
@@ -5538,7 +5669,7 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
           // degrade to nothing.  Pin all preceding reads ahead of the epoch
           // verdict below.
           std::atomic_thread_fence(std::memory_order_acquire);
-          if (!borrow_still_valid(stripe, epoch_start)) {
+          if (!borrow_still_valid(stripe, epoch_start, borrow)) {
             release_borrow(stripe, borrow);
             _mapped_file->unmap_region(*selected_mapped);
             _mapped_file->unmap_region(*mapped);

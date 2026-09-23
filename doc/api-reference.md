@@ -699,15 +699,22 @@ Rules:
   large-stripe, small-object volumes the 65 536-entry directory already
   bounds what can be indexed.
 - Borrow protection is unchanged in kind: `renew_lease_strict()` returns
-  `kTorn` only once a step has exposed the borrow's own chunk, and
-  `kCopyNow` while a step is in flight. The steps that expose a chunk are a
+  `kTorn` once a step has exposed the borrow's own chunk, and `kCopyNow`
+  while a step is in flight. It also returns `kTorn` (and `renew_lease()`
+  returns false) after a ceiling-forced step anywhere on the stripe, even if
+  the borrow's bytes are intact: the force reset every borrow count, so
+  nothing protects the borrow any more. The steps that expose a chunk are a
   frontier advance across it, a ceiling-forced step, and the wrap. The wrap
   exposes only the tail of the retained pass that the frontier never
   reached. For that tail the verdict is conservative: the bytes are still
   intact.
 - Alternates never link across a pass: a write over a retained head starts
   a fresh chain (counted in `alternate_wrap_refusals`), and removing one
-  alternate from a retained chain removes the whole entry.
+  alternate from a retained chain removes the whole entry. **Known gap:**
+  the retained alternates of that key stop resolving at that moment. A
+  PageSpeed-style key whose optimized alternates arrive after a wrap loses
+  its retained Original, Gzip and so on. `retained_hits` counts the hits
+  that retention did serve.
 
 ### Cross-Process RAM Coherence
 

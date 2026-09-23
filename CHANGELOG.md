@@ -8,7 +8,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - **Wrap retention** (`CacheConfig::wrap_retention`, default `false`; C API
-  `disable_wrap_retention`). Normally a stripe's wrap drops its whole
+  `disable_wrap_retention`). Retention is off by default. Known gaps before
+  it can default on: the PageSpeed `cache_burst_test` has not been run
+  against it, and writing an alternate onto a key whose head is retained
+  drops that key's retained chain (R4; counted in `alternate_wrap_refusals`,
+  see `doc/design/wrap-retention.md` section 14). Normally a stripe's wrap drops its whole
   previous pass at once. With retention on, the previous pass stays readable
   until its bytes are needed: a clean frontier moves ahead of the write
   cursor one chunk at a time. A frontier advance waits only for live borrows
@@ -69,6 +73,30 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   exception, verified with Apache RAT.
 
 ### Fixed
+
+- A writer that died inside a *committed* wrap (after the cursor dropped
+  to the data-area start, before the new pass was published) was repaired by
+  clearing its intent flag only. The next writer then filled the current
+  pass from the start, over documents whose live borrows still renewed
+  `kOk`. The intent byte now marks a committed wrap with its target pass,
+  and crash recovery completes the wrap instead.
+- A ceiling-forced step reset every borrow slot of the stripe but exposed
+  only the chunks it crossed, so a live borrow elsewhere lost its count and
+  kept renewing `kOk` until a later normal advance overwrote it with no
+  deferral. `renew_lease()`, `renew_lease_strict()` and the read-time
+  revalidation now also check the borrow's slot generation and report
+  `false` / `kTorn` once it is uncounted.
+- A lease-deferral episode (flush and retention) only ended on a passing
+  mandatory gate or a force. A write that fit without the deferred step
+  left the clock running, so a later first contact with a fresh borrow was
+  forced immediately, and the published force deadline stayed stale
+  (`ns_until_forced_wrap()` near 0). Every write that gets its slot now ends
+  the episode.
+- Process-local borrow slots widened from an 8-bit to a 24-bit count: a
+  borrow acquired at saturation rode along uncounted and lost its protection
+  once the counted holders closed.
+- An alternate write over a retained head no longer fails with
+  `TooManyAlternates` because of the old chain it will not link to.
 
 - A writer that died inside the wrap-intent window left the intent flag set,
   and every read of that stripe retried until it missed. The flag is now

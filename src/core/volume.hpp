@@ -20,8 +20,10 @@
 #ifndef _WIN32
 #include <sys/types.h>  // dev_t, ino_t (Volume::backing_identity)
 #endif
-#if defined(_MSC_VER) && !defined(__clang__)
+#if defined(_MSC_VER) && !defined(__clang__) && \
+    (defined(_M_X64) || defined(_M_ARM64))
 #include <intrin.h>  // __umulh (FastDivU64)
+#define CYCLONE_FASTDIV_UMULH 1
 #endif
 
 #include "cyclone/alternate.hpp"
@@ -274,6 +276,10 @@ static_assert(retention_geometry(uint64_t{1} << 20).chunks == 1,
 // ~11 % single-thread read regression.  Reciprocal m = floor((2^64 - 1) / d)
 // makes mulhi(n, m) either floor(n / d) or one less, for every n (the
 // deficit n * (2^64 / d - m) / 2^64 is below 1); one compare corrects it.
+// The high half of the 64 x 64 product comes from __umulh (MSVC x64/ARM64),
+// unsigned __int128 (GCC/Clang on 64-bit targets), or -- on any other
+// target, 32-bit ones included -- four 32 x 32 partial products
+// (mulhi_portable, exact, pinned by the same test).
 class FastDivU64 {
  public:
   constexpr FastDivU64() = default;
@@ -281,6 +287,23 @@ class FastDivU64 {
       : _d(divisor == 0 ? 1 : divisor), _m(_d <= 1 ? 0 : ~uint64_t{0} / _d) {}
 
   [[nodiscard]] constexpr uint64_t divisor() const noexcept { return _d; }
+
+  // High 64 bits of a * b from 32-bit partial products; the fallback where
+  // neither __umulh nor unsigned __int128 exists.
+  [[nodiscard]] static constexpr uint64_t mulhi_portable(uint64_t a,
+                                                         uint64_t b) noexcept {
+    constexpr uint64_t kLo = 0xFFFFFFFFULL;
+    const uint64_t a_lo = a & kLo;
+    const uint64_t a_hi = a >> 32U;
+    const uint64_t b_lo = b & kLo;
+    const uint64_t b_hi = b >> 32U;
+    const uint64_t lo_lo = a_lo * b_lo;
+    const uint64_t hi_lo = a_hi * b_lo;
+    const uint64_t lo_hi = a_lo * b_hi;
+    const uint64_t hi_hi = a_hi * b_hi;
+    const uint64_t cross = (lo_lo >> 32U) + (hi_lo & kLo) + lo_hi;
+    return hi_hi + (hi_lo >> 32U) + (cross >> 32U);
+  }
 
   [[nodiscard]] uint64_t quot(uint64_t n) const noexcept {
     if (_d == 1) {
@@ -295,11 +318,13 @@ class FastDivU64 {
 
  private:
   [[nodiscard]] static uint64_t mulhi(uint64_t a, uint64_t b) noexcept {
-#if defined(_MSC_VER) && !defined(__clang__)
+#if defined(CYCLONE_FASTDIV_UMULH)
     return __umulh(a, b);
-#else
+#elif defined(__SIZEOF_INT128__)
     __extension__ using U128 = unsigned __int128;
     return static_cast<uint64_t>((static_cast<U128>(a) * b) >> 64U);
+#else
+    return mulhi_portable(a, b);
 #endif
   }
 
@@ -404,15 +429,21 @@ struct Stripe {
   // slot c counts this thread's borrows of documents starting in frontier
   // chunk c, so a gate that exposes chunks [f, t) sums only those slots
   // across the 64 shards -- the same 64 lines the stripe-wide gate summed.
-  // 64 x u16 = 128 bytes = one kShardPad line: the stripe keeps its 8 KiB of
-  // shards, and a reader still CASes only its own thread's line.
-  // Unused when use_mmap_directory (the per-chunk cross-process slots live
-  // in the directory's retention region there).
+  // 64 x u32 {generation:8, count:24} = 256 bytes = two kShardPad lines
+  // per shard (16 KiB per stripe); a reader still CASes only its own
+  // thread's lines.  The count is 24 bits, like the cross-process slots,
+  // because a saturated slot is NOT safe for every holder: a borrow that
+  // acquires at saturation rides along uncounted, and once the counted
+  // holders close the slot reads 0 while it still aliases the bytes.  One
+  // thread can plausibly hold 255 handles on one chunk (an event loop with
+  // many in-flight zero-copy sends of one hot object); 2^24 - 1 cannot be
+  // reached.  Unused when use_mmap_directory (the per-chunk cross-process
+  // slots live in the directory's retention region there).
   struct alignas(kShardPad) BorrowShard {
-    std::array<std::atomic<uint16_t>, MmapDirectory::kMaxChunks> slots{};
+    std::array<std::atomic<uint32_t>, MmapDirectory::kMaxChunks> slots{};
   };
-  static_assert(sizeof(BorrowShard) == kShardPad,
-                "one shard = one padded line of per-chunk slots");
+  static_assert(sizeof(BorrowShard) == 2 * kShardPad,
+                "one shard = two padded lines of per-chunk u32 slots");
   static constexpr size_t kBorrowShards = 64;
   // BorrowToken routes releases through a uint8_t shard index, and
   // thread_shard_index requires a power of two — both would corrupt
@@ -1236,7 +1267,8 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // write-avoidance guard).  Called by ReadHandle::renew_lease() for
   // client-paced transfers.  Returns false when leases are disabled
   // (T == 0), i.e. there is no protection to renew.
-  bool renew_read_lease(Stripe *stripe, const BorrowEpoch &epoch_start);
+  bool renew_read_lease(Stripe *stripe, const BorrowEpoch &epoch_start,
+                        const BorrowToken &token);
   // Lease amendment (2026-07-07): intent-checked lease renewal for the ALIASED
   // zero-copy serve path.  Stamps the lease FIRST, then Dekker-revalidates
   // (borrow_still_valid: wrap_intent loaded before epoch) so a normal wrap
@@ -1246,7 +1278,8 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // whose read is observable; an aliased writev's read is not.  See
   // LeaseRenewal for how the embedder must act on each result.
   LeaseRenewal renew_read_lease_strict(Stripe *stripe,
-                                       const BorrowEpoch &epoch_start);
+                                       const BorrowEpoch &epoch_start,
+                                       const BorrowToken &token);
   // Lease-protocol STEP-3: ns until a ceiling-forced wrap could overwrite a
   // borrow on this stripe (UINT64_MAX = none deferred / leases off).
   [[nodiscard]] uint64_t ns_until_forced_wrap(const Stripe *stripe) const;
@@ -1491,11 +1524,33 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // unmaps and retries/misses.
   [[nodiscard]] bool borrow_still_valid(const Stripe *stripe,
                                         const BorrowEpoch &epoch_start) const;
+  // Same, plus the count check: the borrow's slot must still carry the
+  // generation its acquire saw.  A ceiling-forced step resets EVERY chunk's
+  // slot (S4) but exposes only the chunks it crosses, so a borrow elsewhere
+  // keeps a valid G verdict while its count is gone -- and the next normal
+  // advance over its chunk would pass the gate.  A generation mismatch
+  // therefore means "no longer protected", whatever G says (review R2).
+  [[nodiscard]] bool borrow_still_valid(const Stripe *stripe,
+                                        const BorrowEpoch &epoch_start,
+                                        const BorrowToken &token) const;
+  [[nodiscard]] bool borrow_still_counted(const Stripe *stripe,
+                                          const BorrowToken &token) const;
 
   // Writer-side wrap-intent flag (shared header offset 33 in mmap mode,
   // Stripe::local_wrap_intent otherwise), seq_cst.
   void set_wrap_intent(Stripe *stripe, bool active);
   [[nodiscard]] bool wrap_intent_set(const Stripe *stripe) const;
+  // Mark the intent window as a COMMITTED wrap to pass `new_pass`
+  // (MmapDirectory::kIntentWrapEven / kIntentWrapOdd), stored before the
+  // cursor drops to S.  Crash recovery completes such a wrap instead of
+  // only clearing the flag (repair_wrap_state, review R1).
+  void mark_wrap_committed(Stripe *stripe, uint64_t new_pass);
+  // End a continuous-deferral episode: clear the deferral clock and the
+  // published force deadline.  Called whenever a write gets its slot
+  // (review R3): the episode bounds CONTINUOUS starvation, so any write
+  // that proceeds ends it, including one that fits the tail or the runway
+  // without the deferred step.
+  void end_deferral_episode(Stripe *stripe);
 
   // Writer side: the borrow gate over frontier chunks [chunk_lo, chunk_hi),
   // run with the intent flag already set and BEFORE any side effect.
