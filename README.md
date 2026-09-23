@@ -80,7 +80,7 @@ flowchart LR
     A["RAM tier<br/>probe"] -->|miss| B["Directory probe<br/>per-bucket seqlock"]
     B --> C["Guards<br/>position · CRC32 · full key"]
     C --> D["Borrow region<br/>stamp lease"]
-    D --> G{"Wrap intent or<br/>epoch moved?"}
+    D --> G{"Wrap intent or<br/>chunk exposed?"}
     G -->|no| H["Serve<br/>zero-copy span"]
     G -->|yes| B
     A -->|hit| H
@@ -247,6 +247,11 @@ them instead of recomputing them.
 - **Safe aliasing under eviction.** The borrow + lease pins the region while
   your handle is open; `renew_lease_strict()` and `ns_until_forced_wrap()`
   tell you exactly when to de-alias.
+- **Keep more of the working set.** `wrap_retention = true` keeps the
+  previous lap of each stripe readable until its bytes are reused, instead
+  of dropping it at the wrap. With 2 MiB blocks on a 4 GiB tier the hit ratio
+  rose from 0.726 to 0.788 (Zipf) and from 0.614 to 0.660 (Zipf plus scans).
+  It is off by default.
 - **One cache, many workers.** Tensor-parallel ranks or replicas on one node
   share a single file: each owns a slice of stripes for writes, all read
   everything with no locks.
@@ -321,8 +326,16 @@ every "hit" in the [numbers](#cyclone-in-numbers) measures.
 
 **Eviction is FIFO by wraparound.** When a stripe's write cursor reaches the
 end it wraps, flips the stripe's phase bit, and every entry from the previous
-lap is instantly stale. Nothing is scanned. Pair this with the small-object
-tier when some entries must outlive payload churn.
+lap is instantly stale. Nothing is scanned. That default costs capacity: a
+stripe holds about half its size on average. With
+`CacheConfig::wrap_retention = true` the previous lap stays readable until
+the write cursor actually needs its bytes. A clean frontier moves ahead of the
+cursor one chunk at a time, and it waits only for borrows in the chunk it is
+about to cross. On a churning KV workload this lifted the hit ratio from 0.73
+to 0.79 ([doc/api-reference.md](doc/api-reference.md#wrap-retention)). The
+mode is persisted per volume, so every process sharing a cache must use the
+same setting. Pair either mode with the small-object tier when some entries
+must outlive payload churn.
 
 **Alternates** are variants stored under one key in a singly linked chain:
 `write_alternate_sync(key, AlternateId::Brotli, len)`, then
@@ -478,6 +491,7 @@ struct CacheConfig {
   std::chrono::milliseconds directory_sync_interval{30000};  // multi-process durability cadence
   std::chrono::milliseconds read_lease_duration{5000};       // 0 disables leases
   std::chrono::milliseconds lease_wrap_ceiling{60000};
+  bool         wrap_retention = false;            // keep the previous lap readable (persisted per volume)
   MultiProcessConfig multi_process_config;        // enabled, process_index, total_processes
   OptimizationConfig optimization_config;         // background alternate generation
   // fluent setters: set_ram_cache_size(), set_small_tier_percent(),

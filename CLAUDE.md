@@ -526,7 +526,7 @@ design record for shipped work (background, not a task list);
 | [doc/api-reference.md](doc/api-reference.md) | API documentation | Current |
 | [doc/plugin-development.md](doc/plugin-development.md) | Plugin guide | Current |
 | [doc/multi-process.md](doc/multi-process.md) | Cross-process stripe affinity and locking | Current |
-| [doc/design/wrap-retention.md](doc/design/wrap-retention.md) | Keep the previous pass readable past a wrap (clean frontier, pass stamp) | Design/plan — proposed, not implemented |
+| [doc/design/wrap-retention.md](doc/design/wrap-retention.md) | Keep the previous pass readable past a wrap (clean frontier, pass stamp) | Design/plan — implemented, default off |
 
 Historical fix-logs are archived separately from the living docs — they record
 completed work and are not current spec.

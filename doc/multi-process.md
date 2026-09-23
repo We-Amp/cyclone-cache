@@ -83,11 +83,30 @@ Cache File Layout (multi-process mode):
 │   ├─ Version Counters (4B per bucket)  │
 │   ├─ Directory Entries (4 entries ×    │
 │   │   10B = 40B per bucket)            │
-│   └─ Data Area                         │
+│   ├─ Retention Region (264 bytes,      │
+│   │   8-aligned): exposure gen G +     │
+│   │   64 per-chunk borrow slots (u32)  │
+│   └─ Data Area (page-aligned)          │
 ├────────────────────────────────────────┤
 │ Stripe 1: ...                          │
 └────────────────────────────────────────┘
 ```
+
+The directory region is `MmapDirectory::required_size(buckets)` bytes, rounded
+up to a page. For the default 16384 buckets that is 721 224 bytes, so the data
+area still starts 177 pages into the stripe. The retention region was added in
+directory **version 2** (`MmapDirectory::kVersion`). It holds the stripe's
+exposure generation `G = P * (N + 1) + f` and one `{generation:8, count:24}`
+borrow slot per frontier chunk. It replaces the version-1 stripe-wide borrow
+slot at header offset 34, which is retired and stays zero. `G` also replaces
+the version-1 reader epoch, `{shared_wrap_count, current_phase}`. See
+[architecture.md](architecture.md#eviction-and-wrap-retention).
+
+`kVersion` is mixed into the fingerprinted file name of mmap volumes. A
+version-2 build therefore never opens a version-1 file. It creates a fresh one
+next to it, so the first start after the upgrade is a cold cache. The old file
+is left for the operator to delete. A v2 opener re-initializes a directory
+that carries a foreign version only when it holds the exclusive lifetime lock.
 
 The `MmapDirectory` provides:
 - **Cross-process visibility**: All processes see the same directory entries
@@ -380,7 +399,9 @@ hit-rate graph.
 
 **No format change.** The bucket-version array predates this feature;
 `VolumeHeader::kFormatVersionMajor` and `MmapDirectory::kVersion` are both
-untouched, so adopting the knob costs no cold cache and needs no migration.
+untouched by it, so adopting the knob costs no cold cache and needs no
+migration. (`MmapDirectory::kVersion` moved to 2 later, for wrap retention;
+see "Mmap-Backed Directory" above.)
 
 ### No Migration on Process Count Changes
 
@@ -448,21 +469,38 @@ While this is now safe, best practice is still to release handles promptly to fr
 The seqlock + CRC32 gauntlet protects bytes only *inside* `read_sync`; a
 borrowed `mapped_view()` span outlives it.  Lease-based region pinning protects the borrow itself: every disk-hit read stamps
 a shared per-stripe lease (`CacheConfig::read_lease_duration`, default 5s)
-in the mmap-directory header (offset 56), and a writer that needs to wrap
-the circular write buffer over live regions defers the wrap (dropping the
-fill) while an unexpired lease exists — in every process sharing the file.
-Readers revalidate after stamping: a shared wrap-intent flag (offset 33,
-held by the writer across its entire wrap decision) must be clear and the
-stripe's wrap epoch (shared wrap count + phase) unchanged — so a wrap that
-raced, or is racing, the probe is always detected and the read retries or
-misses instead of returning soon-to-be-overwritten bytes.  The intent-flag
-pairing makes this detection exact within the lease window (a hard
-guarantee), not best-effort.
+in the mmap-directory header (offset 56). It also counts itself in the
+shared borrow slot of its document's chunk (retention region). A writer that
+must expose chunks the forward fill will overwrite defers that step (dropping
+the fill) while any of those chunks holds a live borrow under an unexpired
+lease, in every process sharing the file. In flush mode the step is the wrap,
+and the stripe is one chunk. Under wrap retention the step is a frontier
+advance over one or a few chunks. Readers revalidate after stamping. The
+shared wrap-intent flag (offset 33, held by the writer across the whole
+step) must be clear, and the stripe's exposure generation `G` must not have
+passed the document's threshold. A step that raced, or is racing, the probe
+is therefore always detected, and the read retries or misses instead of
+returning soon-to-be-overwritten bytes. The intent-flag pairing makes this
+detection exact within the lease window (a hard guarantee), not best-effort.
+
+A writer that dies inside that window leaves the intent flag set, and every
+read of the stripe would then retry. The flag is cleared by the next
+`forced_release` that proves the holder dead, or by an open that holds the
+exclusive lifetime lock. It is never cleared on an escalated takeover of a
+holder that may still be running.
+
+**Eviction mode must match across processes.** `CacheConfig::wrap_retention`
+is persisted in the volume header (`VolumeHeader::retain_chunks`, offset 40;
+0 means flush). An open whose configured mode disagrees with the file goes
+through the same live-peer reset gate as a format change. While another
+process holds the volume the open is refused (`ResetRefusedLivePeer`), so a
+mixed-mode deployment fails fast instead of corrupting the other side's
+view.
 
 The guarantee is bounded: holds longer than
 `CacheConfig::lease_wrap_ceiling` (default 60s) are not protected — a
-continuously deferred wrap is eventually forced (observable via the
-`wraps_forced_past_lease` counter).  Long holders must call
+continuously deferred wrap or mandatory frontier advance is eventually forced
+(observable via the `wraps_forced_past_lease` counter).  Long holders must call
 `ReadHandle::renew_lease()` at a cadence of at most 3/4 of the lease
 duration and keep the total hold below the ceiling, or copy the bytes.
 

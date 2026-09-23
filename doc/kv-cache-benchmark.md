@@ -652,8 +652,8 @@ Cyclone's hit ratio is 8–9 points below the LRU stores on both patterns.
 That is a real cost of Cyclone's eviction, and it is the main reason for the
 served-throughput gap at T=1. The per-hit cost is the same (hit p50 191 vs
 178 µs); Cyclone simply has fewer hits and more slow misses. The gap is
-larger than "FIFO vs LRU". On a wrap, Cyclone toggles the stripe's directory
-phase (`Volume::evict_if_needed`), and every entry of the previous pass stops
+larger than "FIFO vs LRU". On a wrap in the default flush mode, Cyclone flips
+the stripe's directory phase (`Volume::publish_wrap_phase`), and every entry of the previous pass stops
 resolving at once, although most of those blocks are still intact on disk
 ahead of the write cursor. Each stripe therefore restarts empty on every wrap
 and holds roughly half its capacity on average. Replaying the same streams
@@ -672,6 +672,13 @@ store about 12 points. Keeping the previous pass resolvable until it is
 actually overwritten would recover the FIFO number. This round
 does not try that; the design for it, with its own replay numbers, is
 [`design/wrap-retention.md`](design/wrap-retention.md).
+
+That design is now implemented as `CacheConfig::wrap_retention` (off by
+default). A later run on the Linux box used a smaller tier than the table
+above: 4 GiB, T=4, `MemoryMax=1G`. On that run the measured hit ratio went
+from 0.726 to 0.788 on `zipf` and from 0.614 to 0.660 on `zipf+scan`. Each
+number is within 0.002 of its replay (flush 0.726 / 0.612, retention
+0.788 / 0.659).
 
 Cyclone is better at the tail under concurrency. At T=4 its hit p99 is
 3.5–4× lower than LMDB's (19–24 ms vs 73–84 ms) and lower than filedir's
