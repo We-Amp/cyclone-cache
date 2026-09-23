@@ -156,7 +156,7 @@ class FrontierRetain {
   size_t _f = 0;
 };
 
-constexpr std::array<size_t, 3> kRetainChunks = {16, 64, 256};
+constexpr std::array<size_t, 4> kRetainChunks = {16, 32, 64, 256};
 
 void run(size_t block, size_t capacity, size_t universe, bool scan) {
   // kv_churn sizes the volume so the stripes' data areas sum to `capacity`;
