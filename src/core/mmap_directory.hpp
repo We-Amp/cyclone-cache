@@ -412,6 +412,18 @@ class MmapDirectory {
   /// Toggle GC phase
   void toggle_phase();
 
+  /// Store the GC phase outright (seq_cst, under phase_lock).  Used only to
+  /// RE-DERIVE the phase from the pass count (phase = pass & 1) after a
+  /// writer was proven to have died inside the wrap window, or on an
+  /// exclusive open -- never on the ordinary wrap path.
+  void set_current_phase(bool phase);
+
+  /// Exclusive-open reset of the reader-exclusion state (no live peer can
+  /// exist, the caller holds the exclusive lifetime lock): zero the borrow
+  /// slot, the read lease and the published force deadline.  Anything left
+  /// there belonged to processes that are gone.
+  void reset_reader_state_exclusive();
+
   /// Get shared write position (ABSOLUTE file offset, 0 = unset)
   [[nodiscard]] uint64_t get_shared_write_pos() const;
 

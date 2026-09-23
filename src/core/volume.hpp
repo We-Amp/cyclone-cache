@@ -760,6 +760,23 @@ class Volume : public std::enable_shared_from_this<Volume> {
       std::function<void(uint64_t write_offset, uint64_t new_write_pos)>;
   static inline WriteTearGateHook s_write_tear_gate_for_test{};
 
+  // TEST SEAM ONLY -- never installed in production.  Points inside the
+  // writer's wrap-intent window at which a test can pause the writer (to
+  // probe a concurrent reader) or kill the process (crash recovery).  Same
+  // shape and cost as s_write_tear_gate_for_test: one predicted-not-taken
+  // branch, on the write path only, never on the lock-free read path.
+  // Every seam fires with the stripe mutex held and, in multi-process mode,
+  // the cross-process write lock held.
+  enum class WriterSeam : uint8_t {
+    kAfterIntentSet,   // intent stored, gate loads not yet run
+    kAfterGatePassed,  // gate said "proceed", nothing published yet
+    kWrapAfterCursor,  // wrap only: cursor lowered to the data-area start,
+                       // epoch not yet stored
+    kAfterEpochStore,  // epoch stored, intent not yet cleared
+  };
+  using WriterSeamHook = std::function<void(WriterSeam seam)>;
+  static inline WriterSeamHook s_writer_seam_for_test{};
+
   Volume(const Volume &) = delete;
   Volume &operator=(const Volume &) = delete;
 
@@ -1300,7 +1317,29 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // Body of open() that runs under the exclusive cross-process init
   // lock; see volume.cpp.
   std::expected<void, CacheError> open_locked(bool created_new);
-  std::expected<void, CacheError> init_stripes();
+  // `exclusive` = this opener proved it has no live peer (it holds the
+  // exclusive lifetime lock, or created the inode): only then may it touch
+  // the shared reader-exclusion state (see repair_wrap_state).
+  std::expected<void, CacheError> init_stripes(bool exclusive);
+
+  // Crash recovery for a writer that died INSIDE the wrap-intent window: its
+  // wrap_intent flag stays set (every read of the stripe misses until the
+  // next wrap) and the phase may have drifted from the pass count.  Clears
+  // the intent and re-derives phase = pass & 1.  Called ONLY when no writer
+  // can be inside the window: after a write-lock acquisition that
+  // force-released a holder PROVEN dead (never after an escalated takeover
+  // of a holder that may still be alive), or on an exclusive open.
+  void repair_wrap_state(Stripe *stripe);
+  // Run repair_wrap_state iff `token` recovered the lock from a proven-dead
+  // holder and escalated over no possibly-live one.
+  void repair_after_forced_release(Stripe *stripe,
+                                   const MmapDirectory::WriteLockToken &token);
+  // Fire the writer seam (test only; a no-op in production).
+  static void writer_seam(WriterSeam seam) {
+    if (s_writer_seam_for_test) {
+      s_writer_seam_for_test(seam);
+    }
+  }
   // Lease-protocol STEP-3: publish the per-stripe force-wrap deadline (ns; 0 =
   // none) to shared (mmap) or process-local storage.
   void publish_wrap_deferred_deadline(Stripe *stripe, uint64_t deadline_ns);

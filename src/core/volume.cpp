@@ -1758,6 +1758,27 @@ std::expected<void, CacheError> Volume::open_locked(bool created_new) {
     }
   }
 
+  // --- Exclusive open: repair a crashed writer's wrap state ----------------
+  // A multi-process opener that finds NO live peer (the exclusive lifetime
+  // probe succeeds) may reset the shared reader-exclusion state that dead
+  // processes left behind: a stuck wrap_intent (a writer killed inside its
+  // wrap window makes every read of the stripe miss for a whole pass),
+  // leaked borrow counts, a stale lease, and a phase that drifted from the
+  // pass count (see repair_wrap_state).  The probe is safe to run on every
+  // such open, unlike the reset gate's: a Conflict here only means "not
+  // exclusive" and the open proceeds without the repair -- it never refuses.
+  // A fresh inode (created_new) or a reset volume has nothing to repair.
+  // (A same-fork-family opener conflicts with its own family's shared lock;
+  // it simply skips the repair, which is the correct answer: the family is
+  // live.)
+  bool exclusive_open = created_new;
+  if (!needs_reset && !created_new && _mp_config.enabled) {
+    if (try_lock_lifetime_exclusive(_fd) == LockResult::Acquired) {
+      holding_exclusive = true;
+      exclusive_open = true;
+    }
+  }
+
   // Pre-allocate the file to the configured size.  On POSIX this uses
   // ftruncate(); on Windows it uses _chsize_s() which also extends files.
   // _chsize_s returns 0 on success and a positive errno on failure (unlike
@@ -1882,7 +1903,7 @@ std::expected<void, CacheError> Volume::open_locked(bool created_new) {
   }
 #endif
 
-  return init_stripes();
+  return init_stripes(exclusive_open);
 }
 
 void Volume::close() {
@@ -2086,7 +2107,7 @@ std::expected<void, CacheError> Volume::reset() {
   return {};
 }
 
-std::expected<void, CacheError> Volume::init_stripes() {
+std::expected<void, CacheError> Volume::init_stripes(bool exclusive) {
   // Account for volume header at the start
   size_t usable_size = _config.size - VolumeHeader::kSize;
 
@@ -2166,6 +2187,16 @@ std::expected<void, CacheError> Volume::init_stripes() {
         stripe->write_pos = saved_write_pos;
       } else {
         stripe->write_pos = stripe->data_offset;
+      }
+
+      // Exclusive open: no live peer can hold a borrow, a lease or a wrap
+      // window on this stripe, so whatever those shared slots still carry
+      // was left by processes that are gone.  Clear it and re-derive the
+      // phase (see repair_wrap_state).  NEVER done on a shared open: a live
+      // peer's borrow or in-flight wrap would be torn out from under it.
+      if (exclusive) {
+        stripe->mmap_directory->reset_reader_state_exclusive();
+        repair_wrap_state(stripe.get());
       }
     } else {
       // Use in-memory directory
@@ -2782,6 +2813,36 @@ void Volume::record_wrap(Stripe* stripe) noexcept {
   }
 }
 
+void Volume::repair_wrap_state(Stripe* stripe) {
+  if (!(stripe->use_mmap_directory && stripe->mmap_directory)) {
+    return;  // Process-local state dies with the process: nothing to repair.
+  }
+  MmapDirectory& dir = *stripe->mmap_directory;
+  // Phase FIRST, intent LAST: a reader that observes the cleared intent must
+  // also observe the re-derived phase (both seq_cst, program order).  The
+  // pass count is the authoritative epoch; the phase is only ever its low
+  // bit.  A writer that died between the phase toggle and the pass-count
+  // bump left the two disagreeing (every current-pass entry then reads as
+  // previous-pass and vice versa); re-deriving closes that drift.  Entries
+  // of the "wrong" phase that become visible again are exactly the
+  // phase-ABA survivors invariants 8 and 9 already reject by key and
+  // position, so this can only ever turn serves into misses.
+  dir.set_current_phase((dir.shared_wrap_count() & 1U) != 0);
+  dir.set_wrap_intent(false);
+}
+
+void Volume::repair_after_forced_release(
+    Stripe* stripe, const MmapDirectory::WriteLockToken& token) {
+  // Proven dead ONLY.  An escalated takeover usurps a holder we could not
+  // prove dead: it may still be alive and inside its wrap window, and
+  // clearing its intent would let a reader borrow bytes that holder is
+  // about to publish over.  Leave the flag to that holder (or to the next
+  // proven-dead recovery / wrap).
+  if (token.acquired && token.forced_release && !token.escalated_takeover) {
+    repair_wrap_state(stripe);
+  }
+}
+
 // --- Lease-based region pinning -------------------------------------------
 // --- + borrow-scoped wrap gating (the write-starvation fix) ---------------
 //
@@ -3245,6 +3306,11 @@ std::expected<Volume::WriteSlot, CacheError> Volume::allocate_write_slot(
       return make_unexpected(CacheError::Busy);
     }
 
+    // Stuck-intent recovery: a holder PROVEN dead may have died inside its
+    // wrap window (see repair_wrap_state).  We hold the lock, so no writer
+    // is in that window now.
+    repair_after_forced_release(stripe, write_token);
+
     // Adopt the shared cursor UNCONDITIONALLY whenever it is a valid in-bounds
     // position -- in EITHER direction.  It is loaded under the cross-process
     // write lock, so it is authoritative: by construction it is the end of the
@@ -3314,6 +3380,7 @@ std::expected<Volume::WriteSlot, CacheError> Volume::allocate_write_slot(
     // invalidation, no write_pos mutation; counters only) — the intent
     // flag is cleared and the fill dropped.
     set_wrap_intent(stripe, true);
+    writer_seam(WriterSeam::kAfterIntentSet);
     if (!lease_permits_wrap(stripe)) {
       set_wrap_intent(stripe, false);
       _wraps_deferred_by_lease.fetch_add(1, std::memory_order_relaxed);
@@ -3336,6 +3403,7 @@ std::expected<Volume::WriteSlot, CacheError> Volume::allocate_write_slot(
     // envelope and the phase-ABA positional guard at both read choke
     // points (probe + hop).  Detectable degradation, not silent overlap;
     // the undetectable channel stays gated at publish/pwrite below.
+    writer_seam(WriterSeam::kAfterGatePassed);
     evict_if_needed(stripe, doc_size);
 
     // Check again after eviction
@@ -3376,7 +3444,9 @@ std::expected<Volume::WriteSlot, CacheError> Volume::allocate_write_slot(
           stripe->mmap_directory->revalidate_write_lock(write_token)) {
         stripe->mmap_directory->set_shared_write_pos(data_area_start);
       }
+      writer_seam(WriterSeam::kWrapAfterCursor);
       record_wrap(stripe);
+      writer_seam(WriterSeam::kAfterEpochStore);
     }
 
     // Wrap decision + publish complete (toggle/reset/record done) — only
@@ -5184,6 +5254,9 @@ std::expected<void, CacheError> Volume::commit_header_rmw(
   if (!token.acquired) {
     // try-once mode only: a peer holds the lock mid-allocation.  Never wait.
     return make_unexpected(CacheError::Busy);
+  }
+  if (dir.revalidate_write_lock(token)) {
+    repair_after_forced_release(stripe, token);  // see allocate_write_slot
   }
   const bool ok = dir.revalidate_write_lock(token) &&
                   wrap_epoch(stripe) == epoch_start && identity_ok();

@@ -186,6 +186,7 @@ if(CYCLONE_BUILD_TESTS)
     tests/integration/test_write_handle_volume_lifetime.cpp
     tests/integration/test_reset_gate_spawn.cpp
     tests/integration/test_readahead.cpp
+    tests/integration/test_wrap_retention.cpp
   )
   # Compile guard: cyclone_c.h is the C ABI header, so it must stay valid C11
   # (it once used C++ alias declarations and did not compile as C).  Built as
@@ -213,6 +214,9 @@ if(CYCLONE_BUILD_TESTS)
   # only -- no Catch2.
   add_executable(cyclone-test-peer tests/support/peer_main.cpp)
   target_link_libraries(cyclone-test-peer PRIVATE cyclone-cache)
+  # The seam mode drives Volume's writer seams (src/core/volume.hpp).
+  target_include_directories(cyclone-test-peer PRIVATE
+                             ${CMAKE_CURRENT_SOURCE_DIR}/src)
   add_dependencies(cyclone-tests cyclone-test-peer)
   target_compile_definitions(cyclone-tests PRIVATE
     CYCLONE_TEST_PEER_EXE="$<TARGET_FILE:cyclone-test-peer>")
