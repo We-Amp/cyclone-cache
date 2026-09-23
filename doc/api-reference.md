@@ -186,6 +186,9 @@ struct CacheStats {
     // use, which is how you tell the feature apart from a no-op.
     uint64_t ram_coherence_rejections;      // RAM hits dropped as stale
     uint64_t ram_coherence_put_rejections;  // RAM inserts declined
+
+    // Large-document readahead (process-local; C++ only, see below)
+    uint64_t readahead_hints_issued;  // Readahead hints that reached the kernel
 };
 ```
 
@@ -238,8 +241,17 @@ chain rather than linking to the pre-wrap one — expected on any cache that
 wraps while alternates are being re-recorded, and otherwise indistinguishable
 from an ordinary wrap.
 
+`readahead_hints_issued` counts the large-document readahead hints the disk
+read path actually issued (see ["Large-Document
+Readahead"](#large-document-readahead) below), summed across volumes. It
+counts hints that got past the per-placement re-advise filter, so it measures
+kernel calls made, not large reads served: a hot document contributes at most
+one hint per re-advise interval (2 s) however often it is read, and a document
+below `readahead_min_bytes` never contributes. Process-local.
+
 The C API mirrors these fields at the end of `CycloneCacheStats`
-(append-only extension).
+(append-only extension), **except `readahead_hints_issued`**, which is
+C++-only.
 
 ```cpp
 void reset_stats();
@@ -517,6 +529,11 @@ struct CacheConfig {
     // Validate RAM-cache hits against the shared directory's bucket version
     // (default: false = off).  See "Cross-Process RAM Coherence" below.
     bool cross_process_ram_coherence = false;
+
+    // Readahead hint for large documents on the disk read path (default:
+    // 256 KiB; 0 = off).  Fluent setter: set_readahead_min_bytes().
+    // See "Large-Document Readahead" below.
+    size_t readahead_min_bytes = 256 * 1024;
 };
 
 enum class RamCacheType {
@@ -701,6 +718,52 @@ stale entries are rejected and removed, and refill depends on
 **No format change.** The bucket-version array predates the feature, so
 adopting the knob costs no cold cache and needs no migration. Rollback is
 turning it back off; nothing persists.
+
+### Large-Document Readahead
+
+```cpp
+size_t readahead_min_bytes = 256 * 1024;          // CacheConfig field (0 = off)
+CacheConfig& set_readahead_min_bytes(size_t bytes);  // fluent setter
+```
+
+The volume mapping is advised `MADV_RANDOM` at open, which is right for small
+HTTP objects (no readahead pollution) but turns a cold read of a large
+document into one serial page fault per page. When a document on the disk hit
+path is **at least `readahead_min_bytes` long** — measured as the stored
+document length, i.e. the 132-byte document header plus any HTTP header plus
+the content — the read issues one readahead hint over exactly that document's
+byte range, after the full-key re-verification and before the CRC pass makes
+the first content touch. Both `read_sync` and the selected-alternate read path
+(`read_alternate_sync`) do this. Documents below the threshold keep the
+fault-per-page behaviour; the open-time `MADV_RANDOM` is left in place.
+
+- **Default** 256 KiB. **`0` disables** the hint entirely (and the volume then
+  does not allocate the 64 KiB per-volume re-advise filter at all).
+- The value is copied into each volume's `VolumeConfig::readahead_min_bytes`
+  when the volume is added; changing `CacheConfig` afterwards has no effect
+  on volumes already open.
+- **Per-platform mechanism** (a build-time choice, not a runtime fallback):
+  - **Linux:** `madvise(MADV_WILLNEED)` over the mapping, page-aligned and
+    issued in 512 KiB chunks (Linux caps a single `MADV_WILLNEED` at the
+    device's readahead budget, so one call would cover only the first ~1 MB
+    of a multi-megabyte range).
+  - **Darwin (macOS):** `fcntl(F_RDADVISE)` over the **file** range. Darwin's
+    `MADV_WILLNEED` is synchronous and serialises on the shared VM object,
+    which costs most of the multi-process read throughput; `F_RDADVISE` is the
+    native asynchronous readahead.
+  - **Windows:** `PrefetchVirtualMemory` over the mapping (Windows 8 /
+    Server 2012 or later; the build imports it from `kernel32`).
+- A given document placement is advised at most once per 2 s, through a
+  lossy lock-free filter, so a hot document does not pay a kernel call per
+  read while one that has since been evicted from the page cache gets its
+  hint back. `CacheStats::readahead_hints_issued` counts the hints issued.
+- The hint is best-effort: it takes no lock, never dereferences the range,
+  and every error is ignored — a failed hint only costs the old behaviour.
+- **Not exposed in the C API.** `CycloneCacheConfig` has no field for it, so a
+  cache created through `cyclone_cache_create` always runs with the C++
+  default (256 KiB).
+
+See `doc/architecture.md` ("Readahead policy") for the measurements.
 
 ### Small-Object Tier
 
