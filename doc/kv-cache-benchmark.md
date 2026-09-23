@@ -574,8 +574,10 @@ byte; no run failed the check. Both harnesses print identical stream heads
 - **Cyclone** (`benchmarks/kv_churn`, round 3 + CRC-32C tree): volume sized so
   the stripes' data areas sum to 17 179 873 216 B (1.0000 × C), 16 stripes of
   ~511 blocks, 65 536 directory entries per stripe (11 MiB of mmap directory
-  in total). Entries never ran out: `tag_collision_evictions` stayed ≤ 7 per
-  run at 2 MiB and ≤ 246 at 512 KiB. mmap directory on, checksum verified on
+  in total). Entries never ran out: tag-collision evictions stayed ≤ 7 per
+  run at 2 MiB and ≤ 246 at 512 KiB (whole-run totals, warm-up included;
+  `cy_tag_collision_evictions` in the recorded JSONL,
+  `cy_tag_collision_evictions_total` in the current harness). mmap directory on, checksum verified on
   read, default readahead, no RAM tier, no fsync. Eviction is Cyclone's own;
   the harness keeps no index.
 - **LMDB 0.9.24**: `MDB_NOSYNC | MDB_NOMETASYNC | MDB_NOTLS`, map 1.5 × C.
@@ -590,9 +592,8 @@ byte; no run failed the check. Both harnesses print identical stream heads
   `rename()` to insert, `preadv(header, staging buffer)` on a hit, no fsync.
 
 Linux (i7-8750H, 970 PRO NVMe, ext4, kernel 5.15), one run per point, with
-the 2 MiB T=4 points run twice. The box also hosts CI runners: the 1-minute
-load at the start of a run was 1.1–4.7 on 12 threads, recorded per run in
-the logs. Raw data: [`doc/kv-cache-benchmark/churn/`](kv-cache-benchmark/churn/).
+the 2 MiB T=4 points run twice. Background load was present: the 1-minute
+load at run start was 1.1–4.7 on 12 threads, recorded per run. Raw data: [`doc/kv-cache-benchmark/churn/`](kv-cache-benchmark/churn/).
 
 ### Headline, 2 MiB blocks
 
@@ -623,8 +624,8 @@ first 10 000 Zipf gets after close + reopen.
 | 4 | filedir | 0.726 | 1.18 / 1.14 | 455 / 36 954 | 3 396 / 66 227 | 1.006 | 16.03 GiB | 0.806 |
 
 T=4 served is "first run / repeat"; the latencies are from the first run
-(hit p99 in the repeat: Cyclone 23.7 / 21.4 ms, LMDB 82.2 / 82.9 ms,
-filedir 38.0 / 38.4 ms). Peak cgroup memory was 4.00 GiB for every store;
+(hit p99 in the repeat, `zipf` / `zipf+scan`: Cyclone 23.7 / 21.4 ms, LMDB
+82.2 / 82.9 ms, filedir 38.0 / 38.4 ms). Peak cgroup memory was 4.00 GiB for every store;
 peak RSS was 3.3–3.7 GiB for the two mmap stores (resident file pages) and
 under 30 MiB for filedir.
 
@@ -648,8 +649,8 @@ point.
 
 ### Why: the hit ratio, and where it comes from
 
-Cyclone's hit ratio is 8–9 points below the LRU stores on both patterns.
-That is a real cost of Cyclone's eviction, and it is the main reason for the
+Cyclone's hit ratio is 8–9 points below the LRU stores on both patterns
+(9.2–9.4 on `zipf`, 8.4–8.9 on `zipf+scan`). That is a real cost of Cyclone's eviction, and it is the main reason for the
 served-throughput gap at T=1. The per-hit cost is the same (hit p50 191 vs
 178 µs); Cyclone simply has fewer hits and more slow misses. The gap is
 larger than "FIFO vs LRU". On a wrap, Cyclone toggles the stripe's directory
@@ -657,18 +658,21 @@ phase (`Volume::evict_if_needed`), and every entry of the previous pass stops
 resolving at once, although most of those blocks are still intact on disk
 ahead of the write cursor. Each stripe therefore restarts empty on every wrap
 and holds roughly half its capacity on average. Replaying the same streams
-through the policies alone (`benchmarks/kv_churn_policy`, no I/O;
+through the policies alone (`benchmarks/kv_churn_policy`, no I/O, keys
+routed to stripes by `segment_hash()` as `Volume::select_stripe` does;
 [`policy-replay.txt`](kv-cache-benchmark/churn/policy-replay.txt)) reproduces
-the measured numbers:
+the measured numbers to within 0.6 points:
 
 | 2 MiB, C = 16 GiB | LRU | FIFO | FIFO per stripe | wrap flush (Cyclone) | measured Cyclone |
 |---|---:|---:|---:|---:|---:|
 | `zipf` | 0.850 | 0.818 | 0.817 | 0.761 | 0.757 |
 | `zipf+scan` | 0.725 | 0.687 | 0.687 | 0.644 | 0.638–0.642 |
 
-Plain FIFO would cost about 3 points against LRU; the phase flush costs
-about 6 more. No store here has scan resistance: the scan stream costs every
-store about 12 points. Keeping the previous pass resolvable until it is
+Plain FIFO would cost 3.2 points against LRU on `zipf` and 3.8 on
+`zipf+scan`; the phase flush costs 5.7 and 4.3 more (FIFO per stripe vs wrap
+flush). So FIFO explains about 3–4 of the 8–9 points and the flush the
+rest. No store here has scan resistance: the scan stream costs every store
+about 12 points. Keeping the previous pass resolvable until it is
 actually overwritten would recover the FIFO number. This round
 does not try that.
 
@@ -723,7 +727,7 @@ per-insert cost that dominates the 2 MiB case.
 - One run per point, except 2 MiB T=4 (two runs). T=4 served varied by up to
   11 % between runs (Cyclone `zipf+scan`: 1.00 vs 0.89 GB/s). That is the
   same size as the margin the only passing criterion rests on.
-- The CI runners on the box were not stopped. The load at run start is in
+- Background load on the box was not stopped. The load at run start is in
   the logs; it was higher (3–4.7) during the repeat.
 - Write amplification is device sectors written (whole partition) over
   payload inserted, including a final `syncfs`. It is about 1.00 for every
