@@ -3343,6 +3343,39 @@ std::expected<Volume::WriteSlot, CacheError> Volume::allocate_write_slot(
     if (doc_size > available) {
       // Wrap to beginning of data area
       stripe->write_pos = data_area_start;
+      // Multi-process: lower the SHARED guard cursor to the wrap target NOW,
+      // inside the intent window, not at commit_write_slot.  Readers' phase-
+      // ABA positional guard reads shared_write_pos; the wrap below makes
+      // every two-wrap survivor in [data_area_start, old cursor) current-phase
+      // again, and this wrap's own reservation starts at data_area_start.
+      // Left HIGH until commit, the guard would admit such a survivor for the
+      // whole reservation->pwrite window, and its borrow revalidates cleanly
+      // (intent already cleared, epoch already bumped) -- a torn live borrow
+      // once the pwrite lands.  It would also make a wrap whose first fill
+      // never commits wrap AGAIN on the next write (the next writer adopts
+      // the stale high cursor above), a second phase toggle with no pass in
+      // between.
+      //
+      // Ordering proof (in the style of the wrap-intent Dekker proof above).
+      // This release store is program-order BEFORE record_wrap's seq_cst
+      // epoch RMW.  A reader captures epoch_start (seq_cst load) before it
+      // probes, and the probe loads the cursor (acquire) after that:
+      //  - epoch_start reads the post-wrap count: it synchronizes with the
+      //    RMW, so the cursor load sees this store or a later one.  Later
+      //    stores are commit_write_slot's, published only after the fill is
+      //    durable, so the guard never covers unfilled bytes (F6 holds).
+      //    Everything at/after data_area_start is rejected until then.
+      //  - epoch_start reads the pre-wrap count: borrow_still_valid's later
+      //    epoch load (or its intent load) is where the reader catches this
+      //    wrap, exactly as before; the cursor value is irrelevant there.
+      // Lowering the cursor only ever REJECTS more (a miss), never exposes
+      // unfilled bytes.  Revalidate the lock first, like commit_write_slot: a
+      // usurped holder must not move the usurper's cursor (its
+      // commit_write_slot then fails the same check and skips the insert).
+      if (has_write_lock &&
+          stripe->mmap_directory->revalidate_write_lock(write_token)) {
+        stripe->mmap_directory->set_shared_write_pos(data_area_start);
+      }
       record_wrap(stripe);
     }
 
