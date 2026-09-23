@@ -3,6 +3,8 @@
 
 #include "hit_tracker.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <mutex>
 
 namespace cyclone {
@@ -219,9 +221,14 @@ void HitTracker::flush_thread_func() {
     auto sleep_time = _config.flush_interval;
     auto sleep_end = std::chrono::steady_clock::now() + sleep_time;
 
-    // Sleep in small increments to check _running flag periodically
-    while (_running.load() && std::chrono::steady_clock::now() < sleep_end) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // Sleep in slices of at most 100 ms so stop() stays prompt, but never
+    // past sleep_end: a fixed 100 ms slice stretched a 50 ms interval to
+    // 100 ms.  No lock is taken here, so HitTracker stays a leaf lock.
+    while (_running.load()) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= sleep_end) break;
+      std::this_thread::sleep_for(std::min<std::chrono::steady_clock::duration>(
+          std::chrono::milliseconds(100), sleep_end - now));
     }
 
     if (!_running.load()) {

@@ -233,14 +233,28 @@ TEST_CASE("HitTracker background flush", "[hit_tracker]") {
   tracker.record_hit(key);
   tracker.record_hit(key);
 
-  // Wait for background flush
-  std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
-  {
+  // Poll for the background flush.  A flush may land between the two
+  // record_hit() calls, yielding two records of delta 1 instead of one of
+  // delta 2, so sum the deltas; the deadline is generous for loaded CI
+  // runners.
+  auto flushed_hits = [&] {
     std::lock_guard<std::mutex> lock(flushed_mutex);
-    REQUIRE(flushed_records.size() == 1);
-    REQUIRE(flushed_records[0].hit_delta == 2);
+    uint64_t sum = 0;
+    for (const auto &record : flushed_records) {
+      REQUIRE(record.key == key);
+      sum += record.hit_delta;
+    }
+    return sum;
+  };
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (flushed_hits() < 2 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
+
+  // Checked before stop(): stop() does a final flush, so a pass here proves
+  // the background thread flushed.
+  REQUIRE(flushed_hits() == 2);
 
   tracker.stop();
 }
