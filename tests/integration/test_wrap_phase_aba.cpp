@@ -98,6 +98,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -1525,6 +1526,284 @@ TEST_CASE(
   cache->stop();
   remove_cache_files(path);
 }
+
+// --- (F6-E-MP): wrap window vs a stale SHARED cursor -------------------------
+// The multi-process counterpart of F6-E, where the guard cursor is the SHARED
+// one.  A wrap resets the process-local stripe->write_pos to the data-area
+// start S, but a multi-process reader's positional guard reads
+// shared_write_pos (Stripe::current_write_cursor).  If the wrap left the shared
+// cursor at its pre-wrap HIGH value until commit_write_slot, then for the whole
+// wrap's reservation->pwrite window the guard would admit offsets in
+// [S, old cursor), including the span the wrapping write is about to fill.
+// Pair that with a two-wrap directory survivor whose bytes at S carry the same
+// key, and every leg of the gauntlet passes:
+//
+//   pass 0: K written at S (entry e1, phase p0), then n-1 size-b fillers.
+//   pass 1: K written again -> wrap #1 lands it at S.  The in-place election
+//           skips e1 (stale phase), so the new entry e2 takes an EMPTY slot
+//           and e1 survives.  Then n-1 fillers.
+//   wrap #2 (the gated write): the phase toggles back to p0, so e1 is current
+//           again and points at S, which still holds K's intact pass-1 bytes
+//           (key + CRC verify).  The epoch was bumped and intent cleared
+//           BEFORE the tear gate, so a reader that starts now captures the
+//           post-wrap epoch and its borrow revalidates cleanly.  Only the
+//           positional guard can reject e1, and only if the shared cursor was
+//           lowered to S inside the wrap.
+//
+// Freeze the wrapping writer at the tear gate (bytes reserved at S, pwrite not
+// run) and read K from the non-owning view: it must be a clean miss, with no
+// borrow handed out over the bytes the pwrite is about to overwrite.
+TEST_CASE(
+    "F6-E in mmap mode: wrap window with stale shared cursor must not admit a "
+    "two-wrap survivor at the wrap target",
+    "[wrap][forwardfill][multiprocess][f6][writelock]") {
+  constexpr uint64_t kHeaderSize = 132;  // Document::kHeaderSize
+  std::string path = create_temp_file("f6e_mp", kVolMB);
+
+  auto make_view = [&](uint32_t process_index) {
+    CacheConfig config;
+    config.ram_cache_size = 0;
+    config.set_enable_checksum(true);  // required in multi-process mode
+    config.set_multi_process(process_index, 2);
+    // Long lease so borrows_outstanding counts real borrows.  No borrow is
+    // held across any wrap below, so the gate never defers.
+    config.read_lease_duration = std::chrono::milliseconds(600000);
+    config.lease_wrap_ceiling = std::chrono::milliseconds(600000);
+    auto cache_result = Cache::create(config);
+    REQUIRE(cache_result.has_value());
+    VolumeConfig vc;
+    vc.path = path;
+    vc.size = kVolMB * 1024 * 1024;
+    REQUIRE((*cache_result)->add_volume(vc).has_value());
+    REQUIRE((*cache_result)->start().has_value());
+    return std::move(*cache_result);
+  };
+
+  auto writer_view = make_view(0);  // owns the single stripe
+  auto reader_view = make_view(1);  // owns nothing: lock-free reads
+  auto s0 = writer_view->stats();
+  REQUIRE(s0.stripe_count == 1);
+  const uint64_t data_area = s0.stripe_bytes - s0.current_bytes;
+  const uint64_t b = uint64_t{64} * 1024;
+  const uint64_t n = data_area / b;
+  REQUIRE(n >= 4);
+  // n docs of size b fill a pass; the (n+1)-th cannot fit the trailing gap
+  // (data_area % b < b) and therefore wraps to S.
+
+  const CacheKey k_key("wrap-target-K");
+  const uint32_t k_bucket = bucket_of(k_key);
+  const auto k0 = make_content(21, b - kHeaderSize);
+  const auto k1 = make_content(22, b - kHeaderSize);
+  const auto filler = make_content(3, b - kHeaderSize);
+  const auto wrapper = make_content(5, b - kHeaderSize);
+  size_t idx = 0;
+
+  // Pass 0: K at S, then n-1 fillers.
+  REQUIRE(write_entry(*writer_view, "wrap-target-K", k0));
+  for (uint64_t i = 0; i + 1 < n; ++i) {
+    REQUIRE(write_entry(*writer_view, next_disjoint_key("c-", idx, k_bucket),
+                        filler));
+  }
+  REQUIRE(writer_view->stats().write_buffer_wraps == 0);
+
+  // Pass 1: K again -> wrap #1 lands it at S (e1 survives), then n-1 fillers.
+  REQUIRE(write_entry(*writer_view, "wrap-target-K", k1));
+  REQUIRE(writer_view->stats().write_buffer_wraps == 1);
+  for (uint64_t i = 0; i + 1 < n; ++i) {
+    REQUIRE(write_entry(*writer_view, next_disjoint_key("c-", idx, k_bucket),
+                        filler));
+  }
+  REQUIRE(writer_view->stats().write_buffer_wraps == 1);
+  {
+    auto rk = reader_view->read_sync(k_key);
+    REQUIRE(rk.has_value());
+    REQUIRE(content_equals(rk->content(), k1));
+  }
+  REQUIRE(reader_view->stats().borrows_outstanding == 0);
+
+  TearGate gate;
+  Volume::s_write_tear_gate_for_test = [&gate](uint64_t wo, uint64_t np) {
+    gate.enter(wo, np);
+  };
+  const std::string w_key = next_disjoint_key("wrap-", idx, k_bucket);
+  std::atomic<bool> writer_ok{false};
+  std::thread writer(
+      [&] { writer_ok.store(write_entry(*writer_view, w_key, wrapper)); });
+
+  gate.wait_until_at_gate();
+  // Wrap #2 is committed (phase toggled back, epoch bumped, intent cleared);
+  // the gated write reserved [S, S + b) and has not filled it.
+  REQUIRE(reader_view->stats().write_buffer_wraps == 2);
+  const uint64_t wrap_target = gate.seen_write_offset;
+
+  std::optional<ReadHandle> held;
+  {
+    auto rk = reader_view->read_sync(k_key);
+    if (rk.has_value()) {
+      held.emplace(std::move(*rk));
+    } else {
+      CHECK(rk.error() == CacheError::NotFound);
+    }
+  }
+  CAPTURE(wrap_target, data_area, b, n);
+  // The invariant: e1 sits at the wrap target, which is AT the (lowered)
+  // shared cursor, so the positional guard rejects it: no serve, no borrow.
+  CHECK_FALSE(held.has_value());
+  CHECK(reader_view->stats().borrows_outstanding == 0);
+
+  gate.release();
+  writer.join();
+  Volume::s_write_tear_gate_for_test = {};
+  REQUIRE(writer_ok.load());
+  REQUIRE(writer_view->stats().write_buffer_wraps == 2);
+
+  if (held.has_value()) {
+    // Diagnostic for the bug: the borrow handed out inside the window now
+    // aliases the wrapping write's bytes — torn under a live handle.
+    CHECK(content_equals(held->content(), k1));
+    held.reset();
+  }
+
+  // After the fill: K misses (e1 now points at the wrapper's bytes -> key
+  // mismatch), and the wrapper serves its own bytes at S.
+  REQUIRE_FALSE(reader_view->read_sync(k_key).has_value());
+  {
+    auto rw = reader_view->read_sync(CacheKey(w_key));
+    REQUIRE(rw.has_value());
+    REQUIRE(content_equals(rw->content(), wrapper));
+  }
+  REQUIRE(reader_view->stats().borrows_outstanding == 0);
+
+  reader_view->stop();
+  writer_view->stop();
+  remove_cache_files(path);
+}
+
+#ifndef _WIN32
+// --- (F6-E-MP'): a wrap whose first fill never commits
+// ------------------------ Companion to the case above.  If the wrap's first
+// write fails before commit_write_slot (here: pwrite fails with EFBIG under an
+// RLIMIT_FSIZE below the wrap target, standing in for ENOSPC/EIO on a sparse
+// cache file), nothing advances the cursor.  Were the shared cursor still at
+// its pre-wrap HIGH value, the next writer would adopt it (allocate_write_slot
+// re-syncs from the shared cursor), find no room, and wrap AGAIN: a second
+// phase toggle with no pass in between, which re-validates every pass-0 entry
+// while their intact bytes sit behind the high cursor, so the positional guard
+// admits them.  With the cursor lowered to S inside the wrap, the next writer
+// adopts S and reserves there without wrapping: exactly ONE wrap, and pass-0
+// entries stay stale.
+TEST_CASE(
+    "F6-E in mmap mode: a wrap whose first fill fails advances "
+    "shared_wrap_count by exactly one",
+    "[wrap][forwardfill][multiprocess][f6][writelock]") {
+  constexpr uint64_t kHeaderSize = 132;  // Document::kHeaderSize
+  std::string path = create_temp_file("f6e_mp_fail", kVolMB);
+
+  auto make_view = [&](uint32_t process_index) {
+    CacheConfig config;
+    config.ram_cache_size = 0;
+    config.set_enable_checksum(true);  // required in multi-process mode
+    config.set_multi_process(process_index, 2);
+    config.read_lease_duration = std::chrono::milliseconds(600000);
+    config.lease_wrap_ceiling = std::chrono::milliseconds(600000);
+    auto cache_result = Cache::create(config);
+    REQUIRE(cache_result.has_value());
+    VolumeConfig vc;
+    vc.path = path;
+    vc.size = kVolMB * 1024 * 1024;
+    REQUIRE((*cache_result)->add_volume(vc).has_value());
+    REQUIRE((*cache_result)->start().has_value());
+    return std::move(*cache_result);
+  };
+
+  auto writer_view = make_view(0);
+  auto reader_view = make_view(1);
+  auto s0 = writer_view->stats();
+  REQUIRE(s0.stripe_count == 1);
+  const uint64_t data_area = s0.stripe_bytes - s0.current_bytes;
+  const uint64_t b = uint64_t{64} * 1024;
+  const uint64_t n = data_area / b;
+  REQUIRE(n >= 4);
+
+  const auto filler = make_content(3, b - kHeaderSize);
+  const auto second = make_content(9, b - kHeaderSize);
+  size_t idx = 0;
+  // Pass 0: n fillers.  second_key is the doc at S + b.
+  std::string second_key;
+  for (uint64_t i = 0; i < n; ++i) {
+    const std::string key = "p0-" + std::to_string(i);
+    REQUIRE(write_entry(*writer_view, key, i == 1 ? second : filler));
+    if (i == 1) {
+      second_key = key;
+    }
+  }
+  REQUIRE(writer_view->stats().write_buffer_wraps == 0);
+  {
+    auto r = reader_view->read_sync(CacheKey(second_key));
+    REQUIRE(r.has_value());
+  }
+
+  // Wrapping write #1: make its pwrite fail.  The hook runs on the writer
+  // thread after the wrap committed and before the pwrite; the limit is below
+  // the wrap target, so the pwrite returns EFBIG (SIGXFSZ ignored).
+  struct rlimit saved{};
+  REQUIRE(::getrlimit(RLIMIT_FSIZE, &saved) == 0);
+  auto *old_xfsz = ::signal(SIGXFSZ, SIG_IGN);
+  Volume::s_write_tear_gate_for_test = [&saved](uint64_t wo, uint64_t) {
+    struct rlimit lim = saved;
+    lim.rlim_cur = static_cast<rlim_t>(wo);
+    (void)::setrlimit(RLIMIT_FSIZE, &lim);
+  };
+  const bool first_ok =
+      write_entry(*writer_view, next_disjoint_key("w1-", idx, 0), filler);
+  Volume::s_write_tear_gate_for_test = {};
+  REQUIRE(::setrlimit(RLIMIT_FSIZE, &saved) == 0);
+  ::signal(SIGXFSZ, old_xfsz);
+  REQUIRE_FALSE(first_ok);  // the fill failed: nothing published
+  REQUIRE(writer_view->stats().write_buffer_wraps == 1);
+
+  // Next write: freeze it at the tear gate and look at the state it made.
+  TearGate gate;
+  Volume::s_write_tear_gate_for_test = [&gate](uint64_t wo, uint64_t np) {
+    gate.enter(wo, np);
+  };
+  const std::string w2_key = next_disjoint_key("w2-", idx, 0);
+  std::atomic<bool> writer_ok{false};
+  std::thread writer(
+      [&] { writer_ok.store(write_entry(*writer_view, w2_key, filler)); });
+  gate.wait_until_at_gate();
+
+  // Exactly one wrap: the failed fill left the cursor at S, not high.
+  CHECK(reader_view->stats().write_buffer_wraps == 1);
+  // The pass-0 doc at S + b must not be admitted inside the window: a second
+  // wrap would have toggled its entry current again behind a high cursor.
+  std::optional<ReadHandle> held;
+  {
+    auto r = reader_view->read_sync(CacheKey(second_key));
+    if (r.has_value()) {
+      held.emplace(std::move(*r));
+    }
+  }
+  CHECK_FALSE(held.has_value());
+  CHECK(reader_view->stats().borrows_outstanding == 0);
+  held.reset();
+
+  gate.release();
+  writer.join();
+  Volume::s_write_tear_gate_for_test = {};
+  REQUIRE(writer_ok.load());
+  CHECK(writer_view->stats().write_buffer_wraps == 1);
+  {
+    auto rw = reader_view->read_sync(CacheKey(w2_key));
+    REQUIRE(rw.has_value());
+    REQUIRE(content_equals(rw->content(), filler));
+  }
+
+  reader_view->stop();
+  writer_view->stop();
+  remove_cache_files(path);
+}
+#endif  // _WIN32
 
 #ifndef _WIN32
 namespace {
