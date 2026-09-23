@@ -479,22 +479,24 @@ Run specific test with verbose output:
 
 ## Performance Baselines
 
-Current performance (Apple M5, 10 cores, macOS 27, Release build, bundled
-SHA-256, single thread except where noted, 4 KB objects;
+Measured 2026-09-23 at commit `87cd986` (Apple M5, 10 cores, macOS 27.0,
+Release build, bundled SHA-256, single thread except where noted, 4 KB
+objects, median of three runs;
 `performance_baseline --cache-size 512 --entries 5000 --content-size 4096`):
 
 | Operation | Throughput | Notes |
 |-----------|------------|-------|
-| Key generation | 2.7-4.9M ops/sec | SHA-256 hashing, 0.2-0.3 µs |
-| Write (4KB) | 96K ops/sec | p50 10.1 µs, p99 14.6 µs |
-| Read (first-touch) | 131K ops/sec | p50 7.3 µs — page-in + CRC-32C |
-| Read (warm, random) | 2.5M ops/sec | p50 0.33 µs |
-| Exists check | 4.4M ops/sec | 0.21 µs; directory lookup only |
-| Cache miss | 3.5M ops/sec | 0.29 µs; fast path |
+| Key generation | 2.9-4.8M ops/sec | SHA-256 hashing, 0.2-0.3 µs |
+| Write (4KB) | 229K ops/sec | p50 2.6 µs, p99 21 µs; varies up to 6× run to run |
+| Read (first-touch) | 1.18M ops/sec | p50 0.67 µs — page-in + CRC-32C |
+| Read (warm, random) | 2.3M ops/sec | p50 0.38 µs |
+| Exists check | 4.1M ops/sec | 0.21 µs; directory lookup only |
+| Cache miss | 3.4M ops/sec | 0.29 µs; fast path |
 
 `read_sync` never populates the RAM tier, so the "warm" reads above are served
 from the mapped file (OS page cache), not the RAM cache; first-touch reads pay
-page-in plus CRC-32C verification.
+page-in plus CRC-32C verification (hardware on ARMv8 and x86-64 with
+SSE4.2).
 
 Read scaling (`concurrent_read_bench 20000 512 2 0 512 ramoff` — 512 B objects,
 RAM tier off; a different harness, not comparable to the table above):
@@ -503,7 +505,7 @@ RAM tier off; a different harness, not comparable to the table above):
 |---------|-----------|
 | 1 | 5.3M/s |
 | 4 | 17.6M/s |
-| 16 | 22.1M/s |
+| 16 | 21.1M/s |
 
 ## Resources
 
@@ -526,6 +528,9 @@ design record for shipped work (background, not a task list);
 | [doc/api-reference.md](doc/api-reference.md) | API documentation | Current |
 | [doc/plugin-development.md](doc/plugin-development.md) | Plugin guide | Current |
 | [doc/multi-process.md](doc/multi-process.md) | Cross-process stripe affinity and locking | Current |
+| [doc/kv-cache-benchmark.md](doc/kv-cache-benchmark.md) | LLM KV-cache tier benchmark vs LMDB, RocksDB, file-per-block; results by round, what to change | Current (Summary); rounds are dated records |
+| [doc/kv-cache-benchmark/kv-workload-spec.md](doc/kv-cache-benchmark/kv-workload-spec.md) | Workload spec for rounds 1–3b | Current (v1.1) |
+| [doc/kv-cache-benchmark/kv-churn-spec.md](doc/kv-cache-benchmark/kv-churn-spec.md) | Bounded-capacity churn spec and decision criteria (round 4) | Current (v1) |
 
 Historical fix-logs are archived separately from the living docs — they record
 completed work and are not current spec.
