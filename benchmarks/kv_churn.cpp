@@ -600,25 +600,26 @@ int main(int argc, char* argv[]) {
   remove_volume_files(opts);
 
   const std::string cg = cgroup_dir();
-  std::cerr << "Cyclone KV churn (kv-churn-spec v1)\n"
-            << "  cpu        : "
-            << run_command(
+  std::cerr
+      << "Cyclone KV churn (kv-churn-spec v1)\n"
+      << "  cpu        : "
+      << run_command(
 #ifdef __APPLE__
-                   "sysctl -n machdep.cpu.brand_string"
+             "sysctl -n machdep.cpu.brand_string"
 #else
-                   "awk -F: '/model name/{print $2; exit}' /proc/cpuinfo"
+             "awk -F: '/model name/{print $2; exit}' /proc/cpuinfo"
 #endif
-                   )
-            << "\n  os         : " << run_command("uname -sr")
-            << "\n  commit     : " << run_command(
-                   "echo ${KV_COMMIT:-$(git rev-parse --short HEAD 2>/dev/null)}")
-            << "\n  device     : " << device_name(opts.path)
-            << "\n  cgroup     : " << (cg.empty() ? "none" : cg)
-            << " memory.max=" << read_word_file(cg + "/memory.max")
-            << "\n  load       : " << run_command("uptime")
-            << "\n  pattern    : " << opts.pattern << ", threads "
-            << opts.threads << ", block " << opts.block_size << ", capacity "
-            << opts.capacity << ", seconds " << opts.seconds << "\n";
+             )
+      << "\n  os         : " << run_command("uname -sr") << "\n  commit     : "
+      << run_command(
+             "echo ${KV_COMMIT:-$(git rev-parse --short HEAD 2>/dev/null)}")
+      << "\n  device     : " << device_name(opts.path)
+      << "\n  cgroup     : " << (cg.empty() ? "none" : cg)
+      << " memory.max=" << read_word_file(cg + "/memory.max")
+      << "\n  load       : " << run_command("uptime")
+      << "\n  pattern    : " << opts.pattern << ", threads " << opts.threads
+      << ", block " << opts.block_size << ", capacity " << opts.capacity
+      << ", seconds " << opts.seconds << "\n";
 
   drop_caches(opts);
   CgroupSampler sampler(cg);
