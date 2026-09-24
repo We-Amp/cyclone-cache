@@ -211,7 +211,7 @@ verification time, this re-verifies continuously instead of in a storm.
 
 ### 3.3 A pre-existing weakness this design closes
 
-> **Fixed** in commit 399a739 (branch `crc-cache-identity`), with no
+> **Fixed** (We-Amp/cyclone-cache#24), with no
 > on-disk or shared-memory format change. The rest of this section records
 > the weakness as it was; "Fix as shipped" below says what changed.
 
