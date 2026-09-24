@@ -1,0 +1,111 @@
+# Intermediate trees, 2026-09-24, Linux benchmark machine. Kept because they shaped the final change (dd487fb).
+
+## A. 10112ba: 64 KiB chunks over the first 1 MiB, then 512 KiB. Cold reps (median of 3, same-day LMDB).
+# 2 MiB regressed (a 512 KiB chunk inside a 2 MiB document); this led to the rule sweep and the 4 MiB head.
+## get_first_touch: median GB/s of 3 [runs]; after/base; lmdb/after
+    64 KiB  base 0.04 [0.04, 0.04, 0.04]  after 0.04 [0.04, 0.04, 0.04]  lmdb 2.20 [2.22, 1.87, 2.2]  after/base 1.00x  lmdb/after 53.86x
+   256 KiB  base 0.60 [0.6, 0.6, 0.57]  after 1.13 [1.14, 1.13, 1.11]  lmdb 2.19 [2.25, 2.13, 2.19]  after/base 1.88x  lmdb/after 1.93x
+   512 KiB  base 0.80 [0.8, 0.82, 0.8]  after 1.72 [1.7, 1.72, 1.73]  lmdb 2.55 [2.55, 2.57, 2.52]  after/base 2.13x  lmdb/after 1.49x
+  1024 KiB  base 1.52 [1.52, 1.36, 1.64]  after 1.65 [1.66, 1.65, 1.58]  lmdb 2.79 [2.73, 2.79, 2.84]  after/base 1.09x  lmdb/after 1.69x
+  2048 KiB  base 2.17 [2.2, 2.16, 2.17]  after 1.90 [1.02, 1.92, 1.9]  lmdb 2.73 [2.7, 2.89, 2.73]  after/base 0.88x  lmdb/after 1.44x
+  8192 KiB  base 3.06 [3.02, 3.06, 3.11]  after 3.09 [3.09, 3.08, 3.11]  lmdb 2.91 [2.91, 2.87, 2.91]  after/base 1.01x  lmdb/after 0.94x
+ 32768 KiB  base 3.39 [3.39, 3.39, 3.37]  after 3.42 [3.4, 3.42, 3.42]  lmdb 2.92 [2.92, 3.02, 2.83]  after/base 1.01x  lmdb/after 0.85x
+## restart: median GB/s of 3 [runs]; after/base; lmdb/after
+    64 KiB  base 0.04 [0.04, 0.04, 0.04]  after 0.04 [0.04, 0.04, 0.04]  lmdb 1.88 [1.88, 1.85, 1.97]  after/base 0.98x  lmdb/after 48.45x
+   256 KiB  base 0.54 [0.54, 0.53, 0.54]  after 0.86 [0.93, 0.86, 0.82]  lmdb 2.15 [2.18, 2.11, 2.15]  after/base 1.61x  lmdb/after 2.49x
+   512 KiB  base 0.71 [0.71, 0.76, 0.71]  after 1.42 [1.4, 1.47, 1.42]  lmdb 2.49 [2.49, 2.48, 2.51]  after/base 1.99x  lmdb/after 1.75x
+  1024 KiB  base 1.31 [1.38, 1.25, 1.31]  after 1.63 [1.33, 1.67, 1.63]  lmdb 2.73 [2.64, 2.73, 2.78]  after/base 1.24x  lmdb/after 1.67x
+  2048 KiB  base 2.00 [2.0, 2.0, 1.87]  after 1.66 [1.66, 1.66, 1.6]  lmdb 2.69 [2.69, 2.84, 2.65]  after/base 0.83x  lmdb/after 1.62x
+  8192 KiB  base 2.86 [2.82, 2.86, 2.86]  after 2.88 [2.88, 2.9, 2.85]  lmdb 2.86 [2.86, 2.88, 2.84]  after/base 1.01x  lmdb/after 0.99x
+ 32768 KiB  base 3.29 [3.29, 3.27, 3.29]  after 3.32 [3.29, 3.33, 3.32]  lmdb 2.78 [2.78, 2.93, 2.76]  after/base 1.01x  lmdb/after 0.83x
+
+## B. d2a5f4b: 64 KiB chunks over the first 4 MiB, then 512 KiB, no residency check.
+# B1. Cold reps (median of 3, same-day LMDB):
+## get_first_touch: median GB/s of 3 [runs]; after/base; lmdb/after
+    64 KiB  base 0.04 [0.04, 0.04, 0.04]  after 0.04 [0.04, 0.04, 0.04]  lmdb 1.88 [1.88, 1.91, 1.61]  after/base 1.02x  lmdb/after 47.93x
+   256 KiB  base 0.60 [0.6, 0.62, 0.6]  after 1.14 [1.1, 1.15, 1.14]  lmdb 2.20 [2.22, 2.2, 2.04]  after/base 1.88x  lmdb/after 1.93x
+   512 KiB  base 0.82 [0.8, 0.86, 0.82]  after 1.71 [1.7, 1.72, 1.71]  lmdb 2.38 [2.38, 2.43, 2.21]  after/base 2.08x  lmdb/after 1.39x
+  1024 KiB  base 1.54 [1.45, 1.54, 1.56]  after 1.59 [1.68, 1.58, 1.59]  lmdb 2.65 [2.74, 2.65, 2.61]  after/base 1.03x  lmdb/after 1.67x
+  2048 KiB  base 2.17 [2.11, 2.46, 2.17]  after 2.37 [2.39, 2.37, 2.36]  lmdb 2.64 [2.72, 2.05, 2.64]  after/base 1.09x  lmdb/after 1.11x
+  8192 KiB  base 3.06 [3.05, 3.15, 3.06]  after 2.99 [2.99, 3.0, 2.96]  lmdb 2.75 [2.9, 2.13, 2.75]  after/base 0.97x  lmdb/after 0.92x
+ 32768 KiB  base 3.36 [3.36, 3.31, 3.36]  after 3.39 [3.39, 3.39, 3.41]  lmdb 2.76 [2.86, 2.09, 2.76]  after/base 1.01x  lmdb/after 0.81x
+## restart: median GB/s of 3 [runs]; after/base; lmdb/after
+    64 KiB  base 0.04 [0.04, 0.04, 0.04]  after 0.04 [0.04, 0.04, 0.04]  lmdb 1.61 [1.61, 1.71, 1.59]  after/base 1.03x  lmdb/after 41.96x
+   256 KiB  base 0.54 [0.56, 0.54, 0.54]  after 0.96 [0.95, 0.96, 0.96]  lmdb 2.06 [2.06, 2.17, 1.99]  after/base 1.79x  lmdb/after 2.15x
+   512 KiB  base 0.79 [0.79, 0.98, 0.71]  after 1.43 [1.44, 1.39, 1.43]  lmdb 2.34 [2.34, 2.39, 2.16]  after/base 1.81x  lmdb/after 1.64x
+  1024 KiB  base 1.33 [1.23, 1.67, 1.33]  after 1.48 [1.45, 1.48, 1.59]  lmdb 2.63 [2.69, 2.63, 2.57]  after/base 1.11x  lmdb/after 1.78x
+  2048 KiB  base 1.96 [1.91, 2.08, 1.96]  after 2.09 [2.09, 2.08, 2.09]  lmdb 2.63 [2.73, 2.13, 2.63]  after/base 1.06x  lmdb/after 1.26x
+  8192 KiB  base 2.89 [2.94, 2.77, 2.89]  after 2.87 [2.88, 2.82, 2.87]  lmdb 2.76 [2.76, 1.88, 2.78]  after/base 0.99x  lmdb/after 0.96x
+ 32768 KiB  base 3.30 [3.25, 3.33, 3.3]  after 3.31 [3.3, 3.31, 3.32]  lmdb 2.77 [2.77, 1.87, 2.77]  after/base 1.01x  lmdb/after 0.84x
+# B2. Full round-5 sweep (kv_bench --seconds 10), b94540d vs d2a5f4b, one run each:
+  block phase              mode   T         base        after ratio
+   512K get_first_touch    view   1         0.84         1.71  2.04 GB/s
+   512K get_warm           copy   1        16.47        16.43  1.00 GB/s
+   512K get_warm           copy   4        33.68        33.70  1.00 GB/s
+   512K get_warm           copy   8        27.36        29.68  1.08 GB/s
+   512K get_warm           view   1    728754.77    676165.10  0.93 gets/s
+   512K get_warm           view   4   2666889.46   2505238.22  0.94 gets/s
+   512K get_warm           view   8   3886457.17   3571450.92  0.92 gets/s
+   512K multiprocess_read  copy   4        33.47        33.40  1.00 GB/s
+   512K multiprocess_read  view   4   2576359.33   2325092.13  0.90 gets/s
+   512K put                -      1         0.74         0.74  1.00 GB/s
+   512K restart            view   1         0.73         1.41  1.94 GB/s
+  2048K get_first_touch    view   1         2.14         2.38  1.11 GB/s
+  2048K get_warm           copy   1        12.30        12.27  1.00 GB/s
+  2048K get_warm           copy   4        12.22        12.21  1.00 GB/s
+  2048K get_warm           copy   8        11.90        11.81  0.99 GB/s
+  2048K get_warm           view   1    261073.91    252907.56  0.97 gets/s
+  2048K get_warm           view   4    776074.30    770629.36  0.99 gets/s
+  2048K get_warm           view   8    855155.13    844794.36  0.99 gets/s
+  2048K multiprocess_read  copy   4        11.66        11.23  0.96 GB/s
+  2048K multiprocess_read  view   4    729821.82    712828.20  0.98 gets/s
+  2048K put                -      1         1.04         1.07  1.02 GB/s
+  2048K restart            view   1         1.93         2.10  1.09 GB/s
+  8192K get_first_touch    view   1         3.06         2.95  0.96 GB/s
+  8192K get_warm           copy   1        11.85        11.66  0.98 GB/s
+  8192K get_warm           copy   4        11.74        11.58  0.99 GB/s
+  8192K get_warm           copy   8        11.47        11.40  0.99 GB/s
+  8192K get_warm           view   1     66638.26     65638.25  0.98 gets/s
+  8192K get_warm           view   4    167702.57    166140.82  0.99 gets/s
+  8192K get_warm           view   8    169059.50    168679.96  1.00 gets/s
+  8192K multiprocess_read  copy   4        10.98        11.26  1.03 GB/s
+  8192K multiprocess_read  view   4    159630.13    158718.05  0.99 gets/s
+  8192K put                -      1         1.01         0.98  0.98 GB/s
+  8192K restart            view   1         2.87         2.85  0.99 GB/s
+ 32768K get_first_touch    view   1         3.37         3.39  1.01 GB/s
+ 32768K get_warm           copy   1        11.14        11.02  0.99 GB/s
+ 32768K get_warm           copy   4        10.86        11.09  1.02 GB/s
+ 32768K get_warm           copy   8        10.85        10.80  1.00 GB/s
+ 32768K get_warm           view   1     16784.38     16717.10  1.00 gets/s
+ 32768K get_warm           view   4     40190.53     40176.70  1.00 gets/s
+ 32768K get_warm           view   8     41183.90     41227.05  1.00 gets/s
+ 32768K multiprocess_read  copy   4        10.65        10.69  1.00 GB/s
+ 32768K multiprocess_read  view   4     38333.67     38640.84  1.01 gets/s
+ 32768K put                -      1         0.47         0.47  0.98 GB/s
+ 32768K restart            view   1         3.28         3.34  1.02 GB/s
+# B3. 512 KiB warm check, kv_bench --block-size 524288 --seconds 5 --threads 1,4 (3 interleaved reps):
+# warm view -7 %, 4-process view -4 %: the re-advise walks resident pages in 9 calls instead of 2.
+512K get_first_touch   view T=1  base 0.82 [0.82, 0.81, 0.83]  after 1.69 [1.69, 1.67, 1.73]  ratio 2.046
+512K get_warm          copy T=1  base 16.89 [17.19, 16.78, 16.89]  after 16.68 [16.74, 16.58, 16.68]  ratio 0.987
+512K get_warm          copy T=4  base 33.67 [34.17, 33.67, 33.67]  after 33.81 [33.73, 33.98, 33.81]  ratio 1.004
+512K get_warm          view T=1  base 727,360.98 [724167.5, 727360.98, 731577.21]  after 676,775.79 [676775.79, 675403.65, 677774.06]  ratio 0.930
+512K get_warm          view T=4  base 2,728,461.48 [2690619.31, 2728461.48, 2737086.15]  after 2,544,149.85 [2555537.15, 2534568.39, 2544149.85]  ratio 0.932
+512K multiprocess_read copy T=4  base 33.36 [33.36, 33.14, 33.49]  after 33.22 [33.48, 33.22, 32.85]  ratio 0.996
+512K multiprocess_read view T=4  base 2,538,999.64 [2601640.29, 2523444.78, 2538999.64]  after 2,436,546.99 [2436778.4, 2400131.37, 2436546.99]  ratio 0.960
+512K put               -    T=1  base 0.74 [0.74, 0.74, 0.74]  after 0.74 [0.74, 0.75, 0.74]  ratio 1.006
+512K restart           view T=1  base 0.71 [0.71, 0.71, 0.68]  after 1.41 [1.38, 1.41, 1.45]  ratio 1.995
+
+## C. c38e555: B plus a ONE-page mincore() probe (the document's second page) that skipped the hint when resident.
+# Warm +10 %, but cold 512 KiB fell to 0.61 GB/s: ~3 % of cold documents had that page resident and the rest not,
+# so their hint was skipped and they faulted in 4 KiB at a time. Rejected; dd487fb requires every page resident.
+512K get_first_touch   view T=1  base 0.83 [0.83, 0.83, 0.85]  after 0.61 [0.59, 0.63, 0.61]  ratio 0.732
+512K get_warm          copy T=1  base 16.78 [16.55, 16.95, 16.78]  after 17.08 [17.22, 16.84, 17.08]  ratio 1.018
+512K get_warm          copy T=4  base 33.96 [33.97, 33.66, 33.96]  after 33.85 [33.84, 33.85, 33.85]  ratio 0.997
+512K get_warm          view T=1  base 728,291.84 [728291.84, 730801.88, 726333.7]  after 799,527.03 [798372.49, 807102.6, 799527.03]  ratio 1.098
+512K get_warm          view T=4  base 2,719,359.67 [2719136.14, 2735949.0, 2719359.67]  after 2,982,337.58 [2982337.58, 2975478.29, 2982678.46]  ratio 1.097
+512K multiprocess_read copy T=4  base 33.72 [33.83, 33.44, 33.72]  after 33.69 [33.33, 33.69, 33.72]  ratio 0.999
+512K multiprocess_read view T=4  base 2,618,977.71 [2610098.68, 2619383.71, 2618977.71]  after 2,805,254.21 [2805254.21, 2848142.88, 2788910.86]  ratio 1.071
+512K put               -    T=1  base 0.74 [0.74, 0.74, 0.74]  after 0.74 [0.74, 0.74, 0.75]  ratio 1.002
+512K restart           view T=1  base 0.70 [0.72, 0.67, 0.7]  after 0.57 [0.57, 0.62, 0.56]  ratio 0.815
+warm-base-1 first-touch window: dt_s 2.490 majflt 188 reads 8217 merged 414 MiB 1975 MB/s 832 avg_req_KiB 246.1 avg_inflight 0.99 us_per_req 301
+warm-after-1 first-touch window: dt_s 2.444 majflt 14800 reads 36069 merged 59 MiB 1238 MB/s 531 avg_req_KiB 35.1 avg_inflight 1.74 us_per_req 118

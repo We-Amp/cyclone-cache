@@ -285,7 +285,8 @@ struct CacheConfig {
   //
   // WHICH kernel call is platform-dependent, because MADV_WILLNEED is
   // portable in spelling but not in cost:
-  //   Linux    madvise(MADV_WILLNEED) over the mapping, in 512 KiB chunks.
+  //   Linux    madvise(MADV_WILLNEED) over the mapping, in 64 KiB chunks
+  //            over the first 4 MiB and 512 KiB chunks after that.
   //   macOS    fcntl(F_RDADVISE) over the FILE range.  Darwin's
   //            MADV_WILLNEED is synchronous and serialises on the shared VM
   //            object, so with four processes reading one volume it costs

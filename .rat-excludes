@@ -35,3 +35,4 @@ corpus
 churn-.*\.txt
 policy-replay\.txt
 round5-.*\.txt
+readahead-.*\.txt

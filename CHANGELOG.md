@@ -13,7 +13,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   selected-alternate path) for documents of at least this many bytes,
   issued before the CRC pass first touches the content. Default 256 KiB;
   `0` disables it. Not exposed in the C API. Per platform:
-  - Linux: `madvise(MADV_WILLNEED)`, page-aligned and in 512 KiB chunks.
+  - Linux: `madvise(MADV_WILLNEED)`, page-aligned, in 64 KiB chunks over
+    the first 4 MiB of the document and 512 KiB chunks after that (a cold
+    512 KiB read is about 2x faster than with uniform 512 KiB chunks), and
+    skipped when `mincore()` reports every page of the range resident.
   - macOS: `fcntl(F_RDADVISE)` over the file range (Darwin's
     `MADV_WILLNEED` is synchronous and serialises across processes).
   - Windows: `PrefetchVirtualMemory` (previously a no-op).

@@ -39,6 +39,9 @@ class MappedFile {
 
   virtual std::error_code advise_sequential(std::span<std::byte> region) = 0;
   virtual std::error_code advise_random(std::span<std::byte> region) = 0;
+  // Best-effort readahead over an ADDRESS range of the mapping.  A pure
+  // hint: it may return without advising (on Linux when the range already
+  // looks resident), and callers ignore its errors.
   virtual std::error_code advise_willneed(std::span<std::byte> region) = 0;
   virtual std::error_code advise_dontneed(std::span<std::byte> region) = 0;
 

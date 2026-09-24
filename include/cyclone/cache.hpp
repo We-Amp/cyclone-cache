@@ -208,7 +208,9 @@ struct CacheStats {
   // Large-document readahead hints issued on the disk read path, summed
   // across all volumes (see CacheConfig::readahead_min_bytes).  Counts the
   // hints that got past the per-document re-advise filter, so it is a
-  // measure of kernel calls made rather than of large reads served.
+  // measure of hints issued rather than of large reads served (on Linux a
+  // hint whose range is already fully resident stops at a mincore()
+  // check).
   // PROCESS-LOCAL.  Appended at the tail so positional initialisation and
   // the layout of the fields above are unchanged; NOT mirrored in
   // CycloneCacheStats (the C API).

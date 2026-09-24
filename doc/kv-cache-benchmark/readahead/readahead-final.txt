@@ -1,0 +1,174 @@
+# Final before/after for issue #18, 2026-09-24/25, Linux benchmark machine.
+# main = b94540d, fix = dd487fb (64 KiB chunks over the first 4 MiB, then 512 KiB; hint skipped when every
+# page is resident). LMDB = the peer harness (LMDB 0.9.24), same session. JSON lines in final/.
+# Drivers: bench-driver.sh, then sweep-full.sh (the full sweeps b and c). Every run: run1.sh (waits for
+# background jobs and 1-min load < 1.0), caches dropped with sync; echo 3 > drop_caches before cold phases.
+
+## Machine
+2026-09-24T22:54:09+02:00
+Samsung SSD 970 PRO 512GB               
+1B2QEXP7
+read_ahead_kb: 128
+max_sectors_kb: 1280
+max_hw_sectors_kb: 2048
+scheduler: [none] mq-deadline 
+vm.dirty_ratio = 20
+vm.dirty_background_ratio = 10
+vm.dirty_bytes = 0
+Ubuntu clang version 20.1.8 (++20250708082409+6fb913d3e2ec-1~exp1~20250708202428.132)
+5.15.0-191-generic
+
+## Unit and integration tests of the fix tree (cyclone-tests, Release)
+test cases:     700 |     696 passed | 4 skipped
+assertions: 2996910 | 2996910 passed
+
+rc=0
+
+## Run log (when each run began waiting for the load gate, and the load then)
+22:57:32 warm-base-1 load: 8.39 4.31 2.53 1/750 1056034
+23:05:28 warm-after-1 load: 2.16 2.12 2.07 1/799 1104308
+23:09:11 warm-base-2 load: 2.48 2.10 2.06 1/756 1137911
+23:11:06 warm-after-2 load: 2.15 1.89 1.98 1/751 1140867
+23:12:48 warm-base-3 load: 2.01 1.76 1.91 1/734 1143598
+23:14:32 warm-after-3 load: 2.33 1.75 1.88 1/734 1146462
+23:16:24 cold-base-1 load: 1.87 1.62 1.81 1/737 1149207
+23:19:47 cold-after-1 load: 1.31 1.34 1.64 1/737 1157767
+23:21:50 cold-lmdb-1 load: 1.21 1.24 1.56 1/739 1163272
+23:26:14 cold-base-2 load: 1.24 1.29 1.51 1/732 1175982
+23:28:40 cold-after-2 load: 1.29 1.27 1.45 1/732 1182677
+23:30:46 cold-lmdb-2 load: 1.46 1.29 1.44 1/737 1188354
+23:35:22 cold-base-3 load: 1.48 1.41 1.45 1/736 1201163
+23:37:43 cold-after-3 load: 1.36 1.30 1.39 1/735 1207042
+23:39:45 cold-lmdb-3 load: 1.21 1.23 1.35 1/734 1212485
+23:44:11 full-base load: 1.15 1.22 1.32 1/737 1225344
+23:51:40 full-after load: 4.85 3.68 2.45 1/735 1247002
+00:12:41 perfbase-base-1 load: 0.92 3.02 2.94 1/759 1352086
+00:12:42 perfbase-after-1 load: 0.92 3.02 2.94 1/759 1352094
+00:12:43 perfbase-base-2 load: 0.92 3.02 2.94 1/759 1352102
+00:12:43 perfbase-after-2 load: 0.92 3.02 2.94 1/759 1352110
+00:12:43 perfbase-base-3 load: 0.92 3.02 2.94 1/759 1352118
+00:12:44 perfbase-after-3 load: 0.92 3.02 2.94 1/759 1352126
+00:12:44 thr-default load: 0.92 3.02 2.94 1/759 1352135
+00:14:11 thr-64k load: 1.56 2.72 2.84 1/760 1356657
+00:16:11 full-base-b load: 1.11 2.22 2.65 1/735 1359369
+00:23:39 full-after-b load: 4.75 3.79 3.23 1/735 1381488
+00:32:35 full-base-c load: 4.64 3.91 3.39 1/737 1403509
+00:41:33 full-after-c load: 4.43 3.94 3.49 1/737 1425684
+
+## Cold, seven sizes: kv_bench --seconds 1 --threads 1 --skip-multiprocess (3 interleaved reps)
+## get_first_touch: median GB/s of 3 [runs]; after/base; lmdb/after
+    64 KiB  base 0.04 [0.0, 0.04, 0.04]  after 0.04 [0.04, 0.04, 0.04]  lmdb 1.56 [1.82, 1.56, 1.37]  after/base 1.01x  lmdb/after 39.02x
+   256 KiB  base 0.65 [0.65, 0.67, 0.63]  after 1.12 [1.11, 1.13, 1.12]  lmdb 2.05 [2.07, 2.05, 1.92]  after/base 1.72x  lmdb/after 1.83x
+   512 KiB  base 0.81 [0.77, 0.81, 0.81]  after 1.70 [1.71, 1.7, 1.67]  lmdb 2.37 [2.3, 2.39, 2.37]  after/base 2.09x  lmdb/after 1.39x
+  1024 KiB  base 1.44 [1.38, 1.49, 1.44]  after 1.65 [1.65, 1.5, 1.71]  lmdb 2.71 [2.71, 2.62, 2.73]  after/base 1.14x  lmdb/after 1.64x
+  2048 KiB  base 2.13 [2.15, 0.44, 2.13]  after 2.38 [2.38, 2.39, 2.35]  lmdb 2.77 [2.77, 2.77, 2.74]  after/base 1.12x  lmdb/after 1.16x
+  8192 KiB  base 3.07 [3.07, 3.08, 3.06]  after 3.01 [3.01, 3.01, 2.99]  lmdb 2.82 [2.9, 2.81, 2.82]  after/base 0.98x  lmdb/after 0.94x
+ 32768 KiB  base 3.37 [3.37, 3.38, 3.37]  after 3.40 [3.4, 3.41, 3.38]  lmdb 2.94 [2.98, 2.8, 2.94]  after/base 1.01x  lmdb/after 0.86x
+## restart: median GB/s of 3 [runs]; after/base; lmdb/after
+    64 KiB  base 0.04 [0.04, 0.04, 0.04]  after 0.04 [0.04, 0.04, 0.04]  lmdb 1.62 [1.62, 1.65, 1.44]  after/base 1.01x  lmdb/after 40.98x
+   256 KiB  base 0.51 [0.52, 0.51, 0.51]  after 0.87 [0.85, 0.87, 0.94]  lmdb 1.99 [1.99, 2.03, 1.88]  after/base 1.68x  lmdb/after 2.30x
+   512 KiB  base 0.71 [0.71, 0.73, 0.68]  after 1.41 [1.43, 1.35, 1.41]  lmdb 2.32 [2.2, 2.32, 2.35]  after/base 1.97x  lmdb/after 1.65x
+  1024 KiB  base 1.30 [1.3, 1.3, 1.25]  after 1.63 [1.63, 1.66, 1.62]  lmdb 2.65 [2.65, 2.57, 2.65]  after/base 1.26x  lmdb/after 1.63x
+  2048 KiB  base 1.95 [2.03, 0.38, 1.95]  after 2.09 [2.09, 0.75, 2.11]  lmdb 2.68 [2.68, 2.72, 2.65]  after/base 1.07x  lmdb/after 1.28x
+  8192 KiB  base 2.89 [2.89, 2.91, 2.89]  after 2.83 [2.84, 2.83, 2.81]  lmdb 2.74 [2.77, 2.72, 2.74]  after/base 0.98x  lmdb/after 0.97x
+ 32768 KiB  base 3.26 [3.26, 3.28, 3.23]  after 3.28 [3.26, 3.28, 3.31]  lmdb 2.85 [2.86, 2.72, 2.85]  after/base 1.01x  lmdb/after 0.87x
+
+## Warm check at 512 KiB: kv_bench --block-size 524288 --seconds 5 --threads 1,4 (3 interleaved reps)
+512K get_first_touch   view T=1  base 0.84 [1.06, 0.84, 0.83]  after 1.70 [1.69, 1.7, 1.7]  ratio 2.026
+512K get_warm          copy T=1  base 16.80 [15.84, 17.01, 16.8]  after 17.11 [16.92, 17.13, 17.11]  ratio 1.018
+512K get_warm          copy T=4  base 33.68 [32.2, 33.68, 33.81]  after 33.49 [33.49, 33.3, 33.84]  ratio 0.994
+512K get_warm          view T=1  base 728,763.39 [634007.34, 728763.39, 729299.85]  after 782,906.36 [787088.05, 782906.36, 782138.15]  ratio 1.074
+512K get_warm          view T=4  base 2,728,992.05 [2368452.24, 2728992.05, 2756283.33]  after 2,918,522.38 [2918522.38, 2901890.72, 2932144.98]  ratio 1.069
+512K multiprocess_read copy T=4  base 33.00 [32.48, 33.0, 33.35]  after 33.03 [32.97, 33.03, 33.41]  ratio 1.001
+512K multiprocess_read view T=4  base 2,614,520.40 [2614520.4, 2626941.08, 2568359.58]  after 2,768,658.53 [2787110.64, 2768658.53, 2744218.93]  ratio 1.059
+512K put               -    T=1  base 0.74 [0.74, 0.74, 0.74]  after 0.75 [0.75, 0.75, 0.74]  ratio 1.013
+512K restart           view T=1  base 0.71 [0.69, 0.71, 0.72]  after 1.37 [1.37, 1.37, 1.43]  ratio 1.942
+
+## Full round-5 sweep: kv_bench --seconds 10 (3 runs each: full-*, full-*-b, full-*-c), medians
+# full-after (the first) read 1.16 GB/s at 8 MiB first touch: a slow-device window (15 reads in flight
+# at 1.5 ms each); kept in the median.
+  block phase             mode   T        base       after ratio  runs(base | after)
+   512K get_first_touch   view   1        0.87        1.67  1.93  [0.9, 0.87, 0.84] | [1.67, 1.67, 1.71] GB/s
+   512K get_warm          copy   1       16.83       16.95  1.01  [16.83, 16.58, 16.94] | [17.24, 16.79, 16.95] GB/s
+   512K get_warm          copy   4       33.60       33.39  0.99  [33.6, 33.46, 33.73] | [33.21, 33.64, 33.39] GB/s
+   512K get_warm          copy   8       28.77       28.71  1.00  [28.88, 28.77, 28.63] | [28.53, 29.28, 28.71] GB/s
+   512K get_warm          view   1   727061.17   777667.69  1.07  [727502.47, 726711.18, 727061.17] | [776562.62, 783405.63, 777667.69] gets/s
+   512K get_warm          view   4  2681330.88  2849881.47  1.06  [2653390.72, 2698707.44, 2681330.88] | [2805965.73, 2849881.47, 2867236.24] gets/s
+   512K get_warm          view   8  3884362.74  4134976.83  1.06  [3814668.68, 3889174.83, 3884362.74] | [4134976.83, 4071281.3, 4256569.58] gets/s
+   512K multiprocess_read copy   4       32.98       33.13  1.00  [32.98, 32.92, 33.25] | [33.33, 32.82, 33.13] GB/s
+   512K multiprocess_read view   4  2482502.30  2734556.47  1.10  [2449027.44, 2482502.3, 2551487.25] | [2739747.25, 2596609.45, 2734556.47] gets/s
+   512K put               -      1        0.74        0.74  1.00  [0.74, 0.74, 0.74] | [0.73, 0.74, 0.75] GB/s
+   512K restart           view   1        0.76        1.38  1.81  [0.76, 0.78, 0.74] | [1.38, 1.38, 1.42] GB/s
+  2048K get_first_touch   view   1        2.21        2.39  1.08  [2.21, 2.23, 2.13] | [2.4, 2.39, 2.39] GB/s
+  2048K get_warm          copy   1       12.37       12.37  1.00  [12.36, 12.37, 12.37] | [12.52, 12.27, 12.37] GB/s
+  2048K get_warm          copy   4       12.36       12.07  0.98  [12.36, 11.92, 12.42] | [12.41, 12.01, 12.07] GB/s
+  2048K get_warm          copy   8       12.04       11.84  0.98  [12.04, 11.78, 12.1] | [12.0, 11.7, 11.84] GB/s
+  2048K get_warm          view   1   258400.89   264601.06  1.02  [257578.12, 258400.89, 259101.1] | [264601.06, 264641.8, 264544.0] gets/s
+  2048K get_warm          view   4   770887.94   773751.28  1.00  [770887.94, 768885.6, 773457.56] | [773751.28, 775616.28, 770390.41] gets/s
+  2048K get_warm          view   8   843758.62   839954.48  1.00  [842561.07, 843758.62, 848508.18] | [839954.48, 842629.1, 833878.99] gets/s
+  2048K multiprocess_read copy   4       11.82       11.57  0.98  [12.11, 11.82, 10.93] | [11.72, 11.52, 11.57] GB/s
+  2048K multiprocess_read view   4   728882.62   742708.90  1.02  [728882.62, 728128.69, 734837.76] | [742708.9, 742026.86, 742773.38] gets/s
+  2048K put               -      1        1.01        1.04  1.03  [1.06, 1.0, 1.01] | [1.04, 1.05, 0.98] GB/s
+  2048K restart           view   1        1.98        2.11  1.07  [2.02, 1.98, 1.93] | [2.11, 2.12, 2.1] GB/s
+  8192K get_first_touch   view   1        3.06        2.92  0.95  [3.06, 3.03, 3.1] | [2.96, 2.92, 1.16] GB/s
+  8192K get_warm          copy   1       11.66       11.84  1.02  [11.66, 11.4, 11.66] | [11.84, 11.59, 11.84] GB/s
+  8192K get_warm          copy   4       11.66       11.55  0.99  [11.66, 11.59, 11.68] | [11.71, 11.55, 11.54] GB/s
+  8192K get_warm          copy   8       11.39       11.28  0.99  [11.39, 11.27, 11.4] | [11.35, 11.24, 11.28] GB/s
+  8192K get_warm          view   1    66357.45    67121.98  1.01  [66414.85, 66357.45, 65774.54] | [67087.66, 67830.38, 67121.98] gets/s
+  8192K get_warm          view   4   166161.56   165571.50  1.00  [165591.35, 166723.36, 166161.56] | [166102.59, 165510.85, 165571.5] gets/s
+  8192K get_warm          view   8   168100.52   167699.64  1.00  [167778.07, 168100.52, 168602.46] | [167699.64, 167681.25, 168108.39] gets/s
+  8192K multiprocess_read copy   4       11.41       11.34  0.99  [11.6, 11.41, 11.04] | [11.47, 11.21, 11.34] GB/s
+  8192K multiprocess_read view   4   159669.34   160433.84  1.00  [159669.34, 159387.31, 160560.99] | [160605.9, 160180.37, 160433.84] gets/s
+  8192K put               -      1        0.99        0.94  0.95  [1.0, 0.99, 0.99] | [0.9, 0.94, 1.01] GB/s
+  8192K restart           view   1        2.90        2.83  0.98  [2.9, 2.91, 2.89] | [2.83, 2.85, 2.83] GB/s
+ 32768K get_first_touch   view   1        3.38        3.40  1.01  [3.32, 3.38, 3.39] | [3.4, 3.4, 3.22] GB/s
+ 32768K get_warm          copy   1       11.29       11.41  1.01  [11.29, 11.31, 10.95] | [11.47, 11.4, 11.41] GB/s
+ 32768K get_warm          copy   4       11.09       11.14  1.00  [11.15, 11.09, 11.04] | [11.27, 11.14, 11.01] GB/s
+ 32768K get_warm          copy   8       10.93       10.89  1.00  [11.03, 10.93, 10.79] | [11.03, 10.89, 10.63] GB/s
+ 32768K get_warm          view   1    16670.30    16898.64  1.01  [16820.47, 16595.89, 16670.3] | [16898.64, 17006.06, 16022.19] gets/s
+ 32768K get_warm          view   4    40132.35    39971.98  1.00  [40132.35, 39850.5, 40239.82] | [40412.23, 39971.98, 39400.71] gets/s
+ 32768K get_warm          view   8    40954.29    40924.16  1.00  [40949.78, 40954.29, 41038.08] | [41071.07, 40888.77, 40924.16] gets/s
+ 32768K multiprocess_read copy   4       10.94       10.94  1.00  [10.94, 11.01, 10.58] | [11.04, 10.94, 10.44] GB/s
+ 32768K multiprocess_read view   4    38305.65    38690.91  1.01  [38299.87, 38305.65, 38455.73] | [38829.3, 38690.91, 35501.78] gets/s
+ 32768K put               -      1        0.47        0.47  0.99  [0.48, 0.47, 0.47] | [0.47, 0.47, 0.46] GB/s
+ 32768K restart           view   1        3.29        3.20  0.97  [3.32, 3.29, 3.2] | [3.34, 3.2, 2.91] GB/s
+
+## performance_baseline --cache-size 512 --entries 5000 --content-size 4096 (4 KB objects, no hint)
+# base-1 ran first after the kv_bench sweeps and was slow on every operation (as in the earlier series); excluded.
+base   1 sequential_write_4096B=9221 sequential_read=202805 random_read=718480 exists_check=1713533 cache_miss=1606341 mixed_workload_70r_20e_10w=357089 
+base   2 sequential_write_4096B=330197 sequential_read=618303 random_read=1152513 exists_check=2186030 cache_miss=1909100 mixed_workload_70r_20e_10w=1076680 
+base   3 sequential_write_4096B=319662 sequential_read=608723 random_read=1144841 exists_check=2101345 cache_miss=1862073 mixed_workload_70r_20e_10w=1064853 
+after  1 sequential_write_4096B=323774 sequential_read=612079 random_read=1130380 exists_check=2138307 cache_miss=1878307 mixed_workload_70r_20e_10w=1060031 
+after  2 sequential_write_4096B=325651 sequential_read=616696 random_read=1139613 exists_check=2150342 cache_miss=1834021 mixed_workload_70r_20e_10w=1065161 
+after  3 sequential_write_4096B=327621 sequential_read=616405 random_read=1146302 exists_check=2179485 cache_miss=1903502 mixed_workload_70r_20e_10w=1051064 
+
+## Threshold side experiment (fix tree): default 256 KiB vs --readahead-min-bytes 65536, one run each
+# kv_bench --block-size 65536 --block-size 131072 --seconds 3 --threads 1,4 --skip-multiprocess
+== thr-default
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+| cyclone | 65536 | 4096 | get_first_touch | view | 1 | 594.0 | 0.039 | 1700.2 | 3399.7 | 6161.7 | 1.000 |
+| cyclone | 65536 | 4096 | get_warm | view | 1 | 2062216.2 | 135.149 | 0.4 | 0.8 | 1.1 | - |
+| cyclone | 65536 | 4096 | get_warm | view | 4 | 7505153.6 | 491.858 | 0.4 | 0.8 | 1.1 | - |
+| cyclone | 65536 | 4096 | get_warm | copy | 1 | 277904.5 | 18.213 | 3.5 | 6.1 | 24.0 | - |
+| cyclone | 65536 | 4096 | get_warm | copy | 4 | 738347.0 | 48.388 | 5.0 | 11.7 | 22.9 | - |
+| cyclone | 65536 | 4096 | restart | view | 1 | 575.2 | 0.038 | 1727.9 | 2918.6 | 5675.9 | 1.000 |
+| cyclone | 131072 | 4096 | get_first_touch | view | 1 | 291.3 | 0.038 | 3473.5 | 5499.5 | 9133.4 | 1.000 |
+| cyclone | 131072 | 4096 | get_warm | view | 1 | 1758242.7 | 230.456 | 0.4 | 1.0 | 1.2 | - |
+| cyclone | 131072 | 4096 | get_warm | view | 4 | 6434234.1 | 843.348 | 0.5 | 1.1 | 1.4 | - |
+| cyclone | 131072 | 4096 | get_warm | copy | 1 | 139916.4 | 18.339 | 7.7 | 11.7 | 35.4 | - |
+| cyclone | 131072 | 4096 | get_warm | copy | 4 | 331924.3 | 43.506 | 12.8 | 26.2 | 43.4 | - |
+| cyclone | 131072 | 4096 | restart | view | 1 | 285.6 | 0.037 | 3510.8 | 5815.0 | 9822.4 | 1.000 |
+== thr-64k
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+| cyclone | 65536 | 4096 | get_first_touch | view | 1 | 3652.9 | 0.239 | 244.6 | 614.7 | 683.2 | 1.000 |
+| cyclone | 65536 | 4096 | get_warm | view | 1 | 1893657.5 | 124.103 | 0.4 | 0.9 | 2.8 | - |
+| cyclone | 65536 | 4096 | get_warm | view | 4 | 6843349.8 | 448.486 | 0.5 | 0.9 | 2.7 | - |
+| cyclone | 65536 | 4096 | get_warm | copy | 1 | 277913.1 | 18.213 | 3.5 | 6.6 | 24.0 | - |
+| cyclone | 65536 | 4096 | get_warm | copy | 4 | 743228.2 | 48.708 | 4.9 | 12.0 | 27.3 | - |
+| cyclone | 65536 | 4096 | restart | view | 1 | 2972.9 | 0.195 | 319.9 | 734.6 | 1126.8 | 1.000 |
+| cyclone | 131072 | 4096 | get_first_touch | view | 1 | 3869.6 | 0.507 | 248.0 | 411.7 | 602.1 | 1.000 |
+| cyclone | 131072 | 4096 | get_warm | view | 1 | 1442321.7 | 189.048 | 0.5 | 2.7 | 3.1 | - |
+| cyclone | 131072 | 4096 | get_warm | view | 4 | 5392012.8 | 706.742 | 0.5 | 2.8 | 3.3 | - |
+| cyclone | 131072 | 4096 | get_warm | copy | 1 | 138753.6 | 18.187 | 7.6 | 13.1 | 35.8 | - |
+| cyclone | 131072 | 4096 | get_warm | copy | 4 | 331014.2 | 43.387 | 12.7 | 26.3 | 42.0 | - |
+| cyclone | 131072 | 4096 | restart | view | 1 | 2946.1 | 0.386 | 333.4 | 651.1 | 1299.8 | 1.000 |

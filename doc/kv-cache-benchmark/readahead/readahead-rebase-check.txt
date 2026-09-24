@@ -1,0 +1,33 @@
+# Confirmation after rebasing onto main e4c051e (wrap retention on by default): main e4c051e vs the fix f9cc804
+# (src/io and its test byte-identical to dd487fb). confirm-rebase.sh; kv_bench --block-size 524288 --block-size 2097152
+# --seconds 5 --threads 1,4, 2 interleaved reps. Median [runs].
+
+## cyclone-tests (fix tree)
+test cases:     713 |     712 passed | 1 skipped
+assertions: 2964336 | 2964336 passed
+
+rc=0
+
+512K get_first_touch   view T=1  base 0.87 [0.84, 0.9]  after 1.69 [1.7, 1.68]  ratio 1.942
+512K get_warm          copy T=1  base 16.80 [16.99, 16.6]  after 16.81 [16.89, 16.72]  ratio 1.001
+512K get_warm          copy T=4  base 33.63 [33.62, 33.63]  after 33.61 [33.5, 33.72]  ratio 0.999
+512K get_warm          view T=1  base 711,881.63 [714897.13, 708866.13]  after 774,444.78 [772622.87, 776266.69]  ratio 1.088
+512K get_warm          view T=4  base 2,681,767.45 [2695039.16, 2668495.74]  after 2,883,248.87 [2865804.76, 2900692.97]  ratio 1.075
+512K multiprocess_read copy T=4  base 32.94 [32.99, 32.9]  after 33.11 [33.08, 33.14]  ratio 1.005
+512K multiprocess_read view T=4  base 2,516,360.75 [2512251.01, 2520470.48]  after 2,751,087.21 [2735698.11, 2766476.32]  ratio 1.093
+512K put               -    T=1  base 0.74 [0.74, 0.74]  after 0.74 [0.74, 0.74]  ratio 0.998
+512K restart           view T=1  base 0.79 [0.79, 0.79]  after 1.42 [1.4, 1.45]  ratio 1.801
+2048K get_first_touch   view T=1  base 2.22 [2.19, 2.24]  after 2.37 [2.38, 2.36]  ratio 1.071
+2048K get_warm          copy T=1  base 12.39 [12.35, 12.43]  after 11.59 [10.69, 12.49]  ratio 0.936
+2048K get_warm          copy T=4  base 12.39 [12.35, 12.43]  after 11.82 [11.19, 12.45]  ratio 0.954
+2048K get_warm          view T=1  base 257,917.59 [258903.19, 256931.99]  after 263,544.92 [263742.66, 263347.18]  ratio 1.022
+2048K get_warm          view T=4  base 771,729.35 [770300.68, 773158.03]  after 771,490.12 [771397.31, 771582.93]  ratio 1.000
+2048K multiprocess_read copy T=4  base 11.87 [11.7, 12.04]  after 11.62 [11.85, 11.39]  ratio 0.979
+2048K multiprocess_read view T=4  base 731,640.01 [731531.83, 731748.18]  after 709,695.48 [686060.26, 733330.7]  ratio 0.970
+2048K put               -    T=1  base 1.05 [1.09, 1.0]  after 1.05 [1.02, 1.09]  ratio 1.006
+2048K restart           view T=1  base 1.97 [1.99, 1.96]  after 2.12 [2.14, 2.1]  ratio 1.073
+
+warm-after-1.marks: 2026-09-25T01:14:55+02:00 start load: 0.90 1.99 2.14 1/730 1514754 com
+warm-after-2.marks: 2026-09-25T01:21:01+02:00 start load: 0.95 1.75 2.03 1/736 1527494 com
+warm-base-1.marks: 2026-09-25T01:12:07+02:00 start load: 0.88 2.35 2.25 1/757 1508810 com
+warm-base-2.marks: 2026-09-25T01:18:12+02:00 start load: 0.85 1.89 2.11 1/739 1521539 com

@@ -1,0 +1,130 @@
+# Chunk-size sweep of the Linux MADV_WILLNEED readahead hint, 2026-09-24, Linux benchmark machine.
+# Tree: origin/main b94540d plus two throwaway patches (not committed):
+#  - src/io/mapped_file.cpp: chunk size read from the RA_CHUNK environment variable
+#  - src/core/volume.cpp: clock_gettime() timing of Volume::read_sync, printed once after
+#    the first-touch phase as INSTR (mean us per get: probe = probe start to key match,
+#    hint = maybe_advise_readahead(), crc = checksum pass incl. waiting for I/O).
+# Command per point (via run1.sh: waits for other background jobs and for 1-min load < 1.0):
+#   RA_CHUNK=<chunk> kv_bench --block-size <bs> --seconds 1 --threads 1 --skip-multiprocess \
+#     --path ~/kvdata/ra512 --drop-caches-cmd "sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches"
+
+=== chunk-2097152-131072: 2026-09-24T20:15:38+02:00 start load: 0.93 0.91 1.23 1/739 475749 commit: ?
+INSTR n=2050 probe_us=15.4 hint_us=383.6 crc_us=620.9 tail_us=2.3 total_us=1022.2
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+| cyclone | 2097152 | 2048 | get_first_touch | view | 1 | 973.8 | 2.042 | 978.3 | 1597.8 | 1818.8 | 1.000 |
+| cyclone | 2097152 | 2048 | restart | view | 1 | 824.3 | 1.729 | 1145.9 | 2166.1 | 2394.0 | 1.000 |
+
+=== chunk-2097152-262144: 2026-09-24T20:15:58+02:00 start load: 0.95 0.92 1.22 1/739 477281 commit: ?
+INSTR n=2050 probe_us=9.8 hint_us=351.6 crc_us=476.1 tail_us=1.6 total_us=839.1
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+| cyclone | 2097152 | 2048 | get_first_touch | view | 1 | 1186.2 | 2.488 | 808.5 | 1319.4 | 1483.8 | 1.000 |
+| cyclone | 2097152 | 2048 | restart | view | 1 | 970.1 | 2.034 | 916.3 | 2030.6 | 2165.9 | 1.000 |
+
+=== chunk-2097152-524288: 2026-09-24T20:15:18+02:00 start load: 0.90 0.91 1.24 1/737 474201 commit: ?
+INSTR n=2050 probe_us=13.5 hint_us=347.2 crc_us=619.9 tail_us=1.9 total_us=982.6
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+| cyclone | 2097152 | 2048 | get_first_touch | view | 1 | 1013.0 | 2.125 | 919.0 | 1490.2 | 1768.0 | 1.000 |
+| cyclone | 2097152 | 2048 | restart | view | 1 | 929.1 | 1.948 | 963.3 | 1986.7 | 2259.3 | 1.000 |
+
+=== chunk-2097152-65536: 2026-09-24T20:16:27+02:00 start load: 0.93 0.93 1.22 1/740 479107 commit: ?
+INSTR n=2050 probe_us=7.1 hint_us=404.7 crc_us=462.5 tail_us=1.0 total_us=875.3
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+| cyclone | 2097152 | 2048 | get_first_touch | view | 1 | 1138.5 | 2.388 | 873.1 | 1094.0 | 2173.2 | 1.000 |
+| cyclone | 2097152 | 2048 | restart | view | 1 | 1001.9 | 2.101 | 978.0 | 1618.7 | 2161.7 | 1.000 |
+
+=== chunk-524288-131072: 2026-09-24T20:14:15+02:00 start load: 0.87 0.89 1.25 1/735 470122 commit: ?
+INSTR n=4098 probe_us=10.2 hint_us=99.4 crc_us=243.8 tail_us=1.3 total_us=354.8
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+| cyclone | 524288 | 4096 | get_first_touch | view | 1 | 2806.0 | 1.471 | 322.2 | 831.3 | 989.1 | 1.000 |
+| cyclone | 524288 | 4096 | restart | view | 1 | 2311.7 | 1.212 | 383.6 | 1067.6 | 1517.2 | 1.000 |
+
+=== chunk-524288-262144: 2026-09-24T20:14:29+02:00 start load: 0.97 0.91 1.25 1/737 471243 commit: ?
+INSTR n=4098 probe_us=9.6 hint_us=127.2 crc_us=327.2 tail_us=1.6 total_us=465.7
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+| cyclone | 524288 | 4096 | get_first_touch | view | 1 | 2137.3 | 1.121 | 419.1 | 837.1 | 1343.9 | 1.000 |
+| cyclone | 524288 | 4096 | restart | view | 1 | 1826.8 | 0.958 | 496.9 | 1235.0 | 1381.4 | 1.000 |
+
+=== chunk-524288-524288: 2026-09-24T20:13:58+02:00 start load: 0.93 0.90 1.26 1/739 468819 commit: ?
+INSTR n=4098 probe_us=10.3 hint_us=175.2 crc_us=433.9 tail_us=2.5 total_us=621.9
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+| cyclone | 524288 | 4096 | get_first_touch | view | 1 | 1599.9 | 0.839 | 644.8 | 955.8 | 1123.7 | 1.000 |
+| cyclone | 524288 | 4096 | restart | view | 1 | 1325.7 | 0.695 | 724.9 | 1237.5 | 1375.2 | 1.000 |
+
+=== chunk-524288-65536: 2026-09-24T20:14:54+02:00 start load: 0.89 0.90 1.24 1/738 472765 commit: ?
+INSTR n=4098 probe_us=6.5 hint_us=103.0 crc_us=202.1 tail_us=0.7 total_us=312.2
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+| cyclone | 524288 | 4096 | get_first_touch | view | 1 | 3193.4 | 1.674 | 292.8 | 530.9 | 831.9 | 1.000 |
+| cyclone | 524288 | 4096 | restart | view | 1 | 2659.6 | 1.394 | 356.0 | 899.5 | 1410.3 | 1.000 |
+
+=== chunk2-2097152-32768: 2026-09-24T20:19:09+02:00 start load: 0.88 0.90 1.15 2/738 489011 commit: ?
+INSTR n=2050 probe_us=7.0 hint_us=477.7 crc_us=343.2 tail_us=0.6 total_us=828.5
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+| cyclone | 2097152 | 2048 | get_first_touch | view | 1 | 1203.2 | 2.523 | 822.1 | 1016.8 | 1167.1 | 1.000 |
+| cyclone | 2097152 | 2048 | restart | view | 1 | 984.6 | 2.065 | 949.2 | 2062.8 | 2284.6 | 1.000 |
+
+=== chunk2-2097152-524288: 2026-09-24T20:18:13+02:00 start load: 0.78 0.86 1.16 1/736 485415 commit: ?
+INSTR n=2050 probe_us=10.7 hint_us=346.7 crc_us=598.1 tail_us=1.7 total_us=957.2
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+| cyclone | 2097152 | 2048 | get_first_touch | view | 1 | 1040.4 | 2.182 | 900.2 | 1428.4 | 1935.0 | 1.000 |
+| cyclone | 2097152 | 2048 | restart | view | 1 | 906.0 | 1.900 | 1000.2 | 2050.1 | 2352.6 | 1.000 |
+
+=== chunk2-2097152-65536: 2026-09-24T20:18:31+02:00 start load: 0.91 0.89 1.16 1/740 486881 commit: ?
+INSTR n=2050 probe_us=6.6 hint_us=395.7 crc_us=466.0 tail_us=0.9 total_us=869.2
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+| cyclone | 2097152 | 2048 | get_first_touch | view | 1 | 1146.7 | 2.405 | 873.7 | 1064.9 | 1148.5 | 1.000 |
+| cyclone | 2097152 | 2048 | restart | view | 1 | 1007.4 | 2.113 | 976.0 | 1576.7 | 2069.7 | 1.000 |
+
+=== chunk2-33554432-32768: 2026-09-24T20:21:26+02:00 start load: 0.90 0.92 1.12 1/739 498476 commit: ?
+INSTR n=130 probe_us=7.6 hint_us=7871.7 crc_us=3594.6 tail_us=2.6 total_us=11476.5
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+| cyclone | 33554432 | 128 | get_first_touch | view | 1 | 85.9 | 2.883 | 11768.6 | 12626.3 | 12633.4 | 1.000 |
+| cyclone | 33554432 | 128 | restart | view | 1 | 82.0 | 2.751 | 11895.7 | 13693.8 | 19954.6 | 1.000 |
+
+=== chunk2-33554432-524288: 2026-09-24T20:20:40+02:00 start load: 0.89 0.91 1.13 1/738 495277 commit: ?
+INSTR n=130 probe_us=11.8 hint_us=5286.5 crc_us=4568.3 tail_us=3.6 total_us=9870.2
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+| cyclone | 33554432 | 128 | get_first_touch | view | 1 | 99.8 | 3.350 | 10064.8 | 10844.0 | 11013.7 | 1.000 |
+| cyclone | 33554432 | 128 | restart | view | 1 | 97.6 | 3.276 | 10160.8 | 11015.7 | 11292.7 | 1.000 |
+
+=== chunk2-33554432-65536: 2026-09-24T20:20:58+02:00 start load: 0.98 0.93 1.13 1/738 496681 commit: ?
+INSTR n=130 probe_us=7.2 hint_us=6555.9 crc_us=3720.9 tail_us=3.1 total_us=10287.2
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+| cyclone | 33554432 | 128 | get_first_touch | view | 1 | 95.8 | 3.216 | 10474.9 | 11555.3 | 11752.1 | 1.000 |
+| cyclone | 33554432 | 128 | restart | view | 1 | 92.6 | 3.106 | 10550.3 | 13381.0 | 19541.7 | 1.000 |
+
+=== chunk2-524288-16384: 2026-09-24T20:17:47+02:00 start load: 0.66 0.85 1.16 1/735 483401 commit: ?
+INSTR n=4098 probe_us=7.3 hint_us=149.8 crc_us=238.5 tail_us=0.8 total_us=396.4
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+| cyclone | 524288 | 4096 | get_first_touch | view | 1 | 2515.7 | 1.319 | 396.1 | 599.6 | 996.2 | 1.000 |
+| cyclone | 524288 | 4096 | restart | view | 1 | 1976.9 | 1.036 | 455.9 | 1188.3 | 1675.4 | 1.000 |
+
+=== chunk2-524288-32768: 2026-09-24T20:17:33+02:00 start load: 0.56 0.84 1.17 3/740 482313 commit: ?
+INSTR n=4098 probe_us=13.6 hint_us=139.1 crc_us=348.8 tail_us=1.7 total_us=503.2
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+| cyclone | 524288 | 4096 | get_first_touch | view | 1 | 1978.8 | 1.037 | 432.8 | 973.5 | 1407.4 | 1.000 |
+| cyclone | 524288 | 4096 | restart | view | 1 | 1984.1 | 1.040 | 452.7 | 1407.8 | 1638.9 | 1.000 |
+
+=== chunk2-524288-65536: 2026-09-24T20:18:00+02:00 start load: 0.73 0.86 1.16 1/737 484450 commit: ?
+INSTR n=4098 probe_us=5.9 hint_us=106.7 crc_us=193.6 tail_us=0.6 total_us=306.7
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+| cyclone | 524288 | 4096 | get_first_touch | view | 1 | 3249.7 | 1.704 | 288.3 | 541.6 | 775.0 | 1.000 |
+| cyclone | 524288 | 4096 | restart | view | 1 | 2679.4 | 1.405 | 353.9 | 903.5 | 1154.5 | 1.000 |
+
+=== chunk2-8388608-32768: 2026-09-24T20:20:13+02:00 start load: 0.86 0.90 1.14 1/736 493534 commit: ?
+INSTR n=514 probe_us=5.9 hint_us=1998.5 crc_us=931.8 tail_us=1.5 total_us=2937.7
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+| cyclone | 8388608 | 512 | get_first_touch | view | 1 | 338.2 | 2.837 | 2940.3 | 3227.6 | 3369.3 | 1.000 |
+| cyclone | 8388608 | 512 | restart | view | 1 | 328.3 | 2.754 | 3018.3 | 3404.4 | 3460.5 | 1.000 |
+
+=== chunk2-8388608-524288: 2026-09-24T20:19:28+02:00 start load: 0.91 0.90 1.15 1/739 490459 commit: ?
+INSTR n=514 probe_us=9.2 hint_us=1313.3 crc_us=1414.5 tail_us=2.1 total_us=2739.1
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+| cyclone | 8388608 | 512 | get_first_touch | view | 1 | 362.5 | 3.041 | 2722.8 | 3318.9 | 3767.3 | 1.000 |
+| cyclone | 8388608 | 512 | restart | view | 1 | 344.9 | 2.893 | 2830.9 | 3750.4 | 3961.2 | 1.000 |
+
+=== chunk2-8388608-65536: 2026-09-24T20:19:45+02:00 start load: 0.94 0.91 1.15 1/737 491824 commit: ?
+INSTR n=514 probe_us=7.3 hint_us=1613.4 crc_us=1064.2 tail_us=1.4 total_us=2686.3
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+| cyclone | 8388608 | 512 | get_first_touch | view | 1 | 369.8 | 3.102 | 2715.6 | 2903.3 | 3089.7 | 1.000 |
+| cyclone | 8388608 | 512 | restart | view | 1 | 345.0 | 2.894 | 2865.2 | 3553.4 | 3774.5 | 1.000 |
+

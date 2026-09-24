@@ -2,7 +2,7 @@
 
 ## Summary
 
-Six rounds of measurements, taken 2026-09-21 to 2026-09-24 on two laptops.
+Six rounds of measurements, taken 2026-09-21 to 2026-09-25 on two laptops.
 One is an Apple M5 running macOS, where only a warm page cache can be
 measured. The other is an i7-8750H with a Samsung 970 PRO NVMe running Linux,
 where the page cache is dropped before each cold phase. The peers are LMDB,
@@ -18,6 +18,11 @@ measured, in order:
 - **Round 5:** main at 2aed24c, which adds opt-in wrap retention. The
   cold sweep and the churn run were repeated, with churn in both retention
   modes against a same-day LMDB.
+- **Readahead chunking (issue #18):** main at b94540d against the fix
+  (dd487fb): the Linux readahead hint in 64 KiB chunks, and skipped on
+  resident documents. The cold sweep ran against a same-day LMDB, and a
+  shorter check repeated it after rebasing onto main with wrap retention
+  on by default.
 
 Each number is one machine's reading. Treat differences under about 20 % as
 noise unless a section says otherwise.
@@ -26,9 +31,13 @@ Where Cyclone stands now:
 
 - **Warm reads:** same class as LMDB. Both return a span into a mapping that
   already exists, with no syscall per get. This is not a differentiator.
-- **Cold reads, Linux/NVMe:** level with LMDB at 2 MiB (2.17 vs 2.15 GB/s,
-  checksum verified). Ahead of every peer at 8 and 32 MiB (3.03 and
-  3.40 GB/s, peers 2.1–2.6). Behind at 512 KiB (1.19 vs LMDB's 1.93).
+- **Cold reads, Linux/NVMe:** against a same-day LMDB, ahead at 8 and
+  32 MiB (3.01 and 3.40 GB/s against 2.82 and 2.94), 1.16× behind at 2 MiB
+  (2.38 against 2.77) and 1.39× behind at 512 KiB (1.70 against 2.37, up
+  from 0.81 before the readahead-chunking fix). Checksum verified. Below the
+  256 KiB readahead threshold, cold reads are far behind (64 KiB: 0.04
+  against 1.56 GB/s). Today's LMDB reads 23–34 % faster than the round-2
+  LMDB figures used elsewhere in this file.
 - **Writes:** about 1 GB/s per thread at 2 MiB, 1.4× behind file-per-block
   (1.01 vs 1.44 GB/s on Linux).
 - **Bounded tier under churn:** with wrap retention on, Cyclone meets the
@@ -49,9 +58,9 @@ Where Cyclone stands now:
 |---|---:|---|---|
 | Warm GET copy, 1 thread, macOS | 63.6 GB/s | LMDB 64.9, filedir 18.0 | [3](#round-3-readahead-and-a-fast-crc32) |
 | Warm GET copy, 1 thread, Linux (DRAM-bound) | 13.1 GB/s | LMDB 12.9, filedir 6.5 | [3b](#round-3b-crc-32c-on-disk-format-v8) |
-| Cold first-touch GET, Linux | 2.17 GB/s | LMDB 2.15, filedir 1.76 | [3b](#round-3b-crc-32c-on-disk-format-v8) |
-| Cold restart GET, Linux | 1.97 GB/s | LMDB 2.16, filedir 1.73 | [3b](#round-3b-crc-32c-on-disk-format-v8) |
-| Cold first-touch, 512 KiB / 8 MiB / 32 MiB, Linux | 1.19 / 3.03 / 3.40 GB/s | LMDB 1.93 / 2.12 / 2.20 | [3b](#round-3b-crc-32c-on-disk-format-v8) |
+| Cold first-touch GET, Linux | 2.38 GB/s | LMDB 2.77 (same day); round 2: LMDB 2.15, filedir 1.76 | [Readahead](#readahead-chunking-issue-18) |
+| Cold restart GET, Linux | 2.09 GB/s | LMDB 2.68 (same day); round 2: LMDB 2.16, filedir 1.73 | [Readahead](#readahead-chunking-issue-18) |
+| Cold first-touch, 512 KiB / 8 MiB / 32 MiB, Linux | 1.70 / 3.01 / 3.40 GB/s | LMDB 2.37 / 2.82 / 2.94 (same day) | [Readahead](#readahead-chunking-issue-18) |
 | PUT, 1 thread, Linux | 1.01 GB/s | filedir 1.44, RocksDB 0.61 | [3b](#round-3b-crc-32c-on-disk-format-v8) |
 | 4 reader processes, `view`, Linux | 755 k gets/s | LMDB 585 k | [3b](#round-3b-crc-32c-on-disk-format-v8) |
 | Churn, `zipf`, 4 threads, retention on: hit ratio / served / hit p99 | 0.814 / 1.73–2.13 GB/s / 25–31 ms | LMDB 0.849 / 1.44–1.51 / 86–92 ms (same day) | [5](#round-5-re-benchmark-at-main-2aed24c) |
@@ -59,7 +68,8 @@ Where Cyclone stands now:
 | Host→GPU, mapping registered once (CUDA, batch 16) | 12.79 GB/s | LMDB 12.81, staged 5.51 | [CUDA](#device-transfer-cuda-gtx-1050-pcie) |
 
 Peer rows come from the round-1 and round-2 sweeps and were not re-run for
-the later rounds. Round 4 has its own peers (LMDB and file-per-block, each
+the later rounds, except the cold LMDB rows, which the readahead-chunking
+section re-ran on the same day as its Cyclone runs. Round 4 has its own peers (LMDB and file-per-block, each
 with an LRU), and round 5 re-ran them at 4 threads. Round 5 re-measured the
 Cyclone cold rows at main: 2, 8 and 32 MiB are unchanged. At 512 KiB it
 read 0.80 GB/s, and a same-day run of the round-3b code read 0.86, so that
@@ -1010,6 +1020,218 @@ hit ratio carries over to Linux. Load was 2.8–4.3.
 These are the same hit ratios as the earlier Linux 4 GiB run (0.726 →
 0.788 and 0.614 → 0.660), on a different OS and filesystem.
 
+## Readahead chunking (issue #18)
+
+> 2026-09-24/25, Linux machine only. main at b94540d against the fix
+> (dd487fb): the Linux readahead hint goes out in 64 KiB chunks over the
+> first 4 MiB of a document, and is skipped when every page is already
+> resident. Same-day LMDB. Wrap retention was off by default in both
+> trees; a shorter check after rebasing onto main e4c051e (retention on
+> by default; the fix as f9cc804, its code unchanged) is at the end of this
+> section. Raw data, per-run load, and every script and throwaway patch
+> used are in
+> [`kv-cache-benchmark/readahead/`](kv-cache-benchmark/readahead/).
+
+Round 5 left cold 512 KiB reads at 0.80 GB/s against LMDB's 1.93 (round 2).
+This section finds where the time went, fixes it, and re-measures every size
+from 64 KiB to 32 MiB.
+
+### Where the time went
+
+Measured on main, cold 512 KiB `kv_bench` first-touch phase
+([`readahead-diagnosis.txt`](kv-cache-benchmark/readahead/readahead-diagnosis.txt)):
+
+- **Not page faults, not the checksum.** 4096 gets took about 180 major
+  faults in total. The hint covers each document, and a document's first
+  page is already cached as the last page of the previous document in the
+  same stripe. The verified-state study had put the checksum at 2–9 % of a
+  cold read.
+- **Not the device's bandwidth.** The same volume file read with `O_DIRECT`,
+  one 512 KiB read at a time, ran at 1.2–1.9 GB/s (280–430 µs per read).
+- **The hint serialises everything.** Timing `read_sync` in pieces: 8.5 µs
+  to find and key-check the document, **159 µs inside
+  `madvise(MADV_WILLNEED)`**, then 410 µs in the checksum pass, almost all
+  of it waiting for I/O. `perf` puts the madvise time in page-cache setup
+  (`__add_to_page_cache_locked`, `clear_page_erms` — the kernel zeroes each
+  new page — and `xas_load`). Linux allocates and inserts every page of an
+  advised chunk before it submits the read, and all pages of one read unlock
+  when the whole read completes. With 512 KiB chunks each document left the
+  device idle for ~150 µs, then gave it one ~508 KiB request that the
+  checksum pass waited out in full. Nothing overlapped.
+- **Against LMDB,** from `/proc/diskstats` over the same phase: both stores
+  keep about 1.4 reads in flight on average, but LMDB's 126 KiB reads (the
+  kernel's own fault readahead) complete in 73 µs and Cyclone's in 424 µs.
+
+### The fix
+
+In `PosixMappedFile::advise_willneed`, the Linux hint:
+
+1. **Small chunks.** The first 4 MiB of a document is advised in 64 KiB
+   chunks, the rest in 512 KiB chunks as before. The first read reaches the
+   device after 16 pages of setup instead of 128, several reads are in
+   flight while the rest are set up, and the checksum pass never waits on
+   one large read.
+2. **No hint on a resident document.** On resident pages the hint queues no
+   I/O but still walks every page, once per call, and the re-advise filter
+   lets a warm document through after 2 s or on a slot collision. With 9
+   calls per 512 KiB document instead of 2, that walk cost 7 % of warm
+   `view` reads. The hint is now skipped when `mincore()` reports every page
+   of the range resident (a 16-page window first, so a cold document
+   answers after one short call). Checking one page instead was tried and
+   rejected: about 3 % of cold documents had that page cached and the rest
+   not, so their hint was skipped, and each took ~128 serial 4 KiB faults.
+   Cold 512 KiB fell to 0.61 GB/s.
+
+macOS (`F_RDADVISE`), Windows (`PrefetchVirtualMemory`) and the
+`readahead_min_bytes` threshold (256 KiB) are unchanged.
+
+### Choosing the chunks
+
+Cold first touch, GB/s, median of three interleaved runs per rule
+([`readahead-rule-sweep.txt`](kv-cache-benchmark/readahead/readahead-rule-sweep.txt);
+the single-run chunk-size sweep before it is in
+[`readahead-chunk-sweep.txt`](kv-cache-benchmark/readahead/readahead-chunk-sweep.txt)):
+
+| chunk rule | 512 KiB | 1 MiB | 2 MiB | 8 MiB | 32 MiB |
+|---|---:|---:|---:|---:|---:|
+| 64 KiB throughout | 1.69 | 1.70 | **2.41** | 3.10 | 3.21 |
+| 128 KiB throughout | 1.50 | **2.22** | 2.02 | 3.04 | 3.38 |
+| 64 KiB over the first 1 MiB, then 512 KiB | 1.71 | 1.62 | 1.88 | 3.09 | 3.40 |
+| 64 KiB over the first 256 KiB and the last 512 KiB, 512 KiB between | 1.70 | 1.42 | 1.91 | 3.10 | 3.39 |
+
+- A 512 KiB chunk anywhere in a document of up to 2 MiB costs 10–20 %: the
+  checksum pass catches up with the reads and stalls on the large one.
+- 32 KiB and 16 KiB chunks were slower at 512 KiB (1.04 and 1.32 GB/s,
+  single runs).
+- At 32 MiB, 64 KiB chunks throughout cost 5 %. The device is the
+  bottleneck there, and the chunks only add syscalls (8× as many).
+- 1 MiB documents read fastest with 128 KiB chunks, in every run, while
+  512 KiB and 2 MiB documents read slowest with them. This was not
+  explained, and the chosen rule does not depend on it.
+
+Hence 64 KiB chunks over the first 4 MiB, then 512 KiB. That behaves as
+"64 KiB throughout" up to 2 MiB with margin, and as the old hint for the
+bulk of a 32 MiB document.
+
+### Before and after, cold (Linux, page cache dropped)
+
+`kv_bench --seconds 1 --threads 1 --skip-multiprocess` over seven block
+sizes in one invocation. main, the fix and LMDB ran interleaved, three runs
+each. Median GB/s, first touch (restart in parentheses):
+
+| block | main (b94540d) | fix (dd487fb) | fix / main | LMDB, same day | LMDB / fix |
+|---|---:|---:|---:|---:|---:|
+| 64 KiB | 0.04 (0.04) | 0.04 (0.04) | — | 1.56 (1.62) | 39× |
+| 256 KiB | 0.65 (0.51) | 1.12 (0.87) | 1.72× (1.68×) | 2.05 (1.99) | 1.83× (2.30×) |
+| **512 KiB** | 0.81 (0.71) | **1.70 (1.41)** | **2.09× (1.97×)** | 2.37 (2.32) | **1.39×** (1.65×) |
+| 1 MiB | 1.44 (1.30) | 1.65 (1.63) | 1.14× (1.26×) | 2.71 (2.65) | 1.64× (1.63×) |
+| 2 MiB | 2.13 (1.95) | 2.38 (2.09) | 1.12× (1.07×) | 2.77 (2.68) | 1.16× (1.28×) |
+| 8 MiB | 3.07 (2.89) | 3.01 (2.83) | 0.98× (0.98×) | 2.82 (2.74) | 0.94× (0.97×) |
+| 32 MiB | 3.37 (3.26) | 3.40 (3.28) | 1.01× (1.01×) | 2.94 (2.85) | 0.86× (0.87×) |
+
+At 512 KiB, first touch is now 1.39× behind LMDB on the same day. The
+issue's acceptance bar was 1.5×. Restart is 1.65× behind. 8 MiB is 2 %
+slower in both phases, in every run (see below). LMDB's 512 KiB rate today
+(2.37) is above round 2's 1.93, so compare these ratios only with each
+other.
+
+### Before and after, everything else
+
+The full round-5 sweep (`kv_bench --seconds 10`: all phases, four sizes,
+the 4-process phase), main and the fix interleaved, three runs each. Median
+ratio, fix / main
+([`readahead-final.txt`](kv-cache-benchmark/readahead/readahead-final.txt)):
+
+| | 512 KiB | 2 MiB | 8 MiB | 32 MiB |
+|---|---:|---:|---:|---:|
+| Cold first touch | **1.93** | 1.08 | 0.95 | 1.01 |
+| Cold restart | **1.81** | 1.07 | 0.98 | 0.97 |
+| Warm `view`, 1 / 4 / 8 threads | 1.07 / 1.06 / 1.06 | 1.02 / 1.00 / 1.00 | 1.01 / 1.00 / 1.00 | 1.01 / 1.00 / 1.00 |
+| Warm `copy`, 1 / 4 / 8 threads | 1.01 / 0.99 / 1.00 | 1.00 / 0.98 / 0.98 | 1.02 / 0.99 / 0.99 | 1.01 / 1.00 / 1.00 |
+| 4 reader processes, `view` / `copy` | 1.10 / 1.00 | 1.02 / 0.98 | 1.00 / 0.99 | 1.01 / 1.00 |
+| PUT | 1.00 | 1.03 | 0.95 | 0.99 |
+
+- **Warm 512 KiB `view` is 6–10 % faster.** The residency check replaces
+  the re-advise's page walk (two `madvise` calls on main) with a cheaper
+  `mincore()`. A separate 512 KiB check with three interleaved runs agreed:
+  warm `view` +7 % at 1 and 4 threads, 4-process `view` +6 %.
+- **8 MiB cold reads are 2–5 % slower,** here and in the cold runs above.
+  (One of the three first-touch runs here also hit a slow-device window at
+  1.16 GB/s.) In the rule sweep, every small-chunk rule read the same at
+  8 MiB, so the number of calls does not explain it. The difference is
+  about the size of the machine's session-to-session spread, but it held in
+  every interleaved pair. 8 MiB PUT ranged 0.90–1.01 against 0.99–1.00;
+  the write path did not change.
+- **4 KB objects are unchanged.** `performance_baseline --cache-size 512
+  --entries 5000 --content-size 4096` reads below the threshold, where no
+  code changed. On every operation the median of the fix's three runs is
+  within 1 % of main's (single runs within 2.5 %). The first main run of
+  each series ran straight after the `kv_bench` sweeps and was slow on
+  every operation; it is excluded.
+
+### After rebasing onto main (wrap retention on by default)
+
+main e4c051e against the fix rebased onto it (f9cc804), 512 KiB and 2 MiB,
+all phases, `--seconds 5 --threads 1,4`, two interleaved runs each
+([`readahead-rebase-check.txt`](kv-cache-benchmark/readahead/readahead-rebase-check.txt)).
+Median, fix / main:
+
+| | 512 KiB | 2 MiB |
+|---|---:|---:|
+| Cold first touch / restart | 1.94 / 1.80 | 1.07 / 1.07 |
+| Warm `view`, T = 1 / 4 | 1.09 / 1.08 | 1.02 / 1.00 |
+| Warm `copy`, T = 1 / 4 | 1.00 / 1.00 | 0.94 / 0.95 |
+| 4 reader processes, `view` / `copy` | 1.09 / 1.01 | 0.97 / 0.98 |
+| PUT | 1.00 | 1.01 |
+
+The same picture as before the rebase. The 2 MiB warm `copy` ratio comes
+from one run of the fix (10.69 GB/s; its other run read 12.49, main 12.35
+and 12.43); the three-run sweep above had it at 0.98–1.00.
+
+### What is left of the gap
+
+At 512 KiB and 1 MiB, Cyclone is still 1.4–1.65× behind LMDB. Two causes
+were measured:
+
+- **Order across documents.** `kv_bench` reads in insertion order. LMDB
+  stores values in that order, so its reads are sequential on disk, and the
+  kernel's fault readahead and the SSD's own prefetch run across value
+  boundaries. Cyclone hashes keys over 16 stripes, so consecutive gets
+  alternate between 16 regions of the file. Read with `O_DIRECT` from the
+  same file, 16-way interleaved 128 KiB reads ran at 0.80 GB/s against
+  1.61 sequential. A per-document hint cannot cover the next document.
+- **Page setup before the checksum.** The hint loop (~100 µs per 512 KiB
+  document) still runs before the checksum pass starts. LMDB pays the same
+  setup inside its page faults, but the kernel's asynchronous readahead
+  overlaps it with reads further ahead, into the next value. Interleaving the
+  hint with the checksum pass could hide at most the checksum's own
+  ~30–40 µs, so it was not done.
+
+Below the 256 KiB threshold there is no hint at all: 64 KiB blocks read cold
+at 0.04 GB/s, 16 serial faults per document, 39× behind LMDB. Lowering
+the threshold to 64 KiB was measured but not changed
+(`--readahead-min-bytes 65536`, one run each, in `thr-*` of
+[`readahead-final.txt`](kv-cache-benchmark/readahead/readahead-final.txt)).
+Cold 64 KiB rises from 0.04 to 0.24 GB/s and 128 KiB from 0.04 to 0.51.
+Warm `view` falls 8–9 % at 64 KiB and 16–18 % at 128 KiB. A warm get there
+takes under a microsecond, and every miss in the re-advise filter now adds
+a syscall to it. Changing the default needs a cheaper warm path first. It is
+left as a follow-up.
+
+### Caveats
+
+- One machine, one SSD (Samsung 970 PRO, `read_ahead_kb` 128,
+  `max_sectors_kb` 1280, kernel 5.15). The chunk sizes are tuned there.
+- In 4 of about 45 multi-size runs, every get of one block size in one run
+  was 2.4–10× slower in one or both cold phases. The device itself was
+  slow in those windows (per-request latency); where it was checked, no
+  other job was running. The medians of three absorb them; the raw files
+  keep them.
+- The machine is shared with other background jobs. Every run waited for
+  them to finish and for the 1-minute load to drop below 1.0. A job that
+  starts mid-run is not prevented; the sampler records one, and none was
+  recorded in the runs where it was on (from the second full sweep on).
+
 ## Device transfer: does zero-copy pay off? (Metal, Apple silicon)
 
 The open question from rounds 1 and 2 is whether the zero-copy read pays
@@ -1449,8 +1671,10 @@ through nvcc in `kv_gpu_cuda.cu`, behind the plain-C seam in
 | Item | Status | Evidence |
 |---|---|---|
 | Readahead for large cold reads: a per-document hint, with a per-platform call | **Done** | [Round 3](#readahead-alone); mechanism in [architecture.md](architecture.md#memory-mapped-io) |
+| Readahead for medium cold reads: the Linux hint in 64 KiB chunks over a document's first 4 MiB, and no hint on a resident document | **Done** (#18) | [Readahead chunking](#readahead-chunking-issue-18): cold 512 KiB 0.81 → 1.70 GB/s, 1.39× behind a same-day LMDB; warm 512 KiB `view` +7 % |
+| Readahead below the 256 KiB threshold: a warm path cheap enough to lower it | Open; 64 KiB reads cold at 0.04 GB/s against LMDB's 1.56. A 64 KiB threshold lifts that to 0.24 but costs warm `view` 8–18 % | [Readahead chunking](#what-is-left-of-the-gap) |
 | Fast document checksum: slice-by-16 / ARMv8 CRC32, then CRC-32C at format v8 | **Done** | [Round 3](#fast-crc32-alone), [Round 3b](#round-3b-crc-32c-on-disk-format-v8); [architecture.md](architecture.md#document-format) |
-| Verified state that outlives the process: keep the CRC-validation cache beside the mmap directory, so a restart and every peer process skip re-verification | Designed, then shelved ([design](design/verified-state.md)); the 512 KiB gap is tracked as a readahead item (#18). Measured there: about half of a warm-page-cache first read (view) is the CRC pass, but only 2–9 % of a cold NVMe read. The 512 KiB cold gap to LMDB is the I/O pattern, not the CRC | [Design, section 2](design/verified-state.md#2-what-is-avoidable-measurement) |
+| Verified state that outlives the process: keep the CRC-validation cache beside the mmap directory, so a restart and every peer process skip re-verification | Designed, then shelved ([design](design/verified-state.md)); the 512 KiB gap was tracked as a readahead item (#18, since [fixed](#readahead-chunking-issue-18)). Measured there: about half of a warm-page-cache first read (view) is the CRC pass, but only 2–9 % of a cold NVMe read. The 512 KiB cold gap to LMDB is the I/O pattern, not the CRC | [Design, section 2](design/verified-state.md#2-what-is-avoidable-measurement) |
 | `WriteHandle::reserve(n)` that returns the destination span, so the caller writes or DMAs straight into the record (three copies become one) | Open; puts are 1.4× behind file-per-block (1.01 vs 1.44 GB/s) | [Round 3b](#round-3b-crc-32c-on-disk-format-v8), insert latency in [Round 4](#round-4-bounded-capacity-under-churn) |
 | An entry point that gives an embedder the mapping identity for one-time GPU registration, instead of inferring it from `content()` / `content_file_offset()` / `volume_files()` | Open | [Metal](#device-transfer-does-zero-copy-pay-off-metal-apple-silicon), [CUDA](#device-transfer-cuda-gtx-1050-pcie) |
 | A zero-copy C read entry point and a Python binding, which is what a vLLM/SGLang connector would call | Open | — |

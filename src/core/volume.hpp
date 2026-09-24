@@ -801,9 +801,11 @@ struct VolumeStats {
 
   // Large-document readahead hints actually issued on the disk read path
   // (see VolumeConfig::readahead_min_bytes).  Counts only the hints that
-  // got past the re-advise filter, so it measures kernel calls made, not
-  // large reads served: a hot document contributes at most one hint per
-  // re-advise interval however often it is read.  PROCESS-LOCAL.
+  // got past the re-advise filter, so it measures hints issued, not large
+  // reads served: a hot document contributes at most one hint per re-advise
+  // interval however often it is read.  On Linux a hint whose range is
+  // already fully resident stops at a mincore() check inside MappedFile and
+  // is still counted.  PROCESS-LOCAL.
   uint64_t readahead_hints_issued = 0;
 
   // Wrap-cadence telemetry: how often the circular write buffer wraps back
