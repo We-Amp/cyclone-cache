@@ -174,6 +174,11 @@ struct InsertChoice {
 // waits to be scheduled again, or on a bucket whose holder is stuck (a
 // process that died mid-update); the next write to the bucket by its owner
 // releases that one (Volume::writer_probe).
+#if defined(_MSC_VER)
+#define CYCLONE_SEQLOCK_COLD __declspec(noinline)
+#else
+#define CYCLONE_SEQLOCK_COLD __attribute__((noinline, cold))
+#endif
 class SeqlockReadWait {
  public:
   static constexpr size_t kFastAttempts = 100;
@@ -187,11 +192,45 @@ class SeqlockReadWait {
   // active: the caller skips the scan and retries.  In the fast phase an
   // odd version is waited on by spinning, then the CPU is yielded; in the
   // timed phase retry() already slept, so this is a single load.
+  //
+  // Only the first load is inline: the wait is out of line so the
+  // uncontended probe stays as small as it was before the wait existed.
   template <typename LoadVersion>
   uint32_t even_version(LoadVersion &&load) {
-    uint32_t version = load();
-    if ((version & 1) == 0 || _attempts > kFastAttempts) {
+    const uint32_t version = load();
+    if ((version & 1) == 0) [[likely]] {
       return version;
+    }
+    return wait_for_even(version, load);
+  }
+
+  // Call after a failed attempt.  True: try again.  False: the budget is
+  // spent and the probe must report Busy.  Only the clock-free fast-phase
+  // count is inline.
+  bool retry() {
+    if (_attempts < kFastAttempts) [[likely]] {
+      ++_attempts;
+      return true;
+    }
+    return timed_retry();
+  }
+
+#ifdef CYCLONE_TEST_SEAMS
+  // TEST-SEAM BUILDS ONLY (see Volume::ReaderSeam).  Nonzero overrides
+  // kBudget, in microseconds, so a test can spend the budget quickly or make
+  // it effectively unbounded.  The counter records each probe that entered
+  // the timed phase, i.e. got past the point the old fixed retry count gave
+  // up at.
+  static inline std::atomic<uint64_t> s_budget_us_for_test{0};
+  static inline std::atomic<uint64_t> s_timed_waits_for_test{0};
+#endif
+
+ private:
+  template <typename LoadVersion>
+  CYCLONE_SEQLOCK_COLD uint32_t wait_for_even(uint32_t version,
+                                              LoadVersion &load) {
+    if (_attempts > kFastAttempts) {
+      return version;  // Timed phase: retry() already slept
     }
     for (size_t spin = 0; spin < kSpinsPerAttempt; ++spin) {
       cpu_pause();
@@ -204,13 +243,7 @@ class SeqlockReadWait {
     return version;
   }
 
-  // Call after a failed attempt.  True: try again.  False: the budget is
-  // spent and the probe must report Busy.
-  bool retry() {
-    if (_attempts < kFastAttempts) {
-      ++_attempts;
-      return true;
-    }
+  CYCLONE_SEQLOCK_COLD bool timed_retry() {
     const auto now = std::chrono::steady_clock::now();
     if (_attempts == kFastAttempts) {
       // Entering the timed phase: the old code gave up here.
@@ -233,17 +266,6 @@ class SeqlockReadWait {
     return true;
   }
 
-#ifdef CYCLONE_TEST_SEAMS
-  // TEST-SEAM BUILDS ONLY (see Volume::ReaderSeam).  Nonzero overrides
-  // kBudget, in microseconds, so a test can spend the budget quickly or make
-  // it effectively unbounded.  The counter records each probe that entered
-  // the timed phase, i.e. got past the point the old fixed retry count gave
-  // up at.
-  static inline std::atomic<uint64_t> s_budget_us_for_test{0};
-  static inline std::atomic<uint64_t> s_timed_waits_for_test{0};
-#endif
-
- private:
   static std::chrono::steady_clock::duration budget() {
 #ifdef CYCLONE_TEST_SEAMS
     const uint64_t us = s_budget_us_for_test.load(std::memory_order_relaxed);

@@ -1565,9 +1565,6 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // Full-bucket nearest-to-clobber evictions (process-local; see VolumeStats).
   std::atomic<uint64_t> _bucket_full_evictions{0};
 
-  // Directory probes that spent the whole seqlock wait budget (process-local;
-  // see VolumeStats).  Touched only on that already-slow path.
-  std::atomic<uint64_t> _directory_read_timeouts{0};
   // Count one such probe and return the Busy it is reported as.
   auto directory_busy() {
     _directory_read_timeouts.fetch_add(1, std::memory_order_relaxed);
@@ -2167,6 +2164,11 @@ class Volume : public std::enable_shared_from_this<Volume> {
 
   // Publish the exposure generation (seq_cst).
   static void store_exposure_gen(Stripe *stripe, uint64_t gen);
+
+  // Directory probes that spent the whole seqlock wait budget (process-local;
+  // see VolumeStats).  Touched only on that already-slow path.  Declared
+  // LAST so adding it shifts no hot member's offset or cache-line layout.
+  std::atomic<uint64_t> _directory_read_timeouts{0};
 };
 
 // Volume is always heap-allocated (make_shared).  Keep it small enough that a
