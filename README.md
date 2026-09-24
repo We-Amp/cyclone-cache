@@ -245,13 +245,17 @@ while you stream it to the device. Persist the key/value tensors of a prompt
 prefix to node-local NVMe, and the next request that shares the prefix loads
 them instead of recomputing them.
 
-Measured against LMDB, RocksDB and file-per-block in
-[doc/kv-cache-benchmark.md](doc/kv-cache-benchmark.md): reads are in LMDB's
-class (warm, and cold on Linux/NVMe from 2 MiB up), writes run at about
-1 GB/s per thread, behind file-per-block, and as a **bounded** tier under
-churn Cyclone is not better than LMDB with an LRU: its wrap-based eviction
-holds a hit ratio about 9 points lower, so it serves 0.6–1.0× LMDB's
-throughput at 2 MiB, though with a lower hit-latency tail at 4 threads.
+Where it fits, measured against LMDB, RocksDB and file-per-block in
+[doc/kv-cache-benchmark.md](doc/kv-cache-benchmark.md): a **node-local,
+multi-process tier for large blocks (2–32 MiB)** that evicts on its own. On
+Linux/NVMe it reads cold 8–32 MiB blocks faster than every peer (3.0–3.4
+GB/s), serves four reader processes 1.3× faster than LMDB, and under
+concurrent churn keeps a 3–4× lower hit-latency tail than LMDB with an LRU;
+with `wrap_retention` on, a bounded tier meets the benchmark's pre-registered
+bar against LMDB on that latency clause. It is not a general LMDB
+replacement: warm reads are in the same class, small blocks (512 KiB) read
+cold at under half LMDB's rate, writes run at about 1 GB/s per thread behind
+file-per-block, and single-threaded churn serves 0.7–0.8× LMDB.
 
 - **Zero-copy loads.** On a disk hit `content()` aliases the mapped volume;
   acquiring a view costs about 0.4 µs regardless of size. For device
