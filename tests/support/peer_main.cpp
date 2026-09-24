@@ -45,6 +45,26 @@
 //                                 never reached.  With `wrap`, only the
 //                                 write that WRAPS arms the seam (not an
 //                                 earlier frontier advance).
+//   carry <raw-path> <size-bytes> <step> <crash|hang> <key> <content-bytes>
+//                                 open a Cache (multi-process, leases off,
+//                                 wrap retention ON) and write ONE AVIF
+//                                 alternate of <content-bytes> 0x5A bytes to
+//                                 <key>, whose chain head the parent made
+//                                 RETAINED, so the write carries the chain
+//                                 forward.  At <step> it _exit(42)s (crash)
+//                                 or says READY and blocks until released,
+//                                 then _exit(0)s (hang).  Steps, in the
+//                                 order the write reaches them:
+//                                   copied  Volume::CarrySeam::kSourcesCopied
+//                                   intent  WriterSeam::kAfterIntentSet
+//                                   gate    WriterSeam::kAfterGatePassed
+//                                   epoch   WriterSeam::kAfterEpochStore
+//                                           (the three writer seams fire in
+//                                           the frontier advance the carry's
+//                                           allocation needs)
+//                                   tear    the F6 reservation->pwrite gate
+//                                   filled  Volume::CarrySeam::kFilled
+//                                 Exit 1 if the step was never reached.
 //   borrow <raw-path> <size-bytes> <key>...
 //                                 open a Cache (multi-process, 600 s lease),
 //                                 take a disk borrow of every key, say READY
@@ -56,6 +76,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -250,6 +271,86 @@ int run_seam(const char* path, unsigned long long size, int seam, bool crash,
   return 1;
 }
 
+int run_carry(const char* path, unsigned long long size, const char* step,
+              bool crash, const char* key, unsigned long long content_bytes) {
+  cyclone::CacheConfig config;
+  config.set_multi_process(0, 1);
+  config.set_ram_cache_size(0);
+  config.set_wrap_retention(true);
+  config.read_lease_duration = std::chrono::milliseconds(0);
+  config.lease_wrap_ceiling = std::chrono::milliseconds(0);
+
+  auto cache = cyclone::Cache::create(config);
+  if (!cache.has_value()) {
+    say("ERR " + std::to_string(static_cast<int>(cache.error())));
+    return 1;
+  }
+  if (auto added = (*cache)->add_volume(path, static_cast<size_t>(size));
+      !added.has_value()) {
+    say("ERR " + std::to_string(static_cast<int>(added.error())));
+    return 1;
+  }
+  if (auto started = (*cache)->start(); !started.has_value()) {
+    say("ERR " + std::to_string(static_cast<int>(started.error())));
+    return 1;
+  }
+
+  static bool s_crash = false;
+  s_crash = crash;
+  auto at_step = [] {
+    if (s_crash) {
+      std::_Exit(kSeamCrashExit);  // no teardown: whatever is held leaks
+    }
+    say("READY");
+    wait_for_release();
+    std::_Exit(0);  // never finishes the write
+  };
+  using cyclone::Volume;
+  const std::string target(step);
+  if (target == "copied" || target == "filled") {
+    const auto want = target == "copied" ? Volume::CarrySeam::kSourcesCopied
+                                         : Volume::CarrySeam::kFilled;
+    Volume::s_carry_seam_for_test = [want, at_step](Volume::CarrySeam at) {
+      if (at == want) {
+        at_step();
+      }
+    };
+  } else if (target == "tear") {
+    Volume::s_write_tear_gate_for_test = [at_step](uint64_t, uint64_t) {
+      at_step();
+    };
+  } else {
+    Volume::WriterSeam want = Volume::WriterSeam::kAfterIntentSet;
+    if (target == "gate") {
+      want = Volume::WriterSeam::kAfterGatePassed;
+    } else if (target == "epoch") {
+      want = Volume::WriterSeam::kAfterEpochStore;
+    } else if (target != "intent") {
+      say("ERR unknown step " + target);
+      return 2;
+    }
+    Volume::s_writer_seam_for_test = [want, at_step](Volume::WriterSeam at) {
+      if (at == want) {
+        at_step();
+      }
+    };
+  }
+
+  std::vector<std::byte> content(static_cast<size_t>(content_bytes),
+                                 std::byte{0x5A});
+  auto wh = (*cache)->write_alternate_sync(
+      cyclone::CacheKey(key), cyclone::AlternateId::AVIF, content.size());
+  if (wh.has_value()) {
+    [[maybe_unused]] const auto wrote = wh->write_sync(content);
+    [[maybe_unused]] const auto closed = wh->close_sync();
+  }
+  Volume::s_carry_seam_for_test = nullptr;
+  Volume::s_write_tear_gate_for_test = nullptr;
+  Volume::s_writer_seam_for_test = nullptr;
+  say("ERR step never reached");
+  return 1;
+}
+
 // Open a Cache with a long read lease, take a disk borrow of every listed
 // key and HOLD the handles: the stand-in for a zero-copy reader.  The
 // parent SIGKILLs it to leak the counts (test 7) or releases it.
@@ -302,6 +403,11 @@ int main(int argc, char** argv) {
                     std::strtoull(argv[6], nullptr, 10),
                     argc >= 8 && std::strcmp(argv[7], "wrap") == 0);
   }
+  if (argc >= 8 && std::strcmp(argv[1], "carry") == 0) {
+    return run_carry(argv[2], std::strtoull(argv[3], nullptr, 10), argv[4],
+                     std::strcmp(argv[5], "crash") == 0, argv[6],
+                     std::strtoull(argv[7], nullptr, 10));
+  }
   if (argc >= 4 && std::strcmp(argv[1], "open") == 0) {
     return run_open(argv[2], std::strtoull(argv[3], nullptr, 10));
   }
@@ -309,6 +415,7 @@ int main(int argc, char** argv) {
     return run_hold(argv[2]);
   }
   say("ERR usage: cyclone-test-peer open <path> <size> | hold <file> | seam "
-      "<path> <size> <seam> <crash|hang> <content-bytes>");
+      "<path> <size> <seam> <crash|hang> <content-bytes> | carry <path> "
+      "<size> <step> <crash|hang> <key> <content-bytes>");
   return 2;
 }
