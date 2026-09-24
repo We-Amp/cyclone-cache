@@ -442,7 +442,7 @@ that reports `std::errc::not_supported`:
 
 | Platform | Call | Why |
 |---|---|---|
-| Linux | `madvise(MADV_WILLNEED)`, 512 KiB chunks | Queues a few large asynchronous reads and returns; honoured on a file mapping despite `MADV_RANDOM` |
+| Linux | `madvise(MADV_WILLNEED)`, 64 KiB chunks over the first 4 MiB, then 512 KiB | Queues asynchronous reads and returns; honoured on a file mapping despite `MADV_RANDOM` |
 | Darwin | `fcntl(F_RDADVISE)` on the volume fd | Darwin's `MADV_WILLNEED` is synchronous and serialises across processes (below) |
 | Windows | `PrefetchVirtualMemory` | Address-range equivalent of the Linux call |
 
@@ -462,11 +462,23 @@ cold-read win. Apple Silicon's 16 KiB base page and Darwin's own clustered
 pagein are why the *upside* is smaller there than on Linux in the first
 place: a cold 2 MiB read is ~128 faults, not ~512.
 
-Two details are load-bearing on the Linux side. The advice is issued in
-512 KiB chunks, because Linux clamps one `MADV_WILLNEED` to
+Three details are load-bearing on the Linux side. The advice is issued in
+chunks, because Linux clamps one `MADV_WILLNEED` to
 `max(bdi->io_pages, ra_pages)` pages (`force_page_cache_ra()`): a single call
 over a 2 MiB document covers only its first ~1.25 MB and the rest still
-faults in a page at a time. And the Volume advises a given document
+faults in a page at a time. The chunks are small: 64 KiB over the first
+4 MiB of the document, then 512 KiB. Inside the call the kernel allocates,
+zeroes and inserts every page of the chunk into the page cache before it
+submits the read, and the pages of one read unlock together when it
+completes. One 512 KiB chunk therefore left the device idle for ~150 µs,
+then gave it a single request that the checksum pass had to wait out in
+full. Small chunks put the first read on the device sooner, keep several in
+flight while the rest is set up, and never leave the checksum pass stalled
+on one large request. On the benchmark NVMe this doubled the cold 512 KiB
+rate
+([kv-cache-benchmark.md, Readahead chunking](kv-cache-benchmark.md#readahead-chunking-issue-18)).
+Past a few MiB the device is the bottleneck, and larger chunks keep the
+syscall count down. And the Volume advises a given document
 placement at most once every `kReadaheadReadviseSeconds` (2 s), through a
 lossy direct-mapped filter (`_readahead_cache`, same shape as the
 CRC-validation cache) — on a warm re-read the pages are already resident but

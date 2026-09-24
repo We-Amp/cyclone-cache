@@ -952,9 +952,12 @@ fault-per-page behaviour; the open-time `MADV_RANDOM` is left in place.
   on volumes already open.
 - **Per-platform mechanism** (a build-time choice, not a runtime fallback):
   - **Linux:** `madvise(MADV_WILLNEED)` over the mapping, page-aligned and
-    issued in 512 KiB chunks (Linux caps a single `MADV_WILLNEED` at the
-    device's readahead budget, so one call would cover only the first ~1 MB
-    of a multi-megabyte range).
+    issued in chunks: 64 KiB over the first 4 MiB of the document, 512 KiB
+    after that. Chunking is needed because Linux caps a single
+    `MADV_WILLNEED` at the device's readahead budget, so one call would
+    cover only the first ~1 MB of a multi-megabyte range. The small head
+    chunks get the first read to the device sooner and keep several reads in
+    flight, which is what makes 512 KiB documents fast.
   - **Darwin (macOS):** `fcntl(F_RDADVISE)` over the **file** range. Darwin's
     `MADV_WILLNEED` is synchronous and serialises on the shared VM object,
     which costs most of the multi-process read throughput; `F_RDADVISE` is the

@@ -23,6 +23,43 @@ namespace cyclone {
 
 #ifdef CYCLONE_USE_POSIX_MMAP
 
+#if defined(__linux__)
+namespace {
+// Whether every page of [addr, addr + length) is in the page cache, by
+// mincore() in windows so the vector stays on the stack.  addr is
+// page-aligned.  The first window is small, so a cold range -- the common
+// case when the hint is issued -- answers after one short call.  An error
+// reads as "not resident": the caller then issues the hint, which is always
+// safe.  Where the kernel restricts mincore() to the caller's own page
+// tables (a file it cannot write), a page cached only by another process
+// reads as not resident, which again only costs the hint.  mincore() never
+// reports a missing page as resident.
+bool range_resident(uintptr_t addr, size_t length, size_t page_size) {
+  constexpr size_t kFirstWindowPages = 16;
+  constexpr size_t kWindowPages = 256;
+  unsigned char vec[kWindowPages];
+  size_t window = kFirstWindowPages * page_size;
+  while (length > 0) {
+    const size_t span = length < window ? length : window;
+    // NOLINTNEXTLINE(performance-no-int-to-ptr)
+    if (mincore(reinterpret_cast<void *>(addr), span, vec) != 0) {
+      return false;
+    }
+    const size_t pages = (span + page_size - 1) / page_size;
+    for (size_t i = 0; i < pages; ++i) {
+      if ((vec[i] & 1U) == 0) {
+        return false;
+      }
+    }
+    addr += span;
+    length -= span;
+    window = kWindowPages * page_size;
+  }
+  return true;
+}
+}  // namespace
+#endif
+
 class PosixMappedFile : public MappedFile {
  public:
   PosixMappedFile() = default;
@@ -237,16 +274,56 @@ class PosixMappedFile : public MappedFile {
     uintptr_t page_addr = addr & ~(page_size - 1);
     size_t advise_length = region.size() + (addr - page_addr);
 
-    // Issue the advice in bounded chunks.  Linux clamps ONE MADV_WILLNEED
-    // to max(bdi->io_pages, ra_pages) pages (force_page_cache_ra()), so a
-    // single call over a multi-megabyte range silently reads ahead only the
-    // first ~1 MB of it and the rest still faults in one page at a time.
-    // Each call gets its own budget, so chunking is what actually covers
-    // the whole document; the extra syscalls are amortised by the caller,
-    // which advises a given document once (Volume::maybe_advise_readahead).
-    constexpr size_t kChunkBytes = size_t{512} * 1024;
+#if defined(__linux__)
+    // Skip the hint only when EVERY page of the range is already resident.
+    // On resident pages MADV_WILLNEED queues no I/O but still walks every
+    // page, once per chunk call below, and the caller's re-advise filter
+    // lets a warm document through again after 2 s or on a slot collision:
+    // with 64 KiB chunks that walk cost 7 % of warm 512 KiB view reads.  The
+    // check must be exhaustive: a partly resident document is common (pages
+    // survive reclaim, and drop_caches, one by one), and skipping its hint
+    // costs one serial 4 KiB fault per missing page -- ~10 ms for a 512 KiB
+    // document, measured when a one-page probe was tried.
+    if (range_resident(page_addr, advise_length,
+                       static_cast<size_t>(page_size))) {
+      return {};
+    }
+#endif
+
+    // Issue the advice in bounded chunks, for two reasons.
+    //
+    // Coverage: Linux clamps ONE MADV_WILLNEED to max(bdi->io_pages,
+    // ra_pages) pages (force_page_cache_ra()), so a single call over a
+    // multi-megabyte range reads ahead only the first ~1 MB of it and the
+    // rest still faults in one page at a time.  Each call gets its own
+    // budget, so chunking is what covers the whole document.
+    //
+    // Latency: the call is not free.  Before it submits any I/O the kernel
+    // allocates, zeroes and inserts into the page cache every page of the
+    // chunk, and the pages of one read unlock together when the whole bio
+    // completes.  One 512 KiB call therefore leaves the device idle for
+    // ~150 us of page setup, then hands it one large request that the CRC
+    // pass must wait out in full (measured: a cold 512 KiB document took
+    // ~160 us in madvise plus ~410 us waiting, 0.84 GB/s).  64 KiB chunks
+    // put the first request on the device after a fraction of that setup,
+    // keep several requests in flight while the rest is set up, and never
+    // leave the CRC pass stalled on one large request (512 KiB documents:
+    // 1.70 GB/s).  A 512 KiB chunk anywhere in a document of up to 2 MiB
+    // costs 10-20 %; 32 KiB and 16 KiB chunks were slower.  Past a few MiB
+    // the device is the bottleneck and the syscall count is what is left
+    // (uniform 64 KiB chunks cost a 32 MiB document ~1.3 ms, -5 %), so the
+    // first 4 MiB of a document goes out in 64 KiB chunks and the rest in
+    // 512 KiB chunks.  Numbers: doc/kv-cache-benchmark.md, "Readahead
+    // chunking".  The caller advises a given document once
+    // (Volume::maybe_advise_readahead).
+    constexpr size_t kHeadChunkBytes = size_t{64} * 1024;
+    constexpr size_t kHeadBytes = size_t{4} * 1024 * 1024;
+    constexpr size_t kTailChunkBytes = size_t{512} * 1024;
+    size_t advised = 0;
     while (advise_length > 0) {
-      size_t chunk = advise_length < kChunkBytes ? advise_length : kChunkBytes;
+      const size_t limit =
+          advised < kHeadBytes ? kHeadChunkBytes : kTailChunkBytes;
+      const size_t chunk = advise_length < limit ? advise_length : limit;
       // NOLINTNEXTLINE(performance-no-int-to-ptr)
       if (madvise(reinterpret_cast<void *>(page_addr), chunk, MADV_WILLNEED) <
           0) {
@@ -254,6 +331,7 @@ class PosixMappedFile : public MappedFile {
       }
       page_addr += chunk;
       advise_length -= chunk;
+      advised += chunk;
     }
 #else
     (void)region;
