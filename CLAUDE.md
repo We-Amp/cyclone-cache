@@ -309,9 +309,12 @@ The read hot path is lock-free (the read-path scaling series). Before refactorin
    (the wrap-intent Dekker proof in `Volume::allocate_write_slot`). Don't reorder or weaken the memory
    order. Borrow is released on ReadHandle **close**, not lease expiry.
 4. **Per-bucket seqlock**: writers publish odd→even under the stripe mutex
-   only; readers retry up to `kMaxReadRetries = 100`. Applies to BOTH
+   only; readers retry via `SeqlockReadWait` (100 clock-free retries, then
+   a yielding wait bounded by `kBudget = 20 ms`), and a bucket still busy
+   after that reports `CacheError::Busy`, never a miss. Applies to BOTH
    `Directory` and `MmapDirectory` (`src/core/directory.hpp`,
    `src/core/mmap_directory.hpp`).
+   Guard: `tests/integration/test_seqlock_read_wait.cpp`.
 5. **HitTracker is a leaf lock** — never hold a stripe lock across
    `record_hit()` (the old AB/BA deadlock). 4096 stripes; key-striped so the
    pending bound stays exact.

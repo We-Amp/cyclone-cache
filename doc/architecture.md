@@ -23,7 +23,7 @@ as a C++ API and a C ABI.
 | **Alternate / AlternateId** | A content variant under one key (Original, Brotli, Gzip, WebP, AVIF, JpegXL, Custom…). `AlternateId` normalizes UA capabilities into discrete classes. | `alternate.hpp` |
 | **Alternate chain** | Singly-linked list of alternates via `next_alternate_offset`. Directory points to the **head** (newest); **tail** is typically Original (oldest). Max 64 per key. | "Alternate Chains" |
 | **CLFUS** | Clock LRU Frequency Size — the default scan-resistant RAM-cache algorithm. Segmented by hardware concurrency. | `clfus.cpp`, "RAM Cache" |
-| **Seqlock** | Lock-free directory read: read a per-bucket even/odd version counter, read entries, re-read the counter; retry on mismatch (`kMaxReadRetries = 100`). Used by BOTH the in-memory `Directory` and the mmap `MmapDirectory`. | `directory.hpp`, `mmap_directory.hpp`, `doc/multi-process.md` |
+| **Seqlock** | Lock-free directory read: read a per-bucket even/odd version counter, read entries, re-read the counter; retry on mismatch (`SeqlockReadWait`: 100 retries, then a yielding wait of up to 20 ms; still busy → `CacheError::Busy`, never a miss). Used by BOTH the in-memory `Directory` and the mmap `MmapDirectory`. | `directory.hpp`, `mmap_directory.hpp`, `doc/multi-process.md` |
 | **Lease / borrow** | Process-local mechanism that makes a zero-copy read aliasing live mmap bytes safe against a concurrent circular-buffer wrap. A reader **borrows** a region and **stamps a lease**; a writer wanting to **wrap** defers while a valid borrow is outstanding. | `volume.cpp`, `doc/multi-process.md`, "Concurrency Model" |
 | **Read anchor** | Per-thread strong `shared_ptr` to the Volume + MappedFile, plus a `torn` latch, that keeps the mapping alive for the life of a `ReadHandle` without an RMW on a process-global control block. 64 shards/volume. | `volume.hpp` (`VolumeReadAnchor`) |
 | **Phase** | 1-bit directory flag used for O(1) phase-based garbage collection. It is derived from the pass (`phase = P & 1`, `Volume::publish_wrap_phase`), never toggled on its own; the cross-process publish is CAS-guarded (`phase_lock`). | `directory.hpp`, `mmap_directory.hpp` |
@@ -571,7 +571,7 @@ Readers take **no stripe lock in any mode** — the reader-side lock was dropped
 `read_sync` (`Volume::read_sync`). Correctness rests on four pillars,
 documented inline at the "Lock-free read" comment in `Volume::read_sync`:
 
-1. **Directory seqlock** — a torn bucket read is detected and retried (up to `kMaxReadRetries = 100`).
+1. **Directory seqlock** — a torn bucket read is detected and retried (`SeqlockReadWait`; see "Per-bucket seqlocks" below).
 2. **Commit ordering** — data is durable *before* the directory entry is published.
 3. **CRC validation** — a torn document (a local writer racing the lock-free reader, or a cross-process wrap) fails its CRC and is treated as a miss/retry.
 4. **Lease/epoch protocol** — a borrowed mmap region cannot be wrapped out from under the reader.
@@ -587,6 +587,19 @@ the version after each candidate and once at the end; any change → retry. Writ
 publish **odd → even** under the stripe mutex (`begin/end_bucket_write`; mmap
 `acquire_writer`/`release_writer` CAS). TSan acquire/release annotations bridge
 the pattern for the sanitizer (the seqlock TSan annotations atop `directory.hpp`).
+
+How long a reader retries is `SeqlockReadWait`'s call (`directory.hpp`, issue
+#21). The first `kFastAttempts = 100` retries read no clock, so an uncontended
+or briefly contended probe costs what it always did. Past them the writer is
+presumed descheduled inside its odd window, and the reader keeps retrying, each
+odd attempt spinning and then yielding its CPU, until `kBudget = 20 ms` has
+passed. That covers a full macOS scheduler quantum (10 ms) and several Linux
+EEVDF slices. If the budget runs out, `probe_each` returns `false`: the bucket's
+contents are unknown, and the Volume reports `CacheError::Busy`, counted in
+`directory_read_timeouts`, never `NotFound`. A probe made under the stripe mutex
+(write, remove, hit count) can only exhaust on a bucket a dead peer left odd. It
+force-releases that bucket (`touch_bucket`) before it returns Busy, so the
+bucket does not stay locked.
 
 ### Read anchors (keeping the mapping alive without a global RMW)
 

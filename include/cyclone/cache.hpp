@@ -247,6 +247,13 @@ struct CacheStats {
   uint64_t alternates_carried_forward = 0;
   uint64_t alternate_carry_bytes = 0;
   uint64_t alternates_carry_dropped = 0;
+
+  // Directory lookups that returned CacheError::Busy because a writer held
+  // the key's directory bucket for the whole seqlock wait budget, so the
+  // key's presence was unknown (PROCESS-LOCAL, summed across volumes,
+  // appended at the tail to match CycloneCacheStats).  Expected 0; full
+  // semantics on VolumeStats in src/core/volume.hpp.
+  uint64_t directory_read_timeouts = 0;
 };
 
 // Thread-safe counters for stats updated from background threads (hit tracker).

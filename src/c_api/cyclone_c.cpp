@@ -47,6 +47,8 @@ static CycloneError to_c_error(CacheError e) {
       return CYCLONE_RESET_REFUSED_LIVE_PEER;
     case CacheError::ObjectTooLarge:
       return CYCLONE_OBJECT_TOO_LARGE;
+    case CacheError::Busy:
+      return CYCLONE_BUSY;
     default:
       return CYCLONE_INTERNAL_ERROR;
   }
@@ -363,6 +365,7 @@ CycloneError cyclone_cache_stats(CycloneCacheHandle *cache,
   out->alternates_carried_forward = s.alternates_carried_forward;
   out->alternate_carry_bytes = s.alternate_carry_bytes;
   out->alternates_carry_dropped = s.alternates_carry_dropped;
+  out->directory_read_timeouts = s.directory_read_timeouts;
   return CYCLONE_OK;
 }
 
@@ -488,9 +491,17 @@ CycloneError cyclone_cache_read_async(CycloneCacheHandle *cache,
   }
 
   if (handler == nullptr) {
-    read_cb(read_user_data, nullptr, 0, CYCLONE_NOT_FOUND);
+    // Busy means the key's presence is unknown (a writer held its directory
+    // bucket past the wait budget): say so rather than report a miss.
+    read_cb(
+        read_user_data, nullptr, 0,
+        result.error() == CacheError::Busy ? CYCLONE_BUSY : CYCLONE_NOT_FOUND);
     return CYCLONE_OK;
   }
+  // With a miss handler, Busy takes the miss path like every other
+  // non-hit: the fetch answers the waiters, and its write-back is also what
+  // recovers a directory bucket a crashed peer left locked, so this read
+  // path can never wedge on one.
 
   // Coalescing logic.
   std::string key_str(key, key_len);

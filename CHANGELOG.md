@@ -91,6 +91,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   adds the retention counters to its JSON. `kv_churn_policy` gains
   `retain/16`, `retain/32`, `retain/64` and `retain/256` columns, the
   retention policy replayed without I/O.
+- `CYCLONE_BUSY` C API error code, appended after `CYCLONE_OBJECT_TOO_LARGE`
+  (existing codes keep their values). It maps `CacheError::Busy`, which the
+  C API used to report as `CYCLONE_INTERNAL_ERROR`, so a C caller that got
+  `CYCLONE_INTERNAL_ERROR` from a contended write, delete or hit-count update
+  now gets `CYCLONE_BUSY`.
+- `CacheStats::directory_read_timeouts` (also on `VolumeStats`, and appended
+  to `CycloneCacheStats`): lookups that returned `Busy` because a writer held
+  the key's directory bucket for the whole seqlock wait budget. Expected 0.
 
 ### Changed
 
@@ -184,6 +192,18 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   CRC, `len`/`header_len` and a key prefix, computed from the header the
   reader has just read and key-verified. Same memory (512 KB per volume),
   still lock-free, no on-disk or shared-memory format change.
+- A directory lookup no longer reports a present key as a miss when a writer
+  is descheduled while it is updating the key's bucket (#21). Readers gave up
+  after 100 seqlock retries, which a preempted writer can outlast. They now
+  make those 100 retries, then keep retrying, yielding the CPU, for up to
+  20 ms (`SeqlockReadWait`). That is enough for the writer to be scheduled
+  again. The uncontended path reads no clock and costs what it did before.
+  If the bucket is still busy after 20 ms, `read_sync`, `exists_sync`,
+  `read_alternate_sync` and `list_alternates_sync` return `CacheError::Busy`
+  (`CYCLONE_BUSY`) instead of `NotFound`. The write, remove and hit-count
+  paths no longer act on a partial directory probe: they return
+  `Busy` and first force-release a bucket that a dead peer left locked. This
+  applies to both the in-memory and the mmap directory.
 - A writer that died inside a *committed* wrap (after the cursor dropped
   to the data-area start, before the new pass was published) was repaired by
   clearing its intent flag only. The next writer then filled the current

@@ -1074,6 +1074,7 @@ CacheStats Cache::stats() const {
     result.alternates_carried_forward += vs.alternates_carried_forward;
     result.alternate_carry_bytes += vs.alternate_carry_bytes;
     result.alternates_carry_dropped += vs.alternates_carry_dropped;
+    result.directory_read_timeouts += vs.directory_read_timeouts;
   }
 
   if (_impl->ram_cache) {

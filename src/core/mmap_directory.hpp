@@ -218,8 +218,9 @@ bool force_reset(AtomicWord &slot) {
 class MmapDirectory {
  public:
   static constexpr size_t kEntriesPerBucket = 4;
-  static constexpr size_t kMaxReadRetries = 100;
-  /// Maximum spins waiting for a writer to release the seqlock (even version).
+  /// Maximum spins per attempt waiting for a writer to release the seqlock
+  /// (even version) before the attempt yields.  How many attempts a reader
+  /// makes, and for how long, is SeqlockReadWait's call (directory.hpp).
   static constexpr size_t kMaxWriterWaitSpins = 1000;
   static constexpr uint32_t kMagic = 0x4D444952;  // "MDIR"
   // Version 2 (wrap retention): the retention region after the entries
@@ -452,24 +453,40 @@ class MmapDirectory {
   /// Open an existing directory from the given memory region
   static std::optional<MmapDirectory> open(std::span<std::byte> region);
 
-  /// Probe for an entry matching the key
-  /// Returns nullopt if not found or if consistent read couldn't be achieved
+  /// Probe for an entry matching the key.  Test-only (no production
+  /// callers).  Returns nullopt if not found, and also if a writer held the
+  /// bucket past the wait budget (probe_each reports that case instead).
   [[nodiscard]] std::optional<DirEntry> probe(const CacheKey &key) const;
 
   /// Iterate over all matching entries without allocation
-  /// Callback returns false to stop iteration
+  /// Callback returns false to stop iteration.  Returns false iff a writer
+  /// held the bucket for the whole SeqlockReadWait budget, i.e. the bucket's
+  /// contents are unknown (see Directory::probe_each).
   template <typename Callback>
-  void probe_each(const CacheKey &key, Callback &&callback) const {
-    probe_each_impl<true>(key, std::forward<Callback>(callback));
+  bool probe_each(const CacheKey &key, Callback &&callback) const {
+    return probe_each_impl<true>(key, std::forward<Callback>(callback));
   }
 
   /// As probe_each, but yields tag matches of BOTH phases; the caller
   /// classifies each entry against its own stripe snapshot (see
   /// Directory::probe_each_all_phases).
   template <typename Callback>
-  void probe_each_all_phases(const CacheKey &key, Callback &&callback) const {
-    probe_each_impl<false>(key, std::forward<Callback>(callback));
+  bool probe_each_all_phases(const CacheKey &key, Callback &&callback) const {
+    return probe_each_impl<false>(key, std::forward<Callback>(callback));
   }
+
+#ifdef CYCLONE_TEST_SEAMS
+  /// TEST-SEAM BUILDS ONLY.  Take / release this key's bucket as a writer
+  /// (even->odd / odd->even), so a test can park a writer inside its odd
+  /// window.  The caller provides the writer serialization, as production
+  /// mutators do.
+  void begin_bucket_write_for_test(const CacheKey &key) {
+    (void)acquire_writer(key.bucket_hash() % _num_buckets);
+  }
+  void end_bucket_write_for_test(const CacheKey &key) {
+    release_writer(key.bucket_hash() % _num_buckets);
+  }
+#endif
 
   /// Sentinels for insert()'s verified_offset parameter — shared semantics
   /// with the in-memory directory (see the discussion on Directory).
@@ -750,7 +767,7 @@ class MmapDirectory {
 
  private:
   template <bool kFilterPhase, typename Callback>
-  void probe_each_impl(const CacheKey &key, Callback &&callback) const;
+  bool probe_each_impl(const CacheKey &key, Callback &&callback) const;
 
   MmapDirectory(Header *header, uint32_t *versions, DirEntry *entries,
                 RetentionRegion *retention, size_t num_buckets);
@@ -796,17 +813,20 @@ class MmapDirectory {
 
 // Template implementation
 template <bool kFilterPhase, typename Callback>
-void MmapDirectory::probe_each_impl(const CacheKey &key,
+bool MmapDirectory::probe_each_impl(const CacheKey &key,
                                     Callback &&callback) const {
   if (!_header) {
-    return;
+    return true;  // No directory, no entries: a definite (empty) answer
   }
 
   uint32_t bucket_idx = key.bucket_hash() % _num_buckets;
   uint16_t target_tag = key.tag();
 
-  // Retry loop for torn read detection
-  for (size_t retry = 0; retry < kMaxReadRetries; ++retry) {
+  // Retry loop for torn read detection, bounded by SeqlockReadWait.  Every
+  // failed attempt, including each `continue` below, goes through
+  // wait.retry() in the loop condition.
+  SeqlockReadWait wait;
+  do {
     // Capture the phase INSIDE the retry loop: a retry triggered by a
     // concurrent toggle_phase() must rescan with the new phase, or
     // entries stamped after the flip would be invisibly skipped
@@ -870,17 +890,18 @@ void MmapDirectory::probe_each_impl(const CacheKey &key,
     }
 
     if (should_stop) {
-      return;
+      return true;
     }
 
     // Check version one more time
     std::atomic_thread_fence(std::memory_order_acquire);
     uint32_t version_after = load_version(bucket_idx);
     if (version_before == version_after) {
-      return;  // Consistent read achieved
+      return true;  // Consistent read achieved
     }
     // Version changed - retry
-  }
+  } while (wait.retry());
+  return false;  // A writer held the bucket past the budget: unknown
 }
 
 }  // namespace cyclone

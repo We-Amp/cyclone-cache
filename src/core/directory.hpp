@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -137,6 +138,81 @@ struct InsertChoice {
     const InsertAdmission &adm, bool *collision_evicted,
     bool *bucket_full_evicted, uint64_t new_offset = 0);
 
+// How long a lock-free directory reader waits out a writer (issue #21).
+//
+// A seqlock reader retries while its bucket is odd (a writer is mid-update)
+// or its scan was torn (the version moved under it).  A fixed retry count
+// alone is not enough: a writer descheduled INSIDE its odd window holds the
+// bucket for a scheduling quantum, every retry lands in that window, and a
+// reader that then gave up would report a key that is present as absent.
+//
+// So the wait has two phases:
+//   1. kFastAttempts retries exactly as before -- no clock read, so an
+//      uncontended or briefly contended probe costs what it always did;
+//   2. past them the writer is presumed descheduled: keep retrying (each
+//      odd-bucket attempt still spins, then yields its CPU, which is what
+//      lets the writer run) until kBudget of steady-clock time has passed.
+// Only when the budget is spent does the probe give up, and it reports that
+// as "unknown" (probe_each returns false, which the Volume turns into
+// CacheError::Busy) -- never as a miss.
+//
+// kBudget covers one full scheduler quantum with room to spare: 10 ms on
+// macOS, and on Linux a few EEVDF slices (3 ms base) of queueing behind CPU
+// hogs.  A writer is never legitimately odd for longer than a few hundred
+// nanoseconds of its own work, so the budget is only ever spent waiting for
+// a writer to be scheduled again -- or, in multi-process mode, on a bucket
+// left odd by a process that died mid-update, until the next write to that
+// bucket force-recovers it (MmapDirectory::acquire_writer).
+class SeqlockReadWait {
+ public:
+  static constexpr size_t kFastAttempts = 100;
+  static constexpr std::chrono::milliseconds kBudget{20};
+
+  // Call after a failed attempt.  True: try again.  False: the budget is
+  // spent and the probe must report Busy.
+  bool retry() {
+    if (_attempts < kFastAttempts) {
+      ++_attempts;
+      return true;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (_attempts == kFastAttempts) {
+      // Entering the timed phase: the old code gave up here.
+      ++_attempts;
+      _deadline = now + budget();
+#ifdef CYCLONE_TEST_SEAMS
+      s_timed_waits_for_test.fetch_add(1, std::memory_order_relaxed);
+#endif
+      return true;
+    }
+    return now < _deadline;
+  }
+
+#ifdef CYCLONE_TEST_SEAMS
+  // TEST-SEAM BUILDS ONLY (see Volume::ReaderSeam).  Nonzero overrides
+  // kBudget, in microseconds, so a test can spend the budget quickly or make
+  // it effectively unbounded.  The counter records each probe that entered
+  // the timed phase, i.e. got past the point the old fixed retry count gave
+  // up at.
+  static inline std::atomic<uint64_t> s_budget_us_for_test{0};
+  static inline std::atomic<uint64_t> s_timed_waits_for_test{0};
+#endif
+
+ private:
+  static std::chrono::steady_clock::duration budget() {
+#ifdef CYCLONE_TEST_SEAMS
+    const uint64_t us = s_budget_us_for_test.load(std::memory_order_relaxed);
+    if (us != 0) {
+      return std::chrono::microseconds(us);
+    }
+#endif
+    return kBudget;
+  }
+
+  size_t _attempts = 0;
+  std::chrono::steady_clock::time_point _deadline{};
+};
+
 // In-memory (single-process) directory.
 //
 // Reader synchronization is a per-bucket SEQLOCK, mirroring MmapDirectory:
@@ -157,9 +233,10 @@ class Directory {
   static constexpr size_t kEntriesPerBucket = 4;
   static constexpr size_t kMaxChainDepth =
       64;  // Limit chain traversal to prevent infinite loops
-  // Seqlock read parameters (same values as MmapDirectory).
-  static constexpr size_t kMaxReadRetries = 100;
-  /// Maximum spins waiting for a writer to release the seqlock (even version).
+  // Seqlock read parameters (same values as MmapDirectory).  How many
+  // attempts a reader makes, and for how long, is SeqlockReadWait's call.
+  /// Maximum spins per attempt waiting for a writer to release the seqlock
+  /// (even version) before the attempt yields.
   static constexpr size_t kMaxWriterWaitSpins = 1000;
 
   // Sentinels for insert()'s verified_offset parameter.  A DirEntry holds no
@@ -183,10 +260,13 @@ class Directory {
 
   void clear();
 
+  // First current-phase entry with this key's tag.  Test-only (no
+  // production callers): a bucket a writer held past the wait budget reads
+  // as nullopt here, where probe_each reports it.
   [[nodiscard]] std::optional<DirEntry> probe(const CacheKey &key) const;
 
   // Get all entries matching this key's tag in the bucket (for collision
-  // handling)
+  // handling).  Test-only, like probe().
   [[nodiscard]] std::vector<DirEntry> probe_all(const CacheKey &key) const;
 
   // Iterate over all matching entries without allocation (returns false to
@@ -196,9 +276,14 @@ class Directory {
   // MmapDirectory::probe_each, a version change after a callback already ran
   // retries the scan — callbacks must tolerate being invoked again for the
   // same entry (the Volume read paths do: candidate probing is idempotent).
+  //
+  // Returns true when the scan completed against a consistent bucket (or the
+  // callback stopped it), false when a writer held the bucket for the whole
+  // SeqlockReadWait budget: the bucket's contents are then UNKNOWN, and a
+  // caller that found nothing must not report a miss (issue #21).
   template <typename Callback>
-  void probe_each(const CacheKey &key, Callback &&callback) const {
-    probe_each_impl<true>(key, std::forward<Callback>(callback));
+  bool probe_each(const CacheKey &key, Callback &&callback) const {
+    return probe_each_impl<true>(key, std::forward<Callback>(callback));
   }
 
   // As probe_each, but yields tag matches of BOTH phases: the caller
@@ -207,17 +292,33 @@ class Directory {
   // mix the directory's own phase load into that decision -- the phase is
   // derived from the pass count in the snapshot instead.
   template <typename Callback>
-  void probe_each_all_phases(const CacheKey &key, Callback &&callback) const {
-    probe_each_impl<false>(key, std::forward<Callback>(callback));
+  bool probe_each_all_phases(const CacheKey &key, Callback &&callback) const {
+    return probe_each_impl<false>(key, std::forward<Callback>(callback));
   }
+
+#ifdef CYCLONE_TEST_SEAMS
+  // TEST-SEAM BUILDS ONLY.  Publish / clear "writer active" on this key's
+  // bucket, so a test can park a writer inside its odd window.  The caller
+  // provides the writer serialization (holds the stripe mutex), exactly as
+  // every production mutator does.
+  void begin_bucket_write_for_test(const CacheKey &key) {
+    begin_bucket_write(key.bucket_hash() % _num_buckets);
+  }
+  void end_bucket_write_for_test(const CacheKey &key) {
+    end_bucket_write(key.bucket_hash() % _num_buckets);
+  }
+#endif
 
  private:
   template <bool kFilterPhase, typename Callback>
-  void probe_each_impl(const CacheKey &key, Callback &&callback) const {
+  bool probe_each_impl(const CacheKey &key, Callback &&callback) const {
     uint32_t bucket_idx = key.bucket_hash() % _num_buckets;
     uint16_t target_tag = key.tag();
 
-    for (size_t retry = 0; retry < kMaxReadRetries; ++retry) {
+    // Every failed attempt, including each `continue` below, goes through
+    // wait.retry() in the loop condition.
+    SeqlockReadWait wait;
+    do {
       // Capture the phase INSIDE the retry loop: a retry triggered by a
       // concurrent toggle_phase() must rescan with the new phase, or
       // entries stamped after the flip would be invisibly skipped
@@ -276,17 +377,18 @@ class Directory {
       }
 
       if (should_stop) {
-        return;
+        return true;
       }
 
       // Check version one more time
       std::atomic_thread_fence(std::memory_order_acquire);
       uint32_t version_after = load_version(bucket_idx);
       if (version_before == version_after) {
-        return;  // Consistent read achieved
+        return true;  // Consistent read achieved
       }
       // Version changed - retry
-    }
+    } while (wait.retry());
+    return false;  // A writer held the bucket past the budget: unknown
   }
 
  public:

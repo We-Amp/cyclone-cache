@@ -271,8 +271,10 @@ std::optional<DirEntry> MmapDirectory::probe(const CacheKey &key) const {
   uint16_t target_tag = key.tag();
   bool cur_phase = current_phase();
 
-  // Retry loop for torn read detection
-  for (size_t retry = 0; retry < kMaxReadRetries; ++retry) {
+  // Retry loop for torn read detection, bounded like probe_each_impl;
+  // `continue` lands on wait.retry().
+  SeqlockReadWait wait;
+  do {
     // Wait for an even version before starting the scan.
     uint32_t version_before = load_version(bucket_idx);
     if ((version_before & 1) != 0) {
@@ -335,9 +337,9 @@ std::optional<DirEntry> MmapDirectory::probe(const CacheKey &key) const {
       return std::nullopt;  // Consistent read, key not found
     }
     // Version changed - retry
-  }
+  } while (wait.retry());
 
-  // Exhausted retries - treat as not found
+  // Budget spent: unknown, reported as absent by this test-only probe
   return std::nullopt;
 }
 

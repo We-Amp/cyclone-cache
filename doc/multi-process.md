@@ -186,7 +186,14 @@ When a reader reads a document while another process is writing, the data may be
 1. Reader loads version counter for bucket
 2. Reader reads directory entries
 3. Reader loads version counter again
-4. If versions differ, retry (up to `kMaxReadRetries = 100`)
+4. If the version was odd or changed, retry: 100 retries with no clock read,
+   then keep retrying, yielding, for up to `SeqlockReadWait::kBudget` (20 ms),
+   so a writer descheduled mid-update is waited out
+5. If the bucket is still busy after that, the lookup returns
+   `CacheError::Busy` (`CYCLONE_BUSY`): the key's presence is unknown, which
+   is not reported as a miss. A bucket left odd by a peer that died
+   mid-update stays busy until the next write, delete or hit-count update
+   of a key in it, which force-releases it.
 
 ### Data Level (CRC-32C)
 

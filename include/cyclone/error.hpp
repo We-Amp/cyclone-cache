@@ -21,7 +21,10 @@ enum class CacheError : std::uint8_t {
   NotInitialized,
   AlreadyOpen,
   Closed,
-  Busy,
+  Busy,  // Transient contention; retry.  From a lookup (read, exists,
+         // list/read alternates): a writer held the key's directory bucket
+         // for the whole seqlock wait budget, so whether the key is present
+         // is UNKNOWN -- deliberately not NotFound.
   Timeout,
   PluginError,
   InternalError,

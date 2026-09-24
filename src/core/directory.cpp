@@ -148,7 +148,9 @@ std::optional<DirEntry> Directory::probe(const CacheKey &key) const {
   uint32_t bucket_idx = key.bucket_hash() % _num_buckets;
   uint16_t target_tag = key.tag();
 
-  for (size_t retry = 0; retry < kMaxReadRetries; ++retry) {
+  // Same bounded wait as probe_each(); `continue` lands on wait.retry().
+  SeqlockReadWait wait;
+  do {
     // Phase captured inside the retry loop — same rationale as
     // probe_each().
     bool cur_phase = current_phase();
@@ -198,13 +200,13 @@ std::optional<DirEntry> Directory::probe(const CacheKey &key) const {
       return result;  // Consistent read achieved
     }
     // Version changed — retry
-  }
-  return std::nullopt;
+  } while (wait.retry());
+  return std::nullopt;  // Budget spent: unknown, reported as absent here
 }
 
 std::vector<DirEntry> Directory::probe_all(const CacheKey &key) const {
   std::vector<DirEntry> results;
-  probe_each(key, [&](const DirEntry &entry) {
+  (void)probe_each(key, [&](const DirEntry &entry) {
     results.push_back(entry);
     return true;  // Collect all matches
   });
