@@ -147,26 +147,62 @@ struct InsertChoice {
 // reader that then gave up would report a key that is present as absent.
 //
 // So the wait has two phases:
-//   1. kFastAttempts retries exactly as before -- no clock read, so an
-//      uncontended or briefly contended probe costs what it always did;
-//   2. past them the writer is presumed descheduled: keep retrying (each
-//      odd-bucket attempt still spins, then yields its CPU, which is what
-//      lets the writer run) until kBudget of steady-clock time has passed.
+//   1. Fast: kFastAttempts retries exactly as before, with no clock read, so
+//      an uncontended or briefly contended probe costs what it always did.
+//      An attempt that finds the bucket odd spins up to kSpinsPerAttempt
+//      pauses for it to turn even, then yields.
+//   2. Timed: past them the writer is presumed descheduled.  Spinning or
+//      sched_yield cannot help a writer waiting on ANOTHER CPU's runqueue,
+//      and would burn this thread's CPU (on an event-loop thread, every
+//      connection's latency).  So the reader SLEEPS between attempts, with
+//      exponential backoff from kFirstSleep to kMaxSleep, and makes one
+//      version check per attempt, until kBudget of steady-clock time has
+//      passed.
 // Only when the budget is spent does the probe give up, and it reports that
 // as "unknown" (probe_each returns false, which the Volume turns into
 // CacheError::Busy) -- never as a miss.
 //
-// kBudget covers one full scheduler quantum with room to spare: 10 ms on
-// macOS, and on Linux a few EEVDF slices (3 ms base) of queueing behind CPU
-// hogs.  A writer is never legitimately odd for longer than a few hundred
-// nanoseconds of its own work, so the budget is only ever spent waiting for
-// a writer to be scheduled again -- or, in multi-process mode, on a bucket
-// left odd by a process that died mid-update, until the next write to that
-// bucket force-recovers it (MmapDirectory::acquire_writer).
+// kBudget is kept small on purpose: a false miss costs a refetch, while a
+// reader parked on the bucket stalls its caller -- and PageSpeed's nginx
+// module reads inline on its event loop -- so it is capped at 5 ms.  In the
+// #21 reproduction (readers and writers on a shared key set, mmap
+// directory, 12 CPU hogs on 10 cores, macOS) a descheduled writer held its
+// bucket for up to ~4-5 ms; 2 ms still let some reads run out, 5 ms turned
+// all but one in 240 s of runs into a successful read (see the PR for #21).
+// A writer is never legitimately odd for longer than a few hundred
+// nanoseconds of its own work, so the budget is only spent while a writer
+// waits to be scheduled again, or on a bucket whose holder is stuck (a
+// process that died mid-update); the next write to the bucket by its owner
+// releases that one (Volume::writer_probe).
 class SeqlockReadWait {
  public:
   static constexpr size_t kFastAttempts = 100;
-  static constexpr std::chrono::milliseconds kBudget{20};
+  static constexpr size_t kSpinsPerAttempt = 1000;
+  static constexpr std::chrono::microseconds kBudget{5000};
+  static constexpr std::chrono::microseconds kFirstSleep{10};
+  static constexpr std::chrono::microseconds kMaxSleep{1000};
+
+  // The bucket version to start an attempt from, via `load` (an acquire
+  // load of the bucket's version).  An odd result means a writer is still
+  // active: the caller skips the scan and retries.  In the fast phase an
+  // odd version is waited on by spinning, then the CPU is yielded; in the
+  // timed phase retry() already slept, so this is a single load.
+  template <typename LoadVersion>
+  uint32_t even_version(LoadVersion &&load) {
+    uint32_t version = load();
+    if ((version & 1) == 0 || _attempts > kFastAttempts) {
+      return version;
+    }
+    for (size_t spin = 0; spin < kSpinsPerAttempt; ++spin) {
+      cpu_pause();
+      version = load();
+      if ((version & 1) == 0) {
+        return version;
+      }
+    }
+    std::this_thread::yield();
+    return version;
+  }
 
   // Call after a failed attempt.  True: try again.  False: the budget is
   // spent and the probe must report Busy.
@@ -183,9 +219,18 @@ class SeqlockReadWait {
 #ifdef CYCLONE_TEST_SEAMS
       s_timed_waits_for_test.fetch_add(1, std::memory_order_relaxed);
 #endif
-      return true;
+    } else if (now >= _deadline) {
+      return false;
     }
-    return now < _deadline;
+    // Sleep, never past the deadline (one more attempt follows it).  Timer
+    // slack can overshoot a short sleep -- notably Windows, whose default
+    // timer resolution is coarse -- which only lengthens this wait.
+    const std::chrono::steady_clock::duration left = _deadline - now;
+    std::this_thread::sleep_for(left < _sleep ? left : _sleep);
+    if (_sleep < kMaxSleep) {
+      _sleep *= 2;
+    }
+    return true;
   }
 
 #ifdef CYCLONE_TEST_SEAMS
@@ -209,8 +254,19 @@ class SeqlockReadWait {
     return kBudget;
   }
 
+  static void cpu_pause() {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    _mm_pause();
+#elif defined(__x86_64__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    __asm__ volatile("yield" ::: "memory");
+#endif
+  }
+
   size_t _attempts = 0;
   std::chrono::steady_clock::time_point _deadline{};
+  std::chrono::microseconds _sleep = kFirstSleep;
 };
 
 // In-memory (single-process) directory.
@@ -233,11 +289,8 @@ class Directory {
   static constexpr size_t kEntriesPerBucket = 4;
   static constexpr size_t kMaxChainDepth =
       64;  // Limit chain traversal to prevent infinite loops
-  // Seqlock read parameters (same values as MmapDirectory).  How many
-  // attempts a reader makes, and for how long, is SeqlockReadWait's call.
-  /// Maximum spins per attempt waiting for a writer to release the seqlock
-  /// (even version) before the attempt yields.
-  static constexpr size_t kMaxWriterWaitSpins = 1000;
+  // Seqlock read pacing (spins, retries, how long) is SeqlockReadWait's
+  // call, shared with MmapDirectory.
 
   // Sentinels for insert()'s verified_offset parameter.  A DirEntry holds no
   // key material — only a 12-bit tag — so a same-tag entry in the bucket may
@@ -326,21 +379,13 @@ class Directory {
       bool cur_phase = current_phase();
 
       // Wait for an even version before starting the scan.  An odd version
-      // means a writer is currently mutating the bucket — spinning here
+      // means a writer is currently mutating the bucket — waiting here
       // avoids wasting a full retry attempt on a guaranteed-inconsistent
       // read.
-      uint32_t version_before = load_version(bucket_idx);
+      const uint32_t version_before =
+          wait.even_version([&] { return load_version(bucket_idx); });
       if ((version_before & 1) != 0) {
-        for (size_t spin = 0; spin < kMaxWriterWaitSpins; ++spin) {
-          cpu_pause();
-          version_before = load_version(bucket_idx);
-          if ((version_before & 1) == 0) break;
-        }
-        if ((version_before & 1) != 0) {
-          // Writer still active after spin limit — yield and retry
-          std::this_thread::yield();
-          continue;
-        }
+        continue;  // Writer still active: retry (wait.retry() paces it)
       }
 
       // Memory barrier to ensure we read entries after version
@@ -458,16 +503,6 @@ class Directory {
   void begin_bucket_write(size_t bucket_idx);
   // Publish "writer done" (odd → even) after all entry mutations.
   void end_bucket_write(size_t bucket_idx);
-
-  static void cpu_pause() {
-#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
-    _mm_pause();
-#elif defined(__x86_64__)
-    __builtin_ia32_pause();
-#elif defined(__aarch64__) || defined(_M_ARM64)
-    __asm__ volatile("yield" ::: "memory");
-#endif
-  }
 
   size_t _num_buckets;
   std::vector<DirEntry> _entries;

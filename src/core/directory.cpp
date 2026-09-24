@@ -155,21 +155,11 @@ std::optional<DirEntry> Directory::probe(const CacheKey &key) const {
     // probe_each().
     bool cur_phase = current_phase();
 
-    uint32_t version_before = load_version(bucket_idx);
+    // Writer active → wait for the even version like probe_each() does.
+    const uint32_t version_before =
+        wait.even_version([&] { return load_version(bucket_idx); });
     if ((version_before & 1) != 0) {
-      // Writer active — spin for the even version like probe_each() does
-      // (a preempted writer can hold the odd version for a scheduling
-      // quantum; burning one bare retry per pause exhausts the retry
-      // budget in microseconds and returns a spurious miss).
-      for (size_t spin = 0; spin < kMaxWriterWaitSpins; ++spin) {
-        cpu_pause();
-        version_before = load_version(bucket_idx);
-        if ((version_before & 1) == 0) break;
-      }
-      if ((version_before & 1) != 0) {
-        std::this_thread::yield();
-        continue;
-      }
+      continue;
     }
     std::atomic_thread_fence(std::memory_order_acquire);
     CYCLONE_TSAN_ACQUIRE(const_cast<uint32_t *>(&_versions[bucket_idx]));

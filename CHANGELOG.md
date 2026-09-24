@@ -97,8 +97,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `CYCLONE_INTERNAL_ERROR` from a contended write, delete or hit-count update
   now gets `CYCLONE_BUSY`.
 - `CacheStats::directory_read_timeouts` (also on `VolumeStats`, and appended
-  to `CycloneCacheStats`): lookups that returned `Busy` because a writer held
-  the key's directory bucket for the whole seqlock wait budget. Expected 0.
+  to `CycloneCacheStats`): directory probes that spent the whole seqlock wait
+  budget because a writer held the key's bucket. Expected near 0. Appending
+  it grows `CycloneCacheStats`, and `cyclone_cache_stats()` writes the whole
+  struct, so a C caller built against an older `cyclone_c.h` passes a
+  smaller buffer: rebuild every consumer against this header (the same
+  lockstep rule as the earlier tail appends).
 
 ### Changed
 
@@ -195,15 +199,26 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - A directory lookup no longer reports a present key as a miss when a writer
   is descheduled while it is updating the key's bucket (#21). Readers gave up
   after 100 seqlock retries, which a preempted writer can outlast. They now
-  make those 100 retries, then keep retrying, yielding the CPU, for up to
-  20 ms (`SeqlockReadWait`). That is enough for the writer to be scheduled
-  again. The uncontended path reads no clock and costs what it did before.
-  If the bucket is still busy after 20 ms, `read_sync`, `exists_sync`,
+  make those 100 retries, then sleep between further retries (10 µs
+  doubling to 1 ms) for up to 5 ms (`SeqlockReadWait`), which is usually
+  enough for the writer to be scheduled again without burning the reader's
+  CPU. The uncontended path reads no clock and costs what it did before.
+  If the bucket is still busy after 5 ms, `read_sync`, `exists_sync`,
   `read_alternate_sync` and `list_alternates_sync` return `CacheError::Busy`
-  (`CYCLONE_BUSY`) instead of `NotFound`. The write, remove and hit-count
-  paths no longer act on a partial directory probe: they return
-  `Busy` and first force-release a bucket that a dead peer left locked. This
-  applies to both the in-memory and the mmap directory.
+  (`CYCLONE_BUSY`) instead of `NotFound`. This applies to both the in-memory
+  and the mmap directory.
+- The write, remove and hit-count paths no longer act on a partial
+  directory probe. When a bucket stays busy past the budget (its holder is
+  stuck: a peer process that died mid-update, or, during a graceful-reload
+  overlap where two processes own a stripe, one that is descheduled), they
+  force-release it and probe again, so the write still goes through.
+- A peer that was force-released while it was descheduled inside a
+  directory-bucket update could, on waking, advance the bucket's version by
+  one and leave it odd ("writer active") with no writer. Every read of that
+  bucket then waited out the full retry budget until the next forced
+  recovery. Bucket releases in the mmap directory are now token-checked (a
+  CAS from the releaser's own odd version), so a late release is a no-op,
+  and the forced release is a CAS from the exact version it waited on.
 - A writer that died inside a *committed* wrap (after the cursor dropped
   to the data-area start, before the new pass was published) was repaired by
   clearing its intent flag only. The next writer then filled the current

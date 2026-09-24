@@ -498,10 +498,14 @@ CycloneError cyclone_cache_read_async(CycloneCacheHandle *cache,
         result.error() == CacheError::Busy ? CYCLONE_BUSY : CYCLONE_NOT_FOUND);
     return CYCLONE_OK;
   }
-  // With a miss handler, Busy takes the miss path like every other
-  // non-hit: the fetch answers the waiters, and its write-back is also what
-  // recovers a directory bucket a crashed peer left locked, so this read
-  // path can never wedge on one.
+  // With a miss handler, Busy takes the miss path like every other non-hit:
+  // the fetch answers the waiters, so a read never fails on a busy bucket.
+  // The write-back does not necessarily fix the bucket.  In the process that
+  // owns the key's stripe, the write force-releases a bucket whose holder is
+  // stuck and then publishes (Volume::writer_probe).  In any other process
+  // the write is refused as NotOwned before it looks at the directory, so
+  // the bucket stays busy until the owner next writes, removes or updates
+  // hit counts in it.
 
   // Coalescing logic.
   std::string key_str(key, key_len);

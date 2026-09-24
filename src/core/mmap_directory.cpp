@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstring>
 #include <thread>
+#include <vector>
 
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
 #include <immintrin.h>
@@ -276,23 +277,10 @@ std::optional<DirEntry> MmapDirectory::probe(const CacheKey &key) const {
   SeqlockReadWait wait;
   do {
     // Wait for an even version before starting the scan.
-    uint32_t version_before = load_version(bucket_idx);
+    const uint32_t version_before =
+        wait.even_version([&] { return load_version(bucket_idx); });
     if ((version_before & 1) != 0) {
-      for (size_t spin = 0; spin < kMaxWriterWaitSpins; ++spin) {
-#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
-        _mm_pause();
-#elif defined(__x86_64__)
-        __builtin_ia32_pause();
-#elif defined(__aarch64__) || defined(_M_ARM64)
-        __asm__ volatile("yield" ::: "memory");
-#endif
-        version_before = load_version(bucket_idx);
-        if ((version_before & 1) == 0) break;
-      }
-      if ((version_before & 1) != 0) {
-        std::this_thread::yield();
-        continue;
-      }
+      continue;  // Writer still active: retry (wait.retry() paces it)
     }
 
     // Memory barrier to ensure we read entries after version
@@ -368,7 +356,7 @@ bool MmapDirectory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
   bool cur_phase = current_phase();
 
   // Acquire writer lock (CAS even → odd, spins if another writer holds it).
-  acquire_writer(bucket_idx);
+  const uint32_t writer_token = acquire_writer(bucket_idx);
 
   if (admission != nullptr) {
     // Boundaries are loaded HERE, inside the bracket and under phase_lock:
@@ -414,7 +402,7 @@ bool MmapDirectory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
         }
       }
     }
-    release_writer(bucket_idx);
+    release_writer(bucket_idx, writer_token);
     release_phase_lock();
     if (choice.slot >= 0 && !choice.replaces) {
       increment_count();
@@ -550,7 +538,7 @@ bool MmapDirectory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
   }
 
   // Release writer lock (odd → even).
-  release_writer(bucket_idx);
+  release_writer(bucket_idx, writer_token);
 
   // Release phase lock after entry is written.
   release_phase_lock();
@@ -573,7 +561,7 @@ bool MmapDirectory::remove(const CacheKey &key) {
   DirEntry *bucket = &_entries[bucket_idx * kEntriesPerBucket];
 
   // Acquire writer lock (CAS even → odd, spins if another writer holds it).
-  acquire_writer(bucket_idx);
+  const uint32_t writer_token = acquire_writer(bucket_idx);
 
   bool found = false;
   for (size_t i = 0; i < kEntriesPerBucket; ++i) {
@@ -585,7 +573,7 @@ bool MmapDirectory::remove(const CacheKey &key) {
   }
 
   // Release writer lock (odd → even).
-  release_writer(bucket_idx);
+  release_writer(bucket_idx, writer_token);
 
   if (found) {
     decrement_count();
@@ -604,7 +592,7 @@ bool MmapDirectory::remove_at(const CacheKey &key, uint64_t target_offset) {
 
   DirEntry *bucket = &_entries[bucket_idx * kEntriesPerBucket];
 
-  acquire_writer(bucket_idx);
+  const uint32_t writer_token = acquire_writer(bucket_idx);
 
   // EVERY entry with this tag at this offset goes (see Directory::remove_at).
   size_t removed = 0;
@@ -616,7 +604,7 @@ bool MmapDirectory::remove_at(const CacheKey &key, uint64_t target_offset) {
     }
   }
 
-  release_writer(bucket_idx);
+  release_writer(bucket_idx, writer_token);
 
   for (size_t i = 0; i < removed; ++i) {
     decrement_count();
@@ -633,8 +621,9 @@ void MmapDirectory::clear() {
   // Acquire writer lock on every bucket.  This uses the same CAS
   // spinlock protocol as insert()/remove(), ensuring concurrent
   // writers on other processes spin until we release.
+  std::vector<uint32_t> writer_tokens(_num_buckets);
   for (size_t i = 0; i < _num_buckets; ++i) {
-    acquire_writer(i);
+    writer_tokens[i] = acquire_writer(i);
   }
 
   // Clear all entries and reset count while holding all locks.
@@ -644,7 +633,7 @@ void MmapDirectory::clear() {
 
   // Release all writer locks.
   for (size_t i = 0; i < _num_buckets; ++i) {
-    release_writer(i);
+    release_writer(i, writer_tokens[i]);
   }
 }
 
@@ -981,8 +970,8 @@ void MmapDirectory::touch_bucket(const CacheKey &key) {
   // Empty writer bracket: +2, fenced and parity-preserving.  A reader inside
   // probe_each's seqlock loop observes the change and retries — a spurious
   // retry, never a wrong serve.
-  acquire_writer(bucket_idx);
-  release_writer(bucket_idx);
+  const uint32_t writer_token = acquire_writer(bucket_idx);
+  release_writer(bucket_idx, writer_token);
 }
 
 uint32_t MmapDirectory::acquire_writer(size_t bucket_idx) {
@@ -996,17 +985,26 @@ uint32_t MmapDirectory::acquire_writer(size_t bucket_idx) {
     if ((v & 1) != 0) {
       // Another writer holds the lock (odd version).
       if (spin >= kMaxSpinIterations) {
-        // Holder presumed dead.  Force to next even value to clear the lock.
+        // Holder presumed STUCK: dead (SIGKILL/OOM), or alive but
+        // descheduled for the whole spin -- possible because two processes
+        // can both own a stripe during a graceful-reload overlap, and the
+        // cross-process write lock is released before the directory insert.
+        // Force the version from exactly the odd value we waited on to the
+        // next even one (a CAS, so a holder that just released, or a new
+        // holder, is never overwritten).  A live usurped holder is harmless
+        // afterwards: its release_writer is token-checked and becomes a
+        // no-op, so it cannot flip the parity back to odd.
         // AUDIT (write-lock hardening): a usurped per-bucket writer produces
         // a torn DirEntry, but the force-to-even is itself a seqlock version
         // change, and a reader additionally full-key-verifies and checksum-
         // verifies the document it points at — so the tear degrades to a
-        // retry or a clean miss, never accepted corrupt bytes.  Presume-dead
-        // recovery is therefore sufficient here (see acquire_write_lock for
-        // the one channel that is NOT reader-detectable).
-        uint32_t next_even = (v | 1) + 1;
-        ref.store(next_even, std::memory_order_release);
-        spin = 0;  // Restart acquisition with the new even version
+        // retry or a clean miss, never accepted corrupt bytes.  Presumed-
+        // stuck recovery is therefore sufficient here (see
+        // acquire_write_lock for the one channel that is NOT
+        // reader-detectable).
+        (void)ref.compare_exchange_strong(v, v + 1, std::memory_order_acq_rel,
+                                          std::memory_order_acquire);
+        spin = 0;  // Restart acquisition from the (now) current version
         continue;
       }
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
@@ -1034,12 +1032,19 @@ uint32_t MmapDirectory::acquire_writer(size_t bucket_idx) {
   }
 }
 
-void MmapDirectory::release_writer(size_t bucket_idx) {
+void MmapDirectory::release_writer(size_t bucket_idx, uint32_t token) {
   // Ensure all entry writes are visible before making the version even.
   std::atomic_thread_fence(std::memory_order_release);
   TSAN_RELEASE(&_versions[bucket_idx]);
-  std::atomic_ref<uint32_t>(_versions[bucket_idx])
-      .fetch_add(1, std::memory_order_release);
+  // odd -> even, but only from OUR odd value (token + 1).  If a peer
+  // force-released this bucket while we were descheduled inside the
+  // bracket, the version has moved on and this is a no-op: a blind +1 would
+  // turn the usurper's even version odd again, leaving the bucket "writer
+  // active" with no writer until the next forced recovery.
+  uint32_t expected = token + 1;
+  (void)std::atomic_ref<uint32_t>(_versions[bucket_idx])
+      .compare_exchange_strong(expected, token + 2, std::memory_order_release,
+                               std::memory_order_relaxed);
 }
 
 void MmapDirectory::increment_count() {

@@ -218,10 +218,8 @@ bool force_reset(AtomicWord &slot) {
 class MmapDirectory {
  public:
   static constexpr size_t kEntriesPerBucket = 4;
-  /// Maximum spins per attempt waiting for a writer to release the seqlock
-  /// (even version) before the attempt yields.  How many attempts a reader
-  /// makes, and for how long, is SeqlockReadWait's call (directory.hpp).
-  static constexpr size_t kMaxWriterWaitSpins = 1000;
+  // Seqlock read pacing (spins, retries, how long) is SeqlockReadWait's
+  // call (directory.hpp), shared with Directory.
   static constexpr uint32_t kMagic = 0x4D444952;  // "MDIR"
   // Version 2 (wrap retention): the retention region after the entries
   // (exposure generation + per-chunk borrow slots) replaces the stripe-wide
@@ -480,11 +478,11 @@ class MmapDirectory {
   /// (even->odd / odd->even), so a test can park a writer inside its odd
   /// window.  The caller provides the writer serialization, as production
   /// mutators do.
-  void begin_bucket_write_for_test(const CacheKey &key) {
-    (void)acquire_writer(key.bucket_hash() % _num_buckets);
+  [[nodiscard]] uint32_t begin_bucket_write_for_test(const CacheKey &key) {
+    return acquire_writer(key.bucket_hash() % _num_buckets);
   }
-  void end_bucket_write_for_test(const CacheKey &key) {
-    release_writer(key.bucket_hash() % _num_buckets);
+  void end_bucket_write_for_test(const CacheKey &key, uint32_t token) {
+    release_writer(key.bucket_hash() % _num_buckets, token);
   }
 #endif
 
@@ -785,11 +783,13 @@ class MmapDirectory {
   // touch_bucket() above.
 
   /// Acquire writer lock on a bucket (spins until CAS even→odd succeeds).
-  /// Returns the pre-lock (even) version for use in release.
+  /// Returns the pre-lock (even) version: the token release_writer needs.
   uint32_t acquire_writer(size_t bucket_idx);
 
-  /// Release writer lock (increments odd→even).
-  void release_writer(size_t bucket_idx);
+  /// Release writer lock: CAS token+1 (odd) -> token+2 (even).  A no-op if
+  /// the bucket was force-released from under us (see acquire_writer), so a
+  /// late release can never flip the parity back to odd.
+  void release_writer(size_t bucket_idx, uint32_t token);
 
   /// Acquire cross-process phase lock (CAS spinlock on header->phase_lock).
   /// Prevents toggle_phase() from invalidating entries mid-insert.
@@ -834,26 +834,12 @@ bool MmapDirectory::probe_each_impl(const CacheKey &key,
     bool cur_phase = current_phase();
 
     // Wait for an even version before starting the scan.  An odd version
-    // means a writer currently holds the bucket lock — spinning here avoids
+    // means a writer currently holds the bucket lock — waiting here avoids
     // wasting a full retry attempt on a guaranteed-inconsistent read.
-    uint32_t version_before = load_version(bucket_idx);
+    const uint32_t version_before =
+        wait.even_version([&] { return load_version(bucket_idx); });
     if ((version_before & 1) != 0) {
-      for (size_t spin = 0; spin < kMaxWriterWaitSpins; ++spin) {
-#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
-        _mm_pause();
-#elif defined(__x86_64__)
-        __builtin_ia32_pause();
-#elif defined(__aarch64__) || defined(_M_ARM64)
-        __asm__ volatile("yield" ::: "memory");
-#endif
-        version_before = load_version(bucket_idx);
-        if ((version_before & 1) == 0) break;
-      }
-      if ((version_before & 1) != 0) {
-        // Writer still active after spin limit — yield and retry
-        std::this_thread::yield();
-        continue;
-      }
+      continue;  // Writer still active: retry (wait.retry() paces it)
     }
 
     // Memory barrier to ensure we read entries after version

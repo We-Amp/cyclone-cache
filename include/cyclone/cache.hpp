@@ -248,11 +248,11 @@ struct CacheStats {
   uint64_t alternate_carry_bytes = 0;
   uint64_t alternates_carry_dropped = 0;
 
-  // Directory lookups that returned CacheError::Busy because a writer held
-  // the key's directory bucket for the whole seqlock wait budget, so the
-  // key's presence was unknown (PROCESS-LOCAL, summed across volumes,
-  // appended at the tail to match CycloneCacheStats).  Expected 0; full
-  // semantics on VolumeStats in src/core/volume.hpp.
+  // Directory probes that spent the whole seqlock wait budget because a
+  // writer held the key's directory bucket; a lookup then returned
+  // CacheError::Busy (PROCESS-LOCAL, summed across volumes, appended at the
+  // tail to match CycloneCacheStats).  Expected near 0; full semantics on
+  // VolumeStats in src/core/volume.hpp.
   uint64_t directory_read_timeouts = 0;
 };
 

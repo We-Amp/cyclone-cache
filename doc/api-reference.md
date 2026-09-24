@@ -110,7 +110,7 @@ Reads an entry from the cache.
 - `ReadHandle` on cache hit
 - `CacheError::NotFound` on cache miss
 - `CacheError::Busy` if a writer held the key's directory bucket for the
-  whole seqlock wait budget (20 ms), so the read could not tell whether the
+  whole seqlock wait budget (5 ms), so the read could not tell whether the
   key is present. This is not a miss; retry, or treat it as a miss if a
   refetch is acceptable. See [Busy lookups](#busy-lookups). The same applies
   to `exists_sync`, `read_alternate_sync` and `list_alternates_sync`.
@@ -1296,8 +1296,12 @@ From a write, delete or hit-count update it means a contended or raced lock;
 before this code existed those cases were reported as
 `CYCLONE_INTERNAL_ERROR`. `cyclone_cache_read_async` passes `CYCLONE_BUSY` to
 `read_cb` only when no miss handler is set. With a miss handler set, a Busy
-read goes to the handler like any other non-hit. The handler's write-back also
-releases a directory bucket that a crashed peer left locked.
+read goes to the handler like any other non-hit, so the waiters get the
+fetched value. The write-back does not always fix the bucket. In the process
+that owns the key's stripe, the write releases a bucket whose holder is stuck
+and then stores the value. In any other process the write fails with
+`NotOwned` before it reaches the directory, so the bucket stays busy until
+its owner next writes, removes or updates hit counts in it.
 
 ### Core Functions
 
@@ -1449,16 +1453,23 @@ enum class CacheError {
 Directory lookups are lock-free: a reader checks a per-bucket seqlock version
 and retries when a writer is mid-update. A writer that is descheduled inside
 that window can hold the bucket for a whole scheduling quantum. So a reader
-retries 100 times without reading the clock, then keeps retrying and yielding
-for up to 20 ms (`SeqlockReadWait::kBudget` in `src/core/directory.hpp`). If
-the bucket is still busy after that, the lookup returns `CacheError::Busy`,
-not `NotFound`. It never saw the bucket in a consistent state, so it cannot
-say whether the key is there. Each such lookup is counted in
-`CacheStats::directory_read_timeouts`. The count is expected to be 0; a
-nonzero count means writers are being descheduled for longer than 20 ms, or,
-in multi-process mode, that a peer died in the middle of a directory update.
-In the second case, the next write, delete or hit-count update of a key in
-that bucket releases it.
+retries 100 times without reading the clock, then sleeps between further
+retries (10 µs, doubling up to 1 ms per sleep) for up to 5 ms
+(`SeqlockReadWait::kBudget` in `src/core/directory.hpp`). It sleeps rather
+than spins so that a waiting reader, possibly on an event-loop thread, does
+not burn its CPU. If the bucket is still busy after that, the lookup returns
+`CacheError::Busy`, not `NotFound`. It never saw the bucket in a consistent
+state, so it cannot say whether the key is there. The 5 ms cap is a
+trade-off: under heavy CPU oversubscription a writer can stay descheduled for
+longer, and those lookups report `Busy`; the caller can retry or refetch.
+
+Every directory probe that spends the whole budget is counted in
+`CacheStats::directory_read_timeouts`. The count is expected to be near 0.
+A steadily growing count means writers are being descheduled for longer
+than 5 ms, or, in multi-process mode, that a writer's process died in the
+middle of a directory update. In the second case, the owning process's
+next write, delete or hit-count update of a key in that bucket releases it;
+that write waits out the budget once and then goes through.
 
 All operations return `std::expected<T, CacheError>`. Use `.has_value()`, `.value()`, and `.error()` to check results:
 

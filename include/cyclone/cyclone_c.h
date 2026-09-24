@@ -53,8 +53,8 @@ enum {
                                       max_object_size */
   CYCLONE_BUSY /* Transient contention; retry.  From a read or exists: a
                   writer held the key's directory bucket for the whole wait
-                  budget, so whether the key is present is UNKNOWN -- not a
-                  miss.  From a write, delete or hit-count update: a
+                  budget (5 ms), so whether the key is present is UNKNOWN --
+                  not a miss.  From a write, delete or hit-count update: a
                   contended or raced lock (previously reported as
                   CYCLONE_INTERNAL_ERROR). */
 };
@@ -413,10 +413,12 @@ typedef struct {
   uint64_t alternate_carry_bytes;
   uint64_t alternates_carry_dropped;
 
-  /* Directory lookups that returned CYCLONE_BUSY because a writer held the
-   * key's directory bucket for the whole seqlock wait budget (append-only
-   * extension at the TAIL, same lockstep-compilation caveat as above).
-   * Process-local, summed across volumes.  Expected 0; see CYCLONE_BUSY. */
+  /* Directory probes that spent the whole seqlock wait budget because a
+   * writer held the key's directory bucket; a read or exists then returned
+   * CYCLONE_BUSY (append-only extension at the TAIL, same lockstep-
+   * compilation caveat as above: cyclone_cache_stats() writes the whole
+   * struct, so rebuild every consumer against this header).  Process-local,
+   * summed across volumes.  Expected near 0; see CYCLONE_BUSY. */
   uint64_t directory_read_timeouts;
 } CycloneCacheStats;
 

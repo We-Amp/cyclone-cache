@@ -2774,19 +2774,18 @@ std::expected<void, CacheError> Volume::remove_sync(const CacheKey& key) {
   size_t num_candidates = 0;
 
   const StripeSnapshot snap = snapshot(stripe);
-  const bool probe_complete = stripe->probe_each(
-      key, snap, [&](const DirEntry& dir_entry, AdmitClass cls) {
-        if (num_candidates < candidates.size()) {
-          candidates[num_candidates++] = {dir_entry.offset(),
-                                          dir_entry.approx_size(), cls};
-        }
-        return true;  // Continue — collect all matching entries
-      });
-  // The bucket stayed odd for the whole wait budget: the candidate list may
-  // be partial, so remove nothing and report Busy rather than NotFound or a
-  // removal that leaves a same-key entry behind (issue #21).
-  if (!probe_complete) {
-    return writer_directory_busy(stripe, key);
+  // A partial candidate list would report NotFound, or remove one same-key
+  // entry and leave another behind: never act on one (writer_probe).
+  if (!writer_probe(
+          stripe, key, snap, [&] { num_candidates = 0; },
+          [&](const DirEntry& dir_entry, AdmitClass cls) {
+            if (num_candidates < candidates.size()) {
+              candidates[num_candidates++] = {dir_entry.offset(),
+                                              dir_entry.approx_size(), cls};
+            }
+            return true;  // Continue — collect all matching entries
+          })) {
+    return make_unexpected(CacheError::Busy);
   }
 
   // Phase 2: For each candidate, read the document to verify the full SHA-256
@@ -4220,8 +4219,14 @@ std::expected<void, CacheError> Volume::commit_write(
     }
   };
   const StripeSnapshot snap = snapshot(stripe);
-  const bool probe_complete = stripe->probe_each(
-      key, snap, [&](const DirEntry& dir_entry, AdmitClass cls) {
+  const bool probe_complete = writer_probe(
+      stripe, key, snap,
+      [&] {
+        verified_offset = Directory::kNoVerifiedEntry;
+        verified_cls = AdmitClass::kReject;
+        clear_count = 0;
+      },
+      [&](const DirEntry& dir_entry, AdmitClass cls) {
         if (dir_entry.offset() == verified_offset) {
           return true;  // a retried scan re-yields the elected entry
         }
@@ -4268,10 +4273,11 @@ std::expected<void, CacheError> Volume::commit_write(
         return true;
       });
   // A partial election could miss this key's live entry and publish a
-  // second one beside it (the uniqueness rule above).  Publish nothing: the
+  // second one beside it (the uniqueness rule above): writer_probe recovers
+  // a stuck bucket and re-elects.  If even that fails, publish nothing: the
   // document stays unreachable, like any fill whose insert never ran.
   if (!probe_complete) {
-    return writer_directory_busy(stripe, key);
+    return make_unexpected(CacheError::Busy);
   }
 
   // Update directory — publishes the entry.  MUST stay after the data sync
@@ -4867,8 +4873,9 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
     };
     std::array<HeadCandidate, Directory::kEntriesPerBucket> heads{};
     size_t head_count = 0;
-    const bool probe_complete = stripe->probe_each(
-        key, snap, [&](const DirEntry& dir_entry, AdmitClass cls) {
+    const bool probe_complete = writer_probe(
+        stripe, key, snap, [&] { head_count = 0; },
+        [&](const DirEntry& dir_entry, AdmitClass cls) {
           // A version change may retry the scan: never record an entry
           // twice.
           for (size_t i = 0; i < head_count; ++i) {
@@ -4891,10 +4898,10 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
           }
           return true;
         });
-    // A partial head election could fork the key's chain (see commit_write).
-    // Nothing is allocated or written yet.
+    // A partial head election could fork the key's chain (see commit_write
+    // and writer_probe).  Nothing is allocated or written yet.
     if (!probe_complete) {
-      return writer_directory_busy(stripe, key);
+      return make_unexpected(CacheError::Busy);
     }
     int elected = -1;
     for (size_t i = 0; i < head_count; ++i) {
@@ -6439,8 +6446,9 @@ std::expected<void, CacheError> Volume::remove_alternate_sync(
     bool found_head = false;
     AdmitClass head_cls = AdmitClass::kReject;
 
-    const bool probe_complete = stripe->probe_each(
-        key, snap, [&](const DirEntry& dir_entry, AdmitClass cls) {
+    const bool probe_complete = writer_probe(
+        stripe, key, snap, [&] { found_head = false; },
+        [&](const DirEntry& dir_entry, AdmitClass cls) {
           if (found_head) {
             return false;
           }
@@ -6474,7 +6482,7 @@ std::expected<void, CacheError> Volume::remove_alternate_sync(
         });
 
     if (!found_head && !probe_complete) {
-      return writer_directory_busy(stripe, key);  // unknown, not NotFound
+      return make_unexpected(CacheError::Busy);  // unknown, not NotFound
     }
     if (!found_head) {
       return make_unexpected(CacheError::NotFound);
@@ -6682,8 +6690,9 @@ std::expected<void, CacheError> Volume::update_hit_count_sync(
   // Find the document with the matching alternate_id
   uint64_t target_offset = 0;
 
-  const bool probe_complete = stripe->probe_each(
-      key, snap, [&](const DirEntry& dir_entry, AdmitClass cls) {
+  const bool probe_complete = writer_probe(
+      stripe, key, snap, [&] { target_offset = 0; },
+      [&](const DirEntry& dir_entry, AdmitClass cls) {
         uint64_t doc_offset = stripe->offset + dir_entry.offset();
 
         auto mapped = _mapped_file->map_region(
@@ -6748,7 +6757,7 @@ std::expected<void, CacheError> Volume::update_hit_count_sync(
   if (target_offset == 0 && !probe_complete) {
     // Busy is how this path already reports a dropped delta (the caller
     // counts it as contention and does not try other volumes).
-    return writer_directory_busy(stripe, key);
+    return make_unexpected(CacheError::Busy);
   }
   if (target_offset == 0) {
     return make_unexpected(CacheError::AlternateNotFound);
