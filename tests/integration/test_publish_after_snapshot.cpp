@@ -21,6 +21,7 @@
 // The test parks the reader at the kSnapshotDone seam (after the snapshot,
 // before the probe) and commits one write of the SAME key in that window.
 
+#include <array>
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
 #include <condition_variable>
@@ -32,6 +33,7 @@
 #include <span>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "core/volume.hpp"
@@ -83,21 +85,23 @@ class ExactIdSelector : public StorageAlternateSelector {
   AlternateId _target;
 };
 
-std::shared_ptr<Volume> open_volume(const std::string &path, bool mmap_dir) {
+// `read_retries` < 0 keeps the MultiProcessConfig default.
+std::shared_ptr<Volume> open_volume(const std::string &path, bool mmap_dir,
+                                    int read_retries = -1) {
   VolumeConfig vc;
   vc.path = path;
   vc.size = kVolumeBytes;
   vc.verify_checksum_on_read = true;
-  std::shared_ptr<Volume> volume;
+  // mmap_dir: the production multi-process setting -- enabled, 0-of-1,
+  // mmap'd directory, shared write cursor.
+  MultiProcessConfig mp;
   if (mmap_dir) {
-    // The production multi-process setting: enabled, 0-of-1, mmap'd
-    // directory, shared write cursor.
-    MultiProcessConfig mp;
     mp.set_enabled(true).set_process_index(0).set_total_processes(1);
-    volume = std::make_shared<Volume>(vc, mp);
-  } else {
-    volume = std::make_shared<Volume>(vc);
   }
+  if (read_retries >= 0) {
+    mp.set_max_read_retries(static_cast<uint32_t>(read_retries));
+  }
+  auto volume = std::make_shared<Volume>(vc, mp);
   REQUIRE(volume->open().has_value());
   return volume;
 }
@@ -206,13 +210,17 @@ TEST_CASE(
     "Publish after snapshot: a same-key write committed between a reader's "
     "snapshot and its probe never turns a present key into a miss",
     "[alternate][concurrent][lockfree][regression]") {
-  for (const bool mmap_dir : {false, true}) {
+  // (mmap_dir, read_retries): the torn-read budget must not be what saves
+  // the read, so it runs with max_read_retries = 0 too.
+  constexpr std::array<std::pair<bool, int>, 3> kConfigs = {
+      {{false, -1}, {true, -1}, {true, 0}}};
+  for (const auto &[mmap_dir, read_retries] : kConfigs) {
     for (const ReaderKind kind :
          {ReaderKind::kReadAlternate, ReaderKind::kListAlternates,
           ReaderKind::kReadSync, ReaderKind::kExists}) {
-      CAPTURE(mmap_dir, name_of(kind));
+      CAPTURE(mmap_dir, read_retries, name_of(kind));
       TempCacheDir tmp("pubsnap");
-      auto volume = open_volume(tmp.path(), mmap_dir);
+      auto volume = open_volume(tmp.path(), mmap_dir, read_retries);
       const CacheKey key("publish-after-snapshot");
       const auto original = make_content(std::byte{0x0A});
       const auto variant = make_content(std::byte{0x0B});

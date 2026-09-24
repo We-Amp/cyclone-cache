@@ -2398,6 +2398,7 @@ std::expected<ReadHandle, CacheError> Volume::read_sync(const CacheKey& key) {
   // the wrap-epoch revalidation catch it and land here for another
   // attempt.
   uint32_t max_attempts = _mp_config.max_read_retries + 1;
+  uint32_t publish_race_retries = 0;
 
   bool saw_checksum_failure = false;
 
@@ -2487,9 +2488,11 @@ std::expected<ReadHandle, CacheError> Volume::read_sync(const CacheKey& key) {
     // against it, and a borrow revalidates against its epoch
     // (stamp-then-revalidate; disk borrows only).
     const StripeSnapshot snap = snapshot(stripe);
+    ProbeRejects rejects;
 
     stripe->probe_each(
-        key, snap, [&](const DirEntry& dir_entry, AdmitClass cls) {
+        key, snap,
+        [&](const DirEntry& dir_entry, AdmitClass cls) {
           if (found) {
             return false;  // Already found, stop iteration
           }
@@ -2636,10 +2639,18 @@ std::expected<ReadHandle, CacheError> Volume::read_sync(const CacheKey& key) {
           result = ReadHandle(impl);
           found = true;
           return false;  // Stop iteration
-        });
+        },
+        &rejects);
 
     if (_hit_tracker && should_record_hit) {
       _hit_tracker->record_hit(key);
+    }
+
+    // Publish-after-snapshot: the key's entry moved under the probe (see
+    // probe_raced_publish).  Not a miss -- try again with a fresh snapshot.
+    if (!found && probe_raced_publish(stripe, rejects)) {
+      extend_for_publish_race(max_attempts, publish_race_retries);
+      continue;
     }
 
     // If we found a valid entry, or neither a checksum failure nor an
@@ -2848,13 +2859,27 @@ std::expected<bool, CacheError> Volume::exists_sync(const CacheKey& key) {
   }
 
   // Lock-free read — pure directory probe (no borrow escapes), covered by
-  // the directory's own synchronization; see the note in read_sync().
-  bool found = false;
-  stripe->probe_each(key, snapshot(stripe), [&](const DirEntry&, AdmitClass) {
-    found = true;
-    return false;  // Stop iteration
-  });
-  return found;
+  // the directory's own synchronization; see the note in read_sync().  A
+  // publish that raced the snapshot is retried like the other readers do
+  // (see probe_raced_publish and extend_for_publish_race).
+  uint32_t max_attempts = _mp_config.max_read_retries + 1;
+  uint32_t publish_race_retries = 0;
+  for (uint32_t attempt = 0; attempt < max_attempts; ++attempt) {
+    bool found = false;
+    ProbeRejects rejects;
+    stripe->probe_each(
+        key, snapshot(stripe),
+        [&](const DirEntry&, AdmitClass) {
+          found = true;
+          return false;  // Stop iteration
+        },
+        &rejects);
+    if (found || !probe_raced_publish(stripe, rejects)) {
+      return found;
+    }
+    extend_for_publish_race(max_attempts, publish_race_retries);
+  }
+  return false;
 }
 
 namespace {
@@ -3203,6 +3228,34 @@ StripeSnapshot Volume::snapshot(const Stripe* stripe) const {
   reader_seam(ReaderSeam::kSnapshotDone);
 #endif
   return snap;
+}
+
+bool Volume::probe_raced_publish(const Stripe* stripe,
+                                 const ProbeRejects& rejects) const {
+  if (rejects.count == 0) {
+    return false;  // Nothing was turned away: a genuine miss.
+  }
+  // A fresh sample, taken AFTER the probe.  Why it sees the racing publish:
+  // a writer advances the cursor (commit_write_slot) strictly before it
+  // publishes the entry under the bucket seqlock, and the probe accepted
+  // that entry only on a matching even version -- acquire-ordered after the
+  // writer's release -- so this cursor load reads at least the cursor that
+  // made the entry legitimate.  The same recheck also catches a wrap that
+  // landed between the snapshot and the probe (the new pass's entry carries
+  // the other phase).  A genuine phase-ABA survivor stays ahead of the live
+  // cursor and is still rejected here, so it triggers no retry until the
+  // forward fill has passed it -- and then the retry is exactly the read any
+  // new caller would make.  Each retry runs the full admission against its
+  // OWN fresh snapshot, so invariant 9's guard applies to every attempt
+  // unchanged: nothing here ever admits an entry against a stale cursor.
+  const StripeSnapshot now = snapshot(stripe);
+  for (size_t i = 0; i < rejects.count; ++i) {
+    if (stripe->admit_position(rejects.rel[i], rejects.phase[i], now) !=
+        AdmitClass::kReject) {
+      return true;
+    }
+  }
+  return false;
 }
 
 bool Volume::renew_read_lease(Stripe* stripe, const BorrowEpoch& epoch_start,
@@ -5158,6 +5211,7 @@ Volume::list_alternates_sync(const CacheKey& key) {
   // the wrap-epoch revalidation catch it and land here for another
   // attempt.
   uint32_t max_attempts = _mp_config.max_read_retries + 1;
+  uint32_t publish_race_retries = 0;
 
   for (uint32_t attempt = 0; attempt < max_attempts; ++attempt) {
     if (attempt > 0) {
@@ -5181,8 +5235,10 @@ Volume::list_alternates_sync(const CacheKey& key) {
     bool chain_incomplete = false;
 
     // First, find the head document via directory probe
+    ProbeRejects rejects;
     stripe->probe_each(
-        key, snap, [&](const DirEntry& dir_entry, AdmitClass cls) {
+        key, snap,
+        [&](const DirEntry& dir_entry, AdmitClass cls) {
           if (found_head) {
             return false;  // Already processing, stop iteration
           }
@@ -5289,7 +5345,15 @@ Volume::list_alternates_sync(const CacheKey& key) {
             checksum_failed = true;
           }
           return false;  // Stop iteration
-        });
+        },
+        &rejects);
+
+    // Publish-after-snapshot: the head moved under the probe (see
+    // probe_raced_publish).  Not a miss -- try again with a fresh snapshot.
+    if (!found_head && probe_raced_publish(stripe, rejects)) {
+      extend_for_publish_race(max_attempts, publish_race_retries);
+      continue;
+    }
 
     // Discard and retry if a wrap raced the walk — the collected
     // AlternateInfo may describe overwritten regions.
@@ -5333,6 +5397,7 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
   // the wrap-epoch revalidation catch it and land here for another
   // attempt.
   uint32_t max_attempts = _mp_config.max_read_retries + 1;
+  uint32_t publish_race_retries = 0;
 
   bool saw_checksum_failure = false;
 
@@ -5381,8 +5446,10 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
     const uint32_t bucket_version_start =
         ram_coherence ? stripe->bucket_version(key) : 0;
 
+    ProbeRejects rejects;
     stripe->probe_each(
-        key, snap, [&](const DirEntry& dir_entry, AdmitClass cls) {
+        key, snap,
+        [&](const DirEntry& dir_entry, AdmitClass cls) {
           if (found_head) {
             return false;
           }
@@ -5788,10 +5855,18 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
           result = ReadHandle(impl);
           _mapped_file->unmap_region(*mapped);
           return false;
-        });
+        },
+        &rejects);
 
     if (_hit_tracker && should_record_hit) {
       _hit_tracker->record_hit(key, hit_alt_id);
+    }
+
+    // Publish-after-snapshot: the head moved under the probe (see
+    // probe_raced_publish).  Not a miss -- try again with a fresh snapshot.
+    if (!found_head && probe_raced_publish(stripe, rejects)) {
+      extend_for_publish_race(max_attempts, publish_race_retries);
+      continue;
     }
 
     if (found_head && !checksum_failed && !epoch_changed) {

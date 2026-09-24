@@ -362,6 +362,33 @@ struct BorrowEpoch {
   friend bool operator==(const BorrowEpoch &, const BorrowEpoch &) = default;
 };
 
+// The directory entries one probe REJECTED on the position leg
+// (Stripe::admit_position) against its snapshot, recorded so a lock-free
+// reader that comes up empty can tell a genuine miss from a publish that
+// raced its snapshot (Volume::probe_raced_publish).  Bounded by one bucket:
+// the directory yields at most kEntriesPerBucket tag matches per scan, and a
+// seqlock rescan re-yields the same slots, so offsets are de-duplicated.
+// Filled only by the caller that passes one; the writers' probes (which run
+// under the stripe mutex and must keep their single sample) never do.
+struct ProbeRejects {
+  static constexpr size_t kMax = Directory::kEntriesPerBucket;
+  std::array<uint64_t, kMax> rel{};
+  std::array<bool, kMax> phase{};
+  size_t count = 0;
+  void note(uint64_t relative_offset, bool entry_phase) noexcept {
+    for (size_t i = 0; i < count; ++i) {
+      if (rel[i] == relative_offset && phase[i] == entry_phase) {
+        return;
+      }
+    }
+    if (count < kMax) {
+      rel[count] = relative_offset;
+      phase[count] = entry_phase;
+      ++count;
+    }
+  }
+};
+
 struct Stripe {
   uint64_t offset = 0;
   uint64_t size = 0;
@@ -649,13 +676,20 @@ struct Stripe {
   // directory yields tag matches of both phases; the phase test lives in
   // admit_position so that it is made against the snapshot, never against a
   // separate load of the directory's own phase.
+  //
+  // `rejects` (optional, lock-free readers only) collects the entries the
+  // position leg turned away, for Volume::probe_raced_publish.
   template <typename Callback>
   void probe_each(const CacheKey &key, const StripeSnapshot &snap,
-                  Callback &&callback) const {
-    auto admitted = [this, &snap, &callback](const DirEntry &entry) -> bool {
+                  Callback &&callback, ProbeRejects *rejects = nullptr) const {
+    auto admitted = [this, &snap, &callback,
+                     rejects](const DirEntry &entry) -> bool {
       const AdmitClass cls =
           admit_position(entry.offset(), entry.phase(), snap);
       if (cls == AdmitClass::kReject) {
+        if (rejects != nullptr) {
+          rejects->note(entry.offset(), entry.phase());
+        }
         return true;  // Inadmissible: skip, keep scanning the bucket.
       }
       return callback(entry, cls);
@@ -1499,6 +1533,29 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // (f > N reads as N) and never write it back: the open path and the read
   // path never repair retention state.
   [[nodiscard]] StripeSnapshot snapshot(const Stripe *stripe) const;
+  // PUBLISH-AFTER-SNAPSHOT recheck for the lock-free readers.  A reader
+  // samples its snapshot BEFORE it probes, so a writer can commit in between:
+  // it allocates at/after the sampled cursor, advances the cursor and then
+  // updates the key's directory entry IN PLACE.  The probe then sees only
+  // the new entry, which the position leg rejects as "at/ahead of the
+  // cursor", and a key that was present throughout reads as a miss.  True
+  // iff a FRESH snapshot admits one of the entries the probe rejected, i.e.
+  // the stripe moved under the probe and a new attempt (with its own fresh
+  // snapshot) would see a different answer.  Called only on the miss path.
+  [[nodiscard]] bool probe_raced_publish(const Stripe *stripe,
+                                         const ProbeRejects &rejects) const;
+  // A publish race is progress, not a fault: the retry it triggers does not
+  // spend the torn-read budget (max_read_retries, possibly 0).  Each race
+  // buys one extra attempt, up to kMaxPublishRaceRetries per read, so a
+  // reader under a continuous same-key write stream still terminates.
+  static constexpr uint32_t kMaxPublishRaceRetries = 8;
+  static void extend_for_publish_race(uint32_t &max_attempts,
+                                      uint32_t &retries) noexcept {
+    if (retries < kMaxPublishRaceRetries) {
+      ++retries;
+      ++max_attempts;
+    }
+  }
 
   // The epoch a borrow of the document at `relative_offset`, admitted as a
   // document of pass `pass`, must still satisfy when it revalidates and on

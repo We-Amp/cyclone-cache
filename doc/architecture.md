@@ -669,7 +669,14 @@ Cache lines touched: 1 gate shard, 1 CLFUS segment, 1 directory bucket (seqlock,
 
 ### Read (miss)
 
-Same up to the probe; no key-verified match → `NotFound`.
+Same up to the probe; no key-verified match → `NotFound` — unless the probe
+turned away a tag match that a **fresh** snapshot now admits
+(`probe_raced_publish`): a same-key write committed between the snapshot and
+the probe (its entry replaced in place, at/after the sampled cursor) or a
+wrap landed there. That is a moved stripe, not a miss, so the reader retries
+with a new snapshot; the retry does not spend `max_read_retries` (at most
+`kMaxPublishRaceRetries` extra attempts). Every attempt still admits only
+against its own snapshot, so the phase-ABA positional guard is unchanged.
 `read_alternate_sync` additionally repopulates the RAM tier on a disk hit
 (the post-copy revalidation in `read_alternate_sync`) with a post-copy revalidation (`borrow_still_valid` +
 `remove_epoch` recheck) so it never caches torn or resurrected bytes.
