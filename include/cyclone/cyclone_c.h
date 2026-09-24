@@ -201,9 +201,10 @@ typedef struct {
   int disable_wrap_retention;
   /* Non-zero: FLUSH mode -- a wrap of a stripe's circular data area makes
      the whole previous pass unreadable at once.  Zero-initialised = the
-     library default (CacheConfig::wrap_retention: the previous pass stays
-     readable until the forward fill needs its bytes).  Stated in the
-     negative so a zero-initialised config lands on the default.
+     library default, which is wrap RETENTION (CacheConfig::wrap_retention:
+     the previous pass stays readable until the forward fill needs its
+     bytes).  Stated in the negative so a zero-initialised config lands on
+     the default; set it to 1 to opt out.
 
      The mode is persisted in the volume when it is CREATED.  An open whose
      mode disagrees with the file goes through the same live-peer reset gate

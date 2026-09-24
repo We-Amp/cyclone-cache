@@ -492,12 +492,23 @@ target pass (`2`/`3`) before it lowers the shared cursor, and recovery
 completes such a wrap (cursor, phase, `G`) rather than just clearing it.
 
 **Eviction mode must match across processes.** `CacheConfig::wrap_retention`
-is persisted in the volume header (`VolumeHeader::retain_chunks`, offset 40;
-0 means flush). An open whose configured mode disagrees with the file goes
+(default `true`, retention; `false` is flush) is persisted in the volume
+header (`VolumeHeader::retain_chunks`, offset 40; 0 means flush). The mode is
+not in the fingerprinted filename, so processes in different modes resolve
+to the same file. An open whose configured mode disagrees with the file goes
 through the same live-peer reset gate as a format change. While another
 process holds the volume the open is refused (`ResetRefusedLivePeer`), so a
 mixed-mode deployment fails fast instead of corrupting the other side's
-view.
+view. With no holder, the opener resets the file cold into its own mode.
+
+This matters for upgrades. Volumes created by a build whose default was
+flush record `retain_chunks = 0`. During an overlapping upgrade, a new
+default-configured process that starts while old processes still hold the
+file is refused until they exit. The first one to open after that resets the
+cache cold. Either stop every old process before starting new ones, or run
+the new binary with `wrap_retention = false` (C API:
+`disable_wrap_retention = 1`) to keep the existing cache. See
+[api-reference.md](api-reference.md#wrap-retention).
 
 The guarantee is bounded: holds longer than
 `CacheConfig::lease_wrap_ceiling` (default 60s) are not protected — a

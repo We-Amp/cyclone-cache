@@ -618,9 +618,9 @@ struct CacheConfig {
     // See "Alternate-Chain Depth Bound" below.
     bool unlink_superseded_alternates = true;
 
-    // Eviction mode (default: false = flush).  Persisted per volume at
-    // creation.  See "Wrap Retention" below.
-    bool wrap_retention = false;
+    // Eviction mode (default: true = retention; false = flush).  Persisted
+    // per volume at creation.  See "Wrap Retention" below.
+    bool wrap_retention = true;
 
     // Validate RAM-cache hits against the shared directory's bucket version
     // (default: false = off).  See "Cross-Process RAM Coherence" below.
@@ -758,18 +758,20 @@ Each stripe's data area is a circular log.  What happens to the previous pass
 when the write cursor wraps is the eviction policy, chosen by
 `CacheConfig::wrap_retention` (C API: `disable_wrap_retention`, below):
 
-- **Flush (`false`, the default).**  The wrap flips the stripe's phase bit and
-  every entry of the pass that just ended stops resolving at once, although
-  nearly all of those documents are still intact on disk.  A stripe therefore
-  holds, on average, about half of its capacity.
-- **Retention (`true`).**  The previous pass stays readable until its bytes
-  are about to be overwritten.  A clean frontier runs ahead of the write
-  cursor in fixed chunks (`N <= 64` of at least 1 MiB each, per stripe);
-  moving it is the only step that hands readable bytes to the forward fill,
-  and it waits for live borrows in exactly the chunks it is about to expose.
-  A borrow's bytes therefore stay intact until the frontier crosses its own
-  chunk.  Each document is stamped with its pass, so a stale entry from two
+- **Retention (`true`, the default).**  The previous pass stays readable
+  until its bytes are about to be overwritten.  A clean frontier runs ahead
+  of the write cursor in fixed chunks (`N <= 64` of at least 1 MiB each, per
+  stripe); moving it is the only step that hands readable bytes to the
+  forward fill, and it waits for live borrows in exactly the chunks it is
+  about to expose.  A borrow's bytes therefore stay intact until the
+  frontier crosses its own chunk.  Each document is stamped with its pass, so a stale entry from two
   or more passes back can never resolve.
+- **Flush (`false`, the opt-out).**  The wrap flips the stripe's phase bit
+  and every entry of the pass that just ended stops resolving at once,
+  although nearly all of those documents are still intact on disk.  A stripe
+  therefore holds, on average, about half of its capacity.  Choose it to keep
+  a volume created by an earlier default-off build warm (see below), or to
+  keep the old eviction behaviour.
 
 In the policy replay of the KV-churn workload (`benchmarks/kv_churn_policy`)
 retention recovers 93-98 % of the gap between flush and a plain per-stripe
@@ -811,6 +813,46 @@ Rules:
   never makes the write fail, but its larger slot can be deferred by a
   borrow like any fill (`NoSpace`). Removing one alternate from a retained
   chain removes the whole entry.
+
+**Upgrading from a default-off build.**  Before this release the default was
+flush, so a volume created with a default config records flush
+(`VolumeHeader::retain_chunks = 0`; volumes from builds that predate wrap
+retention carry the same zero).  The mode is not part of the fingerprinted
+filename, so the new build resolves to the same file and finds a mode
+mismatch on its first open with a default config:
+
+- **No other process holds the file** (the normal restart): the volume is
+  reset cold in place and recreated in retention mode.  Every entry is lost
+  once; no second file is created, so no extra disk is used.
+- **Another process still holds the file** (an overlapping upgrade, or a peer
+  configured with `wrap_retention = false`): `Cache::start()` fails with
+  `ResetRefusedLivePeer` (C API: `cyclone_cache_create` returns
+  `CYCLONE_RESET_REFUSED_LIVE_PEER`).  The running peer is not disturbed.
+- **`auto_reset_on_incompatible = false`**: `IncompatibleVersion`.
+
+To keep an existing cache warm across the upgrade, set
+`wrap_retention = false` (C API: `disable_wrap_retention = 1`) on every
+process.  Switching to retention later costs the same one cold reset.
+
+**Mixed deployments.**  Every process that opens a volume must configure the
+same mode, and a process whose mode disagrees with the file fails fast while
+any peer holds it, rather than joining the ring.  That is deliberate: a
+retaining and a flushing process on one ring is unsafe in both directions (a
+flushing writer overwrites retained documents a retaining reader still
+admits).  The mode is not put in the filename because filenames do not
+reliably carry it (explicit and already-fingerprinted paths are used as
+given, and an unsized open picks the newest file of the format), so two
+modes cannot be made to run side by side on separate files.  Two
+consequences to plan for:
+
+- A multi-process upgrade that keeps old processes running while new ones
+  start (for example an nginx binary upgrade, where old workers drain while
+  the new master starts) must either stop every old process first, or pin
+  the new binary to `wrap_retention = false` for the overlap and switch in a
+  later full restart.
+- Whichever mode opens the file last with no peer holding it wins, and
+  resets it.  Two groups of processes configured differently that take
+  turns on one cache wipe it each time; configure the mode in one place.
 
 ### Cross-Process RAM Coherence
 
@@ -1196,7 +1238,10 @@ the full mapping, and the field comments in `cyclone_c.h`.
 
 **Eviction mode.**  `disable_wrap_retention` is stated in the negative, like
 `disable_alternate_unlink`: `0` keeps the library default
-(`CacheConfig::wrap_retention`), non-zero selects flush mode.  It is a
+(`CacheConfig::wrap_retention`, which is retention), non-zero selects flush
+mode.  A zero-initialised `CycloneCacheConfig` therefore retains; set it to
+`1` to keep a cache created by an earlier default-off build warm (see
+["Upgrading from a default-off build"](#wrap-retention)).  It is a
 trailing field with the same ABI note as `small_tier_percent`: a caller
 compiled against an older header passes a smaller struct, so recompile
 against the new header when adopting it.  Every process sharing a cache must

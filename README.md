@@ -90,10 +90,12 @@ flowchart LR
 
 Writers take exactly one stripe lock — the stripe's mutex in `commit_write` —
 and publish a directory entry only after the document bytes are durable, so a
-crash can never leave an entry pointing at torn data. Eviction is O(1):
-when a stripe's log wraps, a single phase bit flips and every entry from the
-previous lap becomes stale — cheap, at a measurable hit-ratio cost for
-large-value tiers (see the [KV benchmark](doc/kv-cache-benchmark.md)). Details, with file:line anchors, live in
+crash can never leave an entry pointing at torn data. Eviction never scans:
+when a stripe's log wraps, the previous lap stays readable, and a clean
+frontier ahead of the write cursor drops it one chunk at a time, only as the
+new lap needs the bytes. The FIFO order still costs some hit ratio against
+an LRU on large-value tiers (see the
+[KV benchmark](doc/kv-cache-benchmark.md)). Details, with file:line anchors, live in
 [doc/architecture.md](doc/architecture.md) and
 [doc/multi-process.md](doc/multi-process.md).
 
@@ -251,8 +253,8 @@ multi-process tier for large blocks (2–32 MiB)** that evicts on its own. On
 Linux/NVMe it reads cold 8–32 MiB blocks faster than every peer (3.0–3.4
 GB/s), serves four reader processes 1.3× faster than LMDB, and under
 concurrent churn keeps a 3–4× lower hit-latency tail than LMDB with an LRU;
-with `wrap_retention` on, a bounded tier meets the benchmark's pre-registered
-bar against LMDB on that latency clause. It is not a general LMDB
+with wrap retention on (now the default), a bounded tier meets the
+benchmark's pre-registered bar against LMDB on that latency clause. It is not a general LMDB
 replacement: warm reads are in the same class, small blocks (512 KiB) read
 cold at under half LMDB's rate, writes run at about 1 GB/s per thread behind
 file-per-block, and single-threaded churn serves 0.7–0.8× LMDB.
@@ -274,15 +276,15 @@ file-per-block, and single-threaded churn serves 0.7–0.8× LMDB.
 - **Variants per prefix.** Up to 64 alternates per key, IDs 128–255 reserved
   for your own scheme — fp16 / fp8 / int4 copies of the same prefix, chosen
   at read time.
-- **Eviction is FIFO by wrap, not LRU.** When a stripe's log wraps, every
-  entry from its previous lap stops resolving at once, and the disk tier has
-  no scan resistance (CLFUS covers only the RAM tier, which a KV tier
-  normally disables). Under churn that costs about 9 hit-ratio points
-  against an LRU. The opt-in `wrap_retention = true` (off by default) keeps
-  the previous lap readable until its bytes are reused, which recovers part
-  of that gap: on a 2 MiB-block, 4 GiB churn run the hit ratio rose from
-  0.726 to 0.788 (Zipf) and from 0.614 to 0.660 (Zipf plus scans), still
-  below LRU.
+- **Eviction is FIFO by wrap, not LRU.** By default (wrap retention) a
+  stripe's previous lap stays readable after the log wraps, until the new
+  lap actually needs its bytes, so a stripe holds close to its full capacity.
+  The disk tier has no scan resistance (CLFUS covers only the RAM tier, which
+  a KV tier normally disables), so under churn it still trails an LRU by
+  3.5-4 hit-ratio points. The opt-out, `wrap_retention = false` (flush
+  mode), drops the whole previous lap at the wrap and costs about 9 points:
+  on a 2 MiB-block, 4 GiB churn run the hit ratio was 0.788 with retention
+  and 0.726 flushing (Zipf), 0.660 and 0.614 with scans.
 - **Bring your own hash.** `CacheKey::from_digest()` takes a raw 32-byte
   digest, so a rolling hash over token blocks is the key; prefix chaining
   policy stays in your connector.
@@ -348,17 +350,20 @@ it, and is otherwise served straight from the mapped file — which is what
 every "hit" in the [numbers](#cyclone-in-numbers) measures.
 
 **Eviction is FIFO by wraparound.** When a stripe's write cursor reaches the
-end it wraps, flips the stripe's phase bit, and every entry from the previous
-lap is instantly stale. Nothing is scanned. That default costs capacity: a
-stripe holds about half its size on average. With
-`CacheConfig::wrap_retention = true` the previous lap stays readable until
-the write cursor actually needs its bytes. A clean frontier moves ahead of the
-cursor one chunk at a time, and it waits only for borrows in the chunk it is
-about to cross. On a churning KV workload this lifted the hit ratio from 0.73
-to 0.79 ([doc/api-reference.md](doc/api-reference.md#wrap-retention)). The
-mode is persisted per volume, so every process sharing a cache must use the
-same setting. Pair either mode with the small-object tier when some entries
-must outlive payload churn.
+end it wraps. By default (wrap retention) the previous lap stays readable
+until the write cursor actually needs its bytes: a clean frontier moves ahead
+of the cursor one chunk at a time, and it waits only for borrows in the chunk
+it is about to cross. Nothing is scanned. The opt-out is flush mode,
+`CacheConfig::wrap_retention = false` (C API: `disable_wrap_retention = 1`):
+the wrap flips the stripe's phase bit and every entry from the previous lap
+is instantly stale, so a stripe holds about half its size on average. On a
+churning KV workload retention lifts the hit ratio from 0.73 (flush) to 0.79
+([doc/api-reference.md](doc/api-reference.md#wrap-retention)). The mode is
+persisted per volume, so every process sharing a cache must use the same
+setting; a volume created by a build whose default was flush is reset cold
+on its first open by a default-configured process
+([upgrading](doc/api-reference.md#wrap-retention)). Pair either mode with the
+small-object tier when some entries must outlive payload churn.
 
 **Alternates** are variants stored under one key in a singly linked chain:
 `write_alternate_sync(key, AlternateId::Brotli, len)`, then
@@ -515,7 +520,7 @@ struct CacheConfig {
   std::chrono::milliseconds directory_sync_interval{30000};  // multi-process durability cadence
   std::chrono::milliseconds read_lease_duration{5000};       // 0 disables leases
   std::chrono::milliseconds lease_wrap_ceiling{60000};
-  bool         wrap_retention = false;            // keep the previous lap readable (persisted per volume)
+  bool         wrap_retention = true;             // keep the previous lap readable; false = flush (persisted per volume)
   MultiProcessConfig multi_process_config;        // enabled, process_index, total_processes
   OptimizationConfig optimization_config;         // background alternate generation
   // fluent setters: set_ram_cache_size(), set_small_tier_percent(),

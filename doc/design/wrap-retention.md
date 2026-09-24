@@ -1,12 +1,15 @@
 # Wrap retention: keep the previous pass readable until it is overwritten
 
-**Status:** implemented, default off (`CacheConfig::wrap_retention = false`;
-C API `disable_wrap_retention`). All 18 tests of section 11 are in
-`tests/integration/test_wrap_retention.cpp` and pass in both modes. The
-default was not flipped because D1's last gate, the PageSpeed
-`cache_burst_test`, could not be run against this tree (see section 14).
+**Status:** implemented, **default on** (`CacheConfig::wrap_retention = true`;
+flush is the opt-out, C API `disable_wrap_retention = 1`). Every D1 gate
+passed before the flip (section 14, step 6): all 18 tests of section 11 and
+the review tests in `tests/integration/test_wrap_retention.cpp`; the full
+suite and TSan in both modes on macOS and Linux; the PageSpeed
+`cache_burst_test` 200/200 with retention forced on, plus 40/40 under TSan.
 Review item R4 (an alternate write over a retained head dropped the key's
-other alternates) is resolved by the carry-forward in section 4.5.
+other alternates) is resolved by the carry-forward in section 4.5, and the
+read-miss regression that retention exposed (a lock-free read whose probe
+raced a same-key publish) by #20.
 Deviations from the design as written are listed in section 14. Sections 0-13
 are kept as the design record, except 4.5, which describes the carry-forward
 that replaced the original link refusal for retained heads.
@@ -1146,7 +1149,8 @@ that exists at that point.
      mode `N = 1`, so this equals today's semantics.
    - Delete `Stripe::write_serial` / `sync_serial`.
    - Tests 6, 7, 12, 14 and 15.
-4. **Frontier, advance and stamp,** behind the flag (default off).
+4. **Frontier, advance and stamp,** behind the flag (default off until
+   step 6).
    - Wrap and advance in `allocate_write_slot`, mandatory and early advances.
    - Stamp patch.
    - `VolumeHeader::retain_chunks` and the mode check.
@@ -1240,13 +1244,29 @@ that introduced it.
 
 **Step 6 (default, C API, hammer).**
 
-- *The default stays off.*  D1 flips the default only after every gate
-  passes.  All of them passed except one. The PageSpeed `cache_burst_test`
-  (a cross-process stress test in the mod_pagespeed tree) could not be run
-  against this tree. The consumer checkouts pin an older Cyclone commit, and
-  their `third_party/cyclone.BUILD` predates `src/core/crc32c.cpp`, so the
-  run would need edits in the consumer repository. Flipping the default is a
-  one-line change to `kDefaultWrapRetention` once that run is green.
+- *The default, first off, then on.*  D1 flips the default only after
+  every gate passes. At first all passed except one: the PageSpeed
+  `cache_burst_test` (a cross-process stress test in the mod_pagespeed tree)
+  could not be run, because the consumer checkouts pinned an older Cyclone
+  commit whose `third_party/cyclone.BUILD` predates `src/core/crc32c.cpp`.
+  So the step shipped with the default off. The gates were then re-run on
+  the tree with R4 resolved and #20 merged: the section 11 and review tests,
+  the full suite and TSan in both modes on macOS and Linux, and
+  `cache_burst_test` 200/200 with retention forced on (40/40 under TSan).
+  `kDefaultWrapRetention` is now `true`. The test-seam override
+  `CYCLONE_TEST_WRAP_RETENTION=0|1` still forces either default, and
+  "Retention default" in `test_wrap_retention.cpp` (with the C API case in
+  `test_c_api.cpp`) pins the default and the opt-out.
+- *Upgrade cost, against D1's rationale.*  D1 expected the flip to ride the
+  v8 cold start at no extra cost. It came after v8 and the default-off
+  retention reached main, so a volume created by main's default records
+  flush (`retain_chunks = 0`). The mode is not in the filename (4.13), so the
+  first default open by this build finds a mismatch on the same file: a cold
+  reset with no live peer, `ResetRefusedLivePeer` while one holds it. That
+  is one extra cold start for such users, and a hard ordering rule for
+  overlapping multi-process upgrades. Configuring `wrap_retention = false`
+  keeps the old cache. `doc/api-reference.md` ("Wrap Retention") states the
+  procedure.
 - *Test 18 classification.*  The hammer uses a 2 s lease (so no borrow is
   unprotected by lapse) and a 60 ms ceiling (so forced steps occur). A
   content mismatch counts as a tear only when `wraps_forced_past_lease`

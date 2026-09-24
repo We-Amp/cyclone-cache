@@ -18,8 +18,10 @@ namespace cyclone {
 
 class CachePlugin;
 
-// Default of CacheConfig::wrap_retention / VolumeConfig::wrap_retention.
-inline constexpr bool kDefaultWrapRetention = false;
+// Default of CacheConfig::wrap_retention / VolumeConfig::wrap_retention:
+// retention on (the previous pass stays readable until the forward fill needs
+// its bytes).  Flush mode is the opt-out.  See VolumeConfig::wrap_retention.
+inline constexpr bool kDefaultWrapRetention = true;
 
 namespace detail {
 // The default eviction mode.  Test builds only (CYCLONE_TEST_SEAMS, never
@@ -604,14 +606,16 @@ struct VolumeConfig {
   // it is about to reuse are dropped.  When false (flush mode), a wrap makes
   // the whole previous pass unreadable at once.  Retention holds about twice
   // as much readable data per stripe; see doc/design/wrap-retention.md.
+  // Default true (kDefaultWrapRetention); false is the opt-out.
   //
   // Applies when the volume is CREATED: the mode is persisted in the volume
   // header, and an open whose mode disagrees with the file goes through the
   // same live-peer reset gate as a format change (refused while a peer holds
   // the file, a cold reset otherwise, IncompatibleVersion with
   // auto_reset_on_incompatible off).  All processes sharing a cache must
-  // therefore use the same setting.  Normally set from
-  // CacheConfig::wrap_retention.
+  // therefore use the same setting.  A volume created by an earlier build
+  // whose default was flush records flush, so the first default open by this
+  // build resets it cold.  Normally set from CacheConfig::wrap_retention.
   bool wrap_retention = detail::default_wrap_retention();
 
   // Per-object content-size bound enforced at the write entry.

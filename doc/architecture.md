@@ -128,13 +128,14 @@ it was created with.
 A stripe's data area is a circular log: `write_pos` fills forward and wraps to
 the start when a document no longer fits. Eviction is what the wrap does to the
 previous pass, and there are two modes (`CacheConfig::wrap_retention`, default
-off; design record: [design/wrap-retention.md](design/wrap-retention.md)).
+on; design record: [design/wrap-retention.md](design/wrap-retention.md)).
 
-- **Flush (default).** The wrap bumps the pass. The phase bit that new entries
-  carry flips, and every entry of the previous pass stops resolving at once.
-  The wrap is gated on all borrows in the stripe (one chunk, `N = 1`). A stripe
-  holds on average about half its capacity.
-- **Retention.** The previous pass stays readable until its bytes are needed.
+- **Flush (`wrap_retention = false`, the opt-out).** The wrap bumps the pass.
+  The phase bit that new entries carry flips, and every entry of the previous
+  pass stops resolving at once. The wrap is gated on all borrows in the stripe
+  (one chunk, `N = 1`). A stripe holds on average about half its capacity.
+- **Retention (default).** The previous pass stays readable until its bytes
+  are needed.
   A clean **frontier** runs ahead of the write cursor. The wrap itself is
   ungated because it overwrites nothing. Before a document is written, the
   frontier must cover it, so the **mandatory advance** moves `F` to
@@ -179,7 +180,11 @@ matching entry (`Directory::choose_insert_slot`, `InsertAdmission`).
 
 The mode is persisted in `VolumeHeader::retain_chunks` (offset 40; 0 means
 flush). An open whose mode disagrees resets through the live-peer gate, like a
-format change. Every process sharing a volume must use the same mode. The
+format change. Every process sharing a volume must use the same mode. The mode
+is not in the fingerprinted filename, so a flush volume created by an earlier
+default-off build is reset cold by the first default open (refused while a
+peer holds it; see
+[api-reference.md](api-reference.md#wrap-retention)). The
 counters in `CacheStats` (`frontier_advances`, `advances_deferred_by_lease`,
 `early_advances_skipped`, `retained_hits`, `stamp_rejections`) observe it. On
 the KV-churn workload (2 MiB blocks, 4 GiB tier, Zipf, 4 threads, Linux) the
