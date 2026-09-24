@@ -115,6 +115,11 @@ CycloneError cyclone_cache_create(const CycloneCacheConfig *config,
   // Negative-logic at the C boundary so a zero-initialised config keeps the
   // unlink enabled (see disable_alternate_unlink in cyclone_c.h).
   cc.unlink_superseded_alternates = config->disable_alternate_unlink == 0;
+  // Negative-logic too: zero keeps the library default eviction mode (see
+  // disable_wrap_retention in cyclone_c.h).
+  if (config->disable_wrap_retention != 0) {
+    cc.wrap_retention = false;
+  }
   // Sentinel mapping: C 0 = library default (leave the C++ default
   // untouched), C UINT64_MAX = disabled (C++ 0), any other N = bound N.
   if (config->max_object_size == UINT64_MAX) {
@@ -350,6 +355,11 @@ CycloneError cyclone_cache_stats(CycloneCacheHandle *cache,
   out->alternate_wrap_refusals = s.alternate_wrap_refusals;
   out->ram_coherence_rejections = s.ram_coherence_rejections;
   out->ram_coherence_put_rejections = s.ram_coherence_put_rejections;
+  out->frontier_advances = s.frontier_advances;
+  out->advances_deferred_by_lease = s.advances_deferred_by_lease;
+  out->early_advances_skipped = s.early_advances_skipped;
+  out->retained_hits = s.retained_hits;
+  out->stamp_rejections = s.stamp_rejections;
   return CYCLONE_OK;
 }
 

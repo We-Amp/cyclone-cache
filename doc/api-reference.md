@@ -212,6 +212,14 @@ struct CacheStats {
 
     // Large-document readahead (process-local; C++ only, see below)
     uint64_t readahead_hints_issued;  // Readahead hints that reached the kernel
+
+    // Wrap retention (process-local; all 0 in flush mode; see
+    // "Wrap Retention" below)
+    uint64_t frontier_advances;           // Gated frontier moves published
+    uint64_t advances_deferred_by_lease;  // Mandatory advances deferred
+    uint64_t early_advances_skipped;      // Optional runway advances skipped
+    uint64_t retained_hits;               // Hits served from the previous pass
+    uint64_t stamp_rejections;            // Stale pass stamps rejected
 };
 ```
 
@@ -301,10 +309,22 @@ kernel calls made, not large reads served: a hot document contributes at most
 one hint per re-advise interval (2 s) however often it is read, and a document
 below `readahead_min_bytes` never contributes. Process-local.
 
+The wrap-retention counters observe the eviction mode (see ["Wrap
+Retention"](#wrap-retention) below). `retained_hits` is the direct measure of
+what retention buys. `advances_deferred_by_lease` is the retention
+counterpart of `wraps_deferred_by_lease`: a borrow in a chunk the frontier
+must cross defers that advance and drops the fill (also counted in
+`writes_dropped_by_lease`; a ceiling-forced advance counts in
+`wraps_forced_past_lease`). `early_advances_skipped` never drops a fill.
+`stamp_rejections` counts candidates whose pass stamp contradicted their
+class: stale survivors, or a lost timeline after a power loss. All five stay
+0 in flush mode and are process-local.
+
 `CycloneCacheStats` (C API) carries the core counters, the wrap and lease
 counters, `tag_collision_evictions`, `borrows_outstanding`, the reset-gate
-fields, `bucket_full_evictions`, the alternate counters and the RAM-coherence
-counters, in that append-only order. The stripe geometry, HitTracker flush,
+fields, `bucket_full_evictions`, the alternate counters, the RAM-coherence
+counters and the five wrap-retention counters, in that append-only order. The
+stripe geometry, HitTracker flush,
 `directory_syncs`, `fsyncs` and `readahead_hints_issued` fields are C++-only.
 
 ```cpp
@@ -580,6 +600,10 @@ struct CacheConfig {
     // See "Alternate-Chain Depth Bound" below.
     bool unlink_superseded_alternates = true;
 
+    // Eviction mode (default: false = flush).  Persisted per volume at
+    // creation.  See "Wrap Retention" below.
+    bool wrap_retention = false;
+
     // Validate RAM-cache hits against the shared directory's bucket version
     // (default: false = off).  See "Cross-Process RAM Coherence" below.
     bool cross_process_ram_coherence = false;
@@ -709,6 +733,61 @@ and only when the cache directory is owned exclusively by this cache) or by
 deleting it manually. On a cache directory sized for exactly one volume,
 delete the old file **before** starting the new binary — the new volume is
 extended to its full configured size during `start()`, ahead of any GC.
+
+### Wrap Retention
+
+Each stripe's data area is a circular log.  What happens to the previous pass
+when the write cursor wraps is the eviction policy, chosen by
+`CacheConfig::wrap_retention` (C API: `disable_wrap_retention`, below):
+
+- **Flush (`false`, the default).**  The wrap flips the stripe's phase bit and
+  every entry of the pass that just ended stops resolving at once, although
+  nearly all of those documents are still intact on disk.  A stripe therefore
+  holds, on average, about half of its capacity.
+- **Retention (`true`).**  The previous pass stays readable until its bytes
+  are about to be overwritten.  A clean frontier runs ahead of the write
+  cursor in fixed chunks (`N <= 64` of at least 1 MiB each, per stripe);
+  moving it is the only step that hands readable bytes to the forward fill,
+  and it waits for live borrows in exactly the chunks it is about to expose.
+  A borrow's bytes therefore stay intact until the frontier crosses its own
+  chunk.  Each document is stamped with its pass, so a stale entry from two
+  or more passes back can never resolve.
+
+In the policy replay of the KV-churn workload (`benchmarks/kv_churn_policy`)
+retention recovers 93-98 % of the gap between flush and a plain per-stripe
+FIFO; measured on Linux (2 MiB blocks, 4 GiB tier, Zipf, 4 threads) the hit
+ratio went from 0.726 to 0.788, matching the replay within 0.001.  See
+`doc/design/wrap-retention.md` for the mechanism and the correctness argument.
+
+Rules:
+
+- The mode is **persisted in the volume header when the volume is created**.
+  An open whose configured mode disagrees with the file goes through the same
+  live-peer gate as a format change: refused with `ResetRefusedLivePeer`
+  while another process holds the volume, `IncompatibleVersion` when
+  `VolumeConfig::auto_reset_on_incompatible` is off, and a cold reset
+  otherwise.  **Every process sharing a cache must use the same setting.**
+- Retention roughly doubles the number of directory entries that resolve.
+  That is ample for KV blocks and for small objects in 32 MB stripes; on
+  large-stripe, small-object volumes the 65 536-entry directory already
+  bounds what can be indexed.
+- Borrow protection is unchanged in kind: `renew_lease_strict()` returns
+  `kTorn` once a step has exposed the borrow's own chunk, and `kCopyNow`
+  while a step is in flight. It also returns `kTorn` (and `renew_lease()`
+  returns false) after a ceiling-forced step anywhere on the stripe, even if
+  the borrow's bytes are intact: the force reset every borrow count, so
+  nothing protects the borrow any more. The steps that expose a chunk are a
+  frontier advance across it, a ceiling-forced step, and the wrap. The wrap
+  exposes only the tail of the retained pass that the frontier never
+  reached. For that tail the verdict is conservative: the bytes are still
+  intact.
+- Alternates never link across a pass: a write over a retained head starts
+  a fresh chain (counted in `alternate_wrap_refusals`), and removing one
+  alternate from a retained chain removes the whole entry. **Known gap:**
+  the retained alternates of that key stop resolving at that moment. A
+  PageSpeed-style key whose optimized alternates arrive after a wrap loses
+  its retained Original, Gzip and so on. `retained_hits` counts the hits
+  that retention did serve.
 
 ### Cross-Process RAM Coherence
 
@@ -1091,6 +1170,14 @@ means the **library default** (64 MB, not "unbounded"), and
 `enable_checksum = 0` means checksums are **disabled** (the C++ default is
 on). See ["Zero Values"](#zero-values) above for
 the full mapping, and the field comments in `cyclone_c.h`.
+
+**Eviction mode.**  `disable_wrap_retention` is stated in the negative, like
+`disable_alternate_unlink`: `0` keeps the library default
+(`CacheConfig::wrap_retention`), non-zero selects flush mode.  It is a
+trailing field with the same ABI note as `small_tier_percent`: a caller
+compiled against an older header passes a smaller struct, so recompile
+against the new header when adopting it.  Every process sharing a cache must
+pass the same value (see ["Wrap Retention"](#wrap-retention)).
 
 ### Error Codes
 

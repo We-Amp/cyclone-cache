@@ -70,7 +70,7 @@ if(NOT CYCLONE_USE_BUNDLED_SHA256)
 endif()
 find_package(Threads REQUIRED)
 
-add_library(cyclone-cache
+set(CYCLONE_LIBRARY_SOURCES
   src/core/cache.cpp
   src/core/key.cpp
   src/core/volume.cpp
@@ -91,43 +91,54 @@ add_library(cyclone-cache
   src/optimization/optimization_engine.cpp
   src/c_api/cyclone_c.cpp
 )
-
-target_include_directories(cyclone-cache
-  PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>
-  PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-)
-
-target_link_libraries(cyclone-cache
-  PUBLIC
-    Threads::Threads
-)
-
-if(CYCLONE_USE_BUNDLED_SHA256)
-  target_compile_definitions(cyclone-cache PRIVATE CYCLONE_USE_BUNDLED_SHA256)
-  message(STATUS "Using bundled SHA-256 implementation (no OpenSSL dependency)")
-else()
-  target_link_libraries(cyclone-cache PRIVATE OpenSSL::Crypto)
-endif()
-
-target_compile_features(cyclone-cache PUBLIC cxx_std_23)
-
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  target_compile_definitions(cyclone-cache PRIVATE CYCLONE_PLATFORM_LINUX)
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-  target_compile_definitions(cyclone-cache PRIVATE CYCLONE_PLATFORM_MACOS)
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
-  target_compile_definitions(cyclone-cache PRIVATE CYCLONE_PLATFORM_WINDOWS)
-endif()
-
 if(CYCLONE_BUILD_HTTP_PLUGIN)
-  target_sources(cyclone-cache PRIVATE
+  list(APPEND CYCLONE_LIBRARY_SOURCES
     src/plugin/http/http_metadata.cpp
     src/plugin/http/http_alternate.cpp
   )
-  target_compile_definitions(cyclone-cache PUBLIC CYCLONE_HTTP_PLUGIN)
+endif()
+
+# One definition of how a Cyclone library target is built, shared by the
+# release library and the test-seam variant below.
+function(cyclone_configure_library target)
+  target_include_directories(${target}
+    PUBLIC
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+      $<INSTALL_INTERFACE:include>
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+
+  target_link_libraries(${target}
+    PUBLIC
+      Threads::Threads
+  )
+
+  if(CYCLONE_USE_BUNDLED_SHA256)
+    target_compile_definitions(${target} PRIVATE CYCLONE_USE_BUNDLED_SHA256)
+  else()
+    target_link_libraries(${target} PRIVATE OpenSSL::Crypto)
+  endif()
+
+  target_compile_features(${target} PUBLIC cxx_std_23)
+
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_compile_definitions(${target} PRIVATE CYCLONE_PLATFORM_LINUX)
+  elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    target_compile_definitions(${target} PRIVATE CYCLONE_PLATFORM_MACOS)
+  elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+    target_compile_definitions(${target} PRIVATE CYCLONE_PLATFORM_WINDOWS)
+  endif()
+
+  if(CYCLONE_BUILD_HTTP_PLUGIN)
+    target_compile_definitions(${target} PUBLIC CYCLONE_HTTP_PLUGIN)
+  endif()
+endfunction()
+
+add_library(cyclone-cache ${CYCLONE_LIBRARY_SOURCES})
+cyclone_configure_library(cyclone-cache)
+if(CYCLONE_USE_BUNDLED_SHA256)
+  message(STATUS "Using bundled SHA-256 implementation (no OpenSSL dependency)")
 endif()
 
 if(CYCLONE_BUILD_TESTS)
@@ -199,6 +210,7 @@ if(CYCLONE_BUILD_TESTS)
     tests/integration/test_write_handle_volume_lifetime.cpp
     tests/integration/test_reset_gate_spawn.cpp
     tests/integration/test_readahead.cpp
+    tests/integration/test_wrap_retention.cpp
   )
   # Compile guard: cyclone_c.h is the C ABI header, so it must stay valid C11
   # (it once used C++ alias declarations and did not compile as C).  Built as
@@ -213,7 +225,18 @@ if(CYCLONE_BUILD_TESTS)
   target_include_directories(cyclone-c-header-check
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-  target_link_libraries(cyclone-tests PRIVATE cyclone-cache Catch2::Catch2WithMain
+  # The test binary links a TEST-SEAM build of the library: the same
+  # sources compiled with CYCLONE_TEST_SEAMS, which compiles in the reader
+  # seams (pause points on the lock-free read path) and lets the
+  # CYCLONE_TEST_WRAP_RETENTION environment variable choose the default
+  # eviction mode, so the whole suite runs in both modes.  The release
+  # library (cyclone-cache) never defines it: its read path carries no seam.
+  add_library(cyclone-cache-testseams STATIC ${CYCLONE_LIBRARY_SOURCES})
+  cyclone_configure_library(cyclone-cache-testseams)
+  target_compile_definitions(cyclone-cache-testseams PUBLIC CYCLONE_TEST_SEAMS)
+
+  target_link_libraries(cyclone-tests PRIVATE cyclone-cache-testseams
+                                              Catch2::Catch2WithMain
                                               cyclone-c-header-check)
   target_include_directories(cyclone-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
                                                    ${CMAKE_CURRENT_SOURCE_DIR}/tests)
@@ -225,7 +248,11 @@ if(CYCLONE_BUILD_TESTS)
   # lane keys AppVerifier IFEO settings on the image name.  Links the library
   # only -- no Catch2.
   add_executable(cyclone-test-peer tests/support/peer_main.cpp)
-  target_link_libraries(cyclone-test-peer PRIVATE cyclone-cache)
+  # Same seam build as the tests, so a peer honours the same mode override.
+  target_link_libraries(cyclone-test-peer PRIVATE cyclone-cache-testseams)
+  # The seam mode drives Volume's writer seams (src/core/volume.hpp).
+  target_include_directories(cyclone-test-peer PRIVATE
+                             ${CMAKE_CURRENT_SOURCE_DIR}/src)
   add_dependencies(cyclone-tests cyclone-test-peer)
   target_compile_definitions(cyclone-tests PRIVATE
     CYCLONE_TEST_PEER_EXE="$<TARGET_FILE:cyclone-test-peer>")

@@ -20,6 +20,11 @@
 #ifndef _WIN32
 #include <sys/types.h>  // dev_t, ino_t (Volume::backing_identity)
 #endif
+#if defined(_MSC_VER) && !defined(__clang__) && \
+    (defined(_M_X64) || defined(_M_ARM64))
+#include <intrin.h>  // __umulh (FastDivU64)
+#define CYCLONE_FASTDIV_UMULH 1
+#endif
 
 #include "cyclone/alternate.hpp"
 #include "cyclone/config.hpp"
@@ -28,6 +33,7 @@
 #include "cyclone/key.hpp"
 #include "cyclone/task.hpp"
 #include "directory.hpp"
+#include "document.hpp"
 #include "hit_tracker.hpp"
 #include "mmap_directory.hpp"
 #include "thread_shard.hpp"
@@ -131,7 +137,14 @@ struct VolumeHeader {
   uint64_t stripe_count = 0;   // Persisted derived stripe count (v5+); 0 =
                                // unrecorded (pre-v5).  Authoritative: an
                                // open whose derived count disagrees resets.
-  uint8_t reserved[24] = {};   // Future use, zero-filled
+  // Eviction mode, written at creation and AUTHORITATIVE: 0 = flush (wrap
+  // retention off, and every file written before the field existed);
+  // otherwise wrap retention with this volume's base chunk count N.  An open
+  // whose configured mode disagrees resets through the live-peer gate, so a
+  // retaining and a flushing process never run on one ring (the mode is NOT
+  // in the filename: explicit paths and the unsized resolver bypass it).
+  uint16_t retain_chunks = 0;
+  uint8_t reserved[22] = {};  // Future use, zero-filled
 
   [[nodiscard]] bool is_valid() const { return magic == kMagic; }
   [[nodiscard]] bool is_compatible() const {
@@ -146,6 +159,8 @@ struct VolumeHeader {
 
 static_assert(sizeof(VolumeHeader) == VolumeHeader::kSize,
               "VolumeHeader size must match kSize exactly");
+static_assert(offsetof(VolumeHeader, retain_chunks) == 40,
+              "retain_chunks is on-disk format (first reserved bytes)");
 static_assert(
     std::is_trivially_copyable_v<VolumeHeader>,
     "VolumeHeader must be trivially copyable for memcpy serialization");
@@ -212,6 +227,141 @@ std::string fingerprint_base_stem(const std::string &stem);
 bool inodes_match(int fd, const std::string &path);
 #endif
 
+// Frontier chunk geometry of one stripe (doc/design/wrap-retention.md D2):
+// Q = max(1 MiB, round_up(ceil(A / 64), 8)), N = clamp(ceil(A / Q), 1, 64),
+// for a data area of A bytes.  A PURE function of A -- never of
+// max_object_size or any other per-process setting -- so every process
+// mapping the stripe derives the same N and Q.  N = 1 (A <= 1 MiB) behaves
+// like flush mode.
+struct FrontierGeometry {
+  uint32_t chunks = 1;      // N
+  uint64_t chunk_size = 0;  // Q
+};
+inline constexpr uint64_t kMinFrontierChunk = uint64_t{1} << 20;  // 1 MiB
+[[nodiscard]] constexpr FrontierGeometry retention_geometry(
+    uint64_t data_area) {
+  if (data_area == 0) {
+    return {1, 0};
+  }
+  constexpr uint64_t kMaxChunks = 64;
+  uint64_t q = (data_area + kMaxChunks - 1) / kMaxChunks;  // ceil(A / 64)
+  q = (q + 7) & ~uint64_t{7};                              // round_up(., 8)
+  if (q < kMinFrontierChunk) {
+    q = kMinFrontierChunk;
+  }
+  uint64_t n = (data_area + q - 1) / q;  // ceil(A / Q)
+  if (n < 1) {
+    n = 1;
+  }
+  if (n > kMaxChunks) {
+    n = kMaxChunks;
+  }
+  return {static_cast<uint32_t>(n), q};
+}
+static_assert(retention_geometry(uint64_t{32} << 20).chunks == 32 &&
+                  retention_geometry(uint64_t{32} << 20).chunk_size ==
+                      kMinFrontierChunk,
+              "a 32 MiB stripe: Q = 1 MiB, N = 32 (design section 4.1)");
+static_assert(retention_geometry(uint64_t{1} << 30).chunks == 64 &&
+                  retention_geometry(uint64_t{1} << 30).chunk_size ==
+                      uint64_t{16} << 20,
+              "a 1 GiB stripe: Q = 16 MiB, N = 64");
+static_assert(retention_geometry(uint64_t{1} << 20).chunks == 1,
+              "a stripe of 1 MiB or less gets N = 1 (flush behaviour)");
+
+// Exact unsigned 64-bit division by a divisor fixed at open, without a
+// hardware divide.  The read hot path divides by N + 1 (the snapshot's
+// pass/frontier split) and by Q (a document's chunk) on every probe; a
+// 64-bit DIV costs 35-90 cycles on common x86 cores, which measured as an
+// ~11 % single-thread read regression.  Reciprocal m = floor((2^64 - 1) / d)
+// makes mulhi(n, m) either floor(n / d) or one less, for every n (the
+// deficit n * (2^64 / d - m) / 2^64 is below 1); one compare corrects it.
+// The high half of the 64 x 64 product comes from __umulh (MSVC x64/ARM64),
+// unsigned __int128 (GCC/Clang on 64-bit targets), or -- on any other
+// target, 32-bit ones included -- four 32 x 32 partial products
+// (mulhi_portable, exact, pinned by the same test).
+class FastDivU64 {
+ public:
+  constexpr FastDivU64() = default;
+  constexpr explicit FastDivU64(uint64_t divisor)
+      : _d(divisor == 0 ? 1 : divisor), _m(_d <= 1 ? 0 : ~uint64_t{0} / _d) {}
+
+  [[nodiscard]] constexpr uint64_t divisor() const noexcept { return _d; }
+
+  // High 64 bits of a * b from 32-bit partial products; the fallback where
+  // neither __umulh nor unsigned __int128 exists.
+  [[nodiscard]] static constexpr uint64_t mulhi_portable(uint64_t a,
+                                                         uint64_t b) noexcept {
+    constexpr uint64_t kLo = 0xFFFFFFFFULL;
+    const uint64_t a_lo = a & kLo;
+    const uint64_t a_hi = a >> 32U;
+    const uint64_t b_lo = b & kLo;
+    const uint64_t b_hi = b >> 32U;
+    const uint64_t lo_lo = a_lo * b_lo;
+    const uint64_t hi_lo = a_hi * b_lo;
+    const uint64_t lo_hi = a_lo * b_hi;
+    const uint64_t hi_hi = a_hi * b_hi;
+    const uint64_t cross = (lo_lo >> 32U) + (hi_lo & kLo) + lo_hi;
+    return hi_hi + (hi_lo >> 32U) + (cross >> 32U);
+  }
+
+  [[nodiscard]] uint64_t quot(uint64_t n) const noexcept {
+    if (_d == 1) {
+      return n;
+    }
+    uint64_t q = mulhi(n, _m);
+    if (n - (q * _d) >= _d) {
+      ++q;
+    }
+    return q;
+  }
+
+ private:
+  [[nodiscard]] static uint64_t mulhi(uint64_t a, uint64_t b) noexcept {
+#if defined(CYCLONE_FASTDIV_UMULH)
+    return __umulh(a, b);
+#elif defined(__SIZEOF_INT128__)
+    __extension__ using U128 = unsigned __int128;
+    return static_cast<uint64_t>((static_cast<U128>(a) * b) >> 64U);
+#else
+    return mulhi_portable(a, b);
+#endif
+  }
+
+  uint64_t _d = 1;
+  uint64_t _m = 0;
+};
+
+// A reader's (or writer's) snapshot of one stripe -- Sigma in
+// doc/design/wrap-retention.md.  Loaded by Volume::snapshot(): the epoch
+// FIRST (seq_cst), then the write cursor (acquire).  Every admission
+// decision for one probe or walk is made against the same snapshot.
+//
+// The epoch is ONE word, the exposure generation G = P * (N + 1) + f (see
+// Stripe::chunks), so the pass P, the frontier index f and the phase can
+// never be observed torn against each other.  The phase is DERIVED
+// (phase = P & 1); a reader never loads the directory's own phase.
+struct StripeSnapshot {
+  uint64_t gen = 0;           // G: exposure generation
+  uint64_t pass = 0;          // P = G / (N + 1)
+  uint64_t frontier = 0;      // f = G mod (N + 1), clamped to N
+  bool phase = false;         // P & 1: phase carried by this pass's entries
+  uint64_t cursor_rel = 0;    // W: write cursor, relative to the stripe
+  uint64_t frontier_rel = 0;  // F = min(S + f * Q, E), relative
+};
+
+// What a borrow must re-verify after it registered itself.  A borrow of a
+// document from pass p whose first byte lies in chunk c is EXPOSED -- its
+// bytes may be handed to the forward fill -- once G exceeds
+// threshold = (p + 1) * (N + 1) + c.  The borrow, every renew and the
+// strict renew check exactly that, so a wrap or an advance elsewhere in the
+// stripe tears nothing (doc/design/wrap-retention.md section 4.4).  Opaque
+// to the read handle: it only carries it back to the renew paths.
+struct BorrowEpoch {
+  uint64_t threshold = 0;
+  friend bool operator==(const BorrowEpoch &, const BorrowEpoch &) = default;
+};
+
 struct Stripe {
   uint64_t offset = 0;
   uint64_t size = 0;
@@ -225,8 +375,27 @@ struct Stripe {
   // Offset to the data area (after directory)
   uint64_t data_offset = 0;
   std::atomic<uint64_t> write_pos{0};
-  uint32_t sync_serial = 0;
-  uint32_t write_serial = 0;
+
+  // Frontier geometry (doc/design/wrap-retention.md section 4.1): the data
+  // area A = size - data_start_rel() is cut into `chunks` (N) chunks of
+  // `chunk_size` (Q) bytes; the last one may be short.  A pure function of
+  // the stripe's own A (see Volume::init_stripes), so every process derives
+  // the same values.  In flush mode N = 1 and Q = A: one chunk, one borrow
+  // slot, and a wrap exposes everything at once.
+  uint32_t chunks = 1;
+  uint64_t chunk_size = 0;
+  // Divide-free N + 1 and Q for the read hot path (set with them in
+  // Volume::configure_frontier).
+  FastDivU64 gen_div{2};
+  FastDivU64 chunk_div{1};
+  // Wrap retention on for this stripe's volume (VolumeConfig::wrap_retention
+  // as persisted in VolumeHeader::retain_chunks).  Fixed at open.
+  bool retain = false;
+
+  // Exposure generation G for non-mmap stripes (the mmap counterpart lives
+  // in the directory's retention region).  seq_cst; stored only under the
+  // stripe mutex, inside the wrap-intent window.
+  std::atomic<uint64_t> local_exposure_gen{0};
 
   // Multi-process: true if this process owns this stripe (can write)
   // When multi-process is disabled, all stripes are owned (true by default)
@@ -255,12 +424,26 @@ struct Stripe {
   // as the single slot did (proof at Volume::allocate_write_slot).
   // Generations are per-shard; a BorrowToken records its shard so the
   // release and the generation check land on the slot that was acquired.
-  // Unused when use_mmap_directory (the shared cross-process slot is
-  // format-frozen and stays single; multi-process readers keep the
-  // original single-slot cost there).
+  //
+  // Per CHUNK within each shard (wrap retention, doc/design section 4.2):
+  // slot c counts this thread's borrows of documents starting in frontier
+  // chunk c, so a gate that exposes chunks [f, t) sums only those slots
+  // across the 64 shards -- the same 64 lines the stripe-wide gate summed.
+  // 64 x u32 {generation:8, count:24} = 256 bytes = two kShardPad lines
+  // per shard (16 KiB per stripe); a reader still CASes only its own
+  // thread's lines.  The count is 24 bits, like the cross-process slots,
+  // because a saturated slot is NOT safe for every holder: a borrow that
+  // acquires at saturation rides along uncounted, and once the counted
+  // holders close the slot reads 0 while it still aliases the bytes.  One
+  // thread can plausibly hold 255 handles on one chunk (an event loop with
+  // many in-flight zero-copy sends of one hot object); 2^24 - 1 cannot be
+  // reached.  Unused when use_mmap_directory (the per-chunk cross-process
+  // slots live in the directory's retention region there).
   struct alignas(kShardPad) BorrowShard {
-    std::atomic<uint16_t> slot{0};
+    std::array<std::atomic<uint32_t>, MmapDirectory::kMaxChunks> slots{};
   };
+  static_assert(sizeof(BorrowShard) == 2 * kShardPad,
+                "one shard = two padded lines of per-chunk u32 slots");
   static constexpr size_t kBorrowShards = 64;
   // BorrowToken routes releases through a uint8_t shard index, and
   // thread_shard_index requires a power of two — both would corrupt
@@ -270,10 +453,6 @@ struct Stripe {
                     (kBorrowShards & (kBorrowShards - 1)) == 0,
                 "kBorrowShards must be a power of two that fits uint8_t");
   std::array<BorrowShard, kBorrowShards> local_borrow_shards{};
-  // Wrap epoch counterpart of MmapDirectory::shared_wrap_count for
-  // non-mmap stripes (per-stripe, unlike Volume::_wrap_count which
-  // aggregates for stats).
-  std::atomic<uint64_t> local_wrap_count{0};
   // Remove generation: bumped (under the exclusive stripe mutex) by
   // remove_sync / remove_alternate_sync AFTER their directory mutation
   // completes, and by the commit paths after they publish a head that
@@ -327,52 +506,164 @@ struct Stripe {
     return write_pos.load(std::memory_order_acquire);
   }
 
-  // Phase-ABA POSITIONAL GUARD predicate — the shared check behind
-  // BOTH guard legs: the directory-PROBE leg (probe_each below) and the
-  // chain-HOP leg (is_valid_chain_offset in volume.cpp).  A LIVE node always
-  // sits STRICTLY BEHIND the write cursor: both commit paths advance the
-  // cursor past the whole document only AFTER its fill is durable
-  // (commit_write_slot, F6 — never at reservation, so the cursor never
-  // covers reserved-but-unwritten bytes), and strictly before the entry (or
-  // any chain pointer to it) is published.  A node AT or AHEAD of the cursor is
-  // therefore a stale survivor whose bytes the ordinary forward fill will
-  // overwrite IN PLACE — no wrap event, so none of the lease/epoch machinery
-  // fires; reading through it hands out a tearable borrow.  The `<` (i.e.
-  // rejecting `>=`) is load-bearing: at the exact tear boundary the cursor
-  // sits AT the survivor's offset (the overwriter is the very next
-  // reservation) with the bytes still intact — admitting it there is
-  // precisely the tear.  A torn/stale-low cursor read only LOWERS the cursor,
-  // which only WIDENS rejection (at worst a benign miss), never admits a
-  // survivor.  One O(1) lock-free load; no locks on the read path.
-  [[nodiscard]] bool is_behind_write_cursor(uint64_t relative_offset) const {
-    return offset + relative_offset < current_write_cursor();
+  // Start of the data area, relative to the stripe (S in the design).
+  [[nodiscard]] uint64_t data_start_rel() const noexcept {
+    return data_offset - offset;
   }
 
-  // Helper to probe directory regardless of type.
+  // Header-bounds leg shared by every admission: a node must start inside
+  // the data area [S, E) with room for at least a document header.
+  [[nodiscard]] bool in_data_area(uint64_t relative_offset) const noexcept {
+    return relative_offset >= data_start_rel() && relative_offset < size &&
+           relative_offset + Document::kHeaderSize <= size;
+  }
+
+  // Frontier chunk of a document starting at `relative_offset`:
+  // c(o) = (o - S) / Q, clamped to [0, N - 1].
+  [[nodiscard]] uint32_t chunk_of(uint64_t relative_offset) const noexcept {
+    const uint64_t start = data_start_rel();
+    if (chunks <= 1 || relative_offset <= start || chunk_size == 0) {
+      return 0;
+    }
+    const uint64_t c = chunk_div.quot(relative_offset - start);
+    return c >= chunks ? chunks - 1 : static_cast<uint32_t>(c);
+  }
+
+  // F for frontier index f: min(S + f * Q, E), relative to the stripe.
+  [[nodiscard]] uint64_t frontier_rel_of(uint64_t f) const noexcept {
+    const uint64_t start = data_start_rel();
+    if (f >= chunks) {
+      return size;
+    }
+    const uint64_t rel = start + f * chunk_size;
+    return rel < size ? rel : size;
+  }
+
+  // The exposure generation G, seq_cst: the shared word in the directory's
+  // retention region for mmap stripes, the process-local one otherwise.
+  [[nodiscard]] uint64_t exposure_gen() const {
+    if (use_mmap_directory && mmap_directory) {
+      return mmap_directory->exposure_gen();
+    }
+    return local_exposure_gen.load(std::memory_order_seq_cst);
+  }
+
+  // The pass P encoded in a generation word.
+  [[nodiscard]] uint64_t pass_of(uint64_t gen) const noexcept {
+    return gen_div.quot(gen);
+  }
+
+  // Exposure threshold of a document from pass `pass` starting at
+  // `relative_offset`: exposed once G > (p + 1) * (N + 1) + c(o).
+  [[nodiscard]] uint64_t exposure_threshold(
+      uint64_t pass, uint64_t relative_offset) const noexcept {
+    return (pass + 1) * (static_cast<uint64_t>(chunks) + 1) +
+           chunk_of(relative_offset);
+  }
+
+  // ADMISSION, position leg (doc/design/wrap-retention.md section 4.4): the
+  // single predicate that decides whether a directory entry may be mapped,
+  // against a snapshot of the stripe taken BEFORE the probe.  Every site
+  // that resolves a directory entry goes through here (via probe_each
+  // below): reads, chain-head lookups, the write elections, remove and the
+  // hit-count probe.
   //
-  // Phase-ABA positional guard, PROBE leg.  probe_each only ever yields
-  // CURRENT-PHASE entries (Directory/MmapDirectory skip stale-phase slots),
-  // and a legitimate current-phase entry was written this pass, so it is
-  // strictly behind the cursor (see is_behind_write_cursor above).  A
-  // current-phase entry at/ahead of the cursor is, by construction, a
-  // survivor of two GC-phase toggles (a phase ABA); reject it BEFORE the
-  // callback maps or borrows.  This leg covers every directory probe
-  // (primary reads, chain-head lookups, the write-election, remove and
-  // hit-count probes).  Chain HOPS consume offsets from document headers
-  // instead of the directory — a same-key pre-wrap tail reachable with ONE
-  // wrap — and are guarded by the same predicate in is_valid_chain_offset.
+  // Phase-ABA positional guard, PROBE leg: a legitimate current-phase entry
+  // was written this pass, so it sits strictly BEHIND the write cursor --
+  // both commit paths publish the cursor past a document only after its
+  // fill is durable (commit_write_slot, F6) and strictly before the entry
+  // (or any chain pointer to it) is published.  A current-phase entry
+  // at/ahead of the cursor is therefore a survivor of two phase toggles
+  // whose bytes the ordinary forward fill will overwrite IN PLACE, with no
+  // wrap event for the lease/epoch machinery to see.  The `<` (rejecting
+  // `>=`) is load-bearing: at the exact tear boundary the cursor sits AT
+  // the survivor's offset with the bytes still intact.  A torn/stale-low
+  // cursor only WIDENS rejection (a benign miss), never admits a survivor.
+  [[nodiscard]] AdmitClass admit_position(uint64_t relative_offset,
+                                          bool entry_phase,
+                                          const StripeSnapshot &snap) const {
+    if (!in_data_area(relative_offset)) {
+      return AdmitClass::kReject;
+    }
+    if (entry_phase == snap.phase) {
+      return relative_offset < snap.cursor_rel ? AdmitClass::kCurrent
+                                               : AdmitClass::kReject;
+    }
+    // Wrap retention: the previous pass stays readable in [F, E) -- the
+    // bytes the clean frontier has not yet handed to the forward fill.
+    // Everything below F_snap is runway or the current pass; every move of
+    // F is gated per chunk, so a borrow admitted here is protected until the
+    // advance that crosses its own chunk (design section 5.3).  There is no
+    // previous pass before the first wrap.
+    if (retain && snap.pass > 0 && relative_offset >= snap.frontier_rel) {
+      return AdmitClass::kRetained;
+    }
+    return AdmitClass::kReject;
+  }
+
+  // The pass a document admitted as `cls` under `snap` must carry: P for
+  // the current class, P - 1 for the retained class.
+  [[nodiscard]] static uint64_t expected_pass(AdmitClass cls,
+                                              const StripeSnapshot &snap) {
+    return cls == AdmitClass::kRetained ? snap.pass - 1 : snap.pass;
+  }
+
+  // ADMISSION, chain-hop leg: may a walk follow a next_alternate_offset to
+  // `target_rel`?  Hops consume offsets from DOCUMENT HEADERS, bypassing
+  // the directory probe entirely -- and a SAME-KEY dark node passes both the
+  // bounds check and the walks' cross-key guard.  Reachable with ONE wrap: a
+  // head committed across a wrap keeps next pointing at the pre-wrap old
+  // head, an intact node AHEAD of the cursor that the forward fill will
+  // overwrite with no wrap event.  Same boundary and cursor source as the
+  // probe leg.  0 (end of chain) is never admitted.
+  //
+  // Wrap retention (design section 4.5): a live link always points DOWNWARD
+  // into the same pass -- documents of one pass lie in write order and
+  // links never cross a pass (D5) -- so the target must lie strictly below
+  // its source, in the source's own class region:
+  //   current  source s: S <= t < s  -> current  (stamp P)
+  //   retained source s: F <= t < s  -> retained (stamp P - 1)
+  // Every upward hop is rejected.  The retained -> retained hop is what
+  // keeps a retained chain (Brotli -> Gzip -> Original) walkable past its
+  // head.  The returned class selects the stamp the target must carry.
+  [[nodiscard]] AdmitClass admit_hop(uint64_t target_rel, uint64_t source_rel,
+                                     AdmitClass source_cls,
+                                     const StripeSnapshot &snap) const {
+    if (target_rel == 0 || !in_data_area(target_rel) ||
+        target_rel >= source_rel) {
+      return AdmitClass::kReject;
+    }
+    if (source_cls == AdmitClass::kCurrent) {
+      return target_rel < snap.cursor_rel ? AdmitClass::kCurrent
+                                          : AdmitClass::kReject;
+    }
+    if (source_cls == AdmitClass::kRetained && retain &&
+        target_rel >= snap.frontier_rel) {
+      return AdmitClass::kRetained;
+    }
+    return AdmitClass::kReject;
+  }
+
+  // Probe the directory for `key`, handing the callback ONLY entries that
+  // pass the position leg against `snap`, together with their class.  The
+  // directory yields tag matches of both phases; the phase test lives in
+  // admit_position so that it is made against the snapshot, never against a
+  // separate load of the directory's own phase.
   template <typename Callback>
-  void probe_each(const CacheKey &key, Callback &&callback) const {
-    auto guarded = [this, &callback](const DirEntry &entry) -> bool {
-      if (!is_behind_write_cursor(entry.offset())) {
-        return true;  // Phase-ABA survivor: skip, keep scanning the bucket.
+  void probe_each(const CacheKey &key, const StripeSnapshot &snap,
+                  Callback &&callback) const {
+    auto admitted = [this, &snap, &callback](const DirEntry &entry) -> bool {
+      const AdmitClass cls =
+          admit_position(entry.offset(), entry.phase(), snap);
+      if (cls == AdmitClass::kReject) {
+        return true;  // Inadmissible: skip, keep scanning the bucket.
       }
-      return callback(entry);
+      return callback(entry, cls);
     };
     if (use_mmap_directory && mmap_directory) {
-      mmap_directory->probe_each(key, guarded);
+      mmap_directory->probe_each_all_phases(key, admitted);
     } else if (directory) {
-      directory->probe_each(key, guarded);
+      directory->probe_each_all_phases(key, admitted);
     }
   }
 
@@ -387,13 +678,17 @@ struct Stripe {
   bool insert(const CacheKey &key, uint64_t offset, uint64_t size,
               uint64_t verified_offset = Directory::kMatchAnyTag,
               bool *collision_evicted = nullptr,
-              bool *bucket_full_evicted = nullptr) {
+              bool *bucket_full_evicted = nullptr,
+              InsertAdmission *admission = nullptr,
+              std::span<const uint64_t> clear_offsets = {}) {
     if (use_mmap_directory && mmap_directory) {
       return mmap_directory->insert(key, offset, size, verified_offset,
-                                    collision_evicted, bucket_full_evicted);
+                                    collision_evicted, bucket_full_evicted,
+                                    admission, clear_offsets);
     } else if (directory) {
       return directory->insert(key, offset, size, verified_offset,
-                               collision_evicted, bucket_full_evicted);
+                               collision_evicted, bucket_full_evicted,
+                               admission, clear_offsets);
     }
     return false;
   }
@@ -504,6 +799,29 @@ struct VolumeStats {
   uint64_t wraps_deferred_by_lease = 0;  // Wraps deferred by a live lease
   uint64_t writes_dropped_by_lease = 0;  // Fills dropped by a deferred wrap
   uint64_t wraps_forced_past_lease = 0;  // Wraps forced past the ceiling
+                                         // (and, with wrap retention,
+                                         // mandatory advances forced past
+                                         // it)
+
+  // Wrap retention (doc/design/wrap-retention.md), all PROCESS-LOCAL.  All
+  // stay 0 in flush mode.
+  //   frontier_advances: gated frontier moves that published (mandatory and
+  //     early).
+  //   advances_deferred_by_lease: MANDATORY advances deferred by a live
+  //     borrow in the chunks they would expose; each dropped its fill (also
+  //     counted in writes_dropped_by_lease).  The retention counterpart of
+  //     wraps_deferred_by_lease, which counts only flush-mode wraps.
+  //   early_advances_skipped: optional runway advances skipped because a
+  //     chunk they would expose was borrowed (no fill is ever dropped).
+  //   retained_hits: disk reads served from the retained previous pass --
+  //     the direct measure of what retention buys.
+  //   stamp_rejections: candidates whose pass stamp contradicted their
+  //     class (stale survivors, or a lost timeline after power loss).
+  uint64_t frontier_advances = 0;
+  uint64_t advances_deferred_by_lease = 0;
+  uint64_t early_advances_skipped = 0;
+  uint64_t retained_hits = 0;
+  uint64_t stamp_rejections = 0;
 
   // Cross-process write-lock recovery telemetry (PROCESS-LOCAL).  In
   // multi-process mode the write lock (write-pos allocation) can be
@@ -691,6 +1009,9 @@ struct BorrowToken {
   // Which of the stripe's local borrow shards holds this borrow's count
   // (see Stripe::local_borrow_shards).  Unused for mmap stripes.
   uint8_t shard = 0;
+  // Which frontier chunk's slot holds the count: the chunk of the document
+  // actually served (for an alternate read, the selected node, not the head).
+  uint8_t chunk = 0;
 };
 
 class Volume : public std::enable_shared_from_this<Volume> {
@@ -735,7 +1056,15 @@ class Volume : public std::enable_shared_from_this<Volume> {
     // pre-F6 demonstrator seam, where allocate_write_slot already advanced the
     // cursor + released the lock at reservation (reopening the tear window).
     bool deferred_publish = true;
+    // The pass the reservation belongs to: the caller stamps it into the
+    // document's write_serial (patch_pass_stamp) before the pwrite.
+    uint64_t pass = 0;
   };
+
+  // Stamp `pass` (mod 2^32) into a built document's write_serial field --
+  // outside the checksum, which covers only header data + content.  The
+  // stamp is what makes "one pass old" exact for admission (design 4.4).
+  static void patch_pass_stamp(std::span<std::byte> doc, uint64_t pass);
 
   // TEST SEAM ONLY -- never set in production.  When true, allocate_write_slot
   // reverts to the pre-F6 behavior: it advances the guard-visible write cursor
@@ -759,6 +1088,39 @@ class Volume : public std::enable_shared_from_this<Volume> {
   using WriteTearGateHook =
       std::function<void(uint64_t write_offset, uint64_t new_write_pos)>;
   static inline WriteTearGateHook s_write_tear_gate_for_test{};
+
+  // TEST SEAM ONLY -- never installed in production.  Points inside the
+  // writer's wrap-intent window at which a test can pause the writer (to
+  // probe a concurrent reader) or kill the process (crash recovery).  Same
+  // shape and cost as s_write_tear_gate_for_test: one predicted-not-taken
+  // branch, on the write path only, never on the lock-free read path.
+  // Every seam fires with the stripe mutex held and, in multi-process mode,
+  // the cross-process write lock held.
+  enum class WriterSeam : uint8_t {
+    kAfterIntentSet,   // intent stored, gate loads not yet run
+    kAfterGatePassed,  // gate said "proceed", nothing published yet
+    kWrapAfterCursor,  // wrap only: cursor lowered to the data-area start,
+                       // epoch not yet stored
+    kAfterEpochStore,  // epoch stored, intent not yet cleared
+  };
+  using WriterSeamHook = std::function<void(WriterSeam seam)>;
+  static inline WriterSeamHook s_writer_seam_for_test{};
+
+#ifdef CYCLONE_TEST_SEAMS
+  // TEST-SEAM BUILDS ONLY.  Pause points on the LOCK-FREE READ path, so they
+  // exist only when the library is compiled with CYCLONE_TEST_SEAMS (the
+  // cyclone-cache-testseams target the tests link).  The release library has
+  // no hook, no branch and no symbol here: invariant 1's hot path is
+  // untouched.
+  enum class ReaderSeam : uint8_t {
+    kBeforeBorrow,  // document mapped, key + stamp + CRC verified; no borrow
+    kAfterBorrow,   // borrow counted + lease stamped; intent / G not loaded
+    kSnapshotGen,   // Volume::snapshot: G loaded, cursor not yet loaded
+                    // (fires on writer-side snapshots too; filter by thread)
+  };
+  using ReaderSeamHook = std::function<void(ReaderSeam seam)>;
+  static inline ReaderSeamHook s_reader_seam_for_test{};
+#endif
 
   Volume(const Volume &) = delete;
   Volume &operator=(const Volume &) = delete;
@@ -835,23 +1197,26 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // header, shared by the two RMW sites (hit-count bump; middle/tail chain
   // repoint).  Runs `apply` (pure std::atomic_ref stores on the mapped
   // `header`, no syscalls) under the stripe write lock, fenced against a wrap
-  // recycling the target's bytes since `epoch_start` (which the caller MUST
-  // sample before it resolved the offset).  `blocking` selects
+  // recycling the target's bytes since `snap_start` (which the caller MUST
+  // take before it resolved the offset).  `blocking` selects
   // acquire_write_lock (control path) vs try_acquire_write_lock (hit path).
   // Returns Busy on contention or a raced wrap; the caller drops or retries.
+  // `target_rel` is the target's offset relative to the stripe: under the
+  // lock the store also re-runs admission on it (node_admissible_now).
   std::expected<void, CacheError> commit_header_rmw(
-      Stripe *stripe, std::byte *header, const CacheKey &expected_key,
-      AlternateId expected_alt, std::pair<uint64_t, bool> epoch_start,
-      bool blocking, const std::function<void()> &apply);
+      Stripe *stripe, std::byte *header, uint64_t target_rel,
+      const CacheKey &expected_key, AlternateId expected_alt,
+      const StripeSnapshot &snap_start, bool blocking,
+      const std::function<void()> &apply);
 
   // Repoint one chain link in place: store `new_next_offset` into the
   // next_alternate_offset field of the LIVE published document at
   // `pred_absolute_offset`, through commit_header_rmw (write lock + wrap-epoch
   // fence + key/id identity).  Maps read-write before the lock and unmaps
-  // after, so no map/unmap syscall runs under the lock.  `epoch_start` MUST be
-  // the sample taken before the predecessor offset was resolved.  Returns Busy
-  // when the fence or the identity check rejects the store; the caller decides
-  // whether to retry (removal) or leave the chain as it was (write-path
+  // after, so no map/unmap syscall runs under the lock.  `snap_start` MUST be
+  // the snapshot taken before the predecessor offset was resolved.  Returns
+  // Busy when the fence or the identity check rejects the store; the caller
+  // decides whether to retry (removal) or leave the chain as it was (write-path
   // splice).  Does NOT fsync -- the caller owns that.
   //
   // ORDERING INVARIANT (crash safety), binding on every caller: when a pass
@@ -864,7 +1229,7 @@ class Volume : public std::enable_shared_from_this<Volume> {
   std::expected<void, CacheError> repoint_chain_link(
       Stripe *stripe, uint64_t pred_absolute_offset,
       AlternateId pred_alternate_id, const CacheKey &key,
-      uint64_t new_next_offset, std::pair<uint64_t, bool> epoch_start,
+      uint64_t new_next_offset, const StripeSnapshot &snap_start,
       bool blocking);
 
   // Flush volume file descriptor to disk (fsync on POSIX, _commit on Windows).
@@ -902,8 +1267,8 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // write-avoidance guard).  Called by ReadHandle::renew_lease() for
   // client-paced transfers.  Returns false when leases are disabled
   // (T == 0), i.e. there is no protection to renew.
-  bool renew_read_lease(Stripe *stripe,
-                        const std::pair<uint64_t, bool> &epoch_start);
+  bool renew_read_lease(Stripe *stripe, const BorrowEpoch &epoch_start,
+                        const BorrowToken &token);
   // Lease amendment (2026-07-07): intent-checked lease renewal for the ALIASED
   // zero-copy serve path.  Stamps the lease FIRST, then Dekker-revalidates
   // (borrow_still_valid: wrap_intent loaded before epoch) so a normal wrap
@@ -912,8 +1277,9 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // renew_read_lease() above is safe ONLY for the copy-then-verify path,
   // whose read is observable; an aliased writev's read is not.  See
   // LeaseRenewal for how the embedder must act on each result.
-  LeaseRenewal renew_read_lease_strict(
-      Stripe *stripe, const std::pair<uint64_t, bool> &epoch_start);
+  LeaseRenewal renew_read_lease_strict(Stripe *stripe,
+                                       const BorrowEpoch &epoch_start,
+                                       const BorrowToken &token);
   // Lease-protocol STEP-3: ns until a ceiling-forced wrap could overwrite a
   // borrow on this stripe (UINT64_MAX = none deferred / leases off).
   [[nodiscard]] uint64_t ns_until_forced_wrap(const Stripe *stripe) const;
@@ -1051,6 +1417,13 @@ class Volume : public std::enable_shared_from_this<Volume> {
   std::atomic<uint64_t> _writes_dropped_by_lease{0};
   std::atomic<uint64_t> _wraps_forced_past_lease{0};
 
+  // Wrap retention (process-local; see VolumeStats).
+  std::atomic<uint64_t> _frontier_advances{0};
+  std::atomic<uint64_t> _advances_deferred_by_lease{0};
+  std::atomic<uint64_t> _early_advances_skipped{0};
+  mutable std::atomic<uint64_t> _retained_hits{0};
+  mutable std::atomic<uint64_t> _stamp_rejections{0};
+
   // Full-bucket tag-collision evictions (process-local; see VolumeStats).
   std::atomic<uint64_t> _tag_collision_evictions{0};
 
@@ -1100,7 +1473,8 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // --- Lease protocol helpers -------------------------------------------
   // Reader side: stamp the stripe lease (CAS-max now + T, seq_cst, with
   // the write-avoidance guard).  Must run after the entry is located and
-  // BEFORE the borrow escapes; the caller then revalidates wrap_epoch().
+  // BEFORE the borrow escapes; the caller then revalidates
+  // (borrow_still_valid).
   void stamp_read_lease(Stripe *stripe) const;
 
   // Reader side: register a live borrow in the stripe's
@@ -1109,39 +1483,92 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // borrow escapes; the caller then revalidates via borrow_still_valid()
   // and must release_borrow() on a failed revalidation.  Returns an inert
   // token when leases are disabled.
-  [[nodiscard]] BorrowToken acquire_borrow(Stripe *stripe);
+  // `chunk` is the frontier chunk of the document being served
+  // (Stripe::chunk_of): the borrow counts only against that chunk's slot.
+  [[nodiscard]] BorrowToken acquire_borrow(Stripe *stripe,
+                                           uint32_t chunk) const;
 
-  // Wrap epoch {wrap_count, phase} for stamp-then-revalidate.  Captured at
-  // probe start and compared after the stamp; a change means a wrap /
-  // phase toggle raced the read and the borrow must be discarded.
-  // Deliberately independent of the checksum-validation cache.
-  [[nodiscard]] std::pair<uint64_t, bool> wrap_epoch(
-      const Stripe *stripe) const;
+  // The stripe snapshot every admission of one probe or walk is decided
+  // against: G FIRST (seq_cst), then the write cursor W (acquire)
+  // (doc/design/wrap-retention.md section 5.4).  The order matters: a wrap
+  // between the two loads can only LOWER the cursor the snapshot carries,
+  // which rejects more, never admits more.  Readers CLAMP what they load
+  // (f > N reads as N) and never write it back: the open path and the read
+  // path never repair retention state.
+  [[nodiscard]] StripeSnapshot snapshot(const Stripe *stripe) const;
 
-  // Reader-side borrow revalidation, run after stamp_read_lease(): the
-  // borrow is valid only if no writer holds the wrap-intent flag (loaded
-  // seq_cst FIRST — the intent-before-epoch order is part of the Dekker
-  // proof at allocate_write_slot) AND the wrap epoch still matches the
-  // probe-start capture.  On false the caller unmaps and retries/misses.
-  [[nodiscard]] bool borrow_still_valid(
-      const Stripe *stripe, const std::pair<uint64_t, bool> &epoch_start) const;
+  // The epoch a borrow of the document at `relative_offset`, admitted as a
+  // document of pass `pass`, must still satisfy when it revalidates and on
+  // every renew.
+  [[nodiscard]] static BorrowEpoch borrow_epoch(const Stripe *stripe,
+                                                uint64_t pass,
+                                                uint64_t relative_offset) {
+    return {stripe->exposure_threshold(pass, relative_offset)};
+  }
+
+  // Writer-side fence: has the stripe wrapped since `snap_start`?  Compares
+  // the pass P only, never the frontier (S6): an advance elsewhere in the
+  // stripe does not invalidate an offset resolved before it.  Callers that
+  // store into a resolved node also re-run admission under the lock, which
+  // is what catches an advance over that node.
+  [[nodiscard]] bool wrapped_since(const Stripe *stripe,
+                                   const StripeSnapshot &snap_start) const {
+    return stripe->pass_of(stripe->exposure_gen()) != snap_start.pass;
+  }
+
+  // Reader-side borrow revalidation, run after acquire_borrow and
+  // stamp_read_lease(): the borrow is valid only if no writer holds the
+  // wrap-intent flag (loaded seq_cst FIRST — the intent-before-G order is
+  // part of the Dekker proof at allocate_write_slot) AND a fresh G has not
+  // passed the borrow's exposure threshold.  On false the caller releases,
+  // unmaps and retries/misses.
+  [[nodiscard]] bool borrow_still_valid(const Stripe *stripe,
+                                        const BorrowEpoch &epoch_start) const;
+  // Same, plus the count check: the borrow's slot must still carry the
+  // generation its acquire saw.  A ceiling-forced step resets EVERY chunk's
+  // slot (S4) but exposes only the chunks it crosses, so a borrow elsewhere
+  // keeps a valid G verdict while its count is gone -- and the next normal
+  // advance over its chunk would pass the gate.  A generation mismatch
+  // therefore means "no longer protected", whatever G says (review R2).
+  [[nodiscard]] bool borrow_still_valid(const Stripe *stripe,
+                                        const BorrowEpoch &epoch_start,
+                                        const BorrowToken &token) const;
+  [[nodiscard]] bool borrow_still_counted(const Stripe *stripe,
+                                          const BorrowToken &token) const;
 
   // Writer-side wrap-intent flag (shared header offset 33 in mmap mode,
   // Stripe::local_wrap_intent otherwise), seq_cst.
   void set_wrap_intent(Stripe *stripe, bool active);
   [[nodiscard]] bool wrap_intent_set(const Stripe *stripe) const;
+  // Mark the intent window as a COMMITTED wrap to pass `new_pass`
+  // (MmapDirectory::kIntentWrapEven / kIntentWrapOdd), stored before the
+  // cursor drops to S.  Crash recovery completes such a wrap instead of
+  // only clearing the flag (repair_wrap_state, review R1).
+  void mark_wrap_committed(Stripe *stripe, uint64_t new_pass);
+  // End a continuous-deferral episode: clear the deferral clock and the
+  // published force deadline.  Called whenever a write gets its slot
+  // (review R3): the episode bounds CONTINUOUS starvation, so any write
+  // that proceeds ends it, including one that fits the tail or the runway
+  // without the deferred step.
+  void end_deferral_episode(Stripe *stripe);
 
-  // Writer side: wrap gate, run BEFORE evict_if_needed()/toggle_phase()
-  // at BOTH wrap sites.  Returns true when the wrap may proceed: no
-  // outstanding borrows (a residual lease timestamp without a
-  // live ReadHandle no longer blocks), no/expired/staleness-clamped lease,
-  // or anti-starvation ceiling exceeded (increments
-  // wraps_forced_past_lease AND resets the borrow slot so leaked counts
-  // cost at most one ceiling episode).  Returns false when the wrap must
-  // be deferred — a live borrow with a live lease (zero side effects; the
-  // caller drops the fill).  seq_cst gate loads (Dekker pairing with the
-  // reader's count-CAS + stamp).
-  bool lease_permits_wrap(Stripe *stripe);
+  // Writer side: the borrow gate over frontier chunks [chunk_lo, chunk_hi),
+  // run with the intent flag already set and BEFORE any side effect.
+  // Returns true when those chunks may be exposed: no outstanding borrow
+  // counted in them (a residual lease timestamp without a live ReadHandle
+  // no longer blocks), or no/expired/staleness-clamped lease.  With
+  // `episode` (a wrap in flush mode, a MANDATORY advance in retention mode)
+  // a blocked gate also runs the anti-starvation episode: it starts the
+  // deferral clock and publishes the force deadline, and past the ceiling
+  // it forces (increments wraps_forced_past_lease and resets EVERY chunk
+  // slot so leaked counts cost at most one ceiling episode).  Without
+  // `episode` (the optional early advance) it is a pure check with no side
+  // effects at all.  Returns false when the caller must back off (zero side
+  // effects; the caller drops the fill or skips the early advance).
+  // seq_cst gate loads (Dekker pairing with the reader's count-CAS +
+  // stamp).
+  bool lease_gate(Stripe *stripe, uint32_t chunk_lo, uint32_t chunk_hi,
+                  bool episode);
 
   // One shared allocate-with-lease-check helper used by BOTH commit paths
   // (commit_write and commit_alternate_write) so a third write path cannot
@@ -1313,7 +1740,112 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // Body of open() that runs under the exclusive cross-process init
   // lock; see volume.cpp.
   std::expected<void, CacheError> open_locked(bool created_new);
-  std::expected<void, CacheError> init_stripes();
+  // `exclusive` = this opener proved it has no live peer (it holds the
+  // exclusive lifetime lock, or created the inode): only then may it touch
+  // the shared reader-exclusion state (see repair_wrap_state).
+  std::expected<void, CacheError> init_stripes(bool exclusive);
+  // Set stripe.chunks / chunk_size from the stripe's data area and this
+  // volume's mode (flush: N = 1, Q = A).  Requires data_offset.
+  void configure_frontier(Stripe &stripe) const;
+  // True iff some stripe's on-disk mmap directory carries our magic but a
+  // different MmapDirectory::kVersion (pread through _fd; no mapping).
+  [[nodiscard]] bool has_foreign_directory_version() const;
+
+  // Crash recovery for a writer that died INSIDE the wrap-intent window: its
+  // wrap_intent flag stays set (every read of the stripe misses until the
+  // next wrap) and the phase may have drifted from the pass count.  Clears
+  // the intent and re-derives phase = pass & 1.  Called ONLY when no writer
+  // can be inside the window: after a write-lock acquisition that
+  // force-released a holder PROVEN dead (never after an escalated takeover
+  // of a holder that may still be alive), or on an exclusive open.
+  void repair_wrap_state(Stripe *stripe);
+  // Run repair_wrap_state iff `token` recovered the lock from a proven-dead
+  // holder and escalated over no possibly-live one.
+  void repair_after_forced_release(Stripe *stripe,
+                                   const MmapDirectory::WriteLockToken &token);
+  // Fire the writer seam (test only; a no-op in production).
+  static void writer_seam(WriterSeam seam) {
+    if (s_writer_seam_for_test) {
+      s_writer_seam_for_test(seam);
+    }
+  }
+
+  // The insert-time admission view of one stripe (see InsertAdmission in
+  // directory.hpp): refresh() re-snapshots G and W inside the directory's
+  // seqlock bracket; classify() is the position leg against that snapshot.
+  class StripeAdmission final : public InsertAdmission {
+   public:
+    StripeAdmission(const Volume &volume, const Stripe &stripe)
+        : _volume(volume), _stripe(stripe) {}
+    void refresh() override { _snap = _volume.snapshot(&_stripe); }
+    [[nodiscard]] AdmitClass classify(uint64_t relative_offset,
+                                      bool phase) const override {
+      return _stripe.admit_position(relative_offset, phase, _snap);
+    }
+
+   private:
+    const Volume &_volume;
+    const Stripe &_stripe;
+    StripeSnapshot _snap;
+  };
+
+  // Is the chain node at `relative_offset`, whose header is `doc`, still
+  // admissible NOW (fresh snapshot)?  For the in-place header stores, which
+  // re-run admission on their target under the lock (S6): a class implied
+  // by the node's stamp (P current, P - 1 retained) plus that class's
+  // position leg.  This is what catches an advance over the target between
+  // its resolution and the store -- advances run under the same locks.
+  [[nodiscard]] bool node_admissible_now(const Stripe *stripe,
+                                         uint64_t relative_offset,
+                                         const Document &doc) const;
+
+  // --- Wrap retention (doc/design/wrap-retention.md section 4.3) ----------
+  //
+  // Post-mapping admission legs that need no payload: in retention mode the
+  // document's pass stamp must be the pass its class implies (P current,
+  // P - 1 retained), and it must not already be exposed under the snapshot
+  // (snap.gen <= threshold).  Returns the borrow epoch on success.  In flush
+  // mode only the exposure leg applies (it never fails for a current-class
+  // entry), so admission stays today's predicate.
+  [[nodiscard]] std::optional<BorrowEpoch> admit_document(
+      const Stripe *stripe, const StripeSnapshot &snap, AdmitClass cls,
+      uint64_t relative_offset, const Document &doc) const;
+  // The stamp leg alone, for chain nodes and writer-side re-checks.
+  [[nodiscard]] bool stamp_admits(const Stripe *stripe,
+                                  const StripeSnapshot &snap, AdmitClass cls,
+                                  const Document &doc) const;
+
+  // Retention-mode allocation prologue, run by allocate_write_slot under
+  // the stripe mutex and (multi-process) the write lock: the UNGATED wrap
+  // when the document does not fit before the end, then the MANDATORY
+  // advance that exposes exactly the chunks this document needs, then the
+  // optional EARLY advance that keeps a Q/2 runway.  Returns the pass the
+  // reservation belongs to, or nullopt when the mandatory advance was
+  // deferred by a live borrow (the caller drops the fill).
+  std::optional<uint64_t> retention_prepare(
+      Stripe *stripe, size_t doc_size, bool has_write_lock,
+      const MmapDirectory::WriteLockToken &write_token);
+  // One gated frontier move from index `from` to `to` in pass `pass`:
+  // intent -> gate over chunks [from, to) -> G store -> intent clear.
+  // `episode` = the mandatory advance (deferral clock, deadline, ceiling
+  // force); without it a pure check.  False = deferred, zero side effects.
+  bool advance_frontier(Stripe *stripe, uint64_t pass, uint64_t from,
+                        uint64_t to, bool episode);
+  // ceil((abs_offset - S) / Q), clamped to N: the frontier index that makes
+  // [S, abs_offset) clean.
+  [[nodiscard]] static uint64_t chunk_index_ceil(const Stripe *stripe,
+                                                 uint64_t abs_offset);
+  // The chunk count this volume's mode persists in the VolumeHeader
+  // (0 = flush; else N of the base stripe).
+  [[nodiscard]] uint16_t expected_retain_chunks() const;
+
+#ifdef CYCLONE_TEST_SEAMS
+  static void reader_seam(ReaderSeam seam) {
+    if (s_reader_seam_for_test) {
+      s_reader_seam_for_test(seam);
+    }
+  }
+#endif
   // Lease-protocol STEP-3: publish the per-stripe force-wrap deadline (ns; 0 =
   // none) to shared (mmap) or process-local storage.
   void publish_wrap_deferred_deadline(Stripe *stripe, uint64_t deadline_ns);
@@ -1332,8 +1864,14 @@ class Volume : public std::enable_shared_from_this<Volume> {
   std::expected<void, CacheError> write_header(
       const VolumeHeader &header) const;
 
-  // Evict entries to make space
-  void evict_if_needed(Stripe *stripe, size_t required_space);
+  // The wrap's phase publish: store phase = new_pass & 1 in the directory
+  // (seq_cst; under phase_lock for the mmap directory) and count the
+  // eviction.  The phase is DERIVED from the pass, never toggled, so a
+  // crash cannot leave the two disagreeing for longer than one repair.
+  void publish_wrap_phase(Stripe *stripe, uint64_t new_pass);
+
+  // Publish the exposure generation (seq_cst).
+  static void store_exposure_gen(Stripe *stripe, uint64_t gen);
 };
 
 // Volume is always heap-allocated (make_shared).  Keep it small enough that a

@@ -88,47 +88,6 @@ void backoff_sleep(uint32_t attempt) {
 
 }  // namespace
 
-size_t MmapDirectory::required_size(size_t num_buckets) {
-  // Check for overflow in versions_size calculation
-  // versions_size = num_buckets * sizeof(uint32_t)
-  if (num_buckets > SIZE_MAX / sizeof(uint32_t)) {
-    return SIZE_MAX;  // Return max to indicate overflow
-  }
-  size_t versions_size = num_buckets * sizeof(uint32_t);
-
-  // Check for overflow in entries_size calculation
-  // entries_size = num_buckets * kEntriesPerBucket * sizeof(DirEntry)
-  if (num_buckets > SIZE_MAX / kEntriesPerBucket) {
-    return SIZE_MAX;
-  }
-  size_t entries_count = num_buckets * kEntriesPerBucket;
-  if (entries_count > SIZE_MAX / sizeof(DirEntry)) {
-    return SIZE_MAX;
-  }
-  size_t entries_size = entries_count * sizeof(DirEntry);
-
-  size_t header_size = sizeof(Header);
-
-  // Align versions to 4-byte boundary
-  size_t versions_offset = header_size;
-
-  // Check for overflow when adding versions_size
-  if (versions_offset > SIZE_MAX - versions_size) {
-    return SIZE_MAX;
-  }
-
-  // Align entries to 8-byte boundary for better performance
-  size_t entries_offset = versions_offset + versions_size;
-  entries_offset = (entries_offset + 7) & ~7;
-
-  // Check for overflow when adding entries_size
-  if (entries_offset > SIZE_MAX - entries_size) {
-    return SIZE_MAX;
-  }
-
-  return entries_offset + entries_size;
-}
-
 std::optional<MmapDirectory> MmapDirectory::init(std::span<std::byte> region,
                                                  size_t num_buckets) {
   // Validate num_buckets
@@ -152,8 +111,8 @@ std::optional<MmapDirectory> MmapDirectory::init(std::span<std::byte> region,
 
   // Calculate offsets
   size_t versions_offset = sizeof(Header);
-  size_t entries_offset = versions_offset + num_buckets * sizeof(uint32_t);
-  entries_offset = (entries_offset + 7) & ~7;
+  const size_t entries_off = entries_offset(num_buckets);
+  const size_t retention_off = retention_offset(num_buckets);
 
   // Initialize header
   auto *header = reinterpret_cast<Header *>(region.data());
@@ -186,13 +145,19 @@ std::optional<MmapDirectory> MmapDirectory::init(std::span<std::byte> region,
   }
 
   // Initialize entries to empty
-  auto *entries = reinterpret_cast<DirEntry *>(region.data() + entries_offset);
+  auto *entries = reinterpret_cast<DirEntry *>(region.data() + entries_off);
   std::memset(entries, 0, num_buckets * kEntriesPerBucket * sizeof(DirEntry));
+
+  // Retention region: G = 0 (pass 0, nothing exposed yet) and every chunk
+  // borrow slot {generation 0, count 0}.
+  auto *retention =
+      reinterpret_cast<RetentionRegion *>(region.data() + retention_off);
+  std::memset(retention, 0, sizeof(RetentionRegion));
 
   // Ensure all writes are visible
   std::atomic_thread_fence(std::memory_order_release);
 
-  return MmapDirectory(header, versions, entries, num_buckets);
+  return MmapDirectory(header, versions, entries, retention, num_buckets);
 }
 
 std::optional<MmapDirectory> MmapDirectory::open(std::span<std::byte> region) {
@@ -229,14 +194,26 @@ std::optional<MmapDirectory> MmapDirectory::open(std::span<std::byte> region) {
 
   // Calculate offsets (safe now that we've validated num_buckets fits)
   size_t versions_offset = sizeof(Header);
-  size_t entries_offset = versions_offset + num_buckets * sizeof(uint32_t);
-  entries_offset = (entries_offset + 7) & ~7;
-
   auto *versions =
       reinterpret_cast<uint32_t *>(region.data() + versions_offset);
-  auto *entries = reinterpret_cast<DirEntry *>(region.data() + entries_offset);
+  auto *entries =
+      reinterpret_cast<DirEntry *>(region.data() + entries_offset(num_buckets));
+  auto *retention = reinterpret_cast<RetentionRegion *>(
+      region.data() + retention_offset(num_buckets));
 
-  return MmapDirectory(header, versions, entries, num_buckets);
+  return MmapDirectory(header, versions, entries, retention, num_buckets);
+}
+
+bool MmapDirectory::is_foreign_version(std::span<const std::byte> region) {
+  if (region.size() < sizeof(Header)) {
+    return false;
+  }
+  uint32_t magic = 0;
+  uint16_t version = 0;
+  std::memcpy(&magic, region.data() + offsetof(Header, magic), sizeof(magic));
+  std::memcpy(&version, region.data() + offsetof(Header, version),
+              sizeof(version));
+  return magic == kMagic && version != kVersion;
 }
 
 std::span<std::byte> MmapDirectory::region() const {
@@ -247,20 +224,24 @@ std::span<std::byte> MmapDirectory::region() const {
 }
 
 MmapDirectory::MmapDirectory(Header *header, uint32_t *versions,
-                             DirEntry *entries, size_t num_buckets)
+                             DirEntry *entries, RetentionRegion *retention,
+                             size_t num_buckets)
     : _header(header),
       _versions(versions),
       _entries(entries),
+      _retention(retention),
       _num_buckets(num_buckets) {}
 
 MmapDirectory::MmapDirectory(MmapDirectory &&other) noexcept
     : _header(other._header),
       _versions(other._versions),
       _entries(other._entries),
+      _retention(other._retention),
       _num_buckets(other._num_buckets) {
   other._header = nullptr;
   other._versions = nullptr;
   other._entries = nullptr;
+  other._retention = nullptr;
   other._num_buckets = 0;
 }
 
@@ -269,11 +250,13 @@ MmapDirectory &MmapDirectory::operator=(MmapDirectory &&other) noexcept {
     _header = other._header;
     _versions = other._versions;
     _entries = other._entries;
+    _retention = other._retention;
     _num_buckets = other._num_buckets;
 
     other._header = nullptr;
     other._versions = nullptr;
     other._entries = nullptr;
+    other._retention = nullptr;
     other._num_buckets = 0;
   }
   return *this;
@@ -363,7 +346,9 @@ std::optional<DirEntry> MmapDirectory::probe(const CacheKey &key) const {
 // after.  Concurrent writers spin-wait until the version is even.
 bool MmapDirectory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
                            uint64_t verified_offset, bool *collision_evicted,
-                           bool *bucket_full_evicted) {
+                           bool *bucket_full_evicted,
+                           InsertAdmission *admission,
+                           std::span<const uint64_t> clear_offsets) {
   if (_header == nullptr) {
     return false;
   }
@@ -382,6 +367,61 @@ bool MmapDirectory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
 
   // Acquire writer lock (CAS even → odd, spins if another writer holds it).
   acquire_writer(bucket_idx);
+
+  if (admission != nullptr) {
+    // Boundaries are loaded HERE, inside the bracket and under phase_lock:
+    // an independently opened writer in another process may have wrapped
+    // or advanced since the caller's election (S9).
+    admission->refresh();
+    const InsertChoice choice = choose_insert_slot(
+        bucket, kEntriesPerBucket, tag, verified_offset, kMatchAnyTag,
+        *admission, collision_evicted, bucket_full_evicted, offset);
+    size_t cleared = 0;
+    if (choice.slot >= 0) {
+      DirEntry new_entry = choice.verified ? bucket[choice.slot] : DirEntry{};
+      new_entry.set_offset(offset);
+      new_entry.set_approx_size(size);
+      new_entry.set_tag(tag);
+      new_entry.set_phase(cur_phase);
+      if (!choice.verified) {
+        new_entry.set_head(true);
+      }
+      std::memcpy(&bucket[choice.slot], &new_entry, sizeof(DirEntry));
+      // Uniqueness cleanup (rule 2), in the same bracket as the insert.
+      // A same-tag entry already at the offset just written is dead too:
+      // its bytes are the ones the new document replaced.  The chooser
+      // takes such an entry over when nothing better wins, but when the
+      // verified entry wins it would survive beside the new one (review
+      // N1), so it is cleared here in the same bracket.
+      for (size_t i = 0; i < kEntriesPerBucket; ++i) {
+        if (static_cast<int>(i) == choice.slot || bucket[i].is_empty() ||
+            bucket[i].tag() != tag) {
+          continue;
+        }
+        if (bucket[i].offset() == offset) {
+          bucket[i].clear();
+          ++cleared;
+          continue;
+        }
+        for (uint64_t off : clear_offsets) {
+          if (bucket[i].offset() == off) {
+            bucket[i].clear();
+            ++cleared;
+            break;
+          }
+        }
+      }
+    }
+    release_writer(bucket_idx);
+    release_phase_lock();
+    if (choice.slot >= 0 && !choice.replaces) {
+      increment_count();
+    }
+    for (size_t i = 0; i < cleared; ++i) {
+      decrement_count();
+    }
+    return choice.slot >= 0;
+  }
 
   bool success = false;
   bool was_update = false;
@@ -564,23 +604,23 @@ bool MmapDirectory::remove_at(const CacheKey &key, uint64_t target_offset) {
 
   acquire_writer(bucket_idx);
 
-  bool found = false;
+  // EVERY entry with this tag at this offset goes (see Directory::remove_at).
+  size_t removed = 0;
   for (size_t i = 0; i < kEntriesPerBucket; ++i) {
     if (!bucket[i].is_empty() && bucket[i].tag() == target_tag &&
         bucket[i].offset() == target_offset) {
       bucket[i].clear();
-      found = true;
-      break;
+      ++removed;
     }
   }
 
   release_writer(bucket_idx);
 
-  if (found) {
+  for (size_t i = 0; i < removed; ++i) {
     decrement_count();
   }
 
-  return found;
+  return removed != 0;
 }
 
 void MmapDirectory::clear() {
@@ -640,6 +680,33 @@ void MmapDirectory::toggle_phase() {
   std::atomic_ref<uint8_t>(_header->current_phase)
       .fetch_xor(1, std::memory_order_seq_cst);
   release_phase_lock();
+}
+
+void MmapDirectory::set_current_phase(bool phase) {
+  if (_header == nullptr) {
+    return;
+  }
+  // Same lock and ordering as toggle_phase: an insert that read the phase
+  // under phase_lock must not have it change underneath its entry store.
+  acquire_phase_lock();
+  std::atomic_ref<uint8_t>(_header->current_phase)
+      .store(phase ? 1 : 0, std::memory_order_seq_cst);
+  release_phase_lock();
+}
+
+void MmapDirectory::reset_reader_state_exclusive() {
+  if (_header == nullptr) {
+    return;
+  }
+  std::atomic_ref<uint16_t>(_header->stripe_borrow_slot)
+      .store(0, std::memory_order_seq_cst);  // retired in v2; kept zero
+  for (auto &slot : _retention->chunk_borrows) {
+    std::atomic_ref<uint32_t>(slot).store(0, std::memory_order_seq_cst);
+  }
+  std::atomic_ref<uint64_t>(_header->stripe_lease_expiry_ns)
+      .store(0, std::memory_order_seq_cst);
+  std::atomic_ref<uint32_t>(_header->shared_wrap_deferred_deadline_ms)
+      .store(0, std::memory_order_seq_cst);
 }
 
 void MmapDirectory::acquire_phase_lock() {
@@ -1061,50 +1128,58 @@ void MmapDirectory::stamp_lease_expiry(uint64_t new_expiry_ns,
   }
 }
 
-uint16_t MmapDirectory::borrow_slot_raw() const {
-  if (_header == nullptr) {
+uint32_t MmapDirectory::chunk_borrow_raw(size_t chunk) const {
+  if (_retention == nullptr || chunk >= kMaxChunks) {
     return 0;
   }
-  return std::atomic_ref<uint16_t>(
-             const_cast<uint16_t &>(_header->stripe_borrow_slot))
+  return std::atomic_ref<uint32_t>(
+             const_cast<uint32_t &>(_retention->chunk_borrows[chunk]))
       .load(std::memory_order_seq_cst);
 }
 
-borrow_slot::Acquired MmapDirectory::borrow_acquire() {
-  if (_header == nullptr) {
+borrow_slot::Acquired MmapDirectory::chunk_borrow_acquire(size_t chunk) {
+  if (_retention == nullptr || chunk >= kMaxChunks) {
     return {};
   }
-  auto ref = std::atomic_ref<uint16_t>(_header->stripe_borrow_slot);
+  auto ref = std::atomic_ref<uint32_t>(_retention->chunk_borrows[chunk]);
   return borrow_slot::acquire(ref);
 }
 
-void MmapDirectory::borrow_release(uint8_t generation) {
-  if (_header == nullptr) {
+void MmapDirectory::chunk_borrow_release(size_t chunk, uint8_t generation) {
+  if (_retention == nullptr || chunk >= kMaxChunks) {
     return;
   }
-  auto ref = std::atomic_ref<uint16_t>(_header->stripe_borrow_slot);
+  auto ref = std::atomic_ref<uint32_t>(_retention->chunk_borrows[chunk]);
   borrow_slot::release(ref, generation);
 }
 
-bool MmapDirectory::borrow_force_reset() {
-  if (_header == nullptr) {
+bool MmapDirectory::chunk_borrows_force_reset_all() {
+  if (_retention == nullptr) {
     return false;
   }
-  auto ref = std::atomic_ref<uint16_t>(_header->stripe_borrow_slot);
-  return borrow_slot::force_reset(ref);
+  bool any = false;
+  for (auto &slot : _retention->chunk_borrows) {
+    auto ref = std::atomic_ref<uint32_t>(slot);
+    any = borrow_slot::force_reset(ref) || any;
+  }
+  return any;
 }
 
-std::pair<uint64_t, bool> MmapDirectory::wrap_epoch() const {
-  if (_header == nullptr) {
-    return {0, false};
+uint64_t MmapDirectory::exposure_gen() const {
+  if (_retention == nullptr) {
+    return 0;
   }
-  uint64_t wraps = std::atomic_ref<uint64_t>(
-                       const_cast<uint64_t &>(_header->shared_wrap_count))
-                       .load(std::memory_order_seq_cst);
-  bool phase =
-      std::atomic_ref<uint8_t>(const_cast<uint8_t &>(_header->current_phase))
-          .load(std::memory_order_seq_cst) != 0;
-  return {wraps, phase};
+  return std::atomic_ref<uint64_t>(
+             const_cast<uint64_t &>(_retention->exposure_gen))
+      .load(std::memory_order_seq_cst);
+}
+
+void MmapDirectory::set_exposure_gen(uint64_t gen) {
+  if (_retention == nullptr) {
+    return;
+  }
+  std::atomic_ref<uint64_t>(_retention->exposure_gen)
+      .store(gen, std::memory_order_seq_cst);
 }
 
 bool MmapDirectory::wrap_intent() const {
@@ -1116,11 +1191,23 @@ bool MmapDirectory::wrap_intent() const {
 }
 
 void MmapDirectory::set_wrap_intent(bool active) {
+  set_wrap_intent_value(active ? kIntentStep : 0);
+}
+
+uint8_t MmapDirectory::wrap_intent_value() const {
+  if (_header == nullptr) {
+    return 0;
+  }
+  return std::atomic_ref<uint8_t>(const_cast<uint8_t &>(_header->wrap_intent))
+      .load(std::memory_order_seq_cst);
+}
+
+void MmapDirectory::set_wrap_intent_value(uint8_t value) {
   if (_header == nullptr) {
     return;
   }
   std::atomic_ref<uint8_t>(_header->wrap_intent)
-      .store(active ? 1 : 0, std::memory_order_seq_cst);
+      .store(value, std::memory_order_seq_cst);
 }
 
 uint32_t MmapDirectory::wrap_deferred_deadline_ms() const {

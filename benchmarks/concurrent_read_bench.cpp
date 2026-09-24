@@ -55,6 +55,9 @@ int main(int argc, char *argv[]) {
   int fixed_threads = (argc > 4) ? std::stoi(argv[4]) : 0;
   if (argc > 5) cache_size_mb = std::stoul(argv[5]);
   bool ram_off = (argc > 6) && std::string(argv[6]) == "ramoff";
+  // Optional 7th argument: "retain" / "flush" picks the eviction mode
+  // (default: the library default).
+  const std::string mode_arg = argc > 7 ? std::string(argv[7]) : "";
 
   std::cout << "Concurrent read scaling benchmark\n"
             << "  entries=" << num_entries << " content=" << content_size
@@ -68,6 +71,11 @@ int main(int argc, char *argv[]) {
             << " stripes)\n\n";
   std::string cache_path = make_temp_volume(cache_size_mb);
   CacheConfig config;  // default: 256 MB CLFUS RAM cache, num_segments=4
+  if (mode_arg == "retain" || mode_arg == "flush") {
+    config.wrap_retention = mode_arg == "retain";
+  }
+  std::cout << "  wrap retention " << (config.wrap_retention ? "ON" : "OFF")
+            << "\n";
   if (ram_off) {
     config.ram_cache_size = 0;
     std::cout << "  RAM cache DISABLED (volume-only path, matches mps)\n";

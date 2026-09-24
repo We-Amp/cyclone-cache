@@ -104,6 +104,10 @@ struct Document {
   // +doc_type(1) = 85.  Named so the version gate can be exercised on-disk
   // without a magic number; kept honest by a static_assert in document.cpp.
   static constexpr size_t kVersionMajorOffset = 85;
+  // write_serial carries the stripe PASS the document was written in (wrap
+  // retention's pass stamp, mod 2^32; see Volume::patch_pass_stamp).  It
+  // was always 0 before, and it sits outside the checksum.
+  static constexpr size_t kWriteSerialOffset = 92;
   static constexpr size_t kChecksumOffset = 100;
   static constexpr size_t kHitCountOffset = 108;
   static constexpr size_t kNextAlternateOffsetPos = 112;

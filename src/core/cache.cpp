@@ -438,6 +438,9 @@ std::expected<void, CacheError> Cache::add_volume_locked(
   // CacheConfig (see VolumeConfig::unlink_superseded_alternates).
   vol_config.unlink_superseded_alternates =
       _impl->config.unlink_superseded_alternates;
+  // Eviction mode: configured on CacheConfig, persisted per volume at
+  // creation (see VolumeConfig::wrap_retention).
+  vol_config.wrap_retention = _impl->config.wrap_retention;
   // Per-object size bound: configured on CacheConfig, enforced by the
   // volume at the write entry (see VolumeConfig::max_object_size).
   vol_config.max_object_size = _impl->config.max_object_size;
@@ -1061,6 +1064,13 @@ CacheStats Cache::stats() const {
     // Cross-process RAM coherence (process-local, summed).
     result.ram_coherence_rejections += vs.ram_coherence_rejections;
     result.ram_coherence_put_rejections += vs.ram_coherence_put_rejections;
+
+    // Wrap retention (process-local, summed).
+    result.frontier_advances += vs.frontier_advances;
+    result.advances_deferred_by_lease += vs.advances_deferred_by_lease;
+    result.early_advances_skipped += vs.early_advances_skipped;
+    result.retained_hits += vs.retained_hits;
+    result.stamp_rejections += vs.stamp_rejections;
   }
 
   if (_impl->ram_cache) {

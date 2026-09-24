@@ -470,21 +470,24 @@ TEST_CASE("volume_files reports configured and actual on-disk paths",
 // contract: that must be a conscious decision, paired with a
 // kFormatVersionMajor bump.  (Expected hashes independently recomputed from
 // the documented serialization: u16 LE format major, u8 mmap flag, u64 LE
-// {num_stripes, base_stripe_size, stripe_remainder}.)
+// {num_stripes, base_stripe_size, stripe_remainder}, then -- mmap volumes
+// only -- u16 LE MmapDirectory::kVersion.)
 //
-// These values have moved twice: for the 6 -> 7 bump that leaves
-// pre-depth-bound alternate chains behind, and for the 7 -> 8 bump that
-// switches the document checksum to CRC-32C.  Each time they were re-derived
-// from the serialization above rather than copied from the binary's output --
-// the re-derivation is checked by reproducing the superseded hashes with the
-// format major set back (v6: 7ddd9504877110d7 / a43f01449dc2105d, v7:
-// 0d9cd9759862d3ec / f9973954149ff08a).
+// These values have moved three times: for the 6 -> 7 bump that leaves
+// pre-depth-bound alternate chains behind, for the 7 -> 8 bump that
+// switches the document checksum to CRC-32C, and (mmap name only) for
+// MmapDirectory::kVersion 2, the wrap-retention directory layout.  Each time
+// they were re-derived from the serialization above rather than copied from
+// the binary's output -- the re-derivation is checked by reproducing the
+// superseded hashes with the format major set back (v6: 7ddd9504877110d7 /
+// a43f01449dc2105d, v7: 0d9cd9759862d3ec / f9973954149ff08a; v8 without the
+// directory version: 93cd38a16f167c85).
 TEST_CASE("fingerprint golden values pin the naming contract",
           "[fingerprint]") {
   // Auto stripes: 256 MiB, mmap on -> geometry {8, 33550336, 32704}.
   REQUIRE(fingerprint_cache_path("cyclone.dat", 256 * kMB, 0,
                                  /*mmap_directory=*/true) ==
-          "cyclone-8-93cd38a16f167c85.dat");
+          "cyclone-8-818adf88b413a69f.dat");
   // Explicit stripes: 512 MiB + header, 128 MiB stripes, mmap off ->
   // geometry {4, 134217728, 0}.
   REQUIRE(fingerprint_cache_path(

@@ -14,11 +14,20 @@
 //   wrap flush  Cyclone today: per stripe, a wrap toggles the directory
 //               phase and every entry of the previous pass stops resolving at
 //               once (Volume::evict_if_needed), so the stripe restarts empty
+//   retain/N    the wrap-retention proposal (doc/design/wrap-retention.md):
+//               per stripe, the previous pass stays readable until a clean
+//               frontier that advances in N fixed chunks per stripe reaches
+//               it.  The writer advances one chunk early, as soon as less
+//               than half a chunk of cleaned runway is left, so on average
+//               about one chunk per stripe is dead (cleaned, not yet
+//               refilled).  One chunk per stripe degenerates to wrap
+//               flush; one-block chunks approach stripe FIFO.
 //
 // Usage: kv_churn_policy [block_size] [capacity] [universe] [pattern]
 // (defaults 2 MiB, 16 GiB, 3 x capacity / block_size, both patterns).
 // Thread 0's stream, warm-up of 2 x capacity inserts, then 400 000 gets.
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -101,6 +110,54 @@ class WrapFlush {
   std::unordered_set<uint64_t> _set;
 };
 
+// The wrap-retention proposal, on a ring of `slots` equal-sized blocks.  W is
+// the write cursor, F the clean frontier (W <= F): [0, W) holds this pass,
+// [W, F) is cleaned runway nothing resolves into, [F, slots) still holds the
+// previous pass and stays readable.  Advancing F by one chunk evicts the
+// previous-pass blocks in that chunk; a wrap restarts both at 0, turning
+// this pass into the previous one.
+class FrontierRetain {
+ public:
+  FrontierRetain(size_t slots, size_t chunks)
+      : _slots(slots),
+        _chunk((slots + chunks - 1) / chunks),
+        _ring(slots, kEmpty) {}
+  bool access(uint64_t k) {
+    if (_resident.count(k) != 0) return true;
+    if (_w == _slots) {  // wrap: W == slots implies F == slots
+      _w = 0;
+      _f = 0;
+    }
+    if (_w == _f) advance();
+    _ring[_w++] = k;
+    _resident.insert(k);
+    // Early advance: keep at least half a chunk of cleaned runway, so a
+    // writer rarely has to run the reader-exclusion gate for the very
+    // document it is placing.
+    if (_f < _slots && _f - _w < _chunk / 2 + 1) advance();
+    return false;
+  }
+
+ private:
+  static constexpr uint64_t kEmpty = UINT64_MAX;
+  void advance() {
+    const size_t next = std::min(_f + _chunk, _slots);
+    for (size_t i = _f; i < next; ++i) {
+      if (_ring[i] != kEmpty) _resident.erase(_ring[i]);
+      _ring[i] = kEmpty;
+    }
+    _f = next;
+  }
+  size_t _slots;
+  size_t _chunk;
+  std::vector<uint64_t> _ring;
+  std::unordered_set<uint64_t> _resident;
+  size_t _w = 0;
+  size_t _f = 0;
+};
+
+constexpr std::array<size_t, 4> kRetainChunks = {16, 32, 64, 256};
+
 void run(size_t block, size_t capacity, size_t universe, bool scan) {
   // kv_churn sizes the volume so the stripes' data areas sum to `capacity`;
   // the mmap directories and volume header it adds on top are small next to
@@ -116,16 +173,23 @@ void run(size_t block, size_t capacity, size_t universe, bool scan) {
   Fifo fifo(lru_blocks);
   std::vector<Fifo> sfifo(stripes, Fifo(stripe_blocks));
   std::vector<WrapFlush> flush(stripes, WrapFlush(stripe_blocks));
+  std::array<std::vector<FrontierRetain>, kRetainChunks.size()> retain;
+  for (size_t j = 0; j < kRetainChunks.size(); ++j) {
+    retain[j].assign(stripes, FrontierRetain(stripe_blocks, kRetainChunks[j]));
+  }
   const uint64_t warm_inserts = 2 * capacity / block;
   uint64_t inserts = 0;
   uint64_t gets = 0;
-  std::array<uint64_t, 4> hits{};
+  std::array<uint64_t, 4 + kRetainChunks.size()> hits{};
   while (gets < kMeasuredGets) {
     const uint64_t k = stream.next();
     const bool measure = inserts >= warm_inserts;
     const size_t s = churn_stripe_of(k, stripes);
-    const std::array<bool, 4> hit = {lru.access(k), fifo.access(k),
-                                     sfifo[s].access(k), flush[s].access(k)};
+    std::array<bool, 4 + kRetainChunks.size()> hit = {
+        lru.access(k), fifo.access(k), sfifo[s].access(k), flush[s].access(k)};
+    for (size_t j = 0; j < kRetainChunks.size(); ++j) {
+      hit[4 + j] = retain[j][s].access(k);
+    }
     if (!hit[0]) ++inserts;
     if (!measure) continue;
     ++gets;
@@ -136,9 +200,13 @@ void run(size_t block, size_t capacity, size_t universe, bool scan) {
   };
   std::printf(
       "%-9s block=%zu U=%zu capacity=%zu blocks (%zu/stripe x %zu): lru %.4f "
-      "fifo %.4f stripe-fifo %.4f wrap-flush %.4f\n",
+      "fifo %.4f stripe-fifo %.4f wrap-flush %.4f",
       scan ? "zipf+scan" : "zipf", block, universe, lru_blocks, stripe_blocks,
       stripes, ratio(0), ratio(1), ratio(2), ratio(3));
+  for (size_t j = 0; j < kRetainChunks.size(); ++j) {
+    std::printf(" retain/%zu %.4f", kRetainChunks[j], ratio(4 + j));
+  }
+  std::printf("\n");
 }
 
 }  // namespace

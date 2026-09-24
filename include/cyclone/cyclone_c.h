@@ -198,6 +198,23 @@ typedef struct {
      BUCKET, so unrelated writes to the same bucket also invalidate.
 
      Same trailing-field ABI note as small_tier_percent above. */
+  int disable_wrap_retention;
+  /* Non-zero: FLUSH mode -- a wrap of a stripe's circular data area makes
+     the whole previous pass unreadable at once.  Zero-initialised = the
+     library default (CacheConfig::wrap_retention: the previous pass stays
+     readable until the forward fill needs its bytes).  Stated in the
+     negative so a zero-initialised config lands on the default.
+
+     The mode is persisted in the volume when it is CREATED.  An open whose
+     mode disagrees with the file goes through the same live-peer reset gate
+     as a format change: refused with CYCLONE_RESET_REFUSED_LIVE_PEER while
+     another process holds the volume, a cold reset otherwise.
+     Every process sharing a cache must therefore pass the same value.
+
+     Same trailing-field ABI note as small_tier_percent above: there is NO
+     mixed-version ABI safety.  A caller compiled against an older header
+     passes a smaller struct and the library reads garbage here; recompile
+     against this header when adopting it. */
 } CycloneCacheConfig;
 
 /* --------------------------------------------------------------------------
@@ -353,6 +370,26 @@ typedef struct {
    *     saving, but the same crowding signal. */
   uint64_t ram_coherence_rejections;
   uint64_t ram_coherence_put_rejections;
+
+  /* Wrap retention (append-only extension at the TAIL, same lockstep-
+   * compilation caveat as above -- rebuild ALL consumers).  Process-local,
+   * summed across volumes; all stay 0 in flush mode.  Full semantics on
+   * CacheStats in cache.hpp.
+   *   frontier_advances: gated moves of the clean frontier that published.
+   *   advances_deferred_by_lease: mandatory advances deferred by a live
+   *     borrow of a chunk they would expose (each dropped its fill; also in
+   *     writes_dropped_by_lease).  The retention counterpart of
+   *     wraps_deferred_by_lease.
+   *   early_advances_skipped: optional runway advances skipped because a
+   *     chunk was borrowed (never drops a fill).
+   *   retained_hits: disk hits served from the retained previous pass.
+   *   stamp_rejections: candidates whose pass stamp contradicted their
+   *     class (stale survivors; a lost timeline after power loss). */
+  uint64_t frontier_advances;
+  uint64_t advances_deferred_by_lease;
+  uint64_t early_advances_skipped;
+  uint64_t retained_hits;
+  uint64_t stamp_rejections;
 } CycloneCacheStats;
 
 /* --------------------------------------------------------------------------

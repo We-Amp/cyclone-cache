@@ -56,7 +56,7 @@
 //       serve/reject pair.
 //
 //   (E) ONE-wrap dark chain tail: the guard's chain-HOP leg
-//       (is_valid_chain_offset).  A head committed across a wrap keeps
+//       (Stripe::admit_hop).  A head committed across a wrap keeps
 //       next_alternate_offset pointing at the pre-wrap old head — a same-key,
 //       intact, ahead-of-cursor node the probe leg never sees (hops bypass
 //       the directory).  Walks must never enumerate/select/borrow it.
@@ -1300,6 +1300,15 @@ TEST_CASE(
       REQUIRE_FALSE(rj.has_value());
       REQUIRE(rj.error() == CacheError::NotFound);
       REQUIRE(cache->stats().borrows_outstanding == 0);
+    } else if (CacheConfig{}.wrap_retention) {
+      // With wrap retention the PASS STAMP is a second, independent layer: J
+      // carries pass 0 while the snapshot is in pass 2, so even the pre-fix
+      // seam's advanced cursor cannot get it admitted (the position leg
+      // passes, the stamp leg rejects).  Nothing to tear.
+      auto rj = cache->read_sync(j_key);
+      REQUIRE_FALSE(rj.has_value());
+      REQUIRE(cache->stats().stamp_rejections > 0);
+      REQUIRE(cache->stats().borrows_outstanding == 0);
     } else {
       // PRE-FIX DEMONSTRATOR: the cursor advanced past X at reservation, so the
       // survivor is re-admitted mid-window and a zero-copy borrow is handed out
@@ -1316,7 +1325,7 @@ TEST_CASE(
     Volume::s_write_tear_gate_for_test = {};
     REQUIRE(writer_ok.load());
 
-    if (prefix_mode) {
+    if (held.has_value()) {
       // ...the pwrite has now landed the overwriter INTO the borrowed bytes:
       // the still-open zero-copy borrow reads the overwriter's bytes — TORN.
       REQUIRE_FALSE(content_equals(held->content(), j_content));
@@ -1416,6 +1425,12 @@ TEST_CASE(
       REQUIRE_FALSE(rj.has_value());
       REQUIRE(rj.error() == CacheError::NotFound);
       REQUIRE(reader_view->stats().borrows_outstanding == 0);
+    } else if (CacheConfig{}.wrap_retention) {
+      // Wrap retention: the pass stamp rejects J even past the pre-fix seam's
+      // advanced shared cursor (see F6-A).
+      auto rj = reader_view->read_sync(j_key);
+      REQUIRE_FALSE(rj.has_value());
+      REQUIRE(reader_view->stats().stamp_rejections > 0);
     } else {
       // PRE-FIX: shared_write_pos was published past X and the lock dropped at
       // reservation, so the reader view re-admits J and borrows torn-to-be
@@ -1431,7 +1446,7 @@ TEST_CASE(
     Volume::s_write_tear_gate_for_test = {};
     REQUIRE(writer_ok.load());
 
-    if (prefix_mode) {
+    if (held.has_value()) {
       REQUIRE_FALSE(content_equals(held->content(), j_content));
       REQUIRE(content_equals(held->content(), overwriter_content));
       held.reset();
