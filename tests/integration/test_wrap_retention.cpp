@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -3218,4 +3219,85 @@ TEST_CASE(
     REQUIRE(st.alternate_carry_bytes == 0);
   }
   c.stop();
+}
+
+// ---------------------------------------------------------------------------
+// The default (D1): retention is ON.  A default-constructed config retains, a
+// volume it creates records a non-zero retain_chunks, `wrap_retention = false`
+// is the flush opt-out, and a flush volume left by an earlier default-off
+// build is cold-reset in place (same file) by the first default open.  The
+// C API leg is in test_c_api.cpp.  Under the test-seam override
+// (CYCLONE_TEST_WRAP_RETENTION) the default follows the override instead.
+// ---------------------------------------------------------------------------
+
+TEST_CASE(
+    "Retention default: on for a default config, flush is the opt-out, and "
+    "a default-off volume is cold-reset by a default open",
+    "[retention][config]") {
+  static_assert(kDefaultWrapRetention,
+                "wrap retention is the default eviction mode");
+  // NOLINTNEXTLINE(concurrency-mt-unsafe): read-only
+  const char *forced = std::getenv("CYCLONE_TEST_WRAP_RETENTION");
+  const bool expected = forced == nullptr || forced[0] == '1';
+  REQUIRE(CacheConfig{}.wrap_retention == expected);
+  REQUIRE(VolumeConfig{}.wrap_retention == expected);
+  constexpr uint64_t kRetainChunksOffset = 40;  // VolumeHeader::retain_chunks
+
+  const bool multi_process = GENERATE(false, true);
+  CAPTURE(multi_process);
+  auto make_config = [&](std::optional<bool> retention) {
+    CacheConfig config;  // every other field at its default
+    if (multi_process) {
+      config.set_multi_process(0, 1);
+    }
+    if (retention) {
+      config.set_wrap_retention(*retention);
+    }
+    return config;
+  };
+
+  // Default config: the created volume records the default mode.
+  {
+    TempCacheDir tmp("retdef");
+    auto c = Cache::create(make_config(std::nullopt));
+    REQUIRE(c.has_value());
+    REQUIRE((*c)->add_volume(tmp.path(), kRetVol).has_value());
+    REQUIRE((*c)->start().has_value());
+    REQUIRE(write_entry(**c, "d", make_content(1, 4096)));
+    REQUIRE(((*c)->stats().frontier_advances > 0) == expected);
+    const std::string file = volume_file_of(**c);
+    (*c)->stop();
+    REQUIRE((peek_u16(file, kRetainChunksOffset) != 0) == expected);
+  }
+
+  // Opt-out: wrap_retention = false creates a flush volume.
+  TempCacheDir tmp("retoff");
+  std::string flush_file;
+  {
+    auto c = Cache::create(make_config(false));
+    REQUIRE(c.has_value());
+    REQUIRE((*c)->add_volume(tmp.path(), kRetVol).has_value());
+    REQUIRE((*c)->start().has_value());
+    REQUIRE(write_entry(**c, "old", make_content(2, 4096)));
+    REQUIRE((*c)->stats().frontier_advances == 0);
+    flush_file = volume_file_of(**c);
+    (*c)->stop();
+    REQUIRE(peek_u16(flush_file, kRetainChunksOffset) == 0);
+  }
+
+  // Upgrade: a default open of that flush volume resolves to the SAME file
+  // (the mode is not in the fingerprint) and, with no live peer, resets it
+  // cold into the default mode.
+  {
+    auto c = Cache::create(make_config(std::nullopt));
+    REQUIRE(c.has_value());
+    REQUIRE((*c)->add_volume(tmp.path(), kRetVol).has_value());
+    REQUIRE((*c)->start().has_value());
+    REQUIRE(volume_file_of(**c) == flush_file);
+    if (expected) {
+      REQUIRE_FALSE((*c)->read_sync(CacheKey("old")).has_value());  // cold
+    }
+    (*c)->stop();
+    REQUIRE((peek_u16(flush_file, kRetainChunksOffset) != 0) == expected);
+  }
 }

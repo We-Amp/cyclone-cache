@@ -682,8 +682,12 @@ TEST_CASE(
     return stats.frontier_advances;
   };
   REQUIRE(frontier_advances_after_one_write(1) == 0);
-  // Zero-initialised: the library default (CacheConfig::wrap_retention).
+  // Zero-initialised: the library default (CacheConfig::wrap_retention),
+  // which is retention unless the test-seam override forces flush.
   const bool default_retains = cyclone::CacheConfig{}.wrap_retention;
+  // NOLINTNEXTLINE(concurrency-mt-unsafe): read-only
+  const char *forced = std::getenv("CYCLONE_TEST_WRAP_RETENTION");
+  REQUIRE(default_retains == (forced == nullptr || forced[0] == '1'));
   REQUIRE((frontier_advances_after_one_write(0) > 0) == default_retains);
 }
 
