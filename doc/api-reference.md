@@ -220,6 +220,12 @@ struct CacheStats {
     uint64_t early_advances_skipped;      // Optional runway advances skipped
     uint64_t retained_hits;               // Hits served from the previous pass
     uint64_t stamp_rejections;            // Stale pass stamps rejected
+
+    // Alternate carry-forward (process-local; all 0 in flush mode; see
+    // "Wrap Retention" below)
+    uint64_t alternates_carried_forward;  // Retained alternates rewritten
+    uint64_t alternate_carry_bytes;       // Bytes those rewrites cost
+    uint64_t alternates_carry_dropped;    // Retained alternates not kept
 };
 ```
 
@@ -270,7 +276,9 @@ and the backstop fired.  `alternate_wrap_refusals` counts writes whose
 allocation wrapped the circular buffer and which therefore started a fresh
 chain rather than linking to the pre-wrap one — expected on any cache that
 wraps while alternates are being re-recorded, and otherwise indistinguishable
-from an ordinary wrap.
+from an ordinary wrap.  In practice it moves in flush mode only: with wrap
+retention the pre-wrap chain is retained rather than lost, and the write
+carries it forward instead (see the carry-forward counters below).
 
 `tag_collision_evictions` and `bucket_full_evictions` count directory
 entries a write had to evict because the target bucket (4 entries) was
@@ -320,10 +328,20 @@ must cross defers that advance and drops the fill (also counted in
 class: stale survivors, or a lost timeline after a power loss. All five stay
 0 in flush mode and are process-local.
 
+The carry-forward counters observe alternate writes over a retained chain
+(see ["Wrap Retention"](#wrap-retention)). `alternates_carried_forward`
+counts the alternates such a write rewrote into the current pass.
+`alternate_carry_bytes` counts their on-disk bytes: the write amplification
+of the carry. `alternates_carry_dropped` counts the visible retained
+alternates a carry did not keep, because they were over its count or byte
+cap or unreadable when copied. It is the one way a retained alternate is
+still lost on a write. All three stay 0 in flush mode and are process-local.
+
 `CycloneCacheStats` (C API) carries the core counters, the wrap and lease
 counters, `tag_collision_evictions`, `borrows_outstanding`, the reset-gate
 fields, `bucket_full_evictions`, the alternate counters, the RAM-coherence
-counters and the five wrap-retention counters, in that append-only order. The
+counters, the five wrap-retention counters and the three carry-forward
+counters, in that append-only order. The
 stripe geometry, HitTracker flush,
 `directory_syncs`, `fsyncs` and `readahead_hints_issued` fields are C++-only.
 
@@ -781,13 +799,18 @@ Rules:
   exposes only the tail of the retained pass that the frontier never
   reached. For that tail the verdict is conservative: the bytes are still
   intact.
-- Alternates never link across a pass: a write over a retained head starts
-  a fresh chain (counted in `alternate_wrap_refusals`), and removing one
-  alternate from a retained chain removes the whole entry. **Known gap:**
-  the retained alternates of that key stop resolving at that moment. A
-  PageSpeed-style key whose optimized alternates arrive after a wrap loses
-  its retained Original, Gzip and so on. `retained_hits` counts the hits
-  that retention did serve.
+- Alternates never link across a pass. An alternate write over a retained
+  head **carries the chain forward**: it rewrites the key's other
+  alternates as current-pass copies in its own slot and publishes them
+  with the new head in one directory insert. A PageSpeed-style key whose
+  optimized alternates arrive after a wrap keeps its Original, Gzip and so
+  on. A carry happens at most once per key per pass. It keeps at most
+  `kMaxAlternatesPerKey - 1` alternates and `min(A / 8, max_object_size)`
+  bytes (A is the stripe's data area), the Original first and then the
+  newest. What it drops is counted in `alternates_carry_dropped`. A carry
+  never makes the write fail, but its larger slot can be deferred by a
+  borrow like any fill (`NoSpace`). Removing one alternate from a retained
+  chain removes the whole entry.
 
 ### Cross-Process RAM Coherence
 

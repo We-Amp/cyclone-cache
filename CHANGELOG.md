@@ -63,11 +63,27 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `advances_deferred_by_lease`, `early_advances_skipped`, `retained_hits`,
   `stamp_rejections`. See `doc/api-reference.md#wrap-retention` and
   `doc/design/wrap-retention.md`.
-  Retention is off by default. Known gaps before it can default on:
-  - the PageSpeed `cache_burst_test` has not been run against it;
-  - writing an alternate onto a key whose head is retained drops that key's
-    retained chain (R4; counted in `alternate_wrap_refusals`, see
-    `doc/design/wrap-retention.md` section 14).
+  Retention is off by default. Known gap before it can default on: the
+  PageSpeed `cache_burst_test` has not been run against it.
+- **Wrap retention: alternate carry-forward.** An alternate write whose
+  chain head is retained no longer drops the key's other alternates (review
+  R4). A chain may still not link across a pass. Instead the write rewrites
+  the surviving alternates as current-pass documents in its own slot, below
+  the new head, and publishes all of them with one directory insert. A
+  crash at any step leaves either the old retained chain or the new complete
+  chain. For PageSpeed that means the Original, Gzip and WebP keep resolving
+  when the optimization engine adds an AVIF after a wrap. A carry happens at
+  most once per key per pass. It keeps at most `kMaxAlternatesPerKey - 1`
+  alternates and `min(A / 8, max_object_size)` bytes, the Original first,
+  then the newest. A write whose allocation wraps while it links a live
+  chain retries once and carries that chain, where it used to refuse the
+  link. Flush mode is unchanged. New counters in `CacheStats` and at the
+  tail of `CycloneCacheStats`: `alternates_carried_forward`,
+  `alternate_carry_bytes`, `alternates_carry_dropped` (appended, so C
+  consumers must be rebuilt against the new header, as for the earlier
+  tail fields). `alternate_wrap_refusals` no longer moves in retention
+  mode. See
+  `doc/design/wrap-retention.md` sections 4.5 and 14.
 - `performance_baseline --wrap-retention on|off`, a `retain|flush` argument
   for `concurrent_read_bench`, and `kv_churn --wrap-retention on|off`, which
   adds the retention counters to its JSON. `kv_churn_policy` gains
