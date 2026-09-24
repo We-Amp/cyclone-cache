@@ -1071,6 +1071,9 @@ CacheStats Cache::stats() const {
     result.early_advances_skipped += vs.early_advances_skipped;
     result.retained_hits += vs.retained_hits;
     result.stamp_rejections += vs.stamp_rejections;
+    result.alternates_carried_forward += vs.alternates_carried_forward;
+    result.alternate_carry_bytes += vs.alternate_carry_bytes;
+    result.alternates_carry_dropped += vs.alternates_carry_dropped;
   }
 
   if (_impl->ram_cache) {

@@ -3920,6 +3920,12 @@ VolumeStats Volume::stats() const {
       _early_advances_skipped.load(std::memory_order_relaxed);
   result.retained_hits = _retained_hits.load(std::memory_order_relaxed);
   result.stamp_rejections = _stamp_rejections.load(std::memory_order_relaxed);
+  result.alternates_carried_forward =
+      _alternates_carried_forward.load(std::memory_order_relaxed);
+  result.alternate_carry_bytes =
+      _alternate_carry_bytes.load(std::memory_order_relaxed);
+  result.alternates_carry_dropped =
+      _alternates_carry_dropped.load(std::memory_order_relaxed);
   result.write_lock_force_releases =
       _write_lock_force_releases.load(std::memory_order_relaxed);
   result.write_lock_escalation_takeovers =
@@ -4535,6 +4541,205 @@ std::expected<WriteHandle, CacheError> Volume::write_alternate_sync(
 std::expected<void, CacheError> Volume::commit_alternate_write(
     Stripe* stripe, const CacheKey& key, AlternateId alternate_id,
     std::span<const std::byte> header, std::span<const std::byte> content) {
+  // At most one restart: a wrap-raced write whose live chain became retained
+  // in that wrap (see commit_alternate_write_once) retries once, and the
+  // retry carries the chain forward.  The retry cannot restart again: its
+  // head is retained or gone, and a carry never refuses its own links.
+  bool restart = false;
+  auto result =
+      commit_alternate_write_once(stripe, key, alternate_id, header, content,
+                                  /*allow_restart=*/true, &restart);
+  if (restart) {
+    restart = false;
+    result =
+        commit_alternate_write_once(stripe, key, alternate_id, header, content,
+                                    /*allow_restart=*/false, &restart);
+  }
+  return result;
+}
+
+uint64_t Volume::carry_byte_budget(const Stripe* stripe,
+                                   uint64_t new_doc_size) const {
+  const uint64_t area = stripe->size - stripe->data_start_rel();
+  const uint64_t new_aligned = (new_doc_size + 7U) & ~uint64_t{7};
+  if (new_aligned >= area) {
+    return 0;
+  }
+  // A / 8 bounds the stall and the retained bytes one carry can expose; one
+  // maximum-size object bounds the copy on large stripes.  Both are far
+  // above a PageSpeed chain (tens to hundreds of KiB) at the default
+  // geometry (32 MiB stripes: 4 MiB).
+  uint64_t budget = area / 8;
+  if (_config.max_object_size > 0) {
+    budget = std::min<uint64_t>(budget, _config.max_object_size);
+  }
+  return std::min(budget, area - new_aligned);
+}
+
+Volume::CarryPlan Volume::carry_retained_chain(
+    const Stripe* stripe, const CacheKey& key, const StripeSnapshot& snap,
+    std::span<const CarrySource> chain, uint8_t write_id,
+    uint64_t new_doc_size) const {
+  CarryPlan plan;
+  if (!stripe->retain || snap.pass == 0 || chain.empty()) {
+    return plan;
+  }
+  auto align8 = [](uint64_t n) { return (n + 7U) & ~uint64_t{7}; };
+
+  // Candidates, in walk order (newest first): the FIRST copy of every id
+  // except the one being written.  A later copy of an id is a shadow no
+  // reader selects, and every copy of write_id is superseded by this write.
+  std::array<size_t, Document::kMaxChainTraversalDepth> cand{};
+  size_t n = 0;
+  std::bitset<256> seen;
+  seen.set(write_id);
+  for (size_t i = 0; i < chain.size() && n < cand.size(); ++i) {
+    if (seen.test(chain[i].id)) {
+      continue;
+    }
+    seen.set(chain[i].id);
+    cand[n++] = i;
+  }
+  if (n == 0) {
+    return plan;
+  }
+
+  // Caps.  At most kMaxAlternates - 1 nodes (the new head is the last id a
+  // key may hold) and carry_byte_budget() bytes.  Priority: the Original
+  // (AlternateId 0, the one every client can take, and in the PageSpeed
+  // shape the OLDEST node, so plain newest-first would drop it first), then
+  // newest first.  What does not fit is dropped and counted.
+  const uint64_t budget = carry_byte_budget(stripe, new_doc_size);
+  constexpr size_t kMaxCarried = Document::kMaxAlternates - 1;
+  std::array<bool, Document::kMaxChainTraversalDepth> keep{};
+  uint64_t planned = 0;
+  size_t kept = 0;
+  auto consider = [&](size_t c) {
+    const uint64_t sz = align8(chain[cand[c]].len);
+    if (kept < kMaxCarried && sz <= budget - planned) {
+      keep[c] = true;
+      planned += sz;
+      ++kept;
+    } else {
+      ++plan.dropped;
+    }
+  };
+  size_t original = n;
+  for (size_t c = 0; c < n; ++c) {
+    if (chain[cand[c]].id == static_cast<uint8_t>(AlternateId::Original)) {
+      original = c;
+      break;
+    }
+  }
+  if (original < n) {
+    consider(original);
+  }
+  for (size_t c = 0; c < n; ++c) {
+    if (c != original) {
+      consider(c);
+    }
+  }
+
+  // Copy the kept nodes out of the mapping, DEEPEST first: in the new slot
+  // they then lie oldest-lowest, so every rebuilt link points downward
+  // (Stripe::admit_hop) exactly as in a chain written node by node.
+  //
+  // Exposure (the retention rule that a borrow is never served from bytes
+  // the forward fill may overwrite) applies to this copy like to any read:
+  // the bytes are read with plain loads while holding no borrow, so after
+  // ALL copies an acquire fence pins those loads ahead of one fresh G load,
+  // and a node whose chunk G has since exposed is discarded -- an advance
+  // publishes G BEFORE any pwrite into the chunk it exposes, so a copy
+  // judged unexposed was taken from intact bytes.  The CRC re-check on the
+  // copy is the backstop (and catches power-loss damage).  Under the stripe
+  // mutex nothing in this process can advance; a peer writer can.
+  struct Copied {
+    size_t start;
+    uint64_t rel;
+  };
+  std::array<Copied, Document::kMaxChainTraversalDepth> copied{};
+  size_t copied_n = 0;
+  plan.bytes.reserve(planned);
+  const auto want_stamp = static_cast<uint32_t>(snap.pass - 1);
+  for (size_t c = n; c-- > 0;) {
+    if (!keep[c]) {
+      continue;
+    }
+    const CarrySource& src = chain[cand[c]];
+    if (src.len < Document::kHeaderSize || !stripe->in_data_area(src.rel) ||
+        src.len > stripe->size - src.rel) {
+      ++plan.dropped;
+      continue;
+    }
+    auto region = _mapped_file->map_region(stripe->offset + src.rel, src.len,
+                                           MappedFile::MapMode::ReadOnly);
+    if (!region) {
+      ++plan.dropped;
+      continue;
+    }
+    const size_t start = plan.bytes.size();
+    plan.bytes.resize(start + align8(src.len));  // zero padding
+    std::memcpy(plan.bytes.data() + start, region->data(), src.len);
+    [[maybe_unused]] const auto unmapped = _mapped_file->unmap_region(*region);
+
+    const DocumentReader reader(
+        std::span<const std::byte>(plan.bytes.data() + start, src.len));
+    const Document& doc = reader.document();
+    const bool ok =
+        reader.is_valid() && doc.len == src.len &&
+        doc.doc_type == Document::Type::SingleFrag &&
+        doc.alternate_id == src.id && doc.write_serial == want_stamp &&
+        reader.first_key() == key &&
+        (doc.checksum == 0 || doc.verify_checksum(reader.payload()));
+    if (!ok) {
+      plan.bytes.resize(start);
+      ++plan.dropped;
+      continue;
+    }
+    copied[copied_n++] = Copied{start, src.rel};
+  }
+
+  std::atomic_thread_fence(std::memory_order_acquire);
+  const uint64_t gen = stripe->exposure_gen();
+  bool any_exposed = false;
+  for (size_t i = 0; i < copied_n; ++i) {
+    if (gen > stripe->exposure_threshold(snap.pass - 1, copied[i].rel)) {
+      any_exposed = true;
+      break;
+    }
+  }
+  if (!any_exposed) {
+    plan.starts.reserve(copied_n);
+    for (size_t i = 0; i < copied_n; ++i) {
+      plan.starts.push_back(copied[i].start);
+    }
+    return plan;
+  }
+  // Rare (a peer advanced over part of the chain while we copied): keep
+  // only the unexposed copies.
+  std::vector<std::byte> kept_bytes;
+  kept_bytes.reserve(plan.bytes.size());
+  for (size_t i = 0; i < copied_n; ++i) {
+    const size_t end =
+        i + 1 < copied_n ? copied[i + 1].start : plan.bytes.size();
+    if (gen > stripe->exposure_threshold(snap.pass - 1, copied[i].rel)) {
+      ++plan.dropped;
+      continue;
+    }
+    plan.starts.push_back(kept_bytes.size());
+    kept_bytes.insert(
+        kept_bytes.end(),
+        plan.bytes.begin() + static_cast<ptrdiff_t>(copied[i].start),
+        plan.bytes.begin() + static_cast<ptrdiff_t>(end));
+  }
+  plan.bytes = std::move(kept_bytes);
+  return plan;
+}
+
+std::expected<void, CacheError> Volume::commit_alternate_write_once(
+    Stripe* stripe, const CacheKey& key, AlternateId alternate_id,
+    std::span<const std::byte> header, std::span<const std::byte> content,
+    bool allow_restart, bool* restart) {
   if (stripe == nullptr) {
     return make_unexpected(CacheError::NotInitialized);
   }
@@ -4578,6 +4783,7 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
   struct ChainNode {
     uint64_t rel_offset;
     uint64_t next_rel;
+    uint32_t len;  // Document::len (what a carry-forward copies)
     uint8_t id;
     AdmitClass cls;  // the node's admission class (a link may only target
                      // a current node: D5)
@@ -4687,7 +4893,7 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
       unique_alternate_ids.set(doc->reader.document().alternate_id);
       uint64_t next_offset = doc->reader.document().next_alternate_offset;
       nodes[node_count] = ChainNode{
-          current_rel, next_offset,
+          current_rel, next_offset, doc->reader.document().len,
           static_cast<uint8_t>(doc->reader.document().alternate_id), node_cls};
       ++node_count;
       _mapped_file->unmap_region(doc->region);
@@ -4753,19 +4959,22 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
     }
   }
 
-  // A retained head is never linked (S6, below): this write starts a fresh
-  // chain whatever the old one looks like, so the old chain's length and
-  // alternate count cannot make it fail (review N3).
-  const bool retained_head_refused =
-      key_exists && head_cls == AdmitClass::kRetained;
+  // A retained head is never linked (D5).  Instead this write CARRIES the
+  // retained chain forward: its other alternates are rewritten as
+  // current-pass documents in this write's own slot, below the new head
+  // (carry_retained_chain; design section 4.5).  The carry is bounded by
+  // its own count and byte caps and never fails the write, so the old
+  // chain's length and alternate count cannot make it fail (review N3).
+  const bool carry_forward =
+      stripe->retain && key_exists && head_cls == AdmitClass::kRetained;
 
   // Reject if the chain was too long to fully traverse
-  if (chain_truncated && !retained_head_refused) {
+  if (chain_truncated && !carry_forward) {
     return make_unexpected(CacheError::TooManyAlternates);
   }
 
   // Check unique alternate count limit
-  if (!retained_head_refused &&
+  if (!carry_forward &&
       unique_alternate_ids.count() >= Document::kMaxAlternates) {
     return make_unexpected(CacheError::TooManyAlternates);
   }
@@ -4807,7 +5016,10 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
 
   uint64_t new_next_offset = key_exists ? head_relative_offset : 0;
 
-  if (chain_reset) {
+  if (chain_reset || carry_forward) {
+    // A carry-forward links after the allocation, to the carried copies in
+    // this slot.  Superseded copies of write_id are simply not carried: the
+    // unlink is free there, and there is nothing to splice.
     new_next_offset = 0;
   } else if (_config.unlink_superseded_alternates && key_exists &&
              node_count > 0) {
@@ -4910,22 +5122,78 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
     return make_unexpected(CacheError::InvalidArgument);
   }
 
-  size_t doc_size = doc_data.size();
+  const size_t doc_size = doc_data.size();
+
+  // ---- Carry the retained chain forward (wrap retention, R4) -------------
+  //
+  // The slot this write fills is [carried nodes, oldest first][new head]:
+  // ONE reservation, ONE pwrite, ONE directory insert.  Crash safety falls
+  // out of that shape.  Until the insert publishes the new head, the only
+  // entry for the key is the retained head, and the carried copies are
+  // unreferenced bytes; after it, the new head and every carried node are
+  // durable (the insert runs after the fill and, with sync_on_write, after
+  // its fsync -- invariant 2).  So a crash at any step leaves either the
+  // old retained chain or the new complete chain resolvable, never a
+  // published prefix of the new one.  The carried copies sit in the runway
+  // like any fill: no reader can admit them before the cursor covers them
+  // (F6) and the entry names them.
+  CarryPlan carry;
+  std::vector<std::byte> slot_bytes;  // the carry, then the head
+  size_t head_pos = 0;                // the head's start inside the slot
+  if (carry_forward) {
+    std::array<CarrySource, Document::kMaxChainTraversalDepth> sources{};
+    for (size_t i = 0; i < node_count; ++i) {
+      sources[i] = CarrySource{nodes[i].rel_offset, nodes[i].len, nodes[i].id};
+    }
+    carry = carry_retained_chain(
+        stripe, key, snap,
+        std::span<const CarrySource>(sources.data(), node_count), write_id,
+        doc_size);
+    carry_seam(CarrySeam::kSourcesCopied);
+    if (!carry.starts.empty()) {
+      slot_bytes = std::move(carry.bytes);
+      head_pos = slot_bytes.size();  // 8-aligned: every carried node is
+      slot_bytes.insert(slot_bytes.end(), doc_data.begin(), doc_data.end());
+    }
+  }
+  const std::span<std::byte> fill = slot_bytes.empty()
+                                        ? std::span<std::byte>(doc_data)
+                                        : std::span<std::byte>(slot_bytes);
+  const std::span<std::byte> head_doc = fill.subspan(head_pos, doc_size);
 
   // Allocate the write slot via the shared lease-gated helper
   // (write-lock handling, capacity checks, lease gate, eviction/wrap,
   // offset reservation — identical at both commit sites by construction).
-  auto slot_res = allocate_write_slot(stripe, doc_size);
+  auto slot_res = allocate_write_slot(stripe, fill.size());
   if (!slot_res) {
     return make_unexpected(slot_res.error());
   }
   const WriteSlot slot = *slot_res;
   // Pass stamp: part of the same pwrite as the document (design 5.1(2)).
-  patch_pass_stamp(doc_data, slot.pass);
+  patch_pass_stamp(head_doc, slot.pass);
   uint64_t write_offset = slot.write_offset;
   // Release the held lock on any unexpected unwind before commit_write_slot
   // (see HeldWriteSlotReleaser at commit_write).
   HeldWriteSlotReleaser slot_releaser(stripe, slot);
+
+  // Link the carried nodes now that their offsets are known: head -> newest
+  // carried -> ... -> oldest -> 0, every hop downward inside this slot, so
+  // the whole chain lies in ONE pass (D5) and no link names a byte outside
+  // the reservation.  They take this pass's stamp like the head.
+  const size_t carried_nodes = carry.starts.size();
+  if (carried_nodes != 0 && write_offset >= stripe->offset) {
+    const uint64_t base_rel = write_offset - stripe->offset;
+    for (size_t i = 0; i < carried_nodes; ++i) {
+      const std::span<std::byte> node = fill.subspan(carry.starts[i]);
+      patch_pass_stamp(node, slot.pass);
+      const uint64_t next = i == 0 ? 0 : base_rel + carry.starts[i - 1];
+      std::memcpy(node.data() + Document::kNextAlternateOffsetPos, &next,
+                  sizeof(next));
+    }
+    const uint64_t head_next = base_rel + carry.starts[carried_nodes - 1];
+    std::memcpy(head_doc.data() + Document::kNextAlternateOffsetPos, &head_next,
+                sizeof(head_next));
+  }
 
   // WRAP-FRONTIER LINK REFUSAL.  The offset we stamped as this document's
   // next_alternate_offset was resolved before the allocation.  Allocating can
@@ -4952,9 +5220,13 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
   // head it would point at is a RETAINED document of the previous pass.  A
   // retained head is never linked, so a fixed-size new head that lands on
   // the old head's offset cannot form a self-loop (test 9).
+  //
+  // A carry-forward write refuses nothing: its links point only into its
+  // own slot, and its copies were validated before the allocation (a wrap
+  // inside that allocation cannot reach bytes already copied out).
   const bool wrap_raced_write =
-      wrapped_since(stripe, snap) ||
-      (key_exists && head_cls != AdmitClass::kCurrent);
+      !carry_forward && (wrapped_since(stripe, snap) ||
+                         (key_exists && head_cls != AdmitClass::kCurrent));
   // A refusal is only COUNTED when the stamped link was actually live
   //: new_next_offset is still the value the planner stamped into the
   // document, and it is already 0 when there was no pre-wrap chain to orphan
@@ -4962,8 +5234,22 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
   // choosing a fresh chain.  Zeroing an already-zero field refuses nothing,
   // so those wrap-raced writes are ordinary wraps, not wrap-race events.
   const bool link_refused = wrap_raced_write && new_next_offset != 0;
+  // Wrap retention: the wrap did not destroy that chain, it made it
+  // RETAINED.  Give the slot back unfilled (the cursor never moved past it,
+  // F6) and let the caller retry once: the retry sees a retained head and
+  // carries the chain forward instead of orphaning it.
+  if (link_refused && allow_restart && stripe->retain &&
+      slot.deferred_publish) {
+    // Releases the write lock and publishes nothing; a Busy (usurped lock)
+    // changes nothing for the retry, which re-acquires it.
+    [[maybe_unused]] const auto released =
+        commit_write_slot(stripe, slot, /*fill_ok=*/false);
+    slot_releaser.disarm();
+    *restart = true;
+    return make_unexpected(CacheError::Busy);  // the caller retries
+  }
   if (wrap_raced_write) {
-    std::memset(doc_data.data() + Document::kNextAlternateOffsetPos, 0,
+    std::memset(head_doc.data() + Document::kNextAlternateOffsetPos, 0,
                 sizeof(uint64_t));
     // Every offset resolved during the walk is suspect for the same reason,
     // so no in-place splice may run either.  (repoint_chain_link's fence
@@ -4988,19 +5274,19 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
   // If the fill fails, the reserved region becomes a harmless "gap" (the cursor
   // is NOT advanced past it), reclaimed at the next wrap-around.
 #ifdef _WIN32
-  auto map_result = _mapped_file->map_region(write_offset, doc_size,
+  auto map_result = _mapped_file->map_region(write_offset, fill.size(),
                                              MappedFile::MapMode::ReadWrite);
   bool fill_ok = map_result.has_value();
   if (fill_ok) {
-    std::memcpy(map_result->data(), doc_data.data(), doc_size);
+    std::memcpy(map_result->data(), fill.data(), fill.size());
     if (_config.sync_on_write) {
       _mapped_file->sync(*map_result, MappedFile::SyncMode::Sync);
     }
     _mapped_file->unmap_region(*map_result);
   }
 #else
-  ssize_t written = pwrite(_fd, doc_data.data(), doc_size, write_offset);
-  bool fill_ok = !(written < 0 || static_cast<size_t>(written) != doc_size);
+  ssize_t written = pwrite(_fd, fill.data(), fill.size(), write_offset);
+  bool fill_ok = !(written < 0 || static_cast<size_t>(written) != fill.size());
 #endif
 
   // Sync if configured.
@@ -5025,12 +5311,15 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
   if (!fill_ok) {
     return make_unexpected(CacheError::IoError);
   }
+  if (carry_forward) {
+    carry_seam(CarrySeam::kFilled);
+  }
 
   // Calculate offset relative to stripe start
   if (write_offset < stripe->offset) {
     return make_unexpected(CacheError::InternalError);
   }
-  uint64_t relative_offset = write_offset - stripe->offset;
+  const uint64_t relative_offset = write_offset - stripe->offset + head_pos;
   if (relative_offset + doc_size > stripe->size) {
     return make_unexpected(CacheError::InternalError);
   }
@@ -5117,6 +5406,19 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
     // live pre-wrap chain was orphaned by it".
     _alternate_wrap_refusals.fetch_add(1, std::memory_order_relaxed);
   }
+  if (carry_forward) {
+    // Counted post-publish, like the refusal: a write that failed never
+    // carried anything, and the retained chain is still where it was.
+    if (carried_nodes != 0) {
+      _alternates_carried_forward.fetch_add(carried_nodes,
+                                            std::memory_order_relaxed);
+      _alternate_carry_bytes.fetch_add(head_pos, std::memory_order_relaxed);
+    }
+    if (carry.dropped != 0) {
+      _alternates_carry_dropped.fetch_add(carry.dropped,
+                                          std::memory_order_relaxed);
+    }
+  }
 
   // ---- Invalidate the RAM copy this write supersedes (post-publish) ------
   //
@@ -5189,9 +5491,18 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
   //
   // Sited after every early return, so a write that failed to publish never
   // evicts a RAM entry that is still the correct answer.
+  //
+  // A carry that DROPPED alternates (over its caps) detached other ids too,
+  // so the one-id argument above does not cover it: evict the whole key,
+  // same mechanism and order.  (The carried copies are byte-identical to
+  // their sources, so evicting them costs a RAM miss, never correctness.)
   if (_ram_cache) {
     stripe->remove_epoch.fetch_add(1, std::memory_order_acq_rel);
-    _ram_cache->remove(key, alternate_id);
+    if (carry.dropped != 0) {
+      _ram_cache->remove_all(key);
+    } else {
+      _ram_cache->remove(key, alternate_id);
+    }
   }
 
   return {};

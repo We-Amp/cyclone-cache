@@ -171,7 +171,9 @@ struct CacheStats {
   //   alternate_wrap_refusals: writes whose allocation wrapped the stripe and
   //     that therefore refused to link their new head to the pre-wrap chain,
   //     starting a fresh chain instead.  This is what a wrap-race
-  //     event looks like post-migration.
+  //     event looks like post-migration.  In practice flush mode only: with
+  //     wrap retention the write carries the chain forward instead
+  //     (alternates_carried_forward below).
   uint64_t alternate_shadows_unlinked = 0;
   uint64_t alternate_splice_deferred = 0;
   uint64_t alternate_chain_resets = 0;
@@ -231,6 +233,20 @@ struct CacheStats {
   uint64_t early_advances_skipped = 0;
   uint64_t retained_hits = 0;
   uint64_t stamp_rejections = 0;
+
+  // Alternate carry-forward (wrap retention; PROCESS-LOCAL, summed across
+  // volumes, appended at the tail to match CycloneCacheStats).  All stay 0
+  // in flush mode.  Full semantics on VolumeStats in src/core/volume.hpp.
+  //   alternates_carried_forward: alternates of a RETAINED chain that an
+  //     alternate write rewrote into the current pass beside its new head,
+  //     so the key's other alternates keep resolving.
+  //   alternate_carry_bytes: bytes those rewrites cost (the write
+  //     amplification of the carry).
+  //   alternates_carry_dropped: visible retained alternates a carry did not
+  //     keep (over the count or byte cap, or unreadable when copied).
+  uint64_t alternates_carried_forward = 0;
+  uint64_t alternate_carry_bytes = 0;
+  uint64_t alternates_carry_dropped = 0;
 };
 
 // Thread-safe counters for stats updated from background threads (hit tracker).

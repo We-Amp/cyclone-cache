@@ -857,6 +857,23 @@ struct VolumeStats {
   uint64_t retained_hits = 0;
   uint64_t stamp_rejections = 0;
 
+  // Alternate carry-forward (wrap retention only, PROCESS-LOCAL; see
+  // Volume::carry_retained_chain).  An alternate write whose chain head is
+  // RETAINED rewrites the key's other alternates as current-pass documents
+  // in the same slot as the new head, instead of dropping them (D5: a chain
+  // never spans two passes).  All stay 0 in flush mode.
+  //   alternates_carried_forward: retained chain nodes rewritten into the
+  //     current pass.
+  //   alternate_carry_bytes: on-disk bytes of those nodes (8-byte padded):
+  //     the write amplification the carry costs.
+  //   alternates_carry_dropped: visible alternates of a retained chain the
+  //     carry did NOT keep -- over the count or byte cap, or unreadable
+  //     (exposed, torn) when copied.  The one way a retained alternate is
+  //     still lost on a write.
+  uint64_t alternates_carried_forward = 0;
+  uint64_t alternate_carry_bytes = 0;
+  uint64_t alternates_carry_dropped = 0;
+
   // Cross-process write-lock recovery telemetry (PROCESS-LOCAL).  In
   // multi-process mode the write lock (write-pos allocation) can be
   // recovered from a peer that died holding it.
@@ -939,7 +956,8 @@ struct VolumeStats {
   // moves on a refusal (nothing was spliced, nothing was left linked), so
   // without this counter a refusal is indistinguishable from an ordinary
   // wrap.  Counted when the refusing write is published, not when the refusal
-  // is decided.
+  // is decided.  In practice flush mode only: in retention mode the wrap leaves
+  // the chain retained, and the write retries and carries it forward.
   uint64_t alternate_wrap_refusals = 0;
 
   // 1 iff the cross-process reset gate is NOT in effect for this volume, so an
@@ -1139,6 +1157,20 @@ class Volume : public std::enable_shared_from_this<Volume> {
   };
   using WriterSeamHook = std::function<void(WriterSeam seam)>;
   static inline WriterSeamHook s_writer_seam_for_test{};
+
+  // TEST SEAM ONLY -- never installed in production.  The two steps of an
+  // alternate write's carry-forward (see carry_retained_chain) that neither
+  // a writer seam (inside the allocation's advance) nor the tear gate
+  // (reservation -> pwrite) covers, so a crash test can kill the writer at
+  // EVERY step of the carry.  Same shape and cost as the hooks above; fires
+  // with the stripe mutex held.
+  enum class CarrySeam : uint8_t {
+    kSourcesCopied,  // retained nodes copied and validated; nothing reserved
+    kFilled,         // chain + head durable and the cursor published; the
+                     // directory insert (the publish) has not run
+  };
+  using CarrySeamHook = std::function<void(CarrySeam seam)>;
+  static inline CarrySeamHook s_carry_seam_for_test{};
 
 #ifdef CYCLONE_TEST_SEAMS
   // TEST-SEAM BUILDS ONLY.  Pause points on the LOCK-FREE READ path, so they
@@ -1460,6 +1492,9 @@ class Volume : public std::enable_shared_from_this<Volume> {
   std::atomic<uint64_t> _early_advances_skipped{0};
   mutable std::atomic<uint64_t> _retained_hits{0};
   mutable std::atomic<uint64_t> _stamp_rejections{0};
+  std::atomic<uint64_t> _alternates_carried_forward{0};
+  std::atomic<uint64_t> _alternate_carry_bytes{0};
+  std::atomic<uint64_t> _alternates_carry_dropped{0};
 
   // Full-bucket tag-collision evictions (process-local; see VolumeStats).
   std::atomic<uint64_t> _tag_collision_evictions{0};
@@ -1874,6 +1909,63 @@ class Volume : public std::enable_shared_from_this<Volume> {
   [[nodiscard]] bool stamp_admits(const Stripe *stripe,
                                   const StripeSnapshot &snap, AdmitClass cls,
                                   const Document &doc) const;
+
+  // ---- Alternate carry-forward (wrap retention, design section 4.5) ----
+  //
+  // A retained chain may not be linked from a current-pass head (D5), so an
+  // alternate write whose head is retained rewrites the key's other
+  // alternates as current-pass documents in the SAME slot as its new head,
+  // and publishes them with the head's one directory insert.  Nothing is
+  // linked across a pass, and nothing is published before all of it is
+  // durable (see commit_alternate_write for the crash-safety argument).
+
+  // One retained chain node as the alternate write's walk saw it.
+  struct CarrySource {
+    uint64_t rel = 0;  // stripe-relative offset
+    uint32_t len = 0;  // Document::len from the walked header
+    uint8_t id = 0;    // alternate id
+  };
+  // The carried documents, ready to be written directly below the new head:
+  // OLDEST first (the lowest offset, so every link points downward), each
+  // one 8-byte aligned inside `bytes`.  Their next_alternate_offset and
+  // pass stamp are patched once the slot is known.
+  struct CarryPlan {
+    std::vector<std::byte> bytes;
+    std::vector<size_t> starts;  // start of each document in `bytes`
+    uint64_t dropped = 0;        // visible alternates not carried
+  };
+  // Choose, copy and validate the nodes to carry.  `chain` is the walk, head
+  // first, every node in the retained class of `snap`.  Keeps the first
+  // (newest) copy of every id other than `write_id`, at most
+  // kMaxAlternatesPerKey - 1 of them and at most carry_byte_budget() bytes:
+  // the Original first, then newest first.  Each kept node is copied out of
+  // the mapping, re-validated on the copy (magic, version, length, key, id,
+  // stamp, CRC) and, after all copies, re-checked for exposure against a
+  // fresh G; a node that fails any leg is dropped (counted).  Runs under
+  // the stripe mutex.
+  [[nodiscard]] CarryPlan carry_retained_chain(
+      const Stripe *stripe, const CacheKey &key, const StripeSnapshot &snap,
+      std::span<const CarrySource> chain, uint8_t write_id,
+      uint64_t new_doc_size) const;
+  // The byte cap on one carry: min(A / 8, max_object_size) and never more
+  // than what fits in the data area beside the new document.
+  [[nodiscard]] uint64_t carry_byte_budget(const Stripe *stripe,
+                                           uint64_t new_doc_size) const;
+  // One attempt of commit_alternate_write.  With `allow_restart`, a
+  // retention-mode write whose allocation WRAPPED while it planned a link
+  // to a live current chain gives its (unfilled) slot back and sets
+  // `*restart` instead of refusing the link: after the wrap that chain is
+  // retained, and the second attempt carries it forward.
+  std::expected<void, CacheError> commit_alternate_write_once(
+      Stripe *stripe, const CacheKey &key, AlternateId alternate_id,
+      std::span<const std::byte> header, std::span<const std::byte> content,
+      bool allow_restart, bool *restart);
+  // Fire the carry seam (test only; a no-op in production).
+  static void carry_seam(CarrySeam seam) {
+    if (s_carry_seam_for_test) {
+      s_carry_seam_for_test(seam);
+    }
+  }
 
   // Retention-mode allocation prologue, run by allocate_write_slot under
   // the stripe mutex and (multi-process) the write lock: the UNGATED wrap
