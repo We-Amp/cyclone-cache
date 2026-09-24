@@ -17,16 +17,21 @@
 //       only a 12-bit tag), so the aliased entry resolves to a clean miss,
 //       never a stale or foreign serve.  Single-threaded scope.
 //
-//   (B) Checksum-validation cache staleness.  The 64K-slot
-//       offset->top16(CRC32) cache is never invalidated on wrap; after
-//       same-offset reuse, a new document whose checksum shares the cached
-//       verdict's top 16 bits (2^-16) SKIPS re-verification.  The collision
-//       is constructed deterministically below so the skip path really
-//       fires.  NOTE ON WHAT IS OBSERVED: no counter distinguishes
-//       "CRC skipped" from "CRC re-verified", so this test exercises the
-//       skip path without observing it directly; its load-bearing
-//       assertions are that the served bytes are the new document's real
-//       bytes and the old key misses cleanly.  Single-threaded scope.
+//   (B) Checksum-validation cache staleness.  The 64K-slot cache is never
+//       invalidated on wrap; after same-offset reuse, a new document whose
+//       checksum shares the cached verdict's top 16 bits must still serve
+//       its own real bytes, and the replaced key must miss cleanly.  The
+//       collision is constructed deterministically (it was the 2^-16 skip
+//       condition of the former {offset, top16(CRC)} key).
+//
+//   (G) CRC-validation cache identity.  The cache is keyed by a 64-bit
+//       token of the whole incarnation (offset, pass stamp, full CRC,
+//       lengths, key prefix; Volume::checksum_token), so the (B) collision
+//       no longer skips the CRC pass: a same-offset document with a
+//       top-16-colliding CRC and a payload corrupted after its checksum was
+//       computed is REJECTED, a changed pass stamp alone forces a
+//       re-verification, and the identical incarnation still skips it.
+//       Observed through the kCrcVerify reader seam.  Single-threaded.
 //
 //   (C) 2-wrap trailing-gap survivor vs the UNGATED FORWARD FILL, closed by
 //       the phase-ABA POSITIONAL READ GUARD.  With variable-size documents, a
@@ -81,6 +86,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -300,6 +306,82 @@ bool write_alternate_entry(Cache &cache, const std::string &key_str,
   return wh->close_sync().has_value();
 }
 
+// Brute-force a kDocSize payload (make_content(index) with a 4-byte tail
+// varied) whose CRC-32C shares `crc`'s top 16 bits but differs from it
+// (~65536 candidates expected).  The stored checksum covers the payload
+// (empty header + content), so the content CRC is exactly what the read
+// path compares.  Cheap: the prefix CRC state is computed once and only the
+// 4-byte tail is re-hashed per candidate.  Returns an empty vector if no
+// candidate is found (callers REQUIRE a non-empty result).
+std::vector<std::byte> forge_top16_collision(uint32_t crc, size_t index) {
+  std::vector<std::byte> content = make_content(index, kDocSize);
+  const uint32_t prefix_state = oracle_crc32c_update(
+      0xFFFFFFFFu,
+      std::span<const std::byte>(content).first(content.size() - 4));
+  for (uint32_t probe = 0; probe < 40'000'000u; ++probe) {
+    const std::array<std::byte, 4> tail = {
+        static_cast<std::byte>(probe & 0xFF),
+        static_cast<std::byte>((probe >> 8) & 0xFF),
+        static_cast<std::byte>((probe >> 16) & 0xFF),
+        static_cast<std::byte>((probe >> 24) & 0xFF)};
+    const uint32_t got = oracle_crc32c_update(prefix_state, tail) ^ 0xFFFFFFFFu;
+    if ((got >> 16) == (crc >> 16) && got != crc && got != 0) {
+      std::copy(tail.begin(), tail.end(), content.end() - 4);
+      return content;
+    }
+  }
+  return {};
+}
+
+// Counts the CRC-32C passes the read path actually runs (the kCrcVerify
+// reader seam fires only when the CRC-validation cache MISSED).  Test-seam
+// builds only; install before the reads it observes, from a single thread.
+struct CrcVerifyCounter {
+  std::atomic<int> passes{0};
+  CrcVerifyCounter() {
+    Volume::s_reader_seam_for_test = [this](Volume::ReaderSeam at) {
+      if (at == Volume::ReaderSeam::kCrcVerify) {
+        passes.fetch_add(1, std::memory_order_relaxed);
+      }
+    };
+  }
+  ~CrcVerifyCounter() { Volume::s_reader_seam_for_test = nullptr; }
+  CrcVerifyCounter(const CrcVerifyCounter &) = delete;
+  CrcVerifyCounter &operator=(const CrcVerifyCounter &) = delete;
+  int count() const { return passes.load(std::memory_order_relaxed); }
+};
+
+#ifndef _WIN32
+uint32_t pread_u32(const std::string &path, uint64_t offset) {
+  const int fd = ::open(path.c_str(), O_RDONLY);
+  REQUIRE(fd >= 0);
+  uint32_t value = 0;
+  const ssize_t n =
+      ::pread(fd, &value, sizeof(value), static_cast<off_t>(offset));
+  ::close(fd);
+  REQUIRE(n == static_cast<ssize_t>(sizeof(value)));
+  return value;
+}
+
+// Store raw bytes into the volume file behind the cache's back, the way a
+// torn or late write would land them.  The cache maps the file MAP_SHARED,
+// so the page cache makes the store visible to its next read.
+void pwrite_bytes(const std::string &path, uint64_t offset,
+                  std::span<const std::byte> bytes) {
+  const int fd = ::open(path.c_str(), O_WRONLY);
+  REQUIRE(fd >= 0);
+  const ssize_t n =
+      ::pwrite(fd, bytes.data(), bytes.size(), static_cast<off_t>(offset));
+  ::close(fd);
+  REQUIRE(n == static_cast<ssize_t>(bytes.size()));
+}
+
+void pwrite_u32(const std::string &path, uint64_t offset, uint32_t value) {
+  pwrite_bytes(path, offset,
+               std::as_bytes(std::span<const uint32_t, 1>(&value, 1)));
+}
+#endif  // !_WIN32
+
 CacheConfig aba_config() {
   CacheConfig config;
   config.ram_cache_size = 0;  // every read is a disk (mmap) hit
@@ -491,29 +573,9 @@ TEST_CASE(
   uint32_t crc_a = oracle_crc32c(content_a);
   REQUIRE(crc_a != 0);  // read path consults the cache only when checksum != 0
 
-  // Brute-force a DIFFERENT payload whose CRC-32C shares A's top 16 bits
-  // (~65536 candidates expected).  The stored checksum covers the payload
-  // (empty header + content), so the content CRC is exactly what the read
-  // path compares.  Cheap: the prefix CRC state is computed once and only
-  // the 4-byte tail is re-hashed per candidate.
-  std::vector<std::byte> content_b = make_content(1, kDocSize);
-  const uint32_t prefix_state = oracle_crc32c_update(
-      0xFFFFFFFFu,
-      std::span<const std::byte>(content_b).first(content_b.size() - 4));
-  bool collided = false;
-  for (uint32_t probe = 0; probe < 40'000'000u && !collided; ++probe) {
-    std::array<std::byte, 4> tail = {
-        static_cast<std::byte>(probe & 0xFF),
-        static_cast<std::byte>((probe >> 8) & 0xFF),
-        static_cast<std::byte>((probe >> 16) & 0xFF),
-        static_cast<std::byte>((probe >> 24) & 0xFF)};
-    uint32_t crc_b = oracle_crc32c_update(prefix_state, tail) ^ 0xFFFFFFFFu;
-    if ((crc_b >> 16) == (crc_a >> 16) && crc_b != 0) {
-      std::copy(tail.begin(), tail.end(), content_b.end() - 4);
-      collided = true;
-    }
-  }
-  REQUIRE(collided);
+  // A DIFFERENT payload whose CRC-32C shares A's top 16 bits.
+  std::vector<std::byte> content_b = forge_top16_collision(crc_a, 1);
+  REQUIRE_FALSE(content_b.empty());
   REQUIRE((oracle_crc32c(content_b) >> 16) == (crc_a >> 16));
   REQUIRE_FALSE(content_equals(content_b, content_a));
 
@@ -559,6 +621,248 @@ TEST_CASE(
 
   cache->stop();
   remove_cache_files(path);
+}
+
+#ifndef _WIN32
+// --- (G1): a top-16 CRC collision at a reused offset is re-verified --------
+TEST_CASE(
+    "CRC-validation cache: a same-offset document whose CRC shares the "
+    "cached verdict's top 16 bits is re-verified and its corrupt payload "
+    "rejected",
+    "[wrap][checksum][crc_cache]") {
+  // 1. Write A at offset X and read it: the cache now holds A's verdict.
+  // 2. Flood with B, a different payload whose CRC-32C differs from A's but
+  //    shares its top 16 bits, until a wrap lands a B document at X.
+  // 3. Corrupt that B document's payload AFTER its checksum was computed
+  //    (a pwrite behind the cache's back: the torn or late write that
+  //    doc/design/verified-state.md section 3.3 describes).
+  // 4. Read it.  Under the former {offset, top16(CRC)} key, A's verdict
+  //    vouched for B and the corrupt bytes were SERVED.  Keyed by the full
+  //    incarnation token, the CRC pass must run and reject them.
+  auto content_a = make_content(0, kDocSize);
+  const uint32_t crc_a = oracle_crc32c(content_a);
+  REQUIRE(crc_a != 0);
+  const std::vector<std::byte> content_b = forge_top16_collision(crc_a, 1);
+  REQUIRE_FALSE(content_b.empty());
+  const uint32_t crc_b = oracle_crc32c(content_b);
+  REQUIRE((crc_b >> 16) == (crc_a >> 16));
+  REQUIRE(crc_b != crc_a);
+
+  std::string path = create_temp_file("crc_identity_top16", kVolMB);
+  auto cache_result = Cache::create(aba_config());
+  REQUIRE(cache_result.has_value());
+  auto &cache = *cache_result;
+  VolumeConfig vol_config;
+  vol_config.path = path;
+  vol_config.size = kVolMB * 1024 * 1024;
+  REQUIRE(cache->add_volume(vol_config).has_value());
+  REQUIRE(cache->start().has_value());
+  const std::string file = cache->volume_files().at(0).file_path;
+
+  CrcVerifyCounter crc_passes;
+
+  CacheKey key_a("crc-identity-A");
+  REQUIRE(write_entry(*cache, "crc-identity-A", content_a));
+  uint64_t content_off = ReadHandle::kNoFileOffset;
+  {
+    auto rh = cache->read_sync(key_a);
+    REQUIRE(rh.has_value());
+    REQUIRE(content_equals(rh->content(), content_a));
+    content_off = rh->content_file_offset();
+  }
+  REQUIRE(content_off != ReadHandle::kNoFileOffset);
+  REQUIRE(crc_passes.count() == 1);  // A verified once, verdict cached
+  const uint64_t doc_x = content_off - Document::kHeaderSize;  // empty hdr
+  REQUIRE(pread_u32(file, doc_x) == Document::kMagic);
+  REQUIRE(pread_u32(file, doc_x + Document::kChecksumOffset) == crc_a);
+
+  size_t idx = 0;
+  const std::string reuse_key =
+      flood_until_wrap(*cache, idx, 1, content_b, bucket_of(key_a));
+  REQUIRE_FALSE(reuse_key.empty());
+  // The wrap landed a B document at X: its header now carries crc_b.
+  REQUIRE(pread_u32(file, doc_x) == Document::kMagic);
+  REQUIRE(pread_u32(file, doc_x + Document::kChecksumOffset) == crc_b);
+
+  // Corrupt one payload byte of the document at X.
+  const std::array<std::byte, 1> flipped = {content_b[100] ^ std::byte{0xFF}};
+  pwrite_bytes(file, content_off + 100, flipped);
+
+  const int before = crc_passes.count();
+  {
+    auto rh = cache->read_sync(CacheKey(reuse_key));
+    // The corrupt bytes must never be served.
+    CHECK_FALSE(rh.has_value());
+    if (rh.has_value()) {
+      CHECK_FALSE(content_equals(rh->content(), content_b));
+      CHECK(rh->content_file_offset() == content_off);
+    }
+  }
+  CHECK(crc_passes.count() > before);  // the CRC pass ran
+
+  // Undo the corruption: the same document now verifies and serves, so the
+  // rejection above was the CRC pass doing its job, not a lost document.
+  const std::array<std::byte, 1> original = {content_b[100]};
+  pwrite_bytes(file, content_off + 100, original);
+  {
+    auto rh = cache->read_sync(CacheKey(reuse_key));
+    REQUIRE(rh.has_value());
+    REQUIRE(content_equals(rh->content(), content_b));
+    REQUIRE(rh->content_file_offset() == content_off);
+  }
+
+  cache->stop();
+  remove_cache_files(path);
+}
+
+// --- (G2): pass stamp is part of the identity; identical incarnation hits --
+TEST_CASE(
+    "CRC-validation cache: same offset and CRC under a different pass stamp "
+    "is re-verified; the identical incarnation skips the CRC pass",
+    "[checksum][crc_cache]") {
+  // Flush mode on purpose: retention admission compares the pass stamp
+  // itself and would reject the restamped document before the CRC site,
+  // hiding what this test observes.  In flush mode the stamp is admitted
+  // unchecked, so the token is the only thing that tells the two
+  // incarnations apart.
+  CacheConfig config = aba_config();
+  config.wrap_retention = false;
+  std::string path = create_temp_file("crc_identity_stamp", kVolMB);
+  auto cache_result = Cache::create(config);
+  REQUIRE(cache_result.has_value());
+  auto &cache = *cache_result;
+  VolumeConfig vol_config;
+  vol_config.path = path;
+  vol_config.size = kVolMB * 1024 * 1024;
+  vol_config.wrap_retention = false;
+  REQUIRE(cache->add_volume(vol_config).has_value());
+  REQUIRE(cache->start().has_value());
+  const std::string file = cache->volume_files().at(0).file_path;
+
+  CrcVerifyCounter crc_passes;
+
+  SECTION("read_sync") {
+    const auto content = make_content(5, kDocSize);
+    CacheKey key("crc-identity-stamp");
+    REQUIRE(write_entry(*cache, "crc-identity-stamp", content));
+    uint64_t content_off = ReadHandle::kNoFileOffset;
+    for (int i = 0; i < 3; ++i) {
+      auto rh = cache->read_sync(key);
+      REQUIRE(rh.has_value());
+      REQUIRE(content_equals(rh->content(), content));
+      content_off = rh->content_file_offset();
+    }
+    // Verified on the first read only: the warm path skips the CRC pass.
+    REQUIRE(crc_passes.count() == 1);
+    REQUIRE(content_off != ReadHandle::kNoFileOffset);
+    const uint64_t doc = content_off - Document::kHeaderSize;
+    const uint32_t crc = pread_u32(file, doc + Document::kChecksumOffset);
+    const uint32_t stamp = pread_u32(file, doc + Document::kWriteSerialOffset);
+
+    // Same offset, same payload, same CRC field -- another pass stamp.
+    pwrite_u32(file, doc + Document::kWriteSerialOffset, stamp + 1);
+    REQUIRE(pread_u32(file, doc + Document::kChecksumOffset) == crc);
+    for (int i = 0; i < 3; ++i) {
+      auto rh = cache->read_sync(key);
+      REQUIRE(rh.has_value());
+      REQUIRE(content_equals(rh->content(), content));
+    }
+    // A new incarnation: verified once more, then cached in its turn.
+    REQUIRE(crc_passes.count() == 2);
+  }
+
+  SECTION("read_alternate_sync") {
+    const auto content = make_content(6, kDocSize);
+    CacheKey key("crc-identity-alt");
+    REQUIRE(write_alternate_entry(*cache, "crc-identity-alt",
+                                  AlternateId::Brotli, content));
+    auto alts = cache->list_alternates_sync(key);
+    REQUIRE(alts.has_value());
+    REQUIRE(alts->size() == 1);
+    const uint64_t doc = (*alts)[0].disk_offset;
+    REQUIRE(pread_u32(file, doc) == Document::kMagic);
+
+    IdSelector want(AlternateId::Brotli);
+    const auto read_alt = [&] {
+      AlternateSelectionContext ctx;
+      auto rh = cache->read_alternate_sync(key, want, ctx);
+      REQUIRE(rh.has_value());
+      REQUIRE(content_equals(rh->content(), content));
+    };
+    for (int i = 0; i < 3; ++i) {
+      read_alt();
+    }
+    REQUIRE(crc_passes.count() == 1);
+
+    const uint32_t crc = pread_u32(file, doc + Document::kChecksumOffset);
+    const uint32_t stamp = pread_u32(file, doc + Document::kWriteSerialOffset);
+    pwrite_u32(file, doc + Document::kWriteSerialOffset, stamp + 1);
+    REQUIRE(pread_u32(file, doc + Document::kChecksumOffset) == crc);
+    for (int i = 0; i < 3; ++i) {
+      read_alt();
+    }
+    REQUIRE(crc_passes.count() == 2);
+  }
+
+  cache->stop();
+  remove_cache_files(path);
+}
+#endif  // !_WIN32
+
+// --- (G3): every identity field reaches the token ---------------------------
+TEST_CASE("CRC-validation cache: the token binds every identity field",
+          "[checksum][crc_cache]") {
+  VolumeConfig vol_config;
+  vol_config.path = "unused-never-opened";
+  auto volume = std::make_unique<Volume>(vol_config);
+
+  Document doc;
+  doc.len = 4096;
+  doc.header_len = 16;
+  doc.write_serial = 7;
+  doc.checksum = 0xC0FFEE11;
+  for (size_t i = 0; i < doc.first_key.size(); ++i) {
+    doc.first_key[i] = static_cast<std::byte>(i * 37 + 1);
+  }
+  const uint64_t offset = 0x10000;
+  const uint64_t base = volume->checksum_token(offset, doc);
+  REQUIRE(base != 0);
+  REQUIRE(volume->checksum_token(offset, doc) == base);  // deterministic
+
+  std::vector<uint64_t> tokens = {base};
+  tokens.push_back(volume->checksum_token(offset + 4096, doc));
+  const auto varied = [&](auto mutate) {
+    Document d = doc;
+    mutate(d);
+    tokens.push_back(volume->checksum_token(offset, d));
+  };
+  varied([](Document &d) { d.write_serial += 1; });
+  // Low bits: the former key compared only the top 16.
+  varied([](Document &d) { d.checksum ^= 0x1U; });
+  varied([](Document &d) { d.checksum ^= 0x80000000U; });
+  varied([](Document &d) { d.len += 1; });
+  varied([](Document &d) { d.header_len += 1; });
+  varied([](Document &d) { d.first_key[0] ^= std::byte{0x01}; });
+  varied([](Document &d) { d.first_key[7] ^= std::byte{0x80}; });
+  for (size_t i = 0; i < tokens.size(); ++i) {
+    for (size_t j = i + 1; j < tokens.size(); ++j) {
+      CAPTURE(i, j);
+      REQUIRE(tokens[i] != tokens[j]);
+    }
+  }
+
+  // Mutable header state outside the incarnation identity does not perturb
+  // the token: an in-place hit-count, access-time or chain-link update must
+  // not cost a re-verification.
+  Document d = doc;
+  d.hit_count = 99;
+  d.last_access = 123456789;
+  d.next_alternate_offset = 0x2000;
+  REQUIRE(volume->checksum_token(offset, d) == base);
+
+  // A second Volume draws its own salt.
+  auto other = std::make_unique<Volume>(vol_config);
+  REQUIRE(other->checksum_token(offset, doc) != base);
 }
 
 // --- (C): DEMONSTRATOR — trailing-gap survivor vs ungated forward fill -----

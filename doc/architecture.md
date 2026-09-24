@@ -32,7 +32,7 @@ as a C++ API and a C ABI.
 | **Frontier (F)** | Wrap retention: the boundary between the clean runway ahead of the write cursor and the still-readable previous pass. It advances one chunk at a time, gated on the borrows in the chunks it crosses. | `volume.cpp` (`advance_frontier`), "Eviction and Wrap Retention" |
 | **Exposure generation (G)** | The single `seq_cst` word per stripe that encodes pass and frontier: `G = P * (N + 1) + f`. A borrow of a document from pass `p` in chunk `c` is exposed once `G > (p + 1) * (N + 1) + c`. Replaces the former wrap epoch. | `volume.hpp` (`Stripe::exposure_gen`), `mmap_directory.hpp` (retention region) |
 | **HitTracker** | Deferred, striped hit-recording component. 4096 padded stripes keyed by key hash; flushed periodically to `Document.hit_count`. | `src/core/hit_tracker.hpp` |
-| **CRC-validation cache** | Per-volume heap-backed table (65536 slots, 512 KB) that skips re-CRC of an already-verified `{offset, checksum}` pair. Not the overwrite guard — that is the lease/epoch protocol. | `volume.hpp` (`kChecksumCacheSize`) |
+| **CRC-validation cache** | Per-process, per-volume heap-backed table (65536 slots of one 64-bit word, 512 KB), direct-mapped by offset, that skips the CRC pass for a document incarnation this process already verified. A slot holds a salted 64-bit token of the incarnation — offset, pass stamp (`write_serial`), full CRC, `len`/`header_len` and a `first_key` prefix — computed from the header just read and key-verified, so a different document at the same offset matches only on a 2^-64 token collision. Not the overwrite guard — that is the lease/epoch protocol. | `volume.hpp` (`kChecksumCacheSize`, `checksum_token`) |
 
 ## Design Goals
 
@@ -305,7 +305,7 @@ dependent chain leaves two thirds of the issue slots idle. On an M5 that is
 `crc32c_update_hardware_1way()` exists so the comparison stays honest.
 
 This matters because the CRC-validation cache is per-process: the first
-read of an offset, every read after a restart, and every read in a second
+read of a document, every read after a restart, and every read in a second
 process re-verify the whole payload, so the CRC rate is the ceiling on cold
 read bandwidth. See [kv-cache-benchmark.md](kv-cache-benchmark.md).
 
@@ -682,7 +682,7 @@ directory.
 1. Take **one gate shard shared**, check `running`, route to the volume (`segment_hash`).
 2. `select_stripe` (`segment_hash % stripe_count`).
 3. **RAM check first** — CLFUS `get` on the key's segment; on hit, build a RAM `ReadHandle` (owns a copied buffer), `record_hit`, return. No borrow/lease.
-4. **Disk probe** — take a `StripeSnapshot` (`G`, then `W`); run the directory **seqlock read** (no stripe lock), admitting each tag match by position class against the snapshot. For each admitted match: `map_region`, validate the `Document`, **verify `first_key`**, check the **pass stamp** and exposure threshold (`admit_document`), **CRC-verify** unless already in the CRC-validation cache.
+4. **Disk probe** — take a `StripeSnapshot` (`G`, then `W`); run the directory **seqlock read** (no stripe lock), admitting each tag match by position class against the snapshot. For each admitted match: `map_region`, validate the `Document`, **verify `first_key`**, check the **pass stamp** and exposure threshold (`admit_document`), **CRC-verify** unless this incarnation's token (offset, pass stamp, full CRC, lengths, key prefix) is already in the CRC-validation cache.
 5. **Borrow + lease** — `acquire_borrow` (this thread's shard, the document's chunk slot) + `stamp_read_lease` + `borrow_still_valid` (intent, then `G` against the threshold). On failure, release + retry.
 6. Build the disk `ReadHandle` pinned by **this thread's read anchor**; `record_hit`; return.
 

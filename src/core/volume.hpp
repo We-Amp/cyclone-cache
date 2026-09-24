@@ -6,6 +6,8 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <cstring>
 #include <expected>
 #include <functional>
 #include <memory>
@@ -316,7 +318,9 @@ class FastDivU64 {
     return q;
   }
 
- private:
+  // High 64 bits of a * b, on the fastest path the target has.  Public so
+  // the CRC-validation cache's token mixer (Volume::checksum_token) shares
+  // the one portable 64 x 64 -> 128 multiply instead of growing a second.
   [[nodiscard]] static uint64_t mulhi(uint64_t a, uint64_t b) noexcept {
 #if defined(CYCLONE_FASTDIV_UMULH)
     return __umulh(a, b);
@@ -328,6 +332,7 @@ class FastDivU64 {
 #endif
   }
 
+ private:
   uint64_t _d = 1;
   uint64_t _m = 0;
 };
@@ -1186,6 +1191,9 @@ class Volume : public std::enable_shared_from_this<Volume> {
     kSnapshotDone,  // Volume::snapshot: G and cursor loaded, no directory
                     // probed yet (writer-side snapshots too; filter by
                     // thread)
+    kCrcVerify,     // about to run the CRC-32C pass over a document's
+                    // payload: the CRC-validation cache missed for this
+                    // incarnation (read_sync and read_alternate_sync)
   };
   using ReaderSeamHook = std::function<void(ReaderSeam seam)>;
   static inline ReaderSeamHook s_reader_seam_for_test{};
@@ -1689,30 +1697,37 @@ class Volume : public std::enable_shared_from_this<Volume> {
                                                     const WriteSlot &slot,
                                                     bool fill_ok);
 
-  // CRC validation cache: skip CRC32 on subsequent reads of already-verified
-  // entries.  Direct-mapped by file offset; the stored CRC32 value itself
-  // serves as the discriminator — if the content changes, the checksum
-  // stored in the document header changes, causing a cache miss and
-  // re-verification.
+  // CRC validation cache: skip the CRC-32C pass on later reads of a document
+  // INCARNATION this process has already verified.  Per process, per volume,
+  // never shared and never persisted.
   //
-  // Uses Fibonacci hashing (multiply by golden-ratio constant, take top bits)
-  // instead of bare modulo to avoid systematic collisions when documents have
-  // similar sizes (e.g., all ~8KB → offsets differ by 8192 → bare % 2048
-  // maps them all to the same slot).
+  // IDENTITY.  A slot holds a 64-bit token of the incarnation, computed by
+  // checksum_token() from the header the reader is about to trust: the
+  // absolute file offset, the pass stamp (write_serial), the full 32-bit
+  // stored CRC, len and header_len, and the first 8 bytes of first_key,
+  // folded through a keyed 128-bit-multiply mixer (wyhash's "mum" step)
+  // under a per-Volume random salt.  A lookup hits only if the stored token
+  // equals the recomputed one, so a different document at the same offset --
+  // rewritten after a wrap, torn by a usurped writer's late pwrite, or read
+  // back unsynced after a crash -- matches a cached verdict only on a 64-bit
+  // token collision (~2^-64), not, as with the former {offset, top 16 bits
+  // of the CRC} key, whenever its CRC matched in 16 bits (2^-16).  See
+  // doc/design/verified-state.md, section 3.3.
   //
-  // Thread-safe via atomic 64-bit load/store (lock-free on x86/ARM).
-  // Packed format: [48-bit offset | 16-bit checksum(top bits of CRC32)].
-  // 48-bit offset supports volumes up to 256TB.  The 16-bit discriminator
-  // is NOT the full CRC32: an index collision between different offsets
-  // only causes a harmless re-verification (the full offset is compared),
-  // but same-offset content replacement whose new CRC32 matches the old
-  // TOP 16 BITS (2^-16 per rewrite) skips verification of the new bytes.
-  // That is acceptable ONLY because this cache is not the overwrite guard:
-  // the wrap-epoch revalidation (deliberately independent of this
-  // cache) is what protects readers from raced overwrites, and any
-  // document reachable through the directory was fully written before its
-  // entry was published.  Do not lean on this cache for corruption
-  // detection of rewritten offsets.
+  // WHAT IT DOES NOT COVER.  The token binds the HEADER fields; it cannot
+  // see a payload changed under an intact header (a torn tail).  That is
+  // the job of the other gauntlet legs -- admission, the positional guard,
+  // the borrow/lease Dekker revalidation -- which run whether or not this
+  // cache hits.  It is not the overwrite guard; never lean on it as one.
+  //
+  // Direct-mapped by offset (Fibonacci hashing: the multiply spreads
+  // documents of similar size whose offsets differ by a constant stride),
+  // so a rewritten offset replaces its own slot.  Lock-free: one relaxed
+  // 64-bit load on the warm path, one relaxed store after a CRC pass that
+  // succeeded.  A collision, a lost update or a torn pairing costs one
+  // redundant CRC pass and nothing else: a slot only ever holds a whole
+  // token, and 0 means empty.
+  //
   // 64K slots (512 KB per volume), sized for large-cardinality working
   // sets: with the previous 2048 slots, any working set much beyond ~2k
   // documents collision-evicted validations continuously and effectively
@@ -1730,24 +1745,53 @@ class Volume : public std::enable_shared_from_this<Volume> {
       _checksum_cache = std::make_unique<
           std::array<std::atomic<uint64_t>, kChecksumCacheSize>>();
 
+  // Per-Volume random key of checksum_token(), drawn at construction and
+  // fixed for the Volume's lifetime (read without synchronisation).  It
+  // makes tokens unpredictable across processes and runs; it is not a MAC.
+  static std::array<uint64_t, 4> make_checksum_salt(const void *self) noexcept;
+  const std::array<uint64_t, 4> _checksum_salt = make_checksum_salt(this);
+
   static size_t checksum_cache_index(uint64_t offset) {
     return static_cast<size_t>((offset * uint64_t{0x9E3779B97F4A7C15}) >>
                                kChecksumCacheShift);
   }
-  static uint64_t pack_checksum_entry(uint64_t offset, uint32_t checksum) {
-    // Low 48 bits: offset.  High 16 bits: top 16 bits of CRC32.
-    return (offset & 0x0000FFFFFFFFFFFF) |
-           (static_cast<uint64_t>(checksum >> 16) << 48);
+
+ public:
+  // The token of the document incarnation whose header is `doc`, read at
+  // absolute file offset `offset`.  Public for the unit test that pins the
+  // field sensitivity; the read path is its only other caller.
+  [[nodiscard]] uint64_t checksum_token(uint64_t offset,
+                                        const Document &doc) const noexcept {
+    // 64 x 64 -> 128 multiply folded to 64 bits (lo ^ hi).  Each input word
+    // is XORed with a salt word first, so no input value can force a zero
+    // factor except by guessing the salt.
+    const auto fold = [](uint64_t x, uint64_t y) noexcept {
+      return (x * y) ^ FastDivU64::mulhi(x, y);
+    };
+    uint64_t key_prefix = 0;
+    std::memcpy(&key_prefix, doc.first_key.data(), sizeof(key_prefix));
+    const uint64_t crc_stamp =
+        (static_cast<uint64_t>(doc.checksum) << 32U) | doc.write_serial;
+    const uint64_t lengths =
+        (static_cast<uint64_t>(doc.len) << 32U) | doc.header_len;
+    // Two independent multiplies (they issue in parallel), then a third
+    // that mixes them; the constants are wyhash's default secrets.
+    const uint64_t a =
+        fold(offset ^ _checksum_salt[0], key_prefix ^ _checksum_salt[1]);
+    const uint64_t b =
+        fold(crc_stamp ^ _checksum_salt[2], lengths ^ _checksum_salt[3]);
+    return fold(a ^ uint64_t{0xa0761d6478bd642f},
+                b ^ uint64_t{0xe7037ed1a0b428db});
   }
-  bool is_checksum_validated(uint64_t offset, uint32_t checksum) const {
-    uint64_t expected = pack_checksum_entry(offset, checksum);
-    uint64_t stored = (*_checksum_cache)[checksum_cache_index(offset)].load(
-        std::memory_order_relaxed);
-    return stored != 0 && stored == expected;
+
+ private:
+  bool is_checksum_validated(uint64_t offset, uint64_t token) const {
+    return token != 0 && (*_checksum_cache)[checksum_cache_index(offset)].load(
+                             std::memory_order_relaxed) == token;
   }
-  void mark_checksum_validated(uint64_t offset, uint32_t checksum) {
+  void mark_checksum_validated(uint64_t offset, uint64_t token) {
     (*_checksum_cache)[checksum_cache_index(offset)].store(
-        pack_checksum_entry(offset, checksum), std::memory_order_relaxed);
+        token, std::memory_order_relaxed);
   }
 
   // Large-document readahead (see VolumeConfig::readahead_min_bytes).
