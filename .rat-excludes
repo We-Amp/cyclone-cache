@@ -34,3 +34,4 @@ corpus
 .*-crc32c_bench\.txt
 churn-.*\.txt
 policy-replay\.txt
+round5-.*\.txt

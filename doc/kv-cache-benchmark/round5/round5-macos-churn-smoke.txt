@@ -1,0 +1,96 @@
+=== Thu Sep 24 09:16:34 CEST 2026 cyclone zipf T=4 C=4294967296 s=120 retention=off
+load-before:  9:16  up 9 days,  2:21, 9 users, load averages: 4.34 2.67 1.96
+/dev/disk3s5   926Gi   863Gi    27Gi    97%     31M  281M   10%   /System/Volumes/Data
+universe U = 6144 keys
+stream zipf t0: 4012/1ce22cb5 5042/cb171320 794/714b35da 57/c368287c 1260/278a1422 2725/4ef06632 2725/4ef06632 2176/620a19bd 4990/04d266b5 3615/b4df8f4b 1435/d3dfeb29 2943/1726b2e3
+stream zipf t1: 1195/64f1ce68 3639/526edf5b 5374/b8e2dcb9 4013/b20ed07e 3068/9fdae383 3092/0d83c4a2 2819/f4b90d36 2725/4ef06632 824/666955a6 5042/cb171320 5752/8e104331 4012/1ce22cb5
+stream zipf+scan t0: 4012/1ce22cb5 5042/cb171320 794/714b35da 57/c368287c 1260/278a1422 2725/4ef06632 2725/4ef06632 1099511627776/6fdf167b 2176/620a19bd 4990/04d266b5 3615/b4df8f4b 1099511627777/f11f5dc2
+stream zipf+scan t1: 1195/64f1ce68 3639/526edf5b 5374/b8e2dcb9 4013/b20ed07e 3068/9fdae383 3092/0d83c4a2 2819/f4b90d36 2725/4ef06632 824/666955a6 1103806595072/5cb8bfa5 1103806595073/dafeb106 1103806595074/bf4b5300
+Cyclone KV churn (kv-churn-spec v1)
+  cpu        : Apple M5
+  os         : Darwin 27.0.0
+  commit     : 2aed24c
+  device     : unknown
+  cgroup     : none memory.max=?
+  load       :  9:16  up 9 days,  2:21, 9 users, load averages: 4.34 2.67 1.96
+  pattern    : zipf, threads 4, block 2097152, capacity 4294967296, seconds 120
+Cyclone tuning:
+  volume size             = 4306571264 B, 16 stripes, 724992 B mmap directory each (65536 entries/stripe)
+  usable data area        = 4294971328 B (1.0000 x C), ~127 blocks/stripe
+  mmap directory ON, checksum ON + verify on read, readahead default, max_object_size 0, ram_cache_size 0, sync_on_write false, hit tracking/optimization/dir sync off
+  eviction                = FIFO by stripe wrap (no app index), wrap retention OFF
+  warm-up: 4.7 s, inserted 8596226048 B
+{"store":"cyclone","bench":"churn","pattern":"zipf","block_size":2097152,"capacity":4294967296,"universe":6144,"threads":4,"seconds":121.81,"ops_per_s":4050.71,"hit_ratio":0.7266,"served_gb_per_s":6.1722,"inserted_gb_per_s":2.3222,"hit_p50_us":55.5,"hit_p99_us":355.1,"hit_p999_us":1549.3,"miss_p50_us":2497.1,"miss_p99_us":17401.0,"miss_p999_us":71679.5,"hits":322657,"misses":121425,"inserts":121397,"put_failures":28,"read_errors":0,"verified":5042,"write_amp":null,"device_write_bytes":null,"device_read_bytes":null,"footprint_bytes":4275736576,"apparent_bytes":4306571264,"peak_rss_kib":3949696,"cgroup_mem_peak":null,"cgroup_file_end":null,"cgroup_anon_end":null,"warmup_s":4.709,"warmup_inserted_bytes":8596226048,"warmup_capped":false,"reopen_hit_ratio":0.722,"reopen_open_s":0.000,"data_area_bytes":4294971328,"cy_evictions":956,"cy_wraps":956,"cy_writes_dropped_by_lease":28,"cy_wraps_deferred_by_lease":28,"cy_wrap_retention":false,"cy_frontier_advances":0,"cy_advances_deferred_by_lease":0,"cy_retained_hits":0,"cy_stamp_rejections":0,"cy_tag_collision_evictions_total":1025,"cy_entries_total":24223,"cy_readahead_hints":45413,"failed":false}
+rc=0 load-after:  9:18  up 9 days,  2:23, 9 users, load averages: 3.66 2.86 2.12
+=== Thu Sep 24 09:18:44 CEST 2026 cyclone zipf T=4 C=4294967296 s=120 retention=on
+load-before:  9:18  up 9 days,  2:23, 9 users, load averages: 3.66 2.86 2.12
+/dev/disk3s5   926Gi   863Gi    27Gi    97%     31M  281M   10%   /System/Volumes/Data
+universe U = 6144 keys
+stream zipf t0: 4012/1ce22cb5 5042/cb171320 794/714b35da 57/c368287c 1260/278a1422 2725/4ef06632 2725/4ef06632 2176/620a19bd 4990/04d266b5 3615/b4df8f4b 1435/d3dfeb29 2943/1726b2e3
+stream zipf t1: 1195/64f1ce68 3639/526edf5b 5374/b8e2dcb9 4013/b20ed07e 3068/9fdae383 3092/0d83c4a2 2819/f4b90d36 2725/4ef06632 824/666955a6 5042/cb171320 5752/8e104331 4012/1ce22cb5
+stream zipf+scan t0: 4012/1ce22cb5 5042/cb171320 794/714b35da 57/c368287c 1260/278a1422 2725/4ef06632 2725/4ef06632 1099511627776/6fdf167b 2176/620a19bd 4990/04d266b5 3615/b4df8f4b 1099511627777/f11f5dc2
+stream zipf+scan t1: 1195/64f1ce68 3639/526edf5b 5374/b8e2dcb9 4013/b20ed07e 3068/9fdae383 3092/0d83c4a2 2819/f4b90d36 2725/4ef06632 824/666955a6 1103806595072/5cb8bfa5 1103806595073/dafeb106 1103806595074/bf4b5300
+Cyclone KV churn (kv-churn-spec v1)
+  cpu        : Apple M5
+  os         : Darwin 27.0.0
+  commit     : 2aed24c
+  device     : unknown
+  cgroup     : none memory.max=?
+  load       :  9:18  up 9 days,  2:23, 9 users, load averages: 3.66 2.86 2.12
+  pattern    : zipf, threads 4, block 2097152, capacity 4294967296, seconds 120
+Cyclone tuning:
+  volume size             = 4306571264 B, 16 stripes, 724992 B mmap directory each (65536 entries/stripe)
+  usable data area        = 4294971328 B (1.0000 x C), ~127 blocks/stripe
+  mmap directory ON, checksum ON + verify on read, readahead default, max_object_size 0, ram_cache_size 0, sync_on_write false, hit tracking/optimization/dir sync off
+  eviction                = FIFO by stripe wrap (no app index), wrap retention ON
+  warm-up: 4.8 s, inserted 8594128896 B
+{"store":"cyclone","bench":"churn","pattern":"zipf","block_size":2097152,"capacity":4294967296,"universe":6144,"threads":4,"seconds":120.05,"ops_per_s":4260.65,"hit_ratio":0.7879,"served_gb_per_s":7.0399,"inserted_gb_per_s":1.8950,"hit_p50_us":56.8,"hit_p99_us":366.5,"hit_p999_us":2505.5,"miss_p50_us":2480.9,"miss_p99_us":25360.4,"miss_p999_us":200932.3,"hits":368833,"misses":99299,"inserts":99280,"put_failures":19,"read_errors":0,"verified":5762,"write_amp":null,"device_write_bytes":null,"device_read_bytes":null,"footprint_bytes":4275736576,"apparent_bytes":4306571264,"peak_rss_kib":4228352,"cgroup_mem_peak":null,"cgroup_file_end":null,"cgroup_anon_end":null,"warmup_s":4.796,"warmup_inserted_bytes":8594128896,"warmup_capped":false,"reopen_hit_ratio":0.791,"reopen_open_s":0.000,"data_area_bytes":4294971328,"cy_evictions":783,"cy_wraps":783,"cy_writes_dropped_by_lease":19,"cy_wraps_deferred_by_lease":0,"cy_wrap_retention":true,"cy_frontier_advances":50030,"cy_advances_deferred_by_lease":19,"cy_retained_hits":94217,"cy_stamp_rejections":0,"cy_tag_collision_evictions_total":3044,"cy_entries_total":24232,"cy_readahead_hints":56412,"failed":false}
+rc=0 load-after:  9:20  up 9 days,  2:25, 9 users, load averages: 2.84 2.93 2.26
+=== Thu Sep 24 09:20:54 CEST 2026 cyclone zipf+scan T=4 C=4294967296 s=120 retention=off
+load-before:  9:20  up 9 days,  2:25, 9 users, load averages: 2.84 2.93 2.26
+/dev/disk3s5   926Gi   863Gi    27Gi    97%     31M  281M   10%   /System/Volumes/Data
+universe U = 6144 keys
+stream zipf t0: 4012/1ce22cb5 5042/cb171320 794/714b35da 57/c368287c 1260/278a1422 2725/4ef06632 2725/4ef06632 2176/620a19bd 4990/04d266b5 3615/b4df8f4b 1435/d3dfeb29 2943/1726b2e3
+stream zipf t1: 1195/64f1ce68 3639/526edf5b 5374/b8e2dcb9 4013/b20ed07e 3068/9fdae383 3092/0d83c4a2 2819/f4b90d36 2725/4ef06632 824/666955a6 5042/cb171320 5752/8e104331 4012/1ce22cb5
+stream zipf+scan t0: 4012/1ce22cb5 5042/cb171320 794/714b35da 57/c368287c 1260/278a1422 2725/4ef06632 2725/4ef06632 1099511627776/6fdf167b 2176/620a19bd 4990/04d266b5 3615/b4df8f4b 1099511627777/f11f5dc2
+stream zipf+scan t1: 1195/64f1ce68 3639/526edf5b 5374/b8e2dcb9 4013/b20ed07e 3068/9fdae383 3092/0d83c4a2 2819/f4b90d36 2725/4ef06632 824/666955a6 1103806595072/5cb8bfa5 1103806595073/dafeb106 1103806595074/bf4b5300
+Cyclone KV churn (kv-churn-spec v1)
+  cpu        : Apple M5
+  os         : Darwin 27.0.0
+  commit     : 2aed24c
+  device     : unknown
+  cgroup     : none memory.max=?
+  load       :  9:20  up 9 days,  2:25, 9 users, load averages: 2.84 2.93 2.26
+  pattern    : zipf+scan, threads 4, block 2097152, capacity 4294967296, seconds 120
+Cyclone tuning:
+  volume size             = 4306571264 B, 16 stripes, 724992 B mmap directory each (65536 entries/stripe)
+  usable data area        = 4294971328 B (1.0000 x C), ~127 blocks/stripe
+  mmap directory ON, checksum ON + verify on read, readahead default, max_object_size 0, ram_cache_size 0, sync_on_write false, hit tracking/optimization/dir sync off
+  eviction                = FIFO by stripe wrap (no app index), wrap retention OFF
+  warm-up: 5.4 s, inserted 8596226048 B
+{"store":"cyclone","bench":"churn","pattern":"zipf+scan","block_size":2097152,"capacity":4294967296,"universe":6144,"threads":4,"seconds":120.23,"ops_per_s":2321.26,"hit_ratio":0.6117,"served_gb_per_s":2.9776,"inserted_gb_per_s":1.8902,"hit_p50_us":57.7,"hit_p99_us":363.5,"hit_p999_us":2580.0,"miss_p50_us":2602.0,"miss_p99_us":30024.4,"miss_p999_us":231542.2,"hits":156724,"misses":99500,"inserts":99488,"put_failures":12,"read_errors":0,"verified":2449,"write_amp":null,"device_write_bytes":null,"device_read_bytes":null,"footprint_bytes":4275736576,"apparent_bytes":4306571264,"peak_rss_kib":3920320,"cgroup_mem_peak":null,"cgroup_file_end":null,"cgroup_anon_end":null,"warmup_s":5.398,"warmup_inserted_bytes":8596226048,"warmup_capped":false,"reopen_hit_ratio":0.664,"reopen_open_s":0.000,"data_area_bytes":4294971328,"cy_evictions":784,"cy_wraps":784,"cy_writes_dropped_by_lease":12,"cy_wraps_deferred_by_lease":12,"cy_wrap_retention":false,"cy_frontier_advances":0,"cy_advances_deferred_by_lease":0,"cy_retained_hits":0,"cy_stamp_rejections":0,"cy_tag_collision_evictions_total":602,"cy_entries_total":49368,"cy_readahead_hints":26378,"failed":false}
+rc=0 load-after:  9:23  up 9 days,  2:27, 9 users, load averages: 3.26 3.10 2.42
+=== Thu Sep 24 09:23:04 CEST 2026 cyclone zipf+scan T=4 C=4294967296 s=120 retention=on
+load-before:  9:23  up 9 days,  2:27, 9 users, load averages: 3.26 3.10 2.42
+/dev/disk3s5   926Gi   863Gi    27Gi    97%     31M  281M   10%   /System/Volumes/Data
+universe U = 6144 keys
+stream zipf t0: 4012/1ce22cb5 5042/cb171320 794/714b35da 57/c368287c 1260/278a1422 2725/4ef06632 2725/4ef06632 2176/620a19bd 4990/04d266b5 3615/b4df8f4b 1435/d3dfeb29 2943/1726b2e3
+stream zipf t1: 1195/64f1ce68 3639/526edf5b 5374/b8e2dcb9 4013/b20ed07e 3068/9fdae383 3092/0d83c4a2 2819/f4b90d36 2725/4ef06632 824/666955a6 5042/cb171320 5752/8e104331 4012/1ce22cb5
+stream zipf+scan t0: 4012/1ce22cb5 5042/cb171320 794/714b35da 57/c368287c 1260/278a1422 2725/4ef06632 2725/4ef06632 1099511627776/6fdf167b 2176/620a19bd 4990/04d266b5 3615/b4df8f4b 1099511627777/f11f5dc2
+stream zipf+scan t1: 1195/64f1ce68 3639/526edf5b 5374/b8e2dcb9 4013/b20ed07e 3068/9fdae383 3092/0d83c4a2 2819/f4b90d36 2725/4ef06632 824/666955a6 1103806595072/5cb8bfa5 1103806595073/dafeb106 1103806595074/bf4b5300
+Cyclone KV churn (kv-churn-spec v1)
+  cpu        : Apple M5
+  os         : Darwin 27.0.0
+  commit     : 2aed24c
+  device     : unknown
+  cgroup     : none memory.max=?
+  load       :  9:23  up 9 days,  2:27, 9 users, load averages: 3.26 3.10 2.42
+  pattern    : zipf+scan, threads 4, block 2097152, capacity 4294967296, seconds 120
+Cyclone tuning:
+  volume size             = 4306571264 B, 16 stripes, 724992 B mmap directory each (65536 entries/stripe)
+  usable data area        = 4294971328 B (1.0000 x C), ~127 blocks/stripe
+  mmap directory ON, checksum ON + verify on read, readahead default, max_object_size 0, ram_cache_size 0, sync_on_write false, hit tracking/optimization/dir sync off
+  eviction                = FIFO by stripe wrap (no app index), wrap retention ON
+  warm-up: 4.8 s, inserted 8594128896 B
+{"store":"cyclone","bench":"churn","pattern":"zipf+scan","block_size":2097152,"capacity":4294967296,"universe":6144,"threads":4,"seconds":120.40,"ops_per_s":2776.16,"hit_ratio":0.6591,"served_gb_per_s":3.8370,"inserted_gb_per_s":1.9850,"hit_p50_us":57.8,"hit_p99_us":358.8,"hit_p999_us":1153.9,"miss_p50_us":2585.6,"miss_p99_us":28047.7,"miss_p999_us":206901.2,"hits":201040,"misses":104004,"inserts":104004,"put_failures":0,"read_errors":0,"verified":3141,"write_amp":null,"device_write_bytes":null,"device_read_bytes":null,"footprint_bytes":4275736576,"apparent_bytes":4306571264,"peak_rss_kib":4185968,"cgroup_mem_peak":null,"cgroup_file_end":null,"cgroup_anon_end":null,"warmup_s":4.763,"warmup_inserted_bytes":8594128896,"warmup_capped":false,"reopen_hit_ratio":0.737,"reopen_open_s":0.000,"data_area_bytes":4294971328,"cy_evictions":819,"cy_wraps":819,"cy_writes_dropped_by_lease":0,"cy_wraps_deferred_by_lease":0,"cy_wrap_retention":true,"cy_frontier_advances":52411,"cy_advances_deferred_by_lease":0,"cy_retained_hits":65796,"cy_stamp_rejections":0,"cy_tag_collision_evictions_total":2133,"cy_entries_total":54560,"cy_readahead_hints":36237,"failed":false}
+rc=0 load-after:  9:25  up 9 days,  2:29, 9 users, load averages: 2.93 3.12 2.52
