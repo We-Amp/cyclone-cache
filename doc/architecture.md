@@ -23,7 +23,7 @@ as a C++ API and a C ABI.
 | **Alternate / AlternateId** | A content variant under one key (Original, Brotli, Gzip, WebP, AVIF, JpegXL, Custom…). `AlternateId` normalizes UA capabilities into discrete classes. | `alternate.hpp` |
 | **Alternate chain** | Singly-linked list of alternates via `next_alternate_offset`. Directory points to the **head** (newest); **tail** is typically Original (oldest). Max 64 per key. | "Alternate Chains" |
 | **CLFUS** | Clock LRU Frequency Size — the default scan-resistant RAM-cache algorithm. Segmented by hardware concurrency. | `clfus.cpp`, "RAM Cache" |
-| **Seqlock** | Lock-free directory read: read a per-bucket even/odd version counter, read entries, re-read the counter; retry on mismatch (`kMaxReadRetries = 100`). Used by BOTH the in-memory `Directory` and the mmap `MmapDirectory`. | `directory.hpp`, `mmap_directory.hpp`, `doc/multi-process.md` |
+| **Seqlock** | Lock-free directory read: read a per-bucket even/odd version counter, read entries, re-read the counter; retry on mismatch (`SeqlockReadWait`: 100 retries, then sleeping retries for up to 5 ms; still busy → `CacheError::Busy`, never a miss). Used by BOTH the in-memory `Directory` and the mmap `MmapDirectory`. | `directory.hpp`, `mmap_directory.hpp`, `doc/multi-process.md` |
 | **Lease / borrow** | Process-local mechanism that makes a zero-copy read aliasing live mmap bytes safe against a concurrent circular-buffer wrap. A reader **borrows** a region and **stamps a lease**; a writer wanting to **wrap** defers while a valid borrow is outstanding. | `volume.cpp`, `doc/multi-process.md`, "Concurrency Model" |
 | **Read anchor** | Per-thread strong `shared_ptr` to the Volume + MappedFile, plus a `torn` latch, that keeps the mapping alive for the life of a `ReadHandle` without an RMW on a process-global control block. 64 shards/volume. | `volume.hpp` (`VolumeReadAnchor`) |
 | **Phase** | 1-bit directory flag used for O(1) phase-based garbage collection. It is derived from the pass (`phase = P & 1`, `Volume::publish_wrap_phase`), never toggled on its own; the cross-process publish is CAS-guarded (`phase_lock`). | `directory.hpp`, `mmap_directory.hpp` |
@@ -571,7 +571,7 @@ Readers take **no stripe lock in any mode** — the reader-side lock was dropped
 `read_sync` (`Volume::read_sync`). Correctness rests on four pillars,
 documented inline at the "Lock-free read" comment in `Volume::read_sync`:
 
-1. **Directory seqlock** — a torn bucket read is detected and retried (up to `kMaxReadRetries = 100`).
+1. **Directory seqlock** — a torn bucket read is detected and retried (`SeqlockReadWait`; see "Per-bucket seqlocks" below).
 2. **Commit ordering** — data is durable *before* the directory entry is published.
 3. **CRC validation** — a torn document (a local writer racing the lock-free reader, or a cross-process wrap) fails its CRC and is treated as a miss/retry.
 4. **Lease/epoch protocol** — a borrowed mmap region cannot be wrapped out from under the reader.
@@ -587,6 +587,32 @@ the version after each candidate and once at the end; any change → retry. Writ
 publish **odd → even** under the stripe mutex (`begin/end_bucket_write`; mmap
 `acquire_writer`/`release_writer` CAS). TSan acquire/release annotations bridge
 the pattern for the sanitizer (the seqlock TSan annotations atop `directory.hpp`).
+
+How long a reader retries is `SeqlockReadWait`'s call (`directory.hpp`, issue
+#21). The first `kFastAttempts = 100` retries read no clock, so an uncontended
+or briefly contended probe costs what it always did; an odd bucket is waited on
+by spinning, then yielding. Past them the writer is presumed descheduled inside
+its odd window, and the reader SLEEPS between retries (10 µs doubling to 1 ms)
+until `kBudget = 5 ms` has passed. It sleeps because spinning or `sched_yield`
+cannot help a writer queued on another CPU, and would burn the reader's CPU,
+which on an event-loop thread (PageSpeed's nginx module) costs every connection.
+The budget is capped at 5 ms for the same reason: a `Busy` costs the caller a
+refetch at most, a longer stall costs more. If the budget runs out,
+`probe_each` returns `false`: the bucket's contents are unknown, and the Volume
+reports `CacheError::Busy`, counted in `directory_read_timeouts`, never
+`NotFound`.
+
+A probe made under the stripe mutex (write, remove, hit count;
+`Volume::writer_probe`) must not act on a partial answer. The stripe mutex is
+per process and does not exclude a peer: during a graceful-reload or
+overlapped-recycle overlap two processes can own the same stripe, and the
+cross-process write lock is released before the directory insert. So a bucket
+that stays odd past the budget belongs to a peer that is stuck: dead, or alive
+but descheduled. `writer_probe` releases it with `touch_bucket` (whose
+`acquire_writer` force-releases a holder it waited on for too long) and probes
+once more. Releases are token-checked: `release_writer` moves the version from
+exactly its own odd value to the next even one, so a usurped live holder's
+late release is a no-op and cannot turn the bucket odd again.
 
 ### Read anchors (keeping the mapping alive without a global RMW)
 

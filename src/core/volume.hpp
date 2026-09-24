@@ -684,9 +684,15 @@ struct Stripe {
   //
   // `rejects` (optional, lock-free readers only) collects the entries the
   // position leg turned away, for Volume::probe_raced_publish.
+  //
+  // Returns false iff a writer held the key's bucket for the whole
+  // SeqlockReadWait budget (directory.hpp): what the bucket holds is then
+  // UNKNOWN, and a caller that found nothing must report Busy, never a miss
+  // (issue #21).  True otherwise, including when the callback stopped.
   template <typename Callback>
-  void probe_each(const CacheKey &key, const StripeSnapshot &snap,
-                  Callback &&callback, ProbeRejects *rejects = nullptr) const {
+  [[nodiscard]] bool probe_each(const CacheKey &key, const StripeSnapshot &snap,
+                                Callback &&callback,
+                                ProbeRejects *rejects = nullptr) const {
     auto admitted = [this, &snap, &callback,
                      rejects](const DirEntry &entry) -> bool {
       const AdmitClass cls =
@@ -700,10 +706,12 @@ struct Stripe {
       return callback(entry, cls);
     };
     if (use_mmap_directory && mmap_directory) {
-      mmap_directory->probe_each_all_phases(key, admitted);
-    } else if (directory) {
-      directory->probe_each_all_phases(key, admitted);
+      return mmap_directory->probe_each_all_phases(key, admitted);
     }
+    if (directory) {
+      return directory->probe_each_all_phases(key, admitted);
+    }
+    return true;
   }
 
   // Helper to insert into directory.  verified_offset is the directory
@@ -1008,6 +1016,18 @@ struct VolumeStats {
   // so declining it is a pure saving — but a high value against reads is the
   // same crowding signal as the counter above.
   uint64_t ram_coherence_put_rejections = 0;
+
+  // Directory probes that spent the whole SeqlockReadWait budget because a
+  // writer held the key's bucket (odd seqlock version) (issue #21).  A
+  // lock-free lookup (read, exists, list/read alternates) then returns
+  // CacheError::Busy instead of an answer; a write / remove / hit-count
+  // probe (Volume::writer_probe) force-releases the bucket and probes again,
+  // counting each exhausted probe.  PROCESS-LOCAL.  Expected near 0: a
+  // writer is odd for well under a microsecond of its own work, so each
+  // count is a writer descheduled for longer than the budget, or (multi-
+  // process) a bucket whose holder died mid-update, until the owning
+  // process's next write to that bucket recovers it.
+  uint64_t directory_read_timeouts = 0;
 };
 
 class Volume;
@@ -1197,6 +1217,41 @@ class Volume : public std::enable_shared_from_this<Volume> {
   };
   using ReaderSeamHook = std::function<void(ReaderSeam seam)>;
   static inline ReaderSeamHook s_reader_seam_for_test{};
+
+  // Park a writer inside its odd window on `key`'s directory bucket: take the
+  // stripe mutex exclusively (the writer serialization every production
+  // mutator holds) and publish "writer active" on the bucket, then hold both
+  // until end_bucket_write_for_test(key) -- which must run on the SAME
+  // thread.  Lock-free readers of that bucket then wait (issue #21).  The
+  // returned token (the mmap directory's writer token; 0 in memory) goes
+  // back to end_bucket_write_for_test.
+  [[nodiscard]] uint32_t begin_bucket_write_for_test(const CacheKey &key) {
+    Stripe *stripe = select_stripe(key);
+    stripe->mutex.lock();
+    if (stripe->use_mmap_directory && stripe->mmap_directory) {
+      return stripe->mmap_directory->begin_bucket_write_for_test(key);
+    }
+    stripe->directory->begin_bucket_write_for_test(key);
+    return 0;
+  }
+  void end_bucket_write_for_test(const CacheKey &key, uint32_t token) {
+    Stripe *stripe = select_stripe(key);
+    if (stripe->use_mmap_directory && stripe->mmap_directory) {
+      stripe->mmap_directory->end_bucket_write_for_test(key, token);
+    } else {
+      stripe->directory->end_bucket_write_for_test(key);
+    }
+    stripe->mutex.unlock();
+  }
+  // Current seqlock version of `key`'s directory bucket (odd = a writer is
+  // active).  For asserting that a bucket was left healthy.
+  [[nodiscard]] uint32_t bucket_version_for_test(const CacheKey &key) {
+    Stripe *stripe = select_stripe(key);
+    if (stripe->use_mmap_directory && stripe->mmap_directory) {
+      return stripe->mmap_directory->bucket_version(key);
+    }
+    return 0;
+  }
 #endif
 
   Volume(const Volume &) = delete;
@@ -1509,6 +1564,47 @@ class Volume : public std::enable_shared_from_this<Volume> {
 
   // Full-bucket nearest-to-clobber evictions (process-local; see VolumeStats).
   std::atomic<uint64_t> _bucket_full_evictions{0};
+
+  // Count one such probe and return the Busy it is reported as.
+  auto directory_busy() {
+    _directory_read_timeouts.fetch_add(1, std::memory_order_relaxed);
+    return make_unexpected(CacheError::Busy);
+  }
+  // Directory probe for a path that holds stripe->mutex (the write, remove
+  // and hit-count paths).  A writer must never act on a PARTIAL probe: a
+  // partial election could publish a second same-key entry, a partial
+  // remove could leave one behind.
+  //
+  // The mutex is per process, so it does not exclude a peer: during a
+  // graceful-reload / overlapped-recycle overlap two processes can own the
+  // same stripe, and the cross-process write lock is released before the
+  // directory insert.  So a bucket that stayed odd for the whole wait budget
+  // belongs to a peer that is stuck -- dead mid-update, or alive but
+  // descheduled.  Either way, release it the way an insert would
+  // (touch_bucket runs acquire_writer's presumed-stuck recovery; a live
+  // usurped holder's token-checked release then becomes a no-op), then
+  // `reset` the callback's accumulated state and probe once more.  Returns
+  // whether a probe completed; false means the caller must report Busy.
+  // Each exhausted probe is counted in directory_read_timeouts.
+  template <typename Reset, typename Callback>
+  [[nodiscard]] bool writer_probe(Stripe *stripe, const CacheKey &key,
+                                  const StripeSnapshot &snap, Reset &&reset,
+                                  Callback &&callback) {
+    if (stripe->probe_each(key, snap, callback)) {
+      return true;
+    }
+    _directory_read_timeouts.fetch_add(1, std::memory_order_relaxed);
+    if (!(stripe->use_mmap_directory && stripe->mmap_directory)) {
+      return false;  // Unreachable: in-memory mutators all hold the mutex
+    }
+    stripe->mmap_directory->touch_bucket(key);
+    reset();
+    if (stripe->probe_each(key, snap, callback)) {
+      return true;
+    }
+    _directory_read_timeouts.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
 
   // Alternate-chain shadow bound (process-local; see VolumeStats).
   std::atomic<uint64_t> _alternate_shadows_unlinked{0};
@@ -2068,6 +2164,11 @@ class Volume : public std::enable_shared_from_this<Volume> {
 
   // Publish the exposure generation (seq_cst).
   static void store_exposure_gen(Stripe *stripe, uint64_t gen);
+
+  // Directory probes that spent the whole seqlock wait budget (process-local;
+  // see VolumeStats).  Touched only on that already-slow path.  Declared
+  // LAST so adding it shifts no hot member's offset or cache-line layout.
+  std::atomic<uint64_t> _directory_read_timeouts{0};
 };
 
 // Volume is always heap-allocated (make_shared).  Keep it small enough that a

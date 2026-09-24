@@ -186,7 +186,17 @@ When a reader reads a document while another process is writing, the data may be
 1. Reader loads version counter for bucket
 2. Reader reads directory entries
 3. Reader loads version counter again
-4. If versions differ, retry (up to `kMaxReadRetries = 100`)
+4. If the version was odd or changed, retry: 100 retries with no clock read,
+   then sleeping retries (10 µs doubling to 1 ms) for up to
+   `SeqlockReadWait::kBudget` (5 ms), so a writer descheduled mid-update is
+   usually waited out without burning the reader's CPU
+5. If the bucket is still busy after that, the lookup returns
+   `CacheError::Busy` (`CYCLONE_BUSY`): the key's presence is unknown, which
+   is not reported as a miss. The next write, delete or hit-count update of
+   a key in that bucket by the process that owns the stripe releases a
+   holder that is stuck (dead, or descheduled for too long), then proceeds.
+   Bucket releases are token-checked, so a usurped holder that wakes up
+   later cannot turn the bucket odd again.
 
 ### Data Level (CRC-32C)
 

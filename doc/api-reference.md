@@ -109,6 +109,11 @@ Reads an entry from the cache.
 **Returns:**
 - `ReadHandle` on cache hit
 - `CacheError::NotFound` on cache miss
+- `CacheError::Busy` if a writer held the key's directory bucket for the
+  whole seqlock wait budget (5 ms), so the read could not tell whether the
+  key is present. This is not a miss; retry, or treat it as a miss if a
+  refetch is acceptable. See [Busy lookups](#busy-lookups). The same applies
+  to `exists_sync`, `read_alternate_sync` and `list_alternates_sync`.
 - `CacheError::NotInitialized` if cache not started
 
 ```cpp
@@ -226,6 +231,11 @@ struct CacheStats {
     uint64_t alternates_carried_forward;  // Retained alternates rewritten
     uint64_t alternate_carry_bytes;       // Bytes those rewrites cost
     uint64_t alternates_carry_dropped;    // Retained alternates not kept
+
+    // Lookups that returned Busy: a writer held the key's directory bucket
+    // for the whole seqlock wait budget (process-local; expected 0; see
+    // "Busy lookups" below)
+    uint64_t directory_read_timeouts;
 };
 ```
 
@@ -1268,7 +1278,8 @@ enum {
     CYCLONE_NOT_INITIALIZED,
     CYCLONE_INTERNAL_ERROR,
     CYCLONE_RESET_REFUSED_LIVE_PEER,  /* a live peer holds the cache */
-    CYCLONE_OBJECT_TOO_LARGE          /* write exceeds max_object_size */
+    CYCLONE_OBJECT_TOO_LARGE,         /* write exceeds max_object_size */
+    CYCLONE_BUSY                      /* transient contention; retry */
 };
 
 typedef uint8_t CycloneTier;
@@ -1277,6 +1288,20 @@ enum {
     CYCLONE_TIER_SMALL = 1     /* small-object sidecar volume, when enabled */
 };
 ```
+
+`CYCLONE_BUSY` is `CacheError::Busy`. From `cyclone_cache_read`,
+`cyclone_cache_exists` and their `_tier` variants it means the key's presence
+is unknown, not that the key is absent (see [Busy lookups](#busy-lookups)).
+From a write, delete or hit-count update it means a contended or raced lock;
+before this code existed those cases were reported as
+`CYCLONE_INTERNAL_ERROR`. `cyclone_cache_read_async` passes `CYCLONE_BUSY` to
+`read_cb` only when no miss handler is set. With a miss handler set, a Busy
+read goes to the handler like any other non-hit, so the waiters get the
+fetched value. The write-back does not always fix the bucket. In the process
+that owns the key's stripe, the write releases a bucket whose holder is stuck
+and then stores the value. In any other process the write fails with
+`NotOwned` before it reaches the directory, so the bucket stays busy until
+its owner next writes, removes or updates hit counts in it.
 
 ### Core Functions
 
@@ -1418,9 +1443,33 @@ enum class CacheError {
     InvalidArgument,   // Invalid parameter
     OutOfSpace,        // No space available
     Corrupted,         // Data corruption detected
+    Busy,              // Transient contention; retry (see below)
     InternalError      // Internal error
 };
 ```
+
+### Busy lookups
+
+Directory lookups are lock-free: a reader checks a per-bucket seqlock version
+and retries when a writer is mid-update. A writer that is descheduled inside
+that window can hold the bucket for a whole scheduling quantum. So a reader
+retries 100 times without reading the clock, then sleeps between further
+retries (10 µs, doubling up to 1 ms per sleep) for up to 5 ms
+(`SeqlockReadWait::kBudget` in `src/core/directory.hpp`). It sleeps rather
+than spins so that a waiting reader, possibly on an event-loop thread, does
+not burn its CPU. If the bucket is still busy after that, the lookup returns
+`CacheError::Busy`, not `NotFound`. It never saw the bucket in a consistent
+state, so it cannot say whether the key is there. The 5 ms cap is a
+trade-off: under heavy CPU oversubscription a writer can stay descheduled for
+longer, and those lookups report `Busy`; the caller can retry or refetch.
+
+Every directory probe that spends the whole budget is counted in
+`CacheStats::directory_read_timeouts`. The count is expected to be near 0.
+A steadily growing count means writers are being descheduled for longer
+than 5 ms, or, in multi-process mode, that a writer's process died in the
+middle of a directory update. In the second case, the owning process's
+next write, delete or hit-count update of a key in that bucket releases it;
+that write waits out the budget once and then goes through.
 
 All operations return `std::expected<T, CacheError>`. Use `.has_value()`, `.value()`, and `.error()` to check results:
 

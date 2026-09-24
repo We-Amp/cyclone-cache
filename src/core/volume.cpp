@@ -2513,7 +2513,7 @@ std::expected<ReadHandle, CacheError> Volume::read_sync(const CacheKey& key) {
     const StripeSnapshot snap = snapshot(stripe);
     ProbeRejects rejects;
 
-    stripe->probe_each(
+    const bool probe_complete = stripe->probe_each(
         key, snap,
         [&](const DirEntry& dir_entry, AdmitClass cls) {
           if (found) {
@@ -2675,6 +2675,14 @@ std::expected<ReadHandle, CacheError> Volume::read_sync(const CacheKey& key) {
       _hit_tracker->record_hit(key);
     }
 
+    // A writer held the key's bucket for the whole seqlock wait budget: the
+    // probe never saw the bucket consistent, so "nothing found" means
+    // "unknown", not a miss (issue #21).  The budget was already spent
+    // waiting; report Busy rather than retry.
+    if (!found && !probe_complete) {
+      return directory_busy();
+    }
+
     // Publish-after-snapshot: the key's entry moved under the probe (see
     // probe_raced_publish).  Not a miss -- try again with a fresh snapshot.
     if (!found && probe_raced_publish(stripe, rejects)) {
@@ -2766,13 +2774,19 @@ std::expected<void, CacheError> Volume::remove_sync(const CacheKey& key) {
   size_t num_candidates = 0;
 
   const StripeSnapshot snap = snapshot(stripe);
-  stripe->probe_each(key, snap, [&](const DirEntry& dir_entry, AdmitClass cls) {
-    if (num_candidates < candidates.size()) {
-      candidates[num_candidates++] = {dir_entry.offset(),
-                                      dir_entry.approx_size(), cls};
-    }
-    return true;  // Continue — collect all matching entries
-  });
+  // A partial candidate list would report NotFound, or remove one same-key
+  // entry and leave another behind: never act on one (writer_probe).
+  if (!writer_probe(
+          stripe, key, snap, [&] { num_candidates = 0; },
+          [&](const DirEntry& dir_entry, AdmitClass cls) {
+            if (num_candidates < candidates.size()) {
+              candidates[num_candidates++] = {dir_entry.offset(),
+                                              dir_entry.approx_size(), cls};
+            }
+            return true;  // Continue — collect all matching entries
+          })) {
+    return make_unexpected(CacheError::Busy);
+  }
 
   // Phase 2: For each candidate, read the document to verify the full SHA-256
   // key (not just the 12-bit tag), then remove the correct entry precisely.
@@ -2896,13 +2910,16 @@ std::expected<bool, CacheError> Volume::exists_sync(const CacheKey& key) {
   for (uint32_t attempt = 0; attempt < max_attempts; ++attempt) {
     bool found = false;
     ProbeRejects rejects;
-    stripe->probe_each(
+    const bool probe_complete = stripe->probe_each(
         key, snapshot(stripe),
         [&](const DirEntry&, AdmitClass) {
           found = true;
           return false;  // Stop iteration
         },
         &rejects);
+    if (!found && !probe_complete) {
+      return directory_busy();  // Bucket held past the budget (see read_sync)
+    }
     if (found || !probe_raced_publish(stripe, rejects)) {
       return found;
     }
@@ -3967,6 +3984,8 @@ VolumeStats Volume::stats() const {
       _ram_coherence_rejections.load(std::memory_order_relaxed);
   result.ram_coherence_put_rejections =
       _ram_coherence_put_rejections.load(std::memory_order_relaxed);
+  result.directory_read_timeouts =
+      _directory_read_timeouts.load(std::memory_order_relaxed);
   uint64_t last_wrap_ns = _last_wrap_time_ns.load(std::memory_order_acquire);
 
   for (const auto& stripe : _stripes) {
@@ -4200,50 +4219,66 @@ std::expected<void, CacheError> Volume::commit_write(
     }
   };
   const StripeSnapshot snap = snapshot(stripe);
-  stripe->probe_each(key, snap, [&](const DirEntry& dir_entry, AdmitClass cls) {
-    if (dir_entry.offset() == verified_offset) {
-      return true;  // a retried scan re-yields the elected entry
-    }
-    auto region = _mapped_file->map_region(stripe->offset + dir_entry.offset(),
-                                           Document::kHeaderSize,
-                                           MappedFile::MapMode::ReadOnly);
-    if (!region) {
-      // A transient mapping failure proves nothing about the entry: keep it
-      // (review N2).  Only a header that was actually read and failed
-      // validation below is evidence that the entry is dead.
-      return true;
-    }
-    const DocumentReader reader(*region);
-    if (!reader.is_valid()) {
-      // Bad magic / length: nothing any key can resolve through it.
-      _mapped_file->unmap_region(*region);
-      if (stripe->in_data_area(dir_entry.offset())) {
-        add_clear(dir_entry.offset());
-      }
-      return true;
-    }
-    CacheKey stored_key = reader.first_key();
-    const bool stamp_ok = stamp_admits(stripe, snap, cls, reader.document());
-    _mapped_file->unmap_region(*region);
-    if (!stamp_ok) {
-      add_clear(dir_entry.offset());  // a stale survivor, whoever's key
-      return true;
-    }
-    if (stored_key != key) {
-      return true;  // A live tag collision: another key's entry, keep it
-    }
-    if (verified_offset == Directory::kNoVerifiedEntry ||
-        (cls == AdmitClass::kCurrent && verified_cls != AdmitClass::kCurrent)) {
-      if (verified_offset != Directory::kNoVerifiedEntry) {
-        add_clear(verified_offset);  // a retained duplicate loses
-      }
-      verified_offset = dir_entry.offset();
-      verified_cls = cls;
-    } else {
-      add_clear(dir_entry.offset());  // a duplicate
-    }
-    return true;
-  });
+  const bool probe_complete = writer_probe(
+      stripe, key, snap,
+      [&] {
+        verified_offset = Directory::kNoVerifiedEntry;
+        verified_cls = AdmitClass::kReject;
+        clear_count = 0;
+      },
+      [&](const DirEntry& dir_entry, AdmitClass cls) {
+        if (dir_entry.offset() == verified_offset) {
+          return true;  // a retried scan re-yields the elected entry
+        }
+        auto region = _mapped_file->map_region(
+            stripe->offset + dir_entry.offset(), Document::kHeaderSize,
+            MappedFile::MapMode::ReadOnly);
+        if (!region) {
+          // A transient mapping failure proves nothing about the entry: keep it
+          // (review N2).  Only a header that was actually read and failed
+          // validation below is evidence that the entry is dead.
+          return true;
+        }
+        const DocumentReader reader(*region);
+        if (!reader.is_valid()) {
+          // Bad magic / length: nothing any key can resolve through it.
+          _mapped_file->unmap_region(*region);
+          if (stripe->in_data_area(dir_entry.offset())) {
+            add_clear(dir_entry.offset());
+          }
+          return true;
+        }
+        CacheKey stored_key = reader.first_key();
+        const bool stamp_ok =
+            stamp_admits(stripe, snap, cls, reader.document());
+        _mapped_file->unmap_region(*region);
+        if (!stamp_ok) {
+          add_clear(dir_entry.offset());  // a stale survivor, whoever's key
+          return true;
+        }
+        if (stored_key != key) {
+          return true;  // A live tag collision: another key's entry, keep it
+        }
+        if (verified_offset == Directory::kNoVerifiedEntry ||
+            (cls == AdmitClass::kCurrent &&
+             verified_cls != AdmitClass::kCurrent)) {
+          if (verified_offset != Directory::kNoVerifiedEntry) {
+            add_clear(verified_offset);  // a retained duplicate loses
+          }
+          verified_offset = dir_entry.offset();
+          verified_cls = cls;
+        } else {
+          add_clear(dir_entry.offset());  // a duplicate
+        }
+        return true;
+      });
+  // A partial election could miss this key's live entry and publish a
+  // second one beside it (the uniqueness rule above): writer_probe recovers
+  // a stuck bucket and re-elects.  If even that fails, publish nothing: the
+  // document stays unreachable, like any fill whose insert never ran.
+  if (!probe_complete) {
+    return make_unexpected(CacheError::Busy);
+  }
 
   // Update directory — publishes the entry.  MUST stay after the data sync
   // above; see the ordering-invariant comment there.
@@ -4838,8 +4873,9 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
     };
     std::array<HeadCandidate, Directory::kEntriesPerBucket> heads{};
     size_t head_count = 0;
-    stripe->probe_each(
-        key, snap, [&](const DirEntry& dir_entry, AdmitClass cls) {
+    const bool probe_complete = writer_probe(
+        stripe, key, snap, [&] { head_count = 0; },
+        [&](const DirEntry& dir_entry, AdmitClass cls) {
           // A version change may retry the scan: never record an entry
           // twice.
           for (size_t i = 0; i < head_count; ++i) {
@@ -4862,6 +4898,11 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
           }
           return true;
         });
+    // A partial head election could fork the key's chain (see commit_write
+    // and writer_probe).  Nothing is allocated or written yet.
+    if (!probe_complete) {
+      return make_unexpected(CacheError::Busy);
+    }
     int elected = -1;
     for (size_t i = 0; i < head_count; ++i) {
       if (heads[i].live &&
@@ -5576,7 +5617,7 @@ Volume::list_alternates_sync(const CacheKey& key) {
 
     // First, find the head document via directory probe
     ProbeRejects rejects;
-    stripe->probe_each(
+    const bool probe_complete = stripe->probe_each(
         key, snap,
         [&](const DirEntry& dir_entry, AdmitClass cls) {
           if (found_head) {
@@ -5688,6 +5729,12 @@ Volume::list_alternates_sync(const CacheKey& key) {
         },
         &rejects);
 
+    // Bucket held past the seqlock wait budget: unknown, not a miss (see
+    // read_sync).
+    if (!found_head && !probe_complete) {
+      return directory_busy();
+    }
+
     // Publish-after-snapshot: the head moved under the probe (see
     // probe_raced_publish).  Not a miss -- try again with a fresh snapshot.
     if (!found_head && probe_raced_publish(stripe, rejects)) {
@@ -5787,7 +5834,7 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
         ram_coherence ? stripe->bucket_version(key) : 0;
 
     ProbeRejects rejects;
-    stripe->probe_each(
+    const bool probe_complete = stripe->probe_each(
         key, snap,
         [&](const DirEntry& dir_entry, AdmitClass cls) {
           if (found_head) {
@@ -6207,6 +6254,12 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
       _hit_tracker->record_hit(key, hit_alt_id);
     }
 
+    // Bucket held past the seqlock wait budget: unknown, not a miss (see
+    // read_sync).
+    if (!found_head && !probe_complete) {
+      return directory_busy();
+    }
+
     // Publish-after-snapshot: the head moved under the probe (see
     // probe_raced_publish).  Not a miss -- try again with a fresh snapshot.
     if (!found_head && probe_raced_publish(stripe, rejects)) {
@@ -6393,8 +6446,9 @@ std::expected<void, CacheError> Volume::remove_alternate_sync(
     bool found_head = false;
     AdmitClass head_cls = AdmitClass::kReject;
 
-    stripe->probe_each(
-        key, snap, [&](const DirEntry& dir_entry, AdmitClass cls) {
+    const bool probe_complete = writer_probe(
+        stripe, key, snap, [&] { found_head = false; },
+        [&](const DirEntry& dir_entry, AdmitClass cls) {
           if (found_head) {
             return false;
           }
@@ -6427,6 +6481,9 @@ std::expected<void, CacheError> Volume::remove_alternate_sync(
           return false;
         });
 
+    if (!found_head && !probe_complete) {
+      return make_unexpected(CacheError::Busy);  // unknown, not NotFound
+    }
     if (!found_head) {
       return make_unexpected(CacheError::NotFound);
     }
@@ -6633,68 +6690,75 @@ std::expected<void, CacheError> Volume::update_hit_count_sync(
   // Find the document with the matching alternate_id
   uint64_t target_offset = 0;
 
-  stripe->probe_each(key, snap, [&](const DirEntry& dir_entry, AdmitClass cls) {
-    uint64_t doc_offset = stripe->offset + dir_entry.offset();
+  const bool probe_complete = writer_probe(
+      stripe, key, snap, [&] { target_offset = 0; },
+      [&](const DirEntry& dir_entry, AdmitClass cls) {
+        uint64_t doc_offset = stripe->offset + dir_entry.offset();
 
-    auto mapped = _mapped_file->map_region(doc_offset, dir_entry.approx_size(),
-                                           MappedFile::MapMode::ReadOnly);
-    if (!mapped) {
-      return true;  // Continue to next candidate
-    }
+        auto mapped = _mapped_file->map_region(
+            doc_offset, dir_entry.approx_size(), MappedFile::MapMode::ReadOnly);
+        if (!mapped) {
+          return true;  // Continue to next candidate
+        }
 
-    DocumentReader reader(*mapped);
-    if (!reader.is_valid()) {
-      _mapped_file->unmap_region(*mapped);
-      return true;  // Continue to next candidate
-    }
+        DocumentReader reader(*mapped);
+        if (!reader.is_valid()) {
+          _mapped_file->unmap_region(*mapped);
+          return true;  // Continue to next candidate
+        }
 
-    CacheKey stored_key = reader.first_key();
-    if (stored_key != key ||
-        !stamp_admits(stripe, snap, cls, reader.document())) {
-      _mapped_file->unmap_region(*mapped);
-      return true;  // Continue to next candidate
-    }
+        CacheKey stored_key = reader.first_key();
+        if (stored_key != key ||
+            !stamp_admits(stripe, snap, cls, reader.document())) {
+          _mapped_file->unmap_region(*mapped);
+          return true;  // Continue to next candidate
+        }
 
-    _mapped_file->unmap_region(*mapped);
+        _mapped_file->unmap_region(*mapped);
 
-    // Found head - traverse chain to find the right alternate
-    uint64_t current_offset = doc_offset;
-    size_t chain_depth = 0;
-    AdmitClass node_cls = cls;  // each hop re-derives it
+        // Found head - traverse chain to find the right alternate
+        uint64_t current_offset = doc_offset;
+        size_t chain_depth = 0;
+        AdmitClass node_cls = cls;  // each hop re-derives it
 
-    while (current_offset != 0 &&
-           chain_depth < Document::kMaxChainTraversalDepth) {
-      auto mdoc = map_document(*_mapped_file, current_offset,
-                               Document::kHeaderSize, stripe->size, false);
-      if (!mdoc) break;
-      if (!stamp_admits(stripe, snap, node_cls, mdoc->reader.document())) {
-        _mapped_file->unmap_region(mdoc->region);
-        break;  // a stale node ends the visible chain
-      }
+        while (current_offset != 0 &&
+               chain_depth < Document::kMaxChainTraversalDepth) {
+          auto mdoc = map_document(*_mapped_file, current_offset,
+                                   Document::kHeaderSize, stripe->size, false);
+          if (!mdoc) break;
+          if (!stamp_admits(stripe, snap, node_cls, mdoc->reader.document())) {
+            _mapped_file->unmap_region(mdoc->region);
+            break;  // a stale node ends the visible chain
+          }
 
-      const Document& doc = mdoc->reader.document();
-      auto current_id = static_cast<AlternateId>(doc.alternate_id);
+          const Document& doc = mdoc->reader.document();
+          auto current_id = static_cast<AlternateId>(doc.alternate_id);
 
-      if (current_id == alternate_id) {
-        target_offset = current_offset;
-        _mapped_file->unmap_region(mdoc->region);
-        break;
-      }
+          if (current_id == alternate_id) {
+            target_offset = current_offset;
+            _mapped_file->unmap_region(mdoc->region);
+            break;
+          }
 
-      uint64_t next_offset = doc.next_alternate_offset;
-      _mapped_file->unmap_region(mdoc->region);
+          uint64_t next_offset = doc.next_alternate_offset;
+          _mapped_file->unmap_region(mdoc->region);
 
-      if (next_offset == 0) break;
-      node_cls = stripe->admit_hop(next_offset, current_offset - stripe->offset,
-                                   node_cls, snap);
-      if (node_cls == AdmitClass::kReject) break;
-      current_offset = stripe->offset + next_offset;
-      ++chain_depth;
-    }
+          if (next_offset == 0) break;
+          node_cls = stripe->admit_hop(
+              next_offset, current_offset - stripe->offset, node_cls, snap);
+          if (node_cls == AdmitClass::kReject) break;
+          current_offset = stripe->offset + next_offset;
+          ++chain_depth;
+        }
 
-    return false;  // Stop iteration
-  });
+        return false;  // Stop iteration
+      });
 
+  if (target_offset == 0 && !probe_complete) {
+    // Busy is how this path already reports a dropped delta (the caller
+    // counts it as contention and does not try other volumes).
+    return make_unexpected(CacheError::Busy);
+  }
   if (target_offset == 0) {
     return make_unexpected(CacheError::AlternateNotFound);
   }

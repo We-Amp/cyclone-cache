@@ -49,8 +49,14 @@ enum {
                                       retry.  This enum is APPEND-ONLY: new
                                       codes go at the tail, existing values
                                       never renumber. */
-  CYCLONE_OBJECT_TOO_LARGE         /* Write content exceeds the configured
+  CYCLONE_OBJECT_TOO_LARGE,        /* Write content exceeds the configured
                                       max_object_size */
+  CYCLONE_BUSY /* Transient contention; retry.  From a read or exists: a
+                  writer held the key's directory bucket for the whole wait
+                  budget (5 ms), so whether the key is present is UNKNOWN --
+                  not a miss.  From a write, delete or hit-count update: a
+                  contended or raced lock (previously reported as
+                  CYCLONE_INTERNAL_ERROR). */
 };
 
 /* --------------------------------------------------------------------------
@@ -406,6 +412,14 @@ typedef struct {
   uint64_t alternates_carried_forward;
   uint64_t alternate_carry_bytes;
   uint64_t alternates_carry_dropped;
+
+  /* Directory probes that spent the whole seqlock wait budget because a
+   * writer held the key's directory bucket; a read or exists then returned
+   * CYCLONE_BUSY (append-only extension at the TAIL, same lockstep-
+   * compilation caveat as above: cyclone_cache_stats() writes the whole
+   * struct, so rebuild every consumer against this header).  Process-local,
+   * summed across volumes.  Expected near 0; see CYCLONE_BUSY. */
+  uint64_t directory_read_timeouts;
 } CycloneCacheStats;
 
 /* --------------------------------------------------------------------------
@@ -447,6 +461,8 @@ CycloneError cyclone_cache_delete(CycloneCacheHandle *cache, const char *key,
  * Returns:
  *   CYCLONE_OK         - Entry exists
  *   CYCLONE_NOT_FOUND  - Entry does not exist (this is NOT an error condition)
+ *   CYCLONE_BUSY       - Unknown: a writer held the key's directory bucket
+ *                        for the whole wait budget; retry
  *   CYCLONE_INVALID_ARGUMENT - Invalid parameters
  */
 CycloneError cyclone_cache_exists(CycloneCacheHandle *cache, const char *key,
@@ -553,7 +569,10 @@ typedef void (*CycloneReadCallback)(void *, const char *, size_t, CycloneError);
  *     - No fetch in flight for this key: invokes miss handler
  *     - Fetch already in flight: coalesces (waits for in-flight fetch)
  *     - When fetch completes: stores result, invokes read_cb for ALL waiters
- * - Cache miss + no miss handler: invokes read_cb with CYCLONE_NOT_FOUND.
+ * - Cache miss + no miss handler: invokes read_cb with CYCLONE_NOT_FOUND,
+ *   or with CYCLONE_BUSY when the read could not tell whether the key is
+ *   present (see CYCLONE_BUSY).  With a miss handler set, that case takes
+ *   the miss path like any other non-hit.
  * - Cache shutting down: invokes read_cb with CYCLONE_NOT_INITIALIZED.
  */
 CycloneError cyclone_cache_read_async(CycloneCacheHandle *cache,
