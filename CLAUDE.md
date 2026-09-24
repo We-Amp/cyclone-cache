@@ -532,7 +532,7 @@ design record for shipped work (background, not a task list);
 | [doc/kv-cache-benchmark/kv-workload-spec.md](doc/kv-cache-benchmark/kv-workload-spec.md) | Workload spec for rounds 1–3b | Current (v1.1) |
 | [doc/kv-cache-benchmark/kv-churn-spec.md](doc/kv-cache-benchmark/kv-churn-spec.md) | Bounded-capacity churn spec and decision criteria (rounds 4–5) | Current (v1) |
 | [doc/design/wrap-retention.md](doc/design/wrap-retention.md) | Keep the previous pass readable past a wrap (clean frontier, pass stamp) | Design/plan — implemented, default on |
-| [doc/design/verified-state.md](doc/design/verified-state.md) | Share and persist the CRC-verified verdict across processes and restarts (per-stripe token table, nonce, seal) | Design proposal — not implemented |
+| [doc/design/verified-state.md](doc/design/verified-state.md) | Share and persist the CRC-verified verdict across processes and restarts (per-stripe token table, nonce, seal) | Design proposal — shelved (per-process CRC-cache fix shipped in #24) |
 
 Historical fix-logs are archived separately from the living docs — they record
 completed work and are not current spec.
