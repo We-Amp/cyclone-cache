@@ -216,7 +216,7 @@ struct CacheStats {
     uint64_t ram_coherence_put_rejections;  // RAM inserts declined
 
     // Large-document readahead (process-local; C++ only, see below)
-    uint64_t readahead_hints_issued;  // Readahead hints that reached the kernel
+    uint64_t readahead_hints_issued;  // Readahead hints past the re-advise filter
 
     // Wrap retention (process-local; all 0 in flush mode; see
     // "Wrap Retention" below)
@@ -323,9 +323,10 @@ that ran without the gate and should stay 0.
 read path actually issued (see ["Large-Document
 Readahead"](#large-document-readahead) below), summed across volumes. It
 counts hints that got past the per-placement re-advise filter, so it measures
-kernel calls made, not large reads served: a hot document contributes at most
-one hint per re-advise interval (2 s) however often it is read, and a document
-below `readahead_min_bytes` never contributes. Process-local.
+hints issued, not large reads served: a hot document contributes at most one
+hint per re-advise interval (2 s) however often it is read, and a document
+below `readahead_min_bytes` never contributes. On Linux a counted hint whose
+range is already fully resident stops at a `mincore()` check. Process-local.
 
 The wrap-retention counters observe the eviction mode (see ["Wrap
 Retention"](#wrap-retention) below). `retained_hits` is the direct measure of

@@ -501,8 +501,19 @@ The interval only has to be long enough that a hot key cannot pay for a
 redundant or one skipped hint and nothing else, so the filter is never
 consulted for correctness and needs no synchronisation — the warm path is a
 single relaxed load, and the store happens only when a hint is issued.
-`CacheStats::readahead_hints_issued` counts the hints that actually reached
-the kernel, which makes the filter observable.
+`CacheStats::readahead_hints_issued` counts the hints that got past the
+filter, which makes the filter observable.
+
+On Linux a hint that gets past the filter is still skipped when `mincore()`
+reports every page of the document resident. On resident pages the hint
+queues no I/O but walks every page once per chunk call, and the filter lets
+a warm document through again after 2 s or on a slot collision: with the
+64 KiB chunks that walk cost 7 % of warm 512 KiB `view` reads, and with the
+check warm `view` is 6–10 % faster than it was with 512 KiB chunks and no
+check. The check must cover every page. Checking one page was tried: about
+3 % of cold documents had that page cached and the rest not, their hint was
+skipped, and each then faulted in 4 KiB at a time (~10 ms per 512 KiB
+document).
 
 Apart from that one relaxed load/store the hint takes no lock, reads no
 shared state and never dereferences the region, so it sits outside the

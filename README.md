@@ -255,8 +255,9 @@ GB/s), serves four reader processes 1.3× faster than LMDB, and under
 concurrent churn keeps a 3–4× lower hit-latency tail than LMDB with an LRU;
 with wrap retention on (now the default), a bounded tier meets the
 benchmark's pre-registered bar against LMDB on that latency clause. It is not a general LMDB
-replacement: warm reads are in the same class, small blocks (512 KiB) read
-cold at under half LMDB's rate, writes run at about 1 GB/s per thread behind
+replacement: warm reads are in the same class, small blocks read cold
+behind LMDB (512 KiB at 0.7× its rate; below 256 KiB, where no readahead
+hint is issued, far behind), writes run at about 1 GB/s per thread behind
 file-per-block, and single-threaded churn serves 0.7–0.8× LMDB.
 
 - **Zero-copy loads.** On a disk hit `content()` aliases the mapped volume;

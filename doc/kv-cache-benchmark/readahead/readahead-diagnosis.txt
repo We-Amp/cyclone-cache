@@ -1,0 +1,79 @@
+# Diagnosis of the cold 512 KiB gap (issue #18), 2026-09-24, Linux benchmark machine (i7-8750H, Samsung 970 PRO 512GB fw 1B2QEXP7,
+# ext4, kernel 5.15.0-191, nvme0n1 read_ahead_kb=128 max_sectors_kb=1280, scheduler none). Nothing changed on the box.
+
+## 1. Device counters over the first-touch phase (sampler.sh, /proc/vmstat + /proc/diskstats every 100 ms)
+# base-512k: kv_bench (origin/main b94540d) --block-size 524288 --seconds 2 --threads 1 --skip-multiprocess
+# lmdb-512k: kvpeer --store lmdb, same arguments, run right after
+# avg_inflight = delta(ms spent reading)/wall; us_per_req = delta(ms reading)/delta(reads completed)
+2026-09-24T19:44:46+02:00 start load: 3.18 2.67 1.14 1/746 379849
+  [2/5] get_first_touch
+        readahead hints issued so far: 4098 (after get_first_touch)
+  [4/5] restart
+        readahead hints issued so far: 4096 (after restart)
+| cyclone | 524288 | 4096 | get_first_touch | view | 1 | 1575.6 | 0.826 | 687.5 | 986.3 | 1268.6 | 1.000 |
+| cyclone | 524288 | 4096 | restart | view | 1 | 1327.1 | 0.696 | 723.1 | 1211.1 | 1352.4 | 1.000 |
+cyclone first-touch window: dt_s 2.540 majflt 181 reads 8279 merged 415 MiB 1991 MB/s 822 avg_req_KiB 246.3 avg_inflight 1.38 us_per_req 424
+2026-09-24T19:45:51+02:00 start load: 1.28 2.23 1.09 1/742 380778
+  get_first_touch  : 4584.3 gets/s, 2.403 GB/s, p50 159.720 us, p99 1335.512 us
+  restart          : hit_fraction 1.0000, 4539.1 gets/s, 2.380 GB/s
+| get_first_touch | view | 512 KiB | 1 | 4584.3 | 2.403 | 159.7 | 1335.5 | 1809.5 | 1.000 |
+| restart | view | 512 KiB | 1 | 4539.1 | 2.380 | 165.5 | 988.7 | 1430.0 | 1.000 |
+lmdb first-touch window:    dt_s 0.735 majflt 214 reads 13745 merged 0 MiB 1692 MB/s 2414 avg_req_KiB 126.1 avg_inflight 1.36 us_per_req 73
+
+## 2. Where one cold 512 KiB get spends its time (throwaway clock_gettime patch in Volume::read_sync)
+# probe = read_sync entry to key match; hint = maybe_advise_readahead (two madvise calls: 512 KiB + tail page);
+# crc = checksum pass, which first-touches the content and so includes waiting for the I/O
+2026-09-24T20:12:26+02:00 start load: 0.04 0.83 1.29 1/743 464494 commit: ?
+  [2/5] get_first_touch
+INSTR n=4098 probe_us=8.5 hint_us=159.4 crc_us=410.0 tail_us=1.9 total_us=579.7
+        readahead hints issued so far: 4098 (after get_first_touch)
+  [4/5] restart
+        readahead hints issued so far: 4096 (after restart)
+| cyclone | 524288 | 4096 | get_first_touch | view | 1 | 1717.4 | 0.900 | 554.8 | 903.9 | 1382.5 | 1.000 |
+| cyclone | 524288 | 4096 | restart | view | 1 | 1302.8 | 0.683 | 741.1 | 1267.8 | 1407.7 | 1.000 |
+
+## 3. Kernel profile of the same run (perf record -g -e cpu-clock -e sched:sched_switch -p <kv_bench>, 2.5 s from the
+# start of the first-touch phase; the window also covers the start of the warm phase = run_zipf_reader)
+    14.21%  [.] cyclone::(anonymous namespace)::sse42_3way_impl
+    11.79%  [.] (anonymous namespace)::run_zipf_reader(cyclone::Cache&, std::vector<cyclone::CacheKey, std::allocator<cyclone::CacheKey> > const&, (anonymous namespace)::Mode, unsigned long, unsigned int, double, double, bool)::$_0::operator()
+    10.00%  [k] __add_to_page_cache_locked
+     5.96%  [k] clear_page_erms
+     5.18%  [k] xas_load
+     3.62%  [k] __lock_text_start
+     2.69%  [.] __memmove_avx_unaligned_erms
+     2.24%  [k] rmqueue
+     2.14%  [.] cyclone::Stripe::probe_each<cyclone::Volume::read_sync(cyclone::CacheKey const&)::$_0>(cyclone::CacheKey const&, cyclone::StripeSnapshot const&, cyclone::Volume::read_sync(cyclone::CacheKey const&)::$_0&&, cyclone::ProbeRejects*) const::{lambda(cyclone::DirEntry const&)#1}::operator()
+     1.96%  [k] do_user_addr_fault
+     1.93%  [k] ext4_mpage_readpages
+     1.75%  [k] next_uptodate_page
+     1.68%  [.] 0x00000000000006e8
+   100.00%  [k] __schedule
+
+## 4. The volume file, and the device on it with the page cache bypassed (dprobe.py, O_DIRECT, one read in flight)
+# kv_bench --pause-before-warm kept the freshly written 512 KiB volume (16 stripes) on disk; filefrag:
+#   108 extents over 2 GiB of data (8-48 MiB each): no per-document fragmentation.
+# python3 dprobe.py <volume> 1048576 536866816 16 <block> 64, run twice at 512 KiB (second run re-reads the same offsets)
+sequential, one stripe     64 x 512 KiB: 1.86 GB/s, 282 us/read
+16-way interleaved         64 x 512 KiB: 1.46 GB/s, 359 us/read
+random within stripes      64 x 512 KiB: 1.23 GB/s, 427 us/read
+sequential, one stripe     64 x 512 KiB: 1.89 GB/s, 277 us/read
+16-way interleaved         64 x 512 KiB: 1.75 GB/s, 299 us/read
+random within stripes      64 x 512 KiB: 1.79 GB/s, 293 us/read
+sequential, one stripe     64 x 128 KiB: 1.61 GB/s, 81 us/read
+16-way interleaved         64 x 128 KiB: 0.80 GB/s, 163 us/read
+random within stripes      64 x 128 KiB: 1.03 GB/s, 127 us/read
+sequential, one stripe     18 x 2048 KiB: 2.82 GB/s, 745 us/read
+16-way interleaved         64 x 2048 KiB: 2.73 GB/s, 767 us/read
+random within stripes      64 x 2048 KiB: 2.51 GB/s, 837 us/read
+
+## Reading
+- Cyclone and LMDB keep the same average number of reads in flight (~1.4), but LMDB's 126 KiB reads complete in
+  73 us and Cyclone's (one ~508 KiB read plus one 4 KiB tail-page read per document) in 424 us on average.
+- Only ~180 major faults per 4096 gets: the hint covers the content, and the header page is already cached as the
+  tail page of the previous document in the same stripe. Faults are not the cost.
+- The madvise call itself takes ~160 us: the kernel allocates, zeroes (clear_page_erms) and inserts
+  (__add_to_page_cache_locked, xas_load) all 128 pages before it submits the read, so the device idles for that
+  long per document. The checksum pass then waits ~410 us for the single large read, whose pages all unlock only
+  when it completes. Nothing overlaps.
+- The device itself reads a 512 KiB block of this file in 280-430 us with one read in flight, so the ~570 us
+  per get is mostly idle device time plus serialisation, not bandwidth.
