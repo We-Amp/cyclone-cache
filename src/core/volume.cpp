@@ -1503,6 +1503,29 @@ Volume::Volume(VolumeConfig config, const MultiProcessConfig& mp_config)
 
 Volume::~Volume() { close(); }
 
+std::array<uint64_t, 4> Volume::make_checksum_salt(const void* self) noexcept {
+  // splitmix64 over a seed that differs per Volume (its address and a
+  // process-wide counter) and per run (the clock).  The salt only has to be
+  // unpredictable enough that no stored document can be crafted to collide
+  // with a cached token; it is not a secret key.
+  static std::atomic<uint64_t> counter{0};
+  uint64_t state =
+      static_cast<uint64_t>(reinterpret_cast<uintptr_t>(self)) ^
+      static_cast<uint64_t>(
+          std::chrono::steady_clock::now().time_since_epoch().count()) ^
+      (counter.fetch_add(1, std::memory_order_relaxed) *
+       uint64_t{0xD6E8FEB86659FD93});
+  std::array<uint64_t, 4> salt{};
+  for (uint64_t& word : salt) {
+    state += uint64_t{0x9E3779B97F4A7C15};
+    uint64_t z = state;
+    z = (z ^ (z >> 30U)) * uint64_t{0xBF58476D1CE4E5B9};
+    z = (z ^ (z >> 27U)) * uint64_t{0x94D049BB133111EB};
+    word = z ^ (z >> 31U);
+  }
+  return salt;
+}
+
 std::expected<void, CacheError> Volume::open() {
   if (_fd >= 0) {
     return make_unexpected(CacheError::AlreadyOpen);
@@ -2567,20 +2590,26 @@ std::expected<ReadHandle, CacheError> Volume::read_sync(const CacheKey& key) {
                                  mapped->first(std::min<size_t>(
                                      mapped->size(), reader.document().len)));
 
-          // Verify checksum to detect corruption or torn reads.
-          // Skip if this {offset, checksum} pair was already verified.  NOTE:
-          // the validation cache stores a 16-bit discriminator, not the full
-          // CRC32 (see kChecksumCacheSize) — it is NOT the overwrite guard;
-          // the wrap-epoch revalidation below is.
+          // Verify checksum to detect corruption or torn reads.  Skip it only
+          // if this exact incarnation -- the token of the header just read
+          // and key-verified above -- already passed in this process (see
+          // _checksum_cache).  NOT the overwrite guard: the wrap-epoch
+          // revalidation below is.
           if (_config.verify_checksum_on_read &&
-              reader.document().checksum != 0 &&
-              !is_checksum_validated(doc_offset, reader.document().checksum)) {
-            if (!reader.document().verify_checksum(reader.payload())) {
-              _mapped_file->unmap_region(*mapped);
-              checksum_failed = true;
-              return true;  // Continue to next candidate
+              reader.document().checksum != 0) {
+            const uint64_t token =
+                checksum_token(doc_offset, reader.document());
+            if (!is_checksum_validated(doc_offset, token)) {
+#ifdef CYCLONE_TEST_SEAMS
+              reader_seam(ReaderSeam::kCrcVerify);
+#endif
+              if (!reader.document().verify_checksum(reader.payload())) {
+                _mapped_file->unmap_region(*mapped);
+                checksum_failed = true;
+                return true;  // Continue to next candidate
+              }
+              mark_checksum_validated(doc_offset, token);
             }
-            mark_checksum_validated(doc_offset, reader.document().checksum);
           }
 
           // Lease protocol + register the borrow (count+1) and stamp the
@@ -5994,21 +6023,26 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
               selected_mapped->first(std::min<size_t>(
                   selected_mapped->size(), selected_reader.document().len)));
 
-          // Verify checksum of selected alternate.
-          // Skip if this {offset, checksum} pair was already verified.
+          // Verify checksum of selected alternate.  Skip it only if this
+          // exact incarnation -- the token of the header just read and
+          // key-verified above -- already passed in this process.
           if (_config.verify_checksum_on_read &&
-              selected_reader.document().checksum != 0 &&
-              !is_checksum_validated(selected_offset,
-                                     selected_reader.document().checksum)) {
-            if (!selected_reader.document().verify_checksum(
-                    selected_reader.payload())) {
-              _mapped_file->unmap_region(*selected_mapped);
-              _mapped_file->unmap_region(*mapped);
-              checksum_failed = true;
-              return false;
+              selected_reader.document().checksum != 0) {
+            const uint64_t token =
+                checksum_token(selected_offset, selected_reader.document());
+            if (!is_checksum_validated(selected_offset, token)) {
+#ifdef CYCLONE_TEST_SEAMS
+              reader_seam(ReaderSeam::kCrcVerify);
+#endif
+              if (!selected_reader.document().verify_checksum(
+                      selected_reader.payload())) {
+                _mapped_file->unmap_region(*selected_mapped);
+                _mapped_file->unmap_region(*mapped);
+                checksum_failed = true;
+                return false;
+              }
+              mark_checksum_validated(selected_offset, token);
             }
-            mark_checksum_validated(selected_offset,
-                                    selected_reader.document().checksum);
           }
 
           // Lease protocol + register the borrow (count+1) and stamp the

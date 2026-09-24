@@ -174,6 +174,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- The per-process CRC-validation cache identified an already-verified
+  document by its offset and the top 16 bits of its CRC. A later document at
+  the same offset (rewritten after a wrap, torn by a usurped writer's late
+  write, or read back unsynced) whose CRC matched in those 16 bits was
+  trusted without its payload being checked, so corrupt bytes could be
+  served (probability 2^-16 per same-offset replacement). A slot now holds a
+  salted 64-bit token of the document incarnation: offset, pass stamp, full
+  CRC, `len`/`header_len` and a key prefix, computed from the header the
+  reader has just read and key-verified. Same memory (512 KB per volume),
+  still lock-free, no on-disk or shared-memory format change.
 - A writer that died inside a *committed* wrap (after the cursor dropped
   to the data-area start, before the new pass was published) was repaired by
   clearing its intent flag only. The next writer then filled the current

@@ -39,7 +39,7 @@ and `src/core/document.{hpp,cpp}` unless stated otherwise.
 | Q4 | May the writer mark a document verified at commit, since it computed the CRC? | Yes, same trust class as a reader's first verification in the same boot (section 8). Behind its own knob so it can be turned off. |
 | Q5 | Placement: the mmap directory region (data offset moves 177 → 305 pages) or a side file (no layout change, its own lifecycle)? | The directory region, with `MmapDirectory::kVersion` 2 → 3 (section 10). |
 | Q6 | Default in multi-process mode. | `kShared` (cross-process, same boot) on; `kPersistent` (across restart and sealed reboots) opt-in until soaked (section 9). |
-| Q7 | Pre-existing weakness: the per-process CRC-validation cache trusts any document at a verified offset whose CRC matches in its top 16 bits. That includes a later incarnation at the same offset, whether torn, unsynced or rewritten (section 3.3). Fix it in the same change? | Yes. Move the process-local cache to the same token format as a first, format-free step. |
+| Q7 | Pre-existing weakness: the per-process CRC-validation cache trusts any document at a verified offset whose CRC matches in its top 16 bits. That includes a later incarnation at the same offset, whether torn, unsynced or rewritten (section 3.3). Fix it in the same change? | Yes. Move the process-local cache to the same token format as a first, format-free step. **Done** (section 3.3). |
 
 ---
 
@@ -211,8 +211,12 @@ verification time, this re-verifies continuously instead of in a storm.
 
 ### 3.3 A pre-existing weakness this design closes
 
-`_checksum_cache` is keyed by `{offset, top 16 bits of the CRC}`. Its own
-comment says a same-offset replacement whose CRC matches in those 16 bits
+> **Fixed** (We-Amp/cyclone-cache#24), with no
+> on-disk or shared-memory format change. The rest of this section records
+> the weakness as it was; "Fix as shipped" below says what changed.
+
+`_checksum_cache` was keyed by `{offset, top 16 bits of the CRC}`. Its own
+comment said a same-offset replacement whose CRC matches in those 16 bits
 skips verification (2^-16 per rewrite). It argues that this is acceptable
 because "any document reachable through the directory was fully written
 before its entry was published".
@@ -235,6 +239,46 @@ Both are rare, but the fix is free: store the same 64-bit token as the
 shared table (4.5), with a per-process nonce. That brings the aliasing
 probability from 2^-16 down to about 2^-45, and the process-local cache
 then follows the same usurp rule (7.2).
+
+**Fix as shipped.** Each of the 65 536 slots still holds one 64-bit word,
+direct-mapped by offset, so the footprint (512 KB per volume) and the warm
+path (one relaxed load and compare) are unchanged. The word is now a token
+of the document incarnation, `Volume::checksum_token`:
+
+```
+a     = fold(offset ^ s0, first_key[0..8] ^ s1)
+b     = fold((checksum << 32 | write_serial) ^ s2,
+             (len << 32 | header_len) ^ s3)
+token = fold(a ^ c0, b ^ c1)          fold(x, y) = lo64(x*y) ^ hi64(x*y)
+```
+
+`s0..s3` are a per-Volume random salt drawn at construction (the
+per-process nonce of the proposal) and `c0, c1` are fixed odd constants.
+All 64 bits are compared, with no truncation and no separate offset field,
+so another incarnation matches only on a token collision (about 2^-64 per
+lookup instead of 2^-16 per same-offset replacement). The token is
+computed at both CRC sites (`Volume::read_sync` and the selected-alternate
+site in `read_alternate_sync`) from the header the reader has just
+deserialized from the mapping and key-verified (invariant 8). The CRC pass
+and the stored token use the same header copy. No other site consults the
+cache; the RAM-tier path never reaches it.
+
+Not adopted: the usurp rule (7.2). The process-local cache has no nonce to
+zero. With the full token, a usurped holder's late pwrite that reaches the
+header gives the document a new identity and forces a re-verification. The
+residual is a reader that copied the usurper's header before the late
+pwrite reached it and then reads a payload the pwrite is overwriting. That
+window needs the nonce rule of the shared table.
+
+Tests: (G1)–(G3) in `tests/integration/test_wrap_phase_aba.cpp`. G1 places
+document A at offset X and reads it. A wrap then lands document B at X,
+whose CRC differs from A's but shares its top 16 bits, and B's payload is
+corrupted after its checksum was written. Under the old key G1 served the
+corrupt bytes; now the CRC pass runs and rejects them. G2 changes only the
+pass stamp at the same offset and CRC and expects one more CRC pass, on
+both read paths. It also pins that the identical incarnation skips the
+pass. G3 pins that every identity field changes the token and that the
+mutable header fields do not.
 
 ---
 
@@ -339,9 +383,9 @@ With the shared table active on a stripe, the process-local cache is not
 consulted for it. Two levels would add a second trust root for no gain,
 because the shared lookup costs the same. The process-local cache remains
 for in-memory `Directory` stripes and for mmap stripes with the feature off.
-It should adopt the token format with a per-process nonce, which replaces
-the 16-bit discriminator whose 2^-16 same-offset aliasing its own comment
-warns about. It should also honour the usurp rule of 7.2.
+It has adopted the token format with a per-process salt, which replaced
+the 16-bit discriminator and its 2^-16 same-offset aliasing (3.3). It
+does not honour the usurp rule of 7.2; 3.3 states the residual.
 
 ### 4.6 Single-process mode
 
