@@ -47,9 +47,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - `kv_gpu_cuda`, behind the new `CYCLONE_BUILD_CUDA_BENCHMARKS` option
     (default `OFF`, not supported on Windows): the same experiment over
     PCIe with `cudaHostRegister`.
-- **Wrap retention** (`CacheConfig::wrap_retention`, default `false`; C API
-  `disable_wrap_retention`). Normally a stripe's wrap drops its whole
-  previous pass at once. With retention on, the previous pass stays readable
+- **Wrap retention** (`CacheConfig::wrap_retention`, default `true` since
+  the change below; C API `disable_wrap_retention`). In flush mode a
+  stripe's wrap drops its whole previous pass at once. With retention on,
+  the previous pass stays readable
   until its bytes are needed: a clean frontier moves ahead of the write
   cursor one chunk at a time. A frontier advance waits only for live borrows
   in the chunks it crosses, and each document is stamped with its pass, so a
@@ -63,8 +64,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `advances_deferred_by_lease`, `early_advances_skipped`, `retained_hits`,
   `stamp_rejections`. See `doc/api-reference.md#wrap-retention` and
   `doc/design/wrap-retention.md`.
-  Retention is off by default. Known gap before it can default on: the
-  PageSpeed `cache_burst_test` has not been run against it.
+  It first shipped off by default. The one gap that kept it off, the
+  PageSpeed `cache_burst_test`, is resolved (see "Wrap retention is the
+  default" under Changed).
 - **Wrap retention: alternate carry-forward.** An alternate write whose
   chain head is retained no longer drops the key's other alternates (review
   R4). A chain may still not link across a pass. Instead the write rewrites
@@ -92,6 +94,32 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Wrap retention is the default** (`kDefaultWrapRetention = true`, so
+  `CacheConfig::wrap_retention` and `VolumeConfig::wrap_retention` default
+  to `true`, and a zero-initialised `CycloneCacheConfig` retains). Flush is
+  the opt-out: `wrap_retention = false`, or `disable_wrap_retention = 1` in
+  the C API. Every gate of design decision D1 passed first: the design and
+  review tests, the full suite and TSan in both modes on macOS and Linux,
+  and the PageSpeed `cache_burst_test` 200/200 with retention forced on
+  (40/40 under TSan), with review item R4 resolved by the alternate
+  carry-forward and the read-miss regression by the same-key publish retry.
+  **Upgrade impact.** A volume created with the default config by any
+  earlier build records flush (`VolumeHeader::retain_chunks = 0`). The mode
+  is not part of the fingerprinted filename, so this build opens the same
+  file and finds a mode mismatch:
+  - single process, or every old process stopped first: the volume is reset
+    cold in place on the first open. All entries are lost once; no second
+    file is created.
+  - a process of the other mode still holds the file (an overlapping
+    multi-process upgrade, or a peer that opts out): `Cache::start()` fails
+    with `ResetRefusedLivePeer` (`CYCLONE_RESET_REFUSED_LIVE_PEER` from
+    `cyclone_cache_create`) until that process exits. Stop every old
+    process before starting new ones.
+  - `auto_reset_on_incompatible = false`: `IncompatibleVersion`.
+  To keep an existing cache warm, set `wrap_retention = false` on every
+  process. Volumes configured with `wrap_retention = true` before this change
+  are unaffected. The filename, the format version and the C ABI do not
+  change. See `doc/api-reference.md#wrap-retention`.
 - **Mmap directory version 2** (`MmapDirectory::kVersion`). A retention
   region after the directory entries holds the stripe's exposure generation
   and 64 per-chunk borrow slots. It replaces the stripe-wide borrow slot and

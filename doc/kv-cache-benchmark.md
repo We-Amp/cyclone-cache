@@ -37,7 +37,8 @@ Where Cyclone stands now:
   1.02–1.48× LMDB's throughput, on both patterns in two runs. Retention
   lifts the hit ratio from 0.76 to 0.81 (`zipf`), which is still 3.5–4
   points below LMDB with an LRU. At one thread Cyclone still serves less
-  than LMDB (about 0.7–0.8×). In flush mode, the default, the result is
+  than LMDB (about 0.7–0.8×). Retention is now the default; in flush
+  mode, the opt-out (and the default when round 5 ran), the result is
   still partial.
 - **GPU transfer:** registering the whole volume mapping once reaches the
   PCIe ceiling (12.79 of 12.82 GB/s, 2.3× over staging). Pinning each
@@ -734,7 +735,8 @@ that; the design for it, with its own replay numbers, is
 [`design/wrap-retention.md`](design/wrap-retention.md).
 
 That design has since been implemented as `CacheConfig::wrap_retention`, off
-by default (see the [CHANGELOG](../CHANGELOG.md)). A later Linux run used a
+by default at first and the default since (see the
+[CHANGELOG](../CHANGELOG.md)). A later Linux run used a
 smaller tier than the table above: 2 MiB blocks, C = 4 GiB, T=4,
 `memory.max = 1 GiB` (the same 1 : 4 ratio). There, turning retention on moved the
 measured hit ratio from 0.726 to 0.788 on `zipf` and from 0.614 to 0.660 on
@@ -1452,7 +1454,7 @@ through nvcc in `kv_gpu_cuda.cu`, behind the plain-C seam in
 | `WriteHandle::reserve(n)` that returns the destination span, so the caller writes or DMAs straight into the record (three copies become one) | Open; puts are 1.4× behind file-per-block (1.01 vs 1.44 GB/s) | [Round 3b](#round-3b-crc-32c-on-disk-format-v8), insert latency in [Round 4](#round-4-bounded-capacity-under-churn) |
 | An entry point that gives an embedder the mapping identity for one-time GPU registration, instead of inferring it from `content()` / `content_file_offset()` / `volume_files()` | Open | [Metal](#device-transfer-does-zero-copy-pay-off-metal-apple-silicon), [CUDA](#device-transfer-cuda-gtx-1050-pcie) |
 | A zero-copy C read entry point and a Python binding, which is what a vLLM/SGLang connector would call | Open | — |
-| Keep the previous lap resolvable until it is actually overwritten ([design](design/wrap-retention.md)) | Implemented, off by default; see [CHANGELOG](../CHANGELOG.md). Measured: at 16 GiB it meets the churn decision criteria (latency clause, both patterns, T=4); flush mode stays partial | [Round 5](#round-5-re-benchmark-at-main-2aed24c): hit ratio 0.758 → 0.814 (`zipf`) and 0.640 → 0.686 (`zipf+scan`), matching the replay within 0.002; served +16 % at T=1, within noise at T=4; hit p99 0.27–0.37× LMDB's; with it off (the default) the cold sweep is unchanged |
+| Keep the previous lap resolvable until it is actually overwritten ([design](design/wrap-retention.md)) | **Done**: implemented and on by default (`wrap_retention = false` is the flush opt-out); see [CHANGELOG](../CHANGELOG.md). Measured: at 16 GiB it meets the churn decision criteria (latency clause, both patterns, T=4); flush mode stays partial | [Round 5](#round-5-re-benchmark-at-main-2aed24c): hit ratio 0.758 → 0.814 (`zipf`) and 0.640 → 0.686 (`zipf+scan`), matching the replay within 0.002; served +16 % at T=1, within noise at T=4; hit p99 0.27–0.37× LMDB's; the round-5 cold sweep ran with it off (then the default) and was unchanged |
 | Profile insert latency (miss+insert p50 4.0 ms vs 1.4–1.6 ms for the peers) | Open | [Round 4](#round-4-bounded-capacity-under-churn) |
 | Scan resistance or admission control on the disk tier | Open | [Round 4](#why-the-hit-ratio-and-where-it-comes-from): a scan costs every store about 12 points |
 
