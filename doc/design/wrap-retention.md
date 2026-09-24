@@ -5,8 +5,11 @@ C API `disable_wrap_retention`). All 18 tests of section 11 are in
 `tests/integration/test_wrap_retention.cpp` and pass in both modes. The
 default was not flipped because D1's last gate, the PageSpeed
 `cache_burst_test`, could not be run against this tree (see section 14).
+Review item R4 (an alternate write over a retained head dropped the key's
+other alternates) is resolved by the carry-forward in section 4.5.
 Deviations from the design as written are listed in section 14. Sections 0-13
-are kept as the design record.
+are kept as the design record, except 4.5, which describes the carry-forward
+that replaced the original link refusal for retained heads.
 
 **Scope:** what a stripe's circular data area does with directory entries
 when the write cursor wraps and then advances over the previous pass. Out of
@@ -31,7 +34,7 @@ They are in `src/core/volume.{hpp,cpp}`, `src/core/directory.{hpp,cpp}` and
 | D2 | **64 chunks with a 1 MiB minimum chunk.** `Q = max(1 MiB, round_up(A/64, 8))`, `N = clamp(ceil(A/Q), 1, 64)`, with `N` persisted. `N = 1` behaves like flush. The earlier idea "chunk ≥ largest document" is dropped. | Tying `Q` to the largest document would collapse `N` to 1 under HTTP defaults (a 64 MiB `max_object_size` against 32 MiB stripes). It is not needed for correctness either, because a multi-chunk advance is still a single gated step. The 1 MiB floor keeps a stripe of about 32 MiB from running the gate every few writes. |
 | D3 | **Mixed modes are refused**, through the `VolumeHeader` and not the filename (B5, section 4.13). | Mixing is unsafe in both directions. The filename does not reliably carry the mode. |
 | D4 | **Per-chunk borrow counting is in scope**, together with the per-region exposure check (B1). | Without it, a borrow of any document on the stripe blocks every advance, and every advance tears every borrow. |
-| D5 | **No cross-pass alternate links.** Retained chains remain walkable downward (retained → retained). | This removes the self-loop and duplicate hazards (B2). Retained PageSpeed chains still resolve past their head. |
+| D5 | **No cross-pass alternate links.** Retained chains remain walkable downward (retained → retained). An alternate write over a retained head **carries the chain forward** into its own slot instead of linking it (section 4.5, R4). | This removes the self-loop and duplicate hazards (B2). Retained PageSpeed chains still resolve past their head, and keep resolving when the optimization engine adds an alternate after a wrap. |
 | D6–D8 | Out of scope: evacuation / second chance, hardening against forged in-payload headers, directory sizing. | Separate designs. |
 | D9 | **The stuck-intent fix is in scope, as its own commit**, with the S5 refinements. | It is a pre-existing gap: a crash inside the wrap window leaves every read of that stripe missing for a whole pass. |
 
@@ -427,17 +430,57 @@ CRC and borrow legs then apply per node, and the borrow is registered on the
 
 **Alternate writes** (`commit_alternate_write`, B2a/b, S6):
 
-- The planned link `next = old head` is refused (zeroed in the buffer, as
-  today) when either:
-  - the allocation wrapped, which is checked by comparing **`P` only**, never
-    `f`; or
-  - the old head is not in the current class (a retained head), re-checked
-    under the lock after the allocation.
-- In both cases the verified head entry is **updated in place** to the new
-  document, including when the link is refused, and never inserted with
-  `kNoVerifiedEntry`. No retained duplicate can survive.
-- Because a retained head is never linked, a fixed-size new head that lands
-  on the old head's offset cannot form a self-loop (test 9).
+- **Retained head: carry-forward** (R4, `Volume::carry_retained_chain`). The
+  write never links the retained chain. It rewrites the key's other
+  alternates as **current-pass documents in its own slot**:
+  `[carried nodes, oldest first][new head]`, one reservation, one pwrite,
+  one directory insert. The links are patched once the slot is known
+  (head → newest carried → … → oldest → 0, every hop downward inside the
+  slot), and every node takes the slot's pass stamp. So the chain lies in one
+  pass, and D5 holds.
+  - *What is carried:* the first (newest) copy of every id except the one
+    being written, as the walk sees it. Shadows and superseded copies are
+    not carried.
+  - *Caps:* at most `kMaxAlternatesPerKey - 1` nodes and
+    `min(A / 8, max_object_size)` bytes (never more than fits beside the new
+    document). Priority: the Original, then newest first. What does not fit
+    is dropped and counted in `alternates_carry_dropped`. A retained chain
+    never makes the write fail (N3).
+  - *Copy protocol:* each kept node is copied out of the mapping under the
+    stripe mutex, **before** the allocation, and re-validated on the copy:
+    magic, version, length, key, id, stamp `P_Σ − 1`, CRC. After all copies
+    an acquire fence and one fresh `G` load drop any node whose chunk has
+    since been exposed. That is the reader's exposure rule applied to a
+    borrow-less copy: an advance stores `G` before any pwrite into the chunk
+    it exposes, so a copy judged unexposed came from intact bytes.
+  - A wrap inside the carry's own allocation is harmless: the sources are
+    already in memory and every link points into the slot, so nothing is
+    refused.
+- **Current head, allocation wrapped** (the wrap race, checked by comparing
+  **`P` only**, never `f`): in flush mode the planned link is refused (zeroed
+  in the buffer, as before). In retention mode the wrap did not destroy the
+  chain, it made it retained. The write gives its unfilled slot back (the
+  cursor never covered it, F6) and retries once. The retry sees a retained
+  head and carries it. Nodes the retry's own advance exposed are gone, as
+  for any reader.
+- The verified head entry is **updated in place** to the new document in
+  every case, and never inserted with `kNoVerifiedEntry`. No retained
+  duplicate can survive.
+- A retained head is never linked. A fixed-size new head therefore cannot
+  form a self-loop by landing on the old head's offset (test 9). What lands
+  there now is the carried copy, and the head links one document down to
+  it.
+
+**Crash safety of the carry.** Until the insert, the only entry for the key
+is the retained head, and the carried copies are unreferenced bytes. The
+insert runs after the fill (and, with `sync_on_write`, after its fsync), so
+once it has run the head and every carried node are durable. A crash at any
+step therefore leaves either the old retained chain or the new complete
+chain resolvable. It never leaves a published prefix of the new chain. A
+crash inside the allocation is repaired like any writer crash (4.12). Power
+loss with `sync_on_write = false` keeps the existing contract: the directory
+can outrun the data, and each node is then CRC-checked on its own, so a lost
+node ends the chain early. It is never served wrong.
 
 **Header RMW and splices.** `commit_header_rmw` and `repoint_chain_link`
 defer on a wrap race by comparing **`P`** (S6). They re-run `admit` on their
@@ -769,7 +812,8 @@ snapshot still gets the exact verdict.
 | F1 | Reader classifies with a stale `F` | `F_Σ` from the snapshot; exposure check against a fresh `G` (5.3) |
 | F2 | Two-wrap trailing-gap survivor | Stamp (5.2) |
 | F3 | Duplicate entries after a rewrite, or an alternate write whose allocation wrapped | In-place update of the verified head; rule-2 cleanup (4.6, B2a) |
-| F4 | Self-loop: a fixed-size new head lands on a retained old head's offset | No links to retained heads (4.5, B2b) |
+| F4 | Self-loop: a fixed-size new head lands on a retained old head's offset | No links to retained heads (4.5, B2b); the carried copies link downward inside the new slot |
+| F17 | An alternate write over a retained head drops the key's other alternates (R4) | Carry-forward into the write's own slot, capped and counted (4.5) |
 | F5 | Purge misses retained entries | `admit` at every site; `remove_sync` removes all (B2c/d) |
 | F6 | Every borrow torn by any wrap or advance | Per-region exposure `G` (B1) |
 | F7 | Deferred first advance leaves the cursor high | `W := S` inside the wrap intent window (B3) |
@@ -836,6 +880,8 @@ sites before citing any of this elsewhere.
 - **Mode carried in the filename** (the first draft). Rejected (B5).
 - **Cross-pass alternate links** (the first draft). Rejected (D5): they allow
   self-loops and duplicates, for a small gain.
+- **Carry-forward variants** (R4, section 14). All of them keep D5; they
+  differ in what they copy and when. See section 14 for the comparison.
 - **A 2-bit phase.** It still needs the stamp or a sweep. It buys nothing.
 
 ---
@@ -958,7 +1004,8 @@ with nothing to wait on.
 8. **Early advance never forces.** No deferral clock, no deadline, no reset.
 9. **Uniqueness.** Same-offset rewrites with fixed-size documents, and
    `commit_alternate_write` with retained and wrap-raced heads: exactly one
-   resolving entry, no self-loop.
+   resolving entry, no self-loop, and (since R4) the other alternates
+   carried forward.
 10. **Purge of a retained key,** including `remove_alternate_sync` on a
     retained chain (the whole entry goes, S7).
 11. **Retained chain hops.** Downward retained → retained works. Upward hops
@@ -1021,7 +1068,9 @@ path carries nothing in release builds (S10):
 - `test_wrap_phase_aba.cpp` (C)/(D): the trailing-gap survivor is rejected by
   the stamp.
 - `test_wrap_phase_aba.cpp` (E) and the "fresh chain" case: links to retained
-  heads are refused (D5).
+  heads are never made (D5). Since R4 the wrap-raced write carries the
+  chain instead, so (E) serves the dark node's content from its carried,
+  current copy, and the "fresh chain" case counts no refusal.
 
 ### 11.4 Benchmark acceptance (gates D1)
 
@@ -1052,6 +1101,8 @@ path carries nothing in release builds (S10):
 - `early_advances_skipped`
 - `retained_hits`, the direct measure of the benefit
 - `stamp_rejections`
+- `alternates_carried_forward`, `alternate_carry_bytes` and
+  `alternates_carry_dropped` (R4, section 14)
 
 **Risks after the amendment:**
 
@@ -1202,15 +1253,14 @@ that introduced it.
   moved during that read. A forced step is the documented unprotected case,
   and the test reports those reads separately. Any other mismatch fails the
   test.
-- *R4, recorded as an open item.*  Writing an alternate onto a key whose
-  head is retained starts a fresh chain (D5: links never cross a pass), so
-  the retained alternates of that key stop resolving at once even though
-  their bytes stay readable until the frontier reaches them. For the
-  PageSpeed shape (Original first, optimized alternates added later by the
-  optimization engine) this drops Original, Gzip and WebP when an AVIF
-  lands after a wrap. The behaviour stays as is for now; it is counted in
-  `alternate_wrap_refusals`, and the retained reads that did happen in
-  `retained_hits`. It is a known gap before the default can flip.
+- *R4, recorded as an open item (resolved below).*  Writing an alternate
+  onto a key whose head is retained started a fresh chain (D5: links never
+  cross a pass), so the retained alternates of that key stopped resolving
+  at once even though their bytes stayed readable until the frontier
+  reached them. For the PageSpeed shape (Original first, optimized
+  alternates added later by the optimization engine) this dropped
+  Original, Gzip and WebP when an AVIF landed after a wrap, and it was
+  counted in `alternate_wrap_refusals`.
 - *No hardware divide on the read path.*  The snapshot splits `G` by
   `N + 1`, and the chunk of a document is `(o - S) / Q`. Both divisors are
   fixed at open, so `Stripe` holds a reciprocal (`FastDivU64`) for each. A
@@ -1267,3 +1317,60 @@ R1/R2/R3").
     two 128-byte lines (16 KiB per stripe).
   - N6: the comment on the conditional exclusive-lock probe now describes
     both of its uses.
+
+**Review R4 (carry-forward).**  The gap above is closed. An alternate write
+over a retained head keeps the key's other alternates reachable and still
+never links across a pass. Section 4.5 has the mechanism and the crash-safety
+argument. The choice, against the alternatives considered:
+
+| Option | Correctness | Complexity | Write amplification | Verdict |
+|---|---|---|---|---|
+| Keep the drop (before R4) | Correct, loses data | None | 0 | Rejected: cancels retention on PageSpeed's optimize-after-write path |
+| Link across the pass | Self-loops and duplicates (B2) | Low | 0 | Rejected (D5) |
+| **Carry at write time, in the write's own slot** | Nothing published before all of it is durable: old chain or new chain, never a prefix | One copy-and-validate helper, patched links, one retry on a wrap race | The chain once per key per pass, capped | **Chosen** |
+| Carry each node with its own allocation | A crash between allocations leaves a half-built chain to clean up or hide; every allocation may wrap or advance under the next | Several slots, several inserts or a staging protocol | Same bytes | Rejected: more states, no gain |
+| Carry only the Original and the newest K | As chosen | As chosen | Lower | Folded in: it is the chosen cap policy (Original first, then newest), with K set by the count and byte caps rather than a constant |
+| Defer the carry to the next read of the retained chain | Readers are lock-free and may be non-owners (invariants 1, 7), so the read would have to hand the carry to a writer; the write itself must still publish a head that either links across the pass (D5) or drops the chain | High | Same bytes, later | Rejected: it cannot avoid the drop it is meant to fix |
+
+Details:
+
+- *When.*  Only in retention mode, and only when the elected head is
+  retained, or when the allocation of a write that planned a live link
+  wrapped (it then retries once, and the retry finds the head retained).
+  Flush mode runs the old code path unchanged: `carry_forward` is false
+  and the restart needs `stripe->retain`.
+- *Write amplification.*  A carry copies each surviving alternate once. The
+  copies are current, so the rest of that pass links normally: at most one
+  carry per key per pass. It needs an alternate write to a key whose chain
+  is retained. In the PageSpeed-shape test the AVIF write carries Original
+  (30 100 B), Gzip (9 200 B) and WebP (7 000 B): 46 704 bytes on disk beside
+  a 5 136-byte AVIF document. The next alternate that pass (Brotli) copies
+  nothing. After the next wrap, one more write carries all five. The byte
+  cap bounds one carry at `min(A / 8, max_object_size)`, which is 4 MiB on a
+  32 MiB auto-geometry stripe.
+- *Cost of the extra advance.*  A carry's slot is larger than the new
+  document, so its mandatory advance can cross more chunks. A borrow in one
+  of them defers the whole write (`NoSpace`, as for any deferred fill). It is
+  never downgraded to a plain write that drops the chain: losing one
+  optimized write is cheaper than losing the Original.
+- *Counters.*  `alternates_carried_forward`, `alternate_carry_bytes` and
+  `alternates_carry_dropped` (in `VolumeStats`, `CacheStats` and at the tail
+  of `CycloneCacheStats`). `alternate_wrap_refusals` no longer moves in
+  retention mode. It still counts flush-mode wrap races.
+- *RAM tier.*  The carried copies are byte-identical, so only the written
+  id's RAM entry is evicted, as before. A carry that dropped alternates
+  evicts the whole key, because the dropped ids are no longer in the chain.
+- *Tests.*  In `test_wrap_retention.cpp`:
+  - "Retention R4" cases: preservation in single- and multi-process mode; a
+    peer view parked at the publish sees the old chain complete; the byte
+    cap and the count cap (Original kept, oldest others dropped and
+    counted); a writer killed at every carry step (`copied`, the three
+    writer seams of its advance, the tear gate, `filled`) leaves the old
+    chain complete; and a TSan hammer in both modes where readers, half of
+    them on the existing Original, walk the chains while alternate writes
+    carry them.
+  - The seams are the existing writer seams and tear gate, plus
+    `Volume::CarrySeam` for the two steps they do not reach.
+  - The cases that pinned the drop (the "PageSpeed-style" review case,
+    test 9, and `test_wrap_phase_aba.cpp` (E) and (G)) now pin
+    preservation.

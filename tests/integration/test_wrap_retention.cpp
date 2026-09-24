@@ -1684,9 +1684,10 @@ TEST_CASE(
 
 TEST_CASE(
     "Retention 9: an alternate write over a retained or wrap-raced head "
-    "refuses the link, updates the head in place and forms no self-loop",
+    "carries the chain forward, updates the head in place and forms no "
+    "self-loop",
     "[retention][uniqueness][alternate]") {
-  SECTION("retained head, new head lands on the old head's offset") {
+  SECTION("retained head, the carried copy lands on the old head's offset") {
     RetentionVolume v("ret9c", true, std::chrono::milliseconds(600000),
                       std::chrono::milliseconds(300));
     const uint64_t c = 5;
@@ -1700,39 +1701,63 @@ TEST_CASE(
     for (uint64_t i = 0; i < h; ++i) {
       REQUIRE(v.put(1, i));
     }
+    uint64_t old_head_abs = 0;
+    {
+      auto alts = v.cache->list_alternates_sync(CacheKey(key));
+      REQUIRE(alts.has_value());
+      REQUIRE(alts->size() == 1);
+      old_head_abs = (*alts)[0].disk_offset;
+    }
     // The cursor sits exactly on the head's offset.  The first attempt's
     // mandatory advance defers (and starts the episode); past the ceiling
-    // the second is forced -- and lands the new head ON the old one.  A
-    // DIFFERENT id, so the write plans a link to the old head (the same id
-    // would supersede it and plan no link at all).
+    // the second is forced.  A DIFFERENT id, so the retained Original is
+    // carried: the slot is [Original copy][Brotli], and the copy lands
+    // exactly ON the retained Original's offset.
     const auto newer = doc_content(9, h);
     const auto refusals0 = v.cache->stats().alternate_wrap_refusals;
     REQUIRE_FALSE(put_alternate(*v.cache, key, AlternateId::Brotli, newer));
     std::this_thread::sleep_for(std::chrono::milliseconds(400));
     REQUIRE(put_alternate(*v.cache, key, AlternateId::Brotli, newer));
     REQUIRE(v.cache->stats().wraps_forced_past_lease == 1);
-    // The planned link to the RETAINED head was refused (D5)...
-    REQUIRE(v.cache->stats().alternate_wrap_refusals == refusals0 + 1);
+    // Nothing was refused (D5 holds without it); one node was carried.
+    const auto st = v.cache->stats();
+    REQUIRE(st.alternate_wrap_refusals == refusals0);
+    REQUIRE(st.alternates_carried_forward == 1);
+    REQUIRE(st.alternate_carry_bytes == kDoc);
+    REQUIRE(st.alternates_carry_dropped == 0);
 
     auto alts = v.cache->list_alternates_sync(CacheKey(key));
     REQUIRE(alts.has_value());
-    REQUIRE(alts->size() == 1);
+    REQUIRE(alts->size() == 2);
     REQUIRE((*alts)[0].id == AlternateId::Brotli);
-    // ... so no self-loop: the new head sits at the old head's offset and
-    // its link is zero, not its own offset.
-    REQUIRE(read_u64(volume_file_of(*v.cache),
-                     (*alts)[0].disk_offset +
-                         Document::kNextAlternateOffsetPos) == 0);
+    REQUIRE((*alts)[1].id == AlternateId::Original);
+    REQUIRE((*alts)[1].disk_offset == old_head_abs);
+    REQUIRE((*alts)[0].disk_offset == old_head_abs + kDoc);
+    // No self-loop: the head links one document DOWN, to the copy, and the
+    // copy ends the chain.
+    const std::string file = volume_file_of(*v.cache);
+    const uint64_t head_link = read_u64(
+        file, (*alts)[0].disk_offset + Document::kNextAlternateOffsetPos);
+    const uint64_t copy_link = read_u64(
+        file, (*alts)[1].disk_offset + Document::kNextAlternateOffsetPos);
+    REQUIRE(head_link != 0);
+    REQUIRE(copy_link == 0);
+    // head_link is stripe-relative; the head's own relative offset is kDoc
+    // above it.
+    REQUIRE((*alts)[0].disk_offset - (*alts)[1].disk_offset == kDoc);
     auto r = read_alternate(*v.cache, key, AlternateId::Brotli);
     REQUIRE(r.has_value());
     REQUIRE(content_equals(r->content(), newer));
     r.reset();
-    // The retained Original is gone with the refused link (accepted, D5).
-    REQUIRE_FALSE(read_alternate(*v.cache, key, AlternateId::Original));
+    // The retained Original now resolves from its current-pass copy.
+    auto o = read_alternate(*v.cache, key, AlternateId::Original);
+    REQUIRE(o.has_value());
+    REQUIRE(content_equals(o->content(), doc_content(0, h)));
+    o.reset();
     pin.reset();
     v.cache->stop();
   }
-  SECTION("wrap-raced head: updated in place, no duplicate") {
+  SECTION("wrap-raced head: carried after the wrap, updated in place") {
     RetentionVolume v("ret9d", true, std::chrono::milliseconds(0),
                       std::chrono::milliseconds(0));
     const std::string key = "raced-K";
@@ -1746,19 +1771,35 @@ TEST_CASE(
     const auto newer = doc_content(10, 1);
     REQUIRE(put_alternate(*v.cache, key, AlternateId::Original, newer));
     REQUIRE(v.cache->stats().write_buffer_wraps == 1);
+    // The allocation wrapped while the write planned a link to the live
+    // Brotli.  The wrap made that chain retained, so the write gave its slot
+    // back and retried: the retry carried Brotli (the superseded Original
+    // is not carried) instead of refusing the link.
+    const auto st = v.cache->stats();
+    REQUIRE(st.alternate_wrap_refusals == 0);
+    REQUIRE(st.alternates_carried_forward == 1);
     // One entry, updated in place (B2a): no stale head beside it.
-    REQUIRE(v.cache->stats().current_entries == entries_before);
-    REQUIRE(alternate_count(*v.cache, key) == 1);
-    REQUIRE_FALSE(read_alternate(*v.cache, key, AlternateId::Brotli));
-    // Still exactly one after the frontier sweeps the old head's chunk.
+    REQUIRE(st.current_entries == entries_before);
+    REQUIRE(alternate_count(*v.cache, key) == 2);
+    {
+      auto b = read_alternate(*v.cache, key, AlternateId::Brotli);
+      REQUIRE(b.has_value());
+      REQUIRE(content_equals(b->content(), doc_content(0, v.per_pass - 2)));
+    }
+    // Still the same chain after the frontier sweeps the old head's chunk:
+    // the carried copy is current, so the sweep cannot touch it.
     for (uint64_t i = 1; i + 4 < v.per_pass; ++i) {
       REQUIRE(v.put(1, i));
     }
-    REQUIRE(alternate_count(*v.cache, key) == 1);
+    REQUIRE(alternate_count(*v.cache, key) == 2);
     auto r = read_alternate(*v.cache, key, AlternateId::Original);
     REQUIRE(r.has_value());
     REQUIRE(content_equals(r->content(), newer));
     r.reset();
+    auto b = read_alternate(*v.cache, key, AlternateId::Brotli);
+    REQUIRE(b.has_value());
+    REQUIRE(content_equals(b->content(), doc_content(0, v.per_pass - 2)));
+    b.reset();
     v.cache->stop();
   }
 }
@@ -2206,7 +2247,7 @@ std::unique_ptr<Cache> rv_open(const std::string &path, bool mp,
 // reaching it.  Run in both modes (CYCLONE_TEST_WRAP_RETENTION).
 TEST_CASE(
     "Retention review: a PageSpeed-style alternate chain across churn and "
-    "one wrap",
+    "two wraps, carried forward by alternate writes",
     "[retention][review][alternate]") {
   for (bool mp : {false, true}) {
     CAPTURE(mp);
@@ -2220,10 +2261,13 @@ TEST_CASE(
     auto gz = rv_fill(2, 9000);
     auto br = rv_fill(3, 8000);
     auto webp = rv_fill(4, 7000);
-    // Fillers early in the pass so K lands mid-stripe.
+    // Fillers first so K lands mid-stripe (about 6 MB into the 16 MiB
+    // stripe): far enough in that the next pass can place its own copy of
+    // the chain (carried at about 3.6 MB, below) above the chunks the
+    // FOLLOWING wrap exposes first.
     size_t fi = 0;
     auto filler = rv_fill(99, 60000);
-    for (int i = 0; i < 20; ++i)
+    for (int i = 0; i < 100; ++i)
       REQUIRE(rv_put(*c, "f" + std::to_string(fi++), filler));
     REQUIRE(rv_put_alt(*c, K, AlternateId::Original, orig));
     for (int i = 0; i < 5; ++i)
@@ -2257,7 +2301,7 @@ TEST_CASE(
     while (c->stats().write_buffer_wraps == w0) {
       REQUIRE(rv_put(*c, "f" + std::to_string(fi++), filler));
     }
-    for (int i = 0; i < 3; ++i)
+    for (int i = 0; i < 60; ++i)
       (void)rv_put(*c, "g" + std::to_string(i), filler);
     if (retain) {
       // Retained: the whole chain must still resolve past its head.
@@ -2266,16 +2310,63 @@ TEST_CASE(
       CHECK(rv_serves_alt(*c, K, AlternateId::Gzip, gz3));
       CHECK(rv_serves_alt(*c, K, AlternateId::WebP, webp));
       // Optimization engine records a NEW alternate onto the retained key.
+      // D5 forbids linking the retained chain, so the write CARRIES it: the
+      // Original, Gzip and WebP are rewritten into the current pass beside
+      // the AVIF head (review R4, resolved), and every one of them keeps
+      // resolving with its exact bytes.
+      const auto st0 = c->stats();
       auto avif = rv_fill(8, 5000);
       REQUIRE(rv_put_alt(*c, K, AlternateId::AVIF, avif));
-      const auto after = rv_ids(*c, K);
-      // D5: retained heads are never linked, so Original/Gzip/WebP stop
-      // resolving here (review R4, a recorded open item in the design doc,
-      // section 14).  Pinned as the CURRENT behaviour: a fix for R4 must
-      // update this expectation deliberately.
-      CHECK(after == std::set<int>{static_cast<int>(AlternateId::AVIF)});
-      CHECK(c->stats().alternate_wrap_refusals >= 1);
+      const auto st1 = c->stats();
+      CHECK(rv_ids(*c, K) == std::set<int>{0, 3, 16, 17});
       CHECK(rv_serves_alt(*c, K, AlternateId::AVIF, avif));
+      CHECK(rv_serves_alt(*c, K, AlternateId::Original, orig2));
+      CHECK(rv_serves_alt(*c, K, AlternateId::Gzip, gz3));
+      CHECK(rv_serves_alt(*c, K, AlternateId::WebP, webp));
+      CHECK(st1.alternate_wrap_refusals == st0.alternate_wrap_refusals);
+      // Write amplification of this write: exactly the three carried
+      // documents (header + content, 8-byte padded):
+      //   Original 30100 + 132 -> 30232, Gzip 9200 + 132 -> 9336,
+      //   WebP 7000 + 132 -> 7136: 46704 bytes beside a 5136-byte AVIF.
+      auto padded = [](size_t content) {
+        return (uint64_t{content} + 132 + 7) & ~uint64_t{7};
+      };
+      const uint64_t carried_bytes =
+          padded(orig2.size()) + padded(gz3.size()) + padded(webp.size());
+      CHECK(carried_bytes == 46704);
+      CHECK(st1.alternates_carried_forward - st0.alternates_carried_forward ==
+            3);
+      CHECK(st1.alternate_carry_bytes - st0.alternate_carry_bytes ==
+            carried_bytes);
+      CHECK(st1.alternates_carry_dropped == st0.alternates_carry_dropped);
+      // Once per key per pass: the chain is CURRENT now, so the next
+      // optimized alternate links normally and copies nothing.
+      auto br2 = rv_fill(9, 6000);
+      REQUIRE(rv_put_alt(*c, K, AlternateId::Brotli, br2));
+      const auto st2 = c->stats();
+      CHECK(st2.alternate_carry_bytes == st1.alternate_carry_bytes);
+      CHECK(rv_ids(*c, K) == std::set<int>{0, 1, 3, 16, 17});
+
+      // And across the NEXT wrap too: the whole chain is retained again,
+      // and one more alternate write carries all five.
+      const uint64_t w1 = c->stats().write_buffer_wraps;
+      while (c->stats().write_buffer_wraps == w1) {
+        REQUIRE(rv_put(*c, "f" + std::to_string(fi++), filler));
+      }
+      CHECK(rv_ids(*c, K) == std::set<int>{0, 1, 3, 16, 17});
+      auto jxl = rv_fill(10, 4000);
+      REQUIRE(rv_put_alt(*c, K, AlternateId::JpegXL, jxl));
+      const auto st3 = c->stats();
+      CHECK(st3.alternates_carried_forward - st2.alternates_carried_forward ==
+            5);
+      CHECK(rv_ids(*c, K) == std::set<int>{0, 1, 3, 16, 17, 18});
+      CHECK(rv_serves_alt(*c, K, AlternateId::Original, orig2));
+      CHECK(rv_serves_alt(*c, K, AlternateId::Brotli, br2));
+      CHECK(rv_serves_alt(*c, K, AlternateId::Gzip, gz3));
+      CHECK(rv_serves_alt(*c, K, AlternateId::WebP, webp));
+      CHECK(rv_serves_alt(*c, K, AlternateId::AVIF, avif));
+      CHECK(rv_serves_alt(*c, K, AlternateId::JpegXL, jxl));
+      CHECK(st3.alternate_wrap_refusals == st0.alternate_wrap_refusals);
     } else {
       CHECK(rv_ids(*c, K).empty());  // flush: the whole pass is gone
     }
@@ -2621,4 +2712,510 @@ TEST_CASE(
   CHECK(c->stats().wraps_forced_past_lease == forced0);
   b2 = make_unexpected(CacheError::NotFound);
   c->stop();
+}
+
+// ===========================================================================
+// Review R4 -- an alternate write over a RETAINED head carries the chain
+// forward (design section 4.5, "Carry-forward").  D5 still holds: the new
+// head links only to current-pass copies written in its own slot.
+// Every case below forces retention on, so it runs identically in both
+// suite modes.
+// ===========================================================================
+
+namespace {
+
+std::unique_ptr<Cache> carry_open(const std::string &path, bool mp,
+                                  size_t max_object_size = 0) {
+  CacheConfig cfg;
+  if (mp) cfg.set_multi_process(0, 1);
+  cfg.set_ram_cache_size(0);
+  cfg.set_wrap_retention(true);
+  cfg.read_lease_duration = std::chrono::milliseconds(0);
+  cfg.lease_wrap_ceiling = std::chrono::milliseconds(0);
+  if (max_object_size != 0) cfg.max_object_size = max_object_size;
+  auto c = Cache::create(cfg);
+  REQUIRE(c.has_value());
+  REQUIRE((*c)->add_volume(path, kRvVol).has_value());
+  REQUIRE((*c)->start().has_value());
+  REQUIRE((*c)->stats().stripe_count == 1);
+  return std::move(*c);
+}
+
+// Churn `c` with `filler` documents until the stripe has wrapped once more.
+void churn_to_next_wrap(Cache &c, size_t &fi,
+                        std::span<const std::byte> filler) {
+  const uint64_t w0 = c.stats().write_buffer_wraps;
+  while (c.stats().write_buffer_wraps == w0) {
+    REQUIRE(rv_put(c, "cf" + std::to_string(fi++), filler));
+  }
+}
+
+struct CarryChain {
+  std::string key = "http://example.com/hero.jpg";
+  std::vector<std::byte> orig = rv_fill(31, 800000);
+  std::vector<std::byte> gz = rv_fill(32, 200000);
+  std::vector<std::byte> webp = rv_fill(33, 150000);
+  std::vector<std::byte> avif = rv_fill(34, 50000);
+
+  // Pass 0: fillers to about 6 MB, then the chain, then churn into pass 1
+  // and a few fillers.  The chain ends up RETAINED, well above the chunks
+  // the next writes expose.
+  void build(Cache &c, size_t &fi, std::span<const std::byte> filler) const {
+    for (int i = 0; i < 100; ++i) {
+      REQUIRE(rv_put(c, "cf" + std::to_string(fi++), filler));
+    }
+    REQUIRE(rv_put_alt(c, key, AlternateId::Original, orig));
+    REQUIRE(rv_put_alt(c, key, AlternateId::Gzip, gz));
+    REQUIRE(rv_put_alt(c, key, AlternateId::WebP, webp));
+    churn_to_next_wrap(c, fi, filler);
+    for (int i = 0; i < 5; ++i) {
+      REQUIRE(rv_put(c, "cf" + std::to_string(fi++), filler));
+    }
+  }
+  // The old chain, complete and exact.
+  [[nodiscard]] bool old_complete(Cache &c) const {
+    return rv_ids(c, key) == std::set<int>{0, 3, 16} &&
+           rv_serves_alt(c, key, AlternateId::Original, orig) &&
+           rv_serves_alt(c, key, AlternateId::Gzip, gz) &&
+           rv_serves_alt(c, key, AlternateId::WebP, webp);
+  }
+  // The new chain, complete and exact (AVIF content as the caller wrote it).
+  [[nodiscard]] bool new_complete(Cache &c,
+                                  std::span<const std::byte> avif_now) const {
+    return rv_ids(c, key) == std::set<int>{0, 3, 16, 17} &&
+           rv_serves_alt(c, key, AlternateId::Original, orig) &&
+           rv_serves_alt(c, key, AlternateId::Gzip, gz) &&
+           rv_serves_alt(c, key, AlternateId::WebP, webp) &&
+           rv_serves_alt(c, key, AlternateId::AVIF, avif_now);
+  }
+};
+
+}  // namespace
+
+TEST_CASE(
+    "Retention R4: an alternate write over a retained head keeps every "
+    "alternate of the key resolving, in single- and multi-process mode",
+    "[retention][carry][alternate]") {
+  for (bool mp : {false, true}) {
+    CAPTURE(mp);
+    TempCacheDir tmp(mp ? "r4-keep-mp" : "r4-keep");
+    auto c = carry_open(tmp.path(), mp);
+    const auto filler = rv_fill(99, 60000);
+    size_t fi = 0;
+    const CarryChain ch;
+    ch.build(*c, fi, filler);
+    REQUIRE(ch.old_complete(*c));
+    REQUIRE(c->stats().retained_hits > 0);  // served from the retained pass
+
+    const auto st0 = c->stats();
+    REQUIRE(rv_put_alt(*c, ch.key, AlternateId::AVIF, ch.avif));
+    const auto st1 = c->stats();
+    REQUIRE(ch.new_complete(*c, ch.avif));
+    REQUIRE(st1.alternates_carried_forward - st0.alternates_carried_forward ==
+            3);
+    REQUIRE(st1.alternates_carry_dropped == st0.alternates_carry_dropped);
+    REQUIRE(st1.alternate_wrap_refusals == st0.alternate_wrap_refusals);
+    // Every node of the new chain is CURRENT: it survives the frontier
+    // sweeping the old chain's chunks (fill the rest of this pass).
+    const uint64_t w = c->stats().write_buffer_wraps;
+    for (int i = 0; i < 150 && c->stats().write_buffer_wraps == w; ++i) {
+      REQUIRE(rv_put(*c, "cf" + std::to_string(fi++), filler));
+    }
+    REQUIRE(ch.new_complete(*c, ch.avif));
+    c->stop();
+  }
+}
+
+TEST_CASE(
+    "Retention R4: a peer view sees the carried chain complete, never a "
+    "prefix of it",
+    "[retention][carry][alternate][multiprocess]") {
+  TempCacheDir tmp("r4-peer");
+  auto open_view = [&](uint32_t index) {
+    CacheConfig cfg;
+    cfg.set_multi_process(index, 2);
+    cfg.set_ram_cache_size(0);
+    cfg.set_wrap_retention(true);
+    cfg.read_lease_duration = std::chrono::milliseconds(0);
+    cfg.lease_wrap_ceiling = std::chrono::milliseconds(0);
+    auto c = Cache::create(cfg);
+    REQUIRE(c.has_value());
+    REQUIRE((*c)->add_volume(tmp.path(), kRvVol).has_value());
+    REQUIRE((*c)->start().has_value());
+    return std::move(*c);
+  };
+  auto writer = open_view(0);  // owns the single stripe
+  auto reader = open_view(1);  // owns nothing
+  const auto filler = rv_fill(99, 60000);
+  size_t fi = 0;
+  const CarryChain ch;
+  ch.build(*writer, fi, filler);
+  REQUIRE(ch.old_complete(*reader));
+  // The reader is not the owner: it cannot write, so it cannot carry.
+  REQUIRE_FALSE(rv_put_alt(*reader, ch.key, AlternateId::AVIF, ch.avif));
+  REQUIRE(ch.old_complete(*reader));
+
+  // Freeze the owner right before its publish: the peer still sees the old
+  // chain, complete (the carried copies are not reachable yet).
+  std::atomic<bool> parked{false};
+  std::atomic<bool> release{false};
+  Volume::s_carry_seam_for_test = [&](Volume::CarrySeam at) {
+    if (at == Volume::CarrySeam::kFilled) {
+      parked.store(true);
+      while (!release.load()) {
+        std::this_thread::yield();
+      }
+    }
+  };
+  std::atomic<bool> wrote{false};
+  std::thread w([&] {
+    wrote.store(rv_put_alt(*writer, ch.key, AlternateId::AVIF, ch.avif));
+  });
+  while (!parked.load()) {
+    std::this_thread::yield();
+  }
+  CHECK(ch.old_complete(*reader));
+  release.store(true);
+  w.join();
+  Volume::s_carry_seam_for_test = nullptr;
+  REQUIRE(wrote.load());
+  REQUIRE(ch.new_complete(*reader, ch.avif));
+  REQUIRE(ch.new_complete(*writer, ch.avif));
+  reader->stop();
+  writer->stop();
+}
+
+TEST_CASE(
+    "Retention R4: the carry is capped -- the Original and the newest "
+    "alternates are kept, the oldest are dropped and counted",
+    "[retention][carry][alternate]") {
+  SECTION("byte cap") {
+    // max_object_size = 40 KiB caps one carry at 40 KiB: four 10 KB
+    // alternates (10136 bytes on disk each) of the six retained ones.
+    TempCacheDir tmp("r4-cap-bytes");
+    auto c = carry_open(tmp.path(), false, size_t{40} * 1024);
+    const auto filler = rv_fill(99, 30000);
+    size_t fi = 0;
+    for (int i = 0; i < 200; ++i) {
+      REQUIRE(rv_put(*c, "cf" + std::to_string(fi++), filler));
+    }
+    const std::string key = "http://example.com/capped";
+    const std::array<AlternateId, 6> order = {
+        AlternateId::Original, AlternateId::Brotli, AlternateId::Zstd,
+        AlternateId::Gzip,     AlternateId::WebP,   AlternateId::JpegXL};
+    for (size_t i = 0; i < order.size(); ++i) {
+      REQUIRE(rv_put_alt(*c, key, order[i], rv_fill(40 + i, 10000)));
+    }
+    churn_to_next_wrap(*c, fi, filler);
+    REQUIRE(rv_ids(*c, key) == std::set<int>{0, 1, 2, 3, 16, 18});
+
+    const auto st0 = c->stats();
+    REQUIRE(rv_put_alt(*c, key, AlternateId::AVIF, rv_fill(50, 10000)));
+    const auto st1 = c->stats();
+    // Kept: the Original (always first), then the newest three (JpegXL,
+    // WebP, Gzip).  Dropped: the two oldest others (Zstd, Brotli).
+    REQUIRE(rv_ids(*c, key) == std::set<int>{0, 3, 16, 17, 18});
+    REQUIRE(st1.alternates_carried_forward - st0.alternates_carried_forward ==
+            4);
+    REQUIRE(st1.alternate_carry_bytes - st0.alternate_carry_bytes ==
+            4 * uint64_t{10136});
+    REQUIRE(st1.alternates_carry_dropped - st0.alternates_carry_dropped == 2);
+    REQUIRE(rv_serves_alt(*c, key, AlternateId::Original, rv_fill(40, 10000)));
+    REQUIRE(rv_serves_alt(*c, key, AlternateId::Gzip, rv_fill(43, 10000)));
+    REQUIRE(rv_serves_alt(*c, key, AlternateId::WebP, rv_fill(44, 10000)));
+    REQUIRE(rv_serves_alt(*c, key, AlternateId::JpegXL, rv_fill(45, 10000)));
+    REQUIRE(rv_serves_alt(*c, key, AlternateId::AVIF, rv_fill(50, 10000)));
+    c->stop();
+  }
+  SECTION("count cap") {
+    // kMaxAlternatesPerKey distinct ids retained; a NEW id joins them.  The
+    // carry keeps kMaxAlternatesPerKey - 1 (the Original and the newest
+    // others), drops the oldest other one, and the write succeeds -- it is
+    // not refused with TooManyAlternates.
+    TempCacheDir tmp("r4-cap-count");
+    auto c = carry_open(tmp.path(), false);
+    const auto filler = rv_fill(99, 60000);
+    size_t fi = 0;
+    for (int i = 0; i < 100; ++i) {
+      REQUIRE(rv_put(*c, "cf" + std::to_string(fi++), filler));
+    }
+    const std::string key = "http://example.com/many";
+    constexpr int kIds = kMaxAlternatesPerKey;
+    for (int id = 0; id < kIds; ++id) {
+      REQUIRE(rv_put_alt(*c, key, static_cast<AlternateId>(id),
+                         rv_fill(200 + id, 100)));
+    }
+    churn_to_next_wrap(*c, fi, filler);
+    REQUIRE(rv_ids(*c, key).size() == kIds);
+    const auto st0 = c->stats();
+    REQUIRE(rv_put_alt(*c, key, static_cast<AlternateId>(kIds),
+                       rv_fill(200 + kIds, 100)));
+    const auto st1 = c->stats();
+    std::set<int> want;
+    for (int id = 0; id <= kIds; ++id) {
+      if (id != 1) want.insert(id);  // id 1: the oldest non-Original
+    }
+    REQUIRE(rv_ids(*c, key) == want);
+    REQUIRE(st1.alternates_carried_forward - st0.alternates_carried_forward ==
+            kIds - 1);
+    REQUIRE(st1.alternates_carry_dropped - st0.alternates_carry_dropped == 1);
+    REQUIRE(rv_serves_alt(*c, key, AlternateId::Original, rv_fill(200, 100)));
+    REQUIRE(rv_serves_alt(*c, key, static_cast<AlternateId>(kIds),
+                          rv_fill(200 + kIds, 100)));
+    // A current chain of kMaxAlternatesPerKey ids refuses a new one, as
+    // before: the carry does not lift the per-key limit.
+    auto refused = c->write_alternate_sync(
+        CacheKey(key), static_cast<AlternateId>(kIds + 1), 100);
+    if (refused.has_value()) {
+      const auto body = rv_fill(9, 100);
+      REQUIRE(refused->write_sync(body).has_value());
+      auto closed = refused->close_sync();
+      REQUIRE_FALSE(closed.has_value());
+      REQUIRE(closed.error() == CacheError::TooManyAlternates);
+    }
+    c->stop();
+  }
+}
+
+namespace {
+
+const char *kCarrySteps[] = {"copied", "intent", "gate",
+                             "epoch",  "tear",   "filled"};
+
+void spawn_carry_peer(SpawnedPeer &peer, const std::string &path,
+                      const char *step, bool crash, const std::string &key,
+                      size_t content_bytes) {
+  REQUIRE(peer.spawn(peer_exe(), {"carry", path, std::to_string(kRvVol), step,
+                                  crash ? "crash" : "hang", key,
+                                  std::to_string(content_bytes)}));
+}
+
+}  // namespace
+
+TEST_CASE(
+    "Retention R4: a writer killed at any step of a carry-forward leaves the "
+    "old retained chain complete, and the next write carries it",
+    "[retention][carry][crash][multiprocess]") {
+  for (const char *step : kCarrySteps) {
+    CAPTURE(step);
+    TempCacheDir tmp("r4-crash");
+    const std::string path = tmp.path();
+    // The parent view stays open across the crash (no exclusive reopen):
+    // the only repair available is the next writer's forced release.
+    auto view = carry_open(path, /*mp=*/true);
+    const auto filler = rv_fill(99, 60000);
+    size_t fi = 0;
+    const CarryChain ch;
+    ch.build(*view, fi, filler);
+    REQUIRE(ch.old_complete(*view));
+
+    const auto peer_avif =
+        std::vector<std::byte>(ch.avif.size(), std::byte{0x5A});
+    SpawnedPeer peer;
+    spawn_carry_peer(peer, path, step, /*crash=*/true, ch.key, ch.avif.size());
+    auto code = peer.wait_exit(kPeerDeadline);
+    REQUIRE(code.has_value());
+    REQUIRE(*code == 42);  // died AT the step
+
+    // The next write repairs whatever the dead writer held (write lock,
+    // wrap intent) -- then the key must resolve to the OLD chain, complete:
+    // nothing of the dead carry was ever published.
+    REQUIRE(rv_put(*view, "after-crash", filler));
+    CHECK(ch.old_complete(*view));
+    CHECK_FALSE(rv_serves_alt(*view, ch.key, AlternateId::AVIF, peer_avif));
+
+    // And the next alternate write carries it, complete.
+    REQUIRE(rv_put_alt(*view, ch.key, AlternateId::AVIF, ch.avif));
+    CHECK(ch.new_complete(*view, ch.avif));
+    CHECK(view->stats().alternates_carried_forward == 3);
+    view->stop();
+  }
+}
+
+TEST_CASE(
+    "Retention R4: while a peer's carry-forward is parked at a step, readers "
+    "see the old chain complete; released, the new chain complete",
+    "[retention][carry][crash][multiprocess]") {
+  // The steps with no wrap intent held (inside an advance's intent window
+  // every read of the stripe retries by design, so there is nothing to
+  // observe there but misses).
+  for (const char *step : {"copied", "tear", "filled"}) {
+    CAPTURE(step);
+    TempCacheDir tmp("r4-park");
+    const std::string path = tmp.path();
+    auto view = carry_open(path, /*mp=*/true);
+    const auto filler = rv_fill(99, 60000);
+    size_t fi = 0;
+    const CarryChain ch;
+    ch.build(*view, fi, filler);
+
+    SpawnedPeer peer;
+    spawn_carry_peer(peer, path, step, /*crash=*/false, ch.key, ch.avif.size());
+    auto ready = peer.wait_ready(kPeerDeadline);
+    REQUIRE(ready.has_value());
+    REQUIRE(*ready == "READY");
+    CHECK(ch.old_complete(*view));
+    peer.request_exit();  // _exit(0) without finishing the write
+    auto code = peer.wait_exit(kPeerDeadline);
+    REQUIRE(code.has_value());
+    REQUIRE(rv_put(*view, "after-park", filler));
+    CHECK(ch.old_complete(*view));
+    view->stop();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// R4 hammer: readers walk and read a key's chain -- including its EXISTING
+// Original -- while one writer churns the ring and writes new alternates
+// onto the same keys, so carry-forwards (retention) and plain prepends
+// (flush) run under live readers.  Every (key, id) is always written with
+// the same bytes, so any served alternate must be exactly those bytes; a
+// miss is allowed (flush drops whole passes; a key may be mid-rewrite).
+// Under TSan this is the data-race check of the carry's copy (plain loads
+// of retained bytes) against lock-free readers.
+// ---------------------------------------------------------------------------
+
+TEST_CASE(
+    "Retention R4: hammer -- readers walk alternate chains while alternate "
+    "writes carry them forward across wraps",
+    "[retention][carry][hammer][concurrent]") {
+  const bool retention = GENERATE(false, true);
+  CAPTURE(retention);
+  TempCacheDir tmp("r4-hammer");
+  CacheConfig cfg;
+  cfg.set_ram_cache_size(0);
+  cfg.set_wrap_retention(retention);
+  cfg.read_lease_duration = std::chrono::milliseconds(2000);
+  cfg.lease_wrap_ceiling = std::chrono::milliseconds(60);
+  auto created = Cache::create(cfg);
+  REQUIRE(created.has_value());
+  auto &c = **created;
+  REQUIRE(c.add_volume(tmp.path(), kRetVol).has_value());
+  REQUIRE(c.start().has_value());
+
+  constexpr size_t kKeys = 4;
+  const std::array<AlternateId, 6> ids = {
+      AlternateId::Original, AlternateId::Gzip, AlternateId::Brotli,
+      AlternateId::WebP,     AlternateId::AVIF, AlternateId::JpegXL};
+  auto key_of = [](size_t k) { return "r4h-" + std::to_string(k); };
+  auto body_of = [](size_t k, size_t i) {
+    return rv_fill(1000 + k * 16 + i, 3000 + 1500 * i);
+  };
+
+  std::atomic<bool> stop{false};
+  std::atomic<bool> mismatch{false};
+  std::atomic<uint64_t> served{0};
+  std::atomic<uint64_t> original_reads{0};
+  std::atomic<uint64_t> original_misses{0};
+  std::atomic<uint64_t> forced_tears{0};
+
+  std::thread writer([&] {
+    const auto filler = rv_fill(77, 60000);
+    size_t fi = 0;
+    size_t round = 0;
+    while (!stop.load()) {
+      for (int f = 0; f < 6 && !stop.load(); ++f) {
+        (void)rv_put(c, "r4f" + std::to_string(fi++), filler);
+      }
+      const size_t k = round % kKeys;
+      const size_t i = (round / kKeys) % ids.size();
+      ++round;
+      // The Original first when the key has none (flush drops it with its
+      // pass); otherwise the next alternate in the cycle.
+      const size_t pick = rv_ids(c, key_of(k)).count(0) == 0 ? 0 : i;
+      (void)rv_put_alt(c, key_of(k), ids[pick], body_of(k, pick));
+    }
+  });
+  std::vector<std::thread> readers;
+  readers.reserve(4);
+  for (unsigned r = 0; r < 4; ++r) {
+    readers.emplace_back([&, r] {
+      uint64_t rng = 0x9E3779B97F4A7C15ULL * (r + 1);
+      auto next = [&rng] {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        return rng;
+      };
+      while (!stop.load()) {
+        const size_t k = next() % kKeys;
+        // Half the reads target the Original, the one alternate that
+        // already exists while the others are written.
+        const size_t i = next() % 2 == 0 ? 0 : next() % ids.size();
+        const uint64_t forced0 = c.stats().wraps_forced_past_lease;
+        DefaultStorageSelector sel;
+        std::array<AlternateId, 1> acc{ids[i]};
+        AlternateSelectionContext ctx;
+        ctx.acceptable_alternates = acc;
+        auto rh = c.read_alternate_sync(CacheKey(key_of(k)), sel, ctx);
+        if (i == 0) original_reads.fetch_add(1);
+        if (!rh.has_value()) {
+          if (i == 0) original_misses.fetch_add(1);
+          continue;
+        }
+        served.fetch_add(1);
+        const auto want = body_of(k, i);
+        bool ok = rv_eq(rh->content(), want);
+        // Hold some borrows across strict renews, like the main hammer.
+        for (int h = 0; ok && h < 8 && next() % 4 == 0; ++h) {
+          if (rh->renew_lease_strict() == LeaseRenewal::kTorn) break;
+          ok = rv_eq(rh->content(), want);
+          std::this_thread::yield();
+        }
+        if (!ok) {
+          if (c.stats().wraps_forced_past_lease == forced0) {
+            mismatch.store(true);
+          } else {
+            forced_tears.fetch_add(1);
+          }
+        }
+        // The chain as a list: every listed alternate has its exact size.
+        if (next() % 8 == 0) {
+          auto alts = c.list_alternates_sync(CacheKey(key_of(k)));
+          if (alts.has_value()) {
+            for (const auto &a : *alts) {
+              size_t idx = ids.size();
+              for (size_t j = 0; j < ids.size(); ++j) {
+                if (ids[j] == a.id) idx = j;
+              }
+              if (idx == ids.size() ||
+                  a.content_length != body_of(k, idx).size()) {
+                mismatch.store(true);
+              }
+            }
+          }
+        }
+      }
+    });
+  }
+  const auto start = std::chrono::steady_clock::now();
+  while (
+      std::chrono::steady_clock::now() - start <
+          std::chrono::milliseconds(1500) ||
+      (c.stats().write_buffer_wraps < 3 &&
+       std::chrono::steady_clock::now() - start < std::chrono::seconds(90))) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  stop.store(true);
+  writer.join();
+  for (auto &t : readers) t.join();
+
+  const auto st = c.stats();
+  INFO("served " << served.load() << ", Original reads "
+                 << original_reads.load() << " misses "
+                 << original_misses.load() << ", forced tears "
+                 << forced_tears.load() << ", wraps " << st.write_buffer_wraps
+                 << ", carried " << st.alternates_carried_forward << " ("
+                 << st.alternate_carry_bytes << " B), dropped "
+                 << st.alternates_carry_dropped);
+  REQUIRE_FALSE(mismatch.load());
+  REQUIRE(served.load() > 0);
+  REQUIRE(st.write_buffer_wraps >= 3);
+  if (retention) {
+    REQUIRE(st.alternates_carried_forward > 0);
+  } else {
+    REQUIRE(st.alternates_carried_forward == 0);
+    REQUIRE(st.alternate_carry_bytes == 0);
+  }
+  c.stop();
 }

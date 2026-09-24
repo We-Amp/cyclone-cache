@@ -360,6 +360,9 @@ CycloneError cyclone_cache_stats(CycloneCacheHandle *cache,
   out->early_advances_skipped = s.early_advances_skipped;
   out->retained_hits = s.retained_hits;
   out->stamp_rejections = s.stamp_rejections;
+  out->alternates_carried_forward = s.alternates_carried_forward;
+  out->alternate_carry_bytes = s.alternate_carry_bytes;
+  out->alternates_carry_dropped = s.alternates_carry_dropped;
   return CYCLONE_OK;
 }
 

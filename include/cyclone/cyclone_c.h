@@ -341,7 +341,8 @@ typedef struct {
    *     pre-wrap chain, starting a fresh chain instead and orphaning the
    *     stale one.  Neither shadow counter above moves on a refusal,
    *     so without this counter a refusal is indistinguishable from an
-   *     ordinary wrap. */
+   *     ordinary wrap.  In practice flush mode only: with wrap retention the
+   *     write carries the chain forward (alternates_carried_forward). */
   uint64_t alternate_shadows_unlinked;
   uint64_t alternate_splice_deferred;
   uint64_t alternate_chain_resets;
@@ -390,6 +391,20 @@ typedef struct {
   uint64_t early_advances_skipped;
   uint64_t retained_hits;
   uint64_t stamp_rejections;
+
+  /* Alternate carry-forward under wrap retention (append-only extension at
+   * the TAIL, same lockstep-compilation caveat as above -- rebuild ALL
+   * consumers).  Process-local, summed across volumes; all stay 0 in flush
+   * mode.  Full semantics on CacheStats in cache.hpp.
+   *   alternates_carried_forward: alternates of a retained chain rewritten
+   *     into the current pass by an alternate write, so they keep
+   *     resolving beside the new head.
+   *   alternate_carry_bytes: bytes those rewrites cost.
+   *   alternates_carry_dropped: visible retained alternates a carry did not
+   *     keep (over its count or byte cap, or unreadable when copied). */
+  uint64_t alternates_carried_forward;
+  uint64_t alternate_carry_bytes;
+  uint64_t alternates_carry_dropped;
 } CycloneCacheStats;
 
 /* --------------------------------------------------------------------------

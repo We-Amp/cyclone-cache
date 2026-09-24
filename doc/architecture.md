@@ -166,9 +166,10 @@ every directory entry against one `StripeSnapshot` (`G` loaded first, then
 The **pass stamp** closes the phase-bit ABA for good. An entry that survives
 two or more wraps carries a stamp of `P - 2` or older and never resolves,
 whatever its position (counted in `stamp_rejections`). Chain hops go downward
-only, and never across a pass (`Stripe::admit_hop`). A write over a retained
-head starts a fresh chain, and removing one alternate from a retained chain
-removes the whole entry (`alternate_wrap_refusals`).
+only, and never across a pass (`Stripe::admit_hop`). An alternate write over a
+retained head carries the chain forward instead of linking it (see
+[Alternate Chains](#alternate-chains)). Removing one alternate from a retained
+chain removes the whole entry.
 
 **One entry per key.** Under retention two passes resolve at once, so the
 directory must not hold a retained entry and a current entry for the same key.
@@ -330,6 +331,21 @@ graph LR
 
 - New alternates insert at the head (directory always points to the newest).
 - Max **64** alternates per key bounds traversal.
+- Links point downward (to an older, lower offset) and never cross a pass of
+  the circular buffer. Re-recording an id unlinks its superseded copy.
+- **Carry-forward (wrap retention).** When the head is in the retained
+  previous pass, an alternate write cannot link to it. It rewrites the key's
+  other alternates as current-pass copies in its own slot,
+  `[carried, oldest first][new head]`, links them, and publishes the lot with
+  one directory insert (`Volume::carry_retained_chain`). Until that insert
+  the old retained chain resolves, and after it the new complete one does,
+  so a crash never exposes a partial chain. It keeps at most 63 alternates
+  and `min(A / 8, max_object_size)` bytes, the Original first and then the
+  newest, and happens at most once per key per pass. Counters:
+  `alternates_carried_forward`, `alternate_carry_bytes`,
+  `alternates_carry_dropped`. Flush mode never carries: a wrap drops the
+  whole previous pass anyway, and a wrap-raced write refuses its link
+  (`alternate_wrap_refusals`).
 - `AlternateId`: `0` Original; `1–15` compression (Brotli 1, Zstd 2, Gzip 3); `16–31` image (WebP 16, AVIF 17, JpegXL 18); `128–255` plugin-defined.
 
 ```cpp

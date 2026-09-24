@@ -900,6 +900,13 @@ TEST_CASE(
     REQUIRE(rh.has_value());
     REQUIRE(content_equals(rh->content(), h_content));
   }
+  uint64_t h_abs = 0;  // X, as a file offset
+  {
+    auto alts = cache->list_alternates_sync(k_key);
+    REQUIRE(alts.has_value());
+    REQUIRE(alts->size() == 1);
+    h_abs = (*alts)[0].disk_offset;
+  }
 
   // L: K's second alternate.  Doesn't fit in the 4KB slack -> the commit
   // probes H (passes: still behind the pre-wrap cursor), stamps next = X,
@@ -908,23 +915,45 @@ TEST_CASE(
                                 l_content));
   REQUIRE(cache->stats().write_buffer_wraps == 1);
 
-  // list_alternates must never describe the dark node: exactly L.
+  // Wrap retention closes the hazard at its source differently: the wrap
+  // left H RETAINED (readable until the frontier reaches it), so the write
+  // retried and CARRIED H forward -- a current-pass copy of H directly
+  // below L, inside L's own slot.  L links to that copy, never to X.
+  const bool retain = CacheConfig{}.wrap_retention;
+  uint64_t l_abs = 0;
+
+  // list_alternates must never describe the dark node: exactly L (plus, with
+  // retention, the carried copy of H -- which is not at X).
   {
     auto alts = cache->list_alternates_sync(k_key);
     REQUIRE(alts.has_value());
-    REQUIRE(alts->size() == 1);
+    REQUIRE(alts->size() == (retain ? 2U : 1U));
     REQUIRE((*alts)[0].id == AlternateId::Gzip);
     REQUIRE((*alts)[0].content_length == l_content.size());
+    l_abs = (*alts)[0].disk_offset;
+    if (retain) {
+      REQUIRE((*alts)[1].id == AlternateId::Brotli);
+      REQUIRE((*alts)[1].disk_offset < l_abs);  // downward, same slot
+      REQUIRE((*alts)[1].disk_offset + h_doc <= l_abs);
+      REQUIRE((*alts)[1].disk_offset != h_abs);
+      REQUIRE(cache->stats().alternates_carried_forward == 1);
+    }
   }
 
   // A read aimed at H must MISS (hop rejected -> selector never sees it) —
-  // never serve H's bytes through a tearable borrow.
+  // never serve H's bytes through a tearable borrow.  With retention it
+  // serves H's content from the CARRIED copy, which sits behind the cursor.
   {
     IdSelector want_h(AlternateId::Brotli);
     AlternateSelectionContext ctx;
     auto rh = cache->read_alternate_sync(k_key, want_h, ctx);
-    REQUIRE_FALSE(rh.has_value());
-    REQUIRE(rh.error() == CacheError::AlternateNotFound);
+    if (retain) {
+      REQUIRE(rh.has_value());
+      REQUIRE(content_equals(rh->content(), h_content));
+    } else {
+      REQUIRE_FALSE(rh.has_value());
+      REQUIRE(rh.error() == CacheError::AlternateNotFound);
+    }
   }
   REQUIRE(cache->stats().borrows_outstanding == 0);
 
@@ -951,13 +980,21 @@ TEST_CASE(
   {
     auto alts = cache->list_alternates_sync(k_key);
     REQUIRE(alts.has_value());
-    REQUIRE(alts->size() == 1);
+    REQUIRE(alts->size() == (retain ? 2U : 1U));
     REQUIRE((*alts)[0].id == AlternateId::Gzip);
     DefaultStorageSelector first;
     AlternateSelectionContext ctx;
     auto rh = cache->read_alternate_sync(k_key, first, ctx);
     REQUIRE(rh.has_value());
     REQUIRE(content_equals(rh->content(), l_content));
+  }
+  if (retain) {
+    // The carried copy is untouched by the fill over X.
+    IdSelector want_h(AlternateId::Brotli);
+    AlternateSelectionContext ctx;
+    auto rh = cache->read_alternate_sync(k_key, want_h, ctx);
+    REQUIRE(rh.has_value());
+    REQUIRE(content_equals(rh->content(), h_content));
   }
 
   cache->stop();
@@ -1073,10 +1110,18 @@ TEST_CASE(
   // detached the whole old chain, so nothing was left linked and nothing was
   // spliced.  The refusal itself is counted: without it this case
   // would be indistinguishable from an ordinary wrap in stats.
+  //
+  // Wrap retention: the wrap made the old chain RETAINED rather than dead,
+  // so the write gives its slot back and retries, meaning to carry the
+  // chain forward instead of refusing the link.  Here the old chain sits in
+  // chunk 0, which the retry's own frontier advance exposes: nothing is
+  // left to carry or to refuse, and the outcome is the same fresh chain.
   auto st = cache->stats();
   REQUIRE(st.alternate_shadows_unlinked == 0);
   REQUIRE(st.alternate_splice_deferred == 0);
-  REQUIRE(st.alternate_wrap_refusals == 1);
+  REQUIRE(st.alternate_wrap_refusals ==
+          (CacheConfig{}.wrap_retention ? 0U : 1U));
+  REQUIRE(st.alternates_carried_forward == 0);
 
 #ifndef _WIN32
   // Direct evidence, and the only thing that distinguishes the refusal from
