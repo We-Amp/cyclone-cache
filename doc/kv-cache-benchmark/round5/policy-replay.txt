@@ -1,0 +1,3 @@
+# ./build/kv_churn_policy
+zipf      block=2097152 U=24576 capacity=8191 blocks (511/stripe x 16): lru 0.8498 fifo 0.8179 stripe-fifo 0.8172 wrap-flush 0.7605 retain/16 0.8086 retain/32 0.8127 retain/64 0.8150 retain/256 0.8165
+zipf+scan block=2097152 U=24576 capacity=8191 blocks (511/stripe x 16): lru 0.7251 fifo 0.6867 stripe-fifo 0.6867 wrap-flush 0.6438 retain/16 0.6803 retain/32 0.6834 retain/64 0.6850 retain/256 0.6862

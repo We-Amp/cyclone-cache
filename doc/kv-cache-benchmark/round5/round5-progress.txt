@@ -1,0 +1,42 @@
+09:13:25 start kv_bench sweep load: 0.39 0.16 0.09 1/735 284460
+09:20:48 done kv_bench sweep rc=0 load: 4.22 3.18 1.59 1/731 285051
+09:22:13 done noverify rc=0 load: 4.11 3.29 1.76 1/730 285178
+09:22:13 churn cyclone zipf T=1 retention=off load: 4.11 3.29 1.76 1/731 285183
+09:22:13 churn cyclone zipf T=1 retention=on load: 4.11 3.29 1.76 1/731 285186
+09:22:13 churn cyclone zipf T=4 retention=off load: 4.11 3.29 1.76 1/731 285189
+09:22:13 churn cyclone zipf T=4 retention=on load: 4.11 3.29 1.76 1/731 285192
+09:22:13 churn lmdb zipf T=4 load: 4.11 3.29 1.76 1/731 285195
+09:22:13 churn filedir zipf T=4 load: 4.11 3.29 1.76 1/731 285198
+09:22:13 churn cyclone zipf+scan T=1 retention=off load: 4.11 3.29 1.76 1/731 285201
+09:22:13 churn cyclone zipf+scan T=1 retention=on load: 4.11 3.29 1.76 1/731 285204
+09:22:13 churn cyclone zipf+scan T=4 retention=off load: 4.11 3.29 1.76 1/731 285207
+09:22:13 churn cyclone zipf+scan T=4 retention=on load: 4.11 3.29 1.76 1/731 285210
+09:22:13 churn lmdb zipf+scan T=4 load: 4.11 3.29 1.76 1/731 285213
+09:22:13 churn filedir zipf+scan T=4 load: 4.11 3.29 1.76 1/731 285216
+09:22:13 policy replay load: 4.11 3.29 1.76 1/731 285219
+09:22:14 all done load: 3.94 3.27 1.77 1/731 285222
+--- churn restart (run-churn.sh lacked +x)
+09:22:36 churn cyclone zipf T=1 retention=off load: 2.89 3.07 1.73 1/732 285259
+09:26:38 churn cyclone zipf T=1 retention=on load: 1.15 2.03 1.61 1/733 285479
+09:30:53 churn cyclone zipf T=4 retention=off load: 1.13 1.52 1.50 3/736 285713
+09:34:01 churn cyclone zipf T=4 retention=on load: 4.08 2.89 2.05 1/732 285899
+09:37:34 churn lmdb zipf T=4 load: 4.36 3.79 2.60 2/738 286101
+09:41:31 churn filedir zipf T=4 load: 3.72 3.86 2.91 1/737 286322
+09:45:44 churn cyclone zipf+scan T=1 retention=off load: 4.77 4.50 3.41 1/735 286568
+09:49:34 churn cyclone zipf+scan T=1 retention=on load: 1.18 2.71 2.92 1/735 286780
+09:53:23 churn cyclone zipf+scan T=4 retention=off load: 1.26 1.96 2.56 1/737 286999
+09:56:36 churn cyclone zipf+scan T=4 retention=on load: 4.18 3.19 2.95 1/737 287202
+10:00:11 churn lmdb zipf+scan T=4 load: 4.32 3.89 3.29 1/737 287416
+10:03:51 churn filedir zipf+scan T=4 load: 3.25 3.46 3.23 1/732 287629
+10:07:30 policy replay load: 4.72 4.22 3.60 2/739 287837
+10:07:31 all done load: 4.72 4.22 3.60 1/739 287844
+10:07:45 rerun kv_bench 524288 load: 3.67 4.01 3.54 1/735 287856
+10:09:39 rerun kv_bench 2097152 load: 3.95 3.94 3.56 1/733 287996
+10:11:32 rerun noverify load: 4.21 3.97 3.61 1/734 288135
+10:12:58 repeat churn cyclone zipf T=4 retention=off load: 4.65 4.04 3.66 1/729 288247
+10:16:00 repeat churn cyclone zipf T=4 retention=on load: 4.24 4.15 3.78 1/733 288420
+10:19:09 repeat churn lmdb zipf T=4 load: 4.26 4.28 3.91 1/732 288582
+10:23:04 repeat churn cyclone zipf+scan T=4 retention=off load: 3.91 4.11 3.92 2/730 288775
+10:26:47 repeat churn cyclone zipf+scan T=4 retention=on load: 4.39 4.44 4.11 1/732 288961
+10:30:13 repeat churn lmdb zipf+scan T=4 load: 4.47 4.56 4.23 1/734 289138
+10:33:46 repeats done load: 3.29 3.96 4.06 1/737 289330
