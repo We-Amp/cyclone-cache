@@ -2,7 +2,7 @@
 
 ## Summary
 
-Six rounds of measurements, taken 2026-09-21 to 2026-09-24 on two laptops.
+Six rounds of measurements, taken 2026-09-21 to 2026-09-25 on two laptops.
 One is an Apple M5 running macOS, where only a warm page cache can be
 measured. The other is an i7-8750H with a Samsung 970 PRO NVMe running Linux,
 where the page cache is dropped before each cold phase. The peers are LMDB,
@@ -20,7 +20,9 @@ measured, in order:
   modes against a same-day LMDB.
 - **Readahead chunking (issue #18):** main at b94540d against the fix
   (dd487fb): the Linux readahead hint in 64 KiB chunks, and skipped on
-  resident documents. The cold sweep ran against a same-day LMDB.
+  resident documents. The cold sweep ran against a same-day LMDB, and a
+  shorter check repeated it after rebasing onto main with wrap retention
+  on by default.
 
 Each number is one machine's reading. Treat differences under about 20 % as
 noise unless a section says otherwise.
@@ -1023,8 +1025,11 @@ These are the same hit ratios as the earlier Linux 4 GiB run (0.726 →
 > 2026-09-24/25, Linux machine only. main at b94540d against the fix
 > (dd487fb): the Linux readahead hint goes out in 64 KiB chunks over the
 > first 4 MiB of a document, and is skipped when every page is already
-> resident. Same-day LMDB. Raw data, per-run load, and every script and
-> throwaway patch used are in
+> resident. Same-day LMDB. Wrap retention was off by default in both
+> trees; a shorter check after rebasing onto main e4c051e (retention on
+> by default; the fix as f9cc804, its code unchanged) is at the end of this
+> section. Raw data, per-run load, and every script and throwaway patch
+> used are in
 > [`kv-cache-benchmark/readahead/`](kv-cache-benchmark/readahead/).
 
 Round 5 left cold 512 KiB reads at 0.80 GB/s against LMDB's 1.93 (round 2).
@@ -1163,6 +1168,25 @@ ratio, fix / main
   within 1 % of main's (single runs within 2.5 %). The first main run of
   each series ran straight after the `kv_bench` sweeps and was slow on
   every operation; it is excluded.
+
+### After rebasing onto main (wrap retention on by default)
+
+main e4c051e against the fix rebased onto it (f9cc804), 512 KiB and 2 MiB,
+all phases, `--seconds 5 --threads 1,4`, two interleaved runs each
+([`readahead-rebase-check.txt`](kv-cache-benchmark/readahead/readahead-rebase-check.txt)).
+Median, fix / main:
+
+| | 512 KiB | 2 MiB |
+|---|---:|---:|
+| Cold first touch / restart | 1.94 / 1.80 | 1.07 / 1.07 |
+| Warm `view`, T = 1 / 4 | 1.09 / 1.08 | 1.02 / 1.00 |
+| Warm `copy`, T = 1 / 4 | 1.00 / 1.00 | 0.94 / 0.95 |
+| 4 reader processes, `view` / `copy` | 1.09 / 1.01 | 0.97 / 0.98 |
+| PUT | 1.00 | 1.01 |
+
+The same picture as before the rebase. The 2 MiB warm `copy` ratio comes
+from one run of the fix (10.69 GB/s; its other run read 12.49, main 12.35
+and 12.43); the three-run sweep above had it at 0.98–1.00.
 
 ### What is left of the gap
 
