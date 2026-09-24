@@ -1,7 +1,15 @@
 # Verified state that outlives the process
 
-**Status:** design only, nothing implemented. This is phase 1: the
-maintainer decisions in section 0 gate phase 2.
+**Status:** shelved (2026-09-24). The persistent, cross-process table is
+not being built: its gain is mainly for data already in the page cache
+(2–9 % of a cold NVMe first read), and it would cost a directory layout
+change, another cold start for users of `main`, and trust in the disk that
+reaches across reboots. Revisit if a consumer shows restart or peer-process
+verification cost matters. Two findings from this study are being acted on
+separately: the per-process CRC cache's 16-bit identity weakness (section
+3; fixed by moving that cache to the full token format, no layout change),
+and the 512 KiB cold-read gap, which is the I/O pattern rather than the
+checksum (We-Amp/cyclone-cache#18).
 
 **Scope:** whether the "this document's payload already passed its CRC-32C"
 verdict may be shared between processes and kept across a restart, and if
