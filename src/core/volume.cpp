@@ -3199,6 +3199,9 @@ StripeSnapshot Volume::snapshot(const Stripe* stripe) const {
   snap.phase = (snap.pass & 1U) != 0;
   snap.cursor_rel = stripe->current_write_cursor() - stripe->offset;
   snap.frontier_rel = stripe->frontier_rel_of(snap.frontier);
+#ifdef CYCLONE_TEST_SEAMS
+  reader_seam(ReaderSeam::kSnapshotDone);
+#endif
   return snap;
 }
 

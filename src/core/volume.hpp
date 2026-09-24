@@ -1117,6 +1117,9 @@ class Volume : public std::enable_shared_from_this<Volume> {
     kAfterBorrow,   // borrow counted + lease stamped; intent / G not loaded
     kSnapshotGen,   // Volume::snapshot: G loaded, cursor not yet loaded
                     // (fires on writer-side snapshots too; filter by thread)
+    kSnapshotDone,  // Volume::snapshot: G and cursor loaded, no directory
+                    // probed yet (writer-side snapshots too; filter by
+                    // thread)
   };
   using ReaderSeamHook = std::function<void(ReaderSeam seam)>;
   static inline ReaderSeamHook s_reader_seam_for_test{};
