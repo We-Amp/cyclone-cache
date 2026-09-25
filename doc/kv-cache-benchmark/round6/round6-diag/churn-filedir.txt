@@ -1,0 +1,19 @@
+=== 2026-09-25T14:04:23+02:00 filedir zipf T=1 C=17179869184 s=120 --block-size 2097152 --max-warmup-seconds 1800
+load: 0.92 2.67 2.44 2/750 2017628
+universe U = 24576 keys
+stream zipf t0: 7700/c2a3658d 13615/2358d785 15692/f5863216 4926/54e0669b 10997/c6add4fa 23573/677bbff9 23573/677bbff9 22519/01a05535 10549/d01ed625 16656/03258f4e 6506/1525ef69 3338/f3d62629
+stream zipf t1: 12554/1ecaeb65 13478/ec6073a9 22844/19799a46 7190/072f0877 16279/258fda28 8277/acdf06e1 5305/7df2fd1f 23573/677bbff9 14761/ef5e0531 12242/8c3cbd7d 9396/4f79cd21 7700/c2a3658d
+stream zipf+scan t0: 7700/c2a3658d 13615/2358d785 15692/f5863216 4926/54e0669b 10997/c6add4fa 23573/677bbff9 23573/677bbff9 1099511627776/6fdf167b 22519/01a05535 10549/d01ed625 16656/03258f4e 1099511627777/f11f5dc2
+stream zipf+scan t1: 12554/1ecaeb65 13478/ec6073a9 22844/19799a46 7190/072f0877 16279/258fda28 8277/acdf06e1 5305/7df2fd1f 23573/677bbff9 14761/ef5e0531 1103806595072/5cb8bfa5 1103806595073/dafeb106 1103806595074/bf4b5300
+kvchurn (kv-churn-spec v1)
+  store      : filedir
+  os         : Linux 5.15.0-191-generic
+  cgroup     : /sys/fs/cgroup/system.slice/run-re6fc3087086949f2890c9649d097aa83.scope memory.max=4294967296
+  load       :  14:04:23 up 2 days, 20:23,  0 users,  load average: 0,92, 2,67, 2,44
+  pattern    : zipf, threads 1, block 2097152, capacity 17179869184, seconds 120
+  tuning     : one file per block (hex digest), record = 64 B header + value; get = open + preadv(header, staging buffer) + close; put = open(tmp) + writev + close + rename, NO fsync; eviction = in-memory LRU, unlink() under the LRU lock
+  dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  warm-up: 112.7 s, inserted 34359738368 B
+pid 2017632 tids 2017632 2017651 2017654 
+{"store":"filedir","bench":"churn","pattern":"zipf","block_size":2097152,"capacity":17179869184,"universe":24576,"threads":1,"seconds":120.00,"ops_per_s":907.99,"hit_ratio":0.8504,"served_gb_per_s":1.6193,"inserted_gb_per_s":0.2848,"hit_p50_us":221.3,"hit_p99_us":16219.1,"hit_p999_us":74250.8,"miss_p50_us":1477.0,"miss_p99_us":6454.6,"miss_p999_us":8826.8,"hits":86106,"misses":15146,"inserts":15146,"insert_raced":0,"put_failures":0,"map_full_puts":0,"verified":1345,"write_amp":1.038,"device_write_bytes":32963915776,"device_read_bytes":29987815424,"footprint_bytes":17214750720,"apparent_bytes":17178296256,"peak_rss_kib":16480,"cgroup_mem_peak":4294967296,"cgroup_file_end":4204183552,"cgroup_anon_end":7471104,"warmup_s":112.684,"warmup_inserted_bytes":34359738368,"warmup_capped":false,"reopen_hit_ratio":0.849,"reopen_open_s":0.012,"reopen_rebuild_s":0.011,"lru_entries":8191,"lru_ram_bytes":1245032,"failed":false}
+rc=0 load-after: 2.05 2.23 2.30 3/851 2021921

@@ -1,0 +1,178 @@
+06:09:14 cyclone-full-1 load: 0.10 0.12 0.04 1/731 1552838
+06:16:26 cyclone-full-1 rc=0 load: 5.41 3.51 1.67 1/955 1559495
+06:20:41 cyclone-noverify-1 load: 0.88 2.00 1.47 1/749 1563523
+06:22:03 cyclone-noverify-1 rc=0 load: 3.73 2.55 1.70 1/746 1564349
+06:23:33 lmdb-full-1 load: 0.90 1.92 1.56 1/736 1564444
+06:31:57 lmdb-full-1 rc=0 load: 4.30 3.46 2.43 1/735 1569388
+06:33:27 filedir-full-1 load: 0.95 2.56 2.21 1/734 1569481
+06:40:37 filedir-full-1 rc=0 load: 4.44 3.78 2.91 1/731 1573772
+06:42:23 rocksdb-full-1 load: 0.78 2.67 2.60 1/730 1573882
+06:48:45 rocksdb-full-1 rc=0 load: 6.63 4.52 3.37 3/798 1581087
+06:50:50 cyclone-cold-1 load: 0.86 3.01 2.96 1/743 1581671
+06:52:32 cyclone-cold-1 rc=0 load: 1.32 2.54 2.79 1/739 1582736
+06:53:02 lmdb-cold-1 load: 0.80 2.29 2.70 1/743 1582775
+06:57:23 lmdb-cold-1 rc=0 load: 1.31 1.78 2.38 1/731 1585367
+06:57:53 cyclone-full-2 load: 0.79 1.60 2.30 1/730 1585400
+07:05:20 cyclone-full-2 rc=0 load: 4.65 3.56 2.95 1/730 1589787
+07:09:45 cyclone-noverify-2 load: 0.95 2.00 2.44 1/748 1594568
+07:11:08 cyclone-noverify-2 rc=0 load: 3.18 2.40 2.53 1/745 1595395
+07:12:23 lmdb-full-2 load: 0.93 1.88 2.34 1/740 1595475
+07:20:52 lmdb-full-2 rc=0 load: 4.34 3.54 2.95 1/732 1600451
+07:22:37 filedir-full-2 load: 0.79 2.50 2.63 1/729 1600562
+07:29:40 filedir-full-2 rc=0 load: 4.82 3.88 3.21 1/732 1604785
+07:31:26 rocksdb-full-2 load: 0.93 2.78 2.88 1/734 1604899
+07:37:33 rocksdb-full-2 rc=0 load: 4.09 3.47 3.15 1/738 1608741
+07:39:03 cyclone-cold-2 load: 0.91 2.56 2.85 1/737 1608837
+07:40:45 cyclone-cold-2 rc=0 load: 1.31 2.22 2.70 1/734 1609905
+07:41:15 lmdb-cold-2 load: 0.79 2.00 2.61 1/737 1609944
+07:45:40 lmdb-cold-2 rc=0 load: 1.29 1.68 2.32 1/732 1612583
+07:46:11 cyclone-full-3 load: 0.86 1.53 2.25 1/733 1612619
+07:53:24 cyclone-full-3 rc=0 load: 4.03 3.45 2.91 1/732 1616863
+07:54:54 cyclone-noverify-3 load: 0.89 2.54 2.64 1/731 1616957
+07:56:15 cyclone-noverify-3 rc=0 load: 3.75 2.95 2.77 1/734 1617776
+07:57:46 lmdb-full-3 load: 0.83 2.18 2.51 1/734 1617887
+08:06:05 lmdb-full-3 rc=0 load: 4.18 3.56 3.03 1/732 1622762
+08:07:35 filedir-full-3 load: 0.93 2.63 2.74 1/730 1622855
+08:15:02 filedir-full-3 rc=0 load: 4.80 3.90 3.28 1/730 1627310
+08:16:48 rocksdb-full-3 load: 0.83 2.74 2.92 1/730 1627423
+08:23:02 rocksdb-full-3 rc=0 load: 4.72 3.64 3.24 2/777 1631710
+08:30:07 cyclone-cold-3 load: 0.90 3.48 3.41 1/736 1638316
+08:31:54 cyclone-cold-3 rc=0 load: 1.93 3.05 3.25 1/829 1641310
+08:35:55 lmdb-cold-3 load: 0.80 2.10 2.82 1/761 1676299
+08:40:20 lmdb-cold-3 rc=0 load: 1.17 1.65 2.45 1/735 1678950
+08:40:29 cy-flush-zipf-t1-1 load: 0.99 1.60 2.43 1/735 1678969
+08:43:50 cy-flush-zipf-t1-1 rc=0 load: 1.49 1.53 2.23 1/734 1680909
+08:44:20 cy-ret-zipf-t1-1 load: 0.90 1.38 2.16 1/736 1680946
+08:47:43 cy-ret-zipf-t1-1 rc=0 load: 1.59 1.55 2.07 4/746 1685006
+08:48:13 cy-reserve-zipf-t1-1 load: 0.96 1.40 2.00 1/747 1685042
+08:51:43 cy-reserve-zipf-t1-1 rc=0 load: 1.27 1.34 1.86 1/735 1687086
+08:51:58 lmdb-zipf-t1-1 load: 0.98 1.27 1.83 1/735 1687107
+08:55:59 lmdb-zipf-t1-1 rc=0 load: 1.36 1.36 1.74 1/737 1689430
+08:56:29 filedir-zipf-t1-1 load: 0.82 1.22 1.68 1/738 1689466
+09:00:29 filedir-zipf-t1-1 rc=0 load: 1.50 1.35 1.63 1/739 1691788
+09:02:44 cy-flush-zipf-t4-1 load: 0.34 0.93 1.43 1/752 1693994
+09:05:48 cy-flush-zipf-t4-1 rc=0 load: 3.84 2.48 1.96 1/750 1695770
+09:07:18 cy-ret-zipf-t4-1 load: 0.99 1.88 1.80 1/746 1695863
+09:10:21 cy-ret-zipf-t4-1 rc=0 load: 3.88 2.96 2.24 1/733 1697627
+09:11:51 cy-reserve-zipf-t4-1 load: 0.86 2.19 2.03 1/733 1697721
+09:15:04 cy-reserve-zipf-t4-1 rc=0 load: 3.92 3.26 2.50 2/735 1699571
+09:16:34 lmdb-zipf-t4-1 load: 0.87 2.40 2.27 1/735 1699665
+09:20:08 lmdb-zipf-t4-1 rc=0 load: 4.74 3.33 2.66 22/1035 1703763
+09:23:49 filedir-zipf-t4-1 load: 0.87 3.20 2.88 1/742 1707822
+09:27:09 filedir-zipf-t4-1 rc=0 load: 5.33 4.41 3.43 2/842 1714115
+09:30:19 cy-flush-zipf+scan-t1-1 load: 0.84 3.10 3.13 1/761 1742369
+09:33:30 cy-flush-zipf+scan-t1-1 rc=0 load: 1.29 2.30 2.81 1/734 1744209
+09:34:00 cy-ret-zipf+scan-t1-1 load: 0.78 2.08 2.72 1/733 1744247
+09:37:14 cy-ret-zipf+scan-t1-1 rc=0 load: 1.34 1.73 2.45 1/735 1746124
+09:37:44 cy-reserve-zipf+scan-t1-1 load: 0.81 1.57 2.37 1/738 1746162
+09:41:04 cy-reserve-zipf+scan-t1-1 rc=0 load: 1.36 1.47 2.17 1/732 1748084
+09:41:34 lmdb-zipf+scan-t1-1 load: 0.83 1.33 2.10 1/734 1748120
+09:45:02 lmdb-zipf+scan-t1-1 rc=0 load: 1.40 1.38 1.96 1/738 1750129
+09:45:32 filedir-zipf+scan-t1-1 load: 0.85 1.25 1.90 1/739 1750164
+09:49:00 filedir-zipf+scan-t1-1 rc=0 load: 1.73 1.47 1.86 2/736 1752169
+09:49:45 cy-flush-zipf+scan-t4-1 load: 0.88 1.28 1.77 1/739 1752222
+09:52:43 cy-flush-zipf+scan-t4-1 rc=0 load: 3.82 2.62 2.22 1/740 1753929
+09:54:13 cy-ret-zipf+scan-t4-1 load: 0.85 1.93 2.01 1/735 1754019
+09:57:09 cy-ret-zipf+scan-t4-1 rc=0 load: 4.34 3.06 2.44 1/736 1755720
+09:58:39 cy-reserve-zipf+scan-t4-1 load: 0.96 2.26 2.21 1/739 1755817
+10:01:46 cy-reserve-zipf+scan-t4-1 rc=0 load: 3.95 3.18 2.59 2/738 1757613
+10:03:16 lmdb-zipf+scan-t4-1 load: 0.88 2.35 2.35 1/734 1757704
+10:06:32 lmdb-zipf+scan-t4-1 rc=0 load: 2.78 2.64 2.46 1/736 1759578
+10:07:47 filedir-zipf+scan-t4-1 load: 0.79 2.05 2.27 1/737 1759658
+10:10:49 filedir-zipf+scan-t4-1 rc=0 load: 4.62 3.38 2.75 2/736 1761402
+10:12:34 cy-flush-zipf-t1-2 load: 0.80 2.37 2.45 1/735 1761511
+10:15:55 cy-flush-zipf-t1-2 rc=0 load: 1.42 1.93 2.26 1/736 1763445
+10:16:25 cy-ret-zipf-t1-2 load: 0.86 1.75 2.19 1/733 1763478
+10:19:52 cy-ret-zipf-t1-2 rc=0 load: 1.24 1.48 1.98 1/739 1765483
+10:20:07 cy-reserve-zipf-t1-2 load: 0.97 1.40 1.95 1/737 1765503
+10:23:50 cy-reserve-zipf-t1-2 rc=0 load: 1.66 1.66 1.94 1/743 1784857
+10:24:35 lmdb-zipf-t1-2 load: 0.78 1.43 1.85 1/742 1784906
+10:28:43 lmdb-zipf-t1-2 rc=0 load: 1.76 1.75 1.88 1/740 1788751
+10:29:28 filedir-zipf-t1-2 load: 0.91 1.52 1.80 1/739 1788800
+10:33:30 filedir-zipf-t1-2 rc=0 load: 1.65 1.45 1.70 1/736 1791143
+10:34:15 cy-flush-zipf-t4-2 load: 0.78 1.25 1.61 1/736 1791194
+10:37:21 cy-flush-zipf-t4-2 rc=0 load: 4.11 2.74 2.14 1/734 1792976
+10:38:51 cy-ret-zipf-t4-2 load: 0.91 2.02 1.94 1/737 1793071
+10:42:03 cy-ret-zipf-t4-2 rc=0 load: 4.30 3.29 2.47 1/737 1794921
+10:43:33 cy-reserve-zipf-t4-2 load: 0.99 2.44 2.24 1/738 1795023
+10:46:49 cy-reserve-zipf-t4-2 rc=0 load: 4.24 3.46 2.69 1/739 1796901
+10:48:20 lmdb-zipf-t4-2 load: 0.94 2.56 2.44 1/731 1796994
+10:51:50 lmdb-zipf-t4-2 rc=0 load: 3.70 3.08 2.66 1/737 1799010
+10:53:20 filedir-zipf-t4-2 load: 0.82 2.28 2.41 1/736 1799102
+10:56:39 filedir-zipf-t4-2 rc=0 load: 4.60 3.54 2.90 1/735 1800999
+10:58:25 cy-flush-zipf+scan-t1-2 load: 0.79 2.49 2.58 1/733 1801108
+11:01:38 cy-flush-zipf+scan-t1-2 rc=0 load: 1.20 1.92 2.34 1/736 1802985
+11:01:53 cy-ret-zipf+scan-t1-2 load: 0.94 1.83 2.30 1/736 1803006
+11:05:08 cy-ret-zipf+scan-t1-2 rc=0 load: 1.45 1.65 2.14 1/737 1804886
+11:05:38 cy-reserve-zipf+scan-t1-2 load: 0.85 1.48 2.06 1/735 1804920
+11:08:57 cy-reserve-zipf+scan-t1-2 rc=0 load: 1.26 1.45 1.94 1/734 1806832
+11:09:12 lmdb-zipf+scan-t1-2 load: 0.98 1.37 1.91 1/734 1806854
+11:12:43 lmdb-zipf+scan-t1-2 rc=0 load: 1.39 1.39 1.81 1/736 1808887
+11:13:13 filedir-zipf+scan-t1-2 load: 0.89 1.27 1.75 1/736 1808923
+11:16:42 filedir-zipf+scan-t1-2 rc=0 load: 1.83 1.52 1.75 1/738 1811168
+11:17:27 cy-flush-zipf+scan-t4-2 load: 0.86 1.30 1.66 1/737 1811221
+11:20:29 cy-flush-zipf+scan-t4-2 rc=0 load: 3.86 2.70 2.16 1/736 1812964
+11:23:04 cy-ret-zipf+scan-t4-2 load: 0.38 1.69 1.86 1/755 1814910
+11:26:04 cy-ret-zipf+scan-t4-2 rc=0 load: 3.60 2.75 2.25 1/745 1816650
+11:27:35 cy-reserve-zipf+scan-t4-2 load: 0.82 2.04 2.05 1/742 1816741
+11:30:40 cy-reserve-zipf+scan-t4-2 rc=0 load: 3.95 3.08 2.46 1/735 1818525
+11:32:10 lmdb-zipf+scan-t4-2 load: 0.88 2.28 2.23 1/738 1818622
+11:35:25 lmdb-zipf+scan-t4-2 rc=0 load: 3.05 2.74 2.42 1/736 1820494
+11:36:41 filedir-zipf+scan-t4-2 load: 0.87 2.12 2.23 1/737 1820573
+11:39:42 filedir-zipf+scan-t4-2 rc=0 load: 4.73 3.46 2.74 1/736 1822317
+11:41:27 cy-flush-zipf-t1-3 load: 0.82 2.43 2.44 1/735 1822426
+11:44:50 cy-flush-zipf-t1-3 rc=0 load: 1.36 1.91 2.23 1/736 1824378
+11:45:20 cy-ret-zipf-t1-3 load: 0.82 1.73 2.15 1/737 1824417
+11:48:49 cy-ret-zipf-t1-3 rc=0 load: 1.13 1.48 1.97 2/737 1826429
+11:49:04 cy-reserve-zipf-t1-3 load: 0.88 1.40 1.94 1/737 1826450
+11:52:39 cy-reserve-zipf-t1-3 rc=0 load: 1.46 1.44 1.84 1/734 1828514
+11:53:09 lmdb-zipf-t1-3 load: 0.95 1.32 1.79 1/736 1828550
+11:57:10 lmdb-zipf-t1-3 rc=0 load: 1.33 1.37 1.71 1/739 1830864
+11:57:40 filedir-zipf-t1-3 load: 0.81 1.24 1.65 1/737 1830901
+12:01:41 filedir-zipf-t1-3 rc=0 load: 1.45 1.42 1.63 1/735 1833213
+12:02:11 cy-flush-zipf-t4-3 load: 0.88 1.28 1.58 1/738 1833250
+12:05:16 cy-flush-zipf-t4-3 rc=0 load: 4.00 2.69 2.08 1/740 1835026
+12:06:46 cy-ret-zipf-t4-3 load: 0.89 1.98 1.89 1/736 1835117
+12:09:52 cy-ret-zipf-t4-3 rc=0 load: 4.07 3.09 2.35 2/735 1836901
+12:11:22 cy-reserve-zipf-t4-3 load: 0.95 2.30 2.13 1/738 1836996
+12:14:34 cy-reserve-zipf-t4-3 rc=0 load: 4.00 3.20 2.52 1/734 1838838
+12:16:04 lmdb-zipf-t4-3 load: 0.89 2.36 2.29 1/735 1838931
+12:19:31 lmdb-zipf-t4-3 rc=0 load: 3.92 3.17 2.62 1/742 1840941
+12:21:01 filedir-zipf-t4-3 load: 0.80 2.30 2.36 1/741 1841033
+12:24:19 filedir-zipf-t4-3 rc=0 load: 4.91 3.68 2.90 1/738 1842926
+12:26:04 cy-flush-zipf+scan-t1-3 load: 0.85 2.59 2.59 1/734 1843031
+12:29:17 cy-flush-zipf+scan-t1-3 rc=0 load: 1.44 2.08 2.39 1/736 1844889
+12:29:47 cy-ret-zipf+scan-t1-3 load: 0.87 1.88 2.31 1/733 1844925
+12:32:59 cy-ret-zipf+scan-t1-3 rc=0 load: 1.44 1.68 2.15 1/736 1846784
+12:33:29 cy-reserve-zipf+scan-t1-3 load: 0.87 1.52 2.08 1/739 1846822
+12:36:46 cy-reserve-zipf+scan-t1-3 rc=0 load: 1.52 1.53 1.97 1/738 1848735
+12:37:16 lmdb-zipf+scan-t1-3 load: 0.92 1.38 1.90 1/739 1848786
+12:40:44 lmdb-zipf+scan-t1-3 rc=0 load: 1.48 1.43 1.82 1/735 1850828
+12:41:14 filedir-zipf+scan-t1-3 load: 0.89 1.29 1.76 1/738 1850865
+12:44:43 filedir-zipf+scan-t1-3 rc=0 load: 1.51 1.42 1.72 1/733 1852879
+12:45:13 cy-flush-zipf+scan-t4-3 load: 0.91 1.28 1.66 1/739 1852921
+12:48:10 cy-flush-zipf+scan-t4-3 rc=0 load: 4.34 2.71 2.15 3/777 1857831
+12:49:50 cy-ret-zipf+scan-t4-3 load: 0.97 2.03 1.96 1/742 1872038
+12:52:46 cy-ret-zipf+scan-t4-3 rc=0 load: 3.89 3.04 2.38 1/740 1873732
+12:54:16 cy-reserve-zipf+scan-t4-3 load: 0.86 2.24 2.15 1/737 1873826
+12:57:20 cy-reserve-zipf+scan-t4-3 rc=0 load: 6.18 4.03 2.85 2/847 1877841
+13:01:31 lmdb-zipf+scan-t4-3 load: 0.84 2.76 2.64 1/764 1912315
+13:04:46 lmdb-zipf+scan-t4-3 rc=0 load: 3.50 3.00 2.74 1/777 1914876
+13:06:06 filedir-zipf+scan-t4-3 load: 0.99 2.33 2.53 1/739 1915151
+13:09:09 filedir-zipf+scan-t4-3 rc=0 load: 4.37 3.50 2.96 1/736 1916916
+13:17:24 cy-flush-zipf+scan-t4-4 load: 0.41 1.82 2.44 1/755 1923992
+13:20:32 cy-flush-zipf+scan-t4-4 rc=0 load: 5.81 3.74 3.08 5/824 1963906
+13:22:42 cy-reserve-zipf+scan-t4-4 load: 0.83 2.57 2.74 1/759 1972952
+13:25:47 cy-reserve-zipf+scan-t4-4 rc=0 load: 4.11 3.47 3.07 1/740 1974727
+13:27:32 cy-reserve-zipf-t1-4 load: 0.84 2.50 2.77 1/738 1974836
+13:30:58 cy-reserve-zipf-t1-4 rc=0 load: 1.21 1.90 2.47 1/736 1976825
+13:31:13 cy-ret-zipf-t1-4 load: 0.94 1.81 2.43 1/738 1976847
+13:34:40 cy-ret-zipf-t1-4 rc=0 load: 1.05 1.47 2.17 2/741 1978841
+13:34:55 filedir-zipf-t4-4 load: 0.82 1.40 2.13 1/739 1978862
+13:38:18 filedir-zipf-t4-4 rc=0 load: 4.42 3.08 2.67 1/736 1980799
+13:40:03 lmdb-zipf+scan-t4-4 load: 0.83 2.19 2.39 1/737 1980933
+13:43:20 lmdb-zipf+scan-t4-4 rc=0 load: 1.85 2.24 2.39 1/739 1982824
+13:44:20 lmdb-zipf-t1-4 load: 0.79 1.87 2.25 1/739 1982888
+13:48:22 lmdb-zipf-t1-4 rc=0 load: 1.16 1.54 2.02 1/737 1985213
+13:48:37 lmdb-zipf-t4-4 load: 0.90 1.46 1.99 1/740 1985237
+13:52:21 lmdb-zipf-t4-4 rc=0 load: 3.72 2.74 2.39 1/738 1987381

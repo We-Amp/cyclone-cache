@@ -1,0 +1,2 @@
+[ perf record: Woken up 325 times to write data ]
+[ perf record: Captured and wrote 83,548 MB ~/round6/out/diag/perf-lmdb.data (308759 samples) ]

@@ -35,7 +35,7 @@ three runs. Every number below is reproducible with the commands in
 | **17.6 M reads/s** | 4 threads hammering the mmap tier (512 B objects), 3.3× one thread; 21 M/s at 16 threads |
 | **2.6 µs** | p50 for a 4 KB write, 21 µs p99 — **229 K writes/s**, no per-write fsync |
 | **11–13 GB/s** | single-thread first read of a 64 KB–1 MB object, checksum verified (hardware CRC-32C) |
-| **~1 GB/s** | sustained single-thread write of 2 MiB values over a 4 GiB dataset ([KV benchmark](doc/kv-cache-benchmark.md)) |
+| **~1.5 GB/s** | sustained single-thread write of 2 MiB values over a 4 GiB dataset, Linux/NVMe ([KV benchmark](doc/kv-cache-benchmark.md)) |
 | **0.4 µs** | to acquire a zero-copy view of a 1 MB object once it has been verified — cost is independent of object size |
 | **0** | stripe locks on the read path — per-bucket seqlocks, CRC-32C and read leases instead |
 | **10 bytes** | per directory entry; 132-byte document header; 1 TiB addressable per stripe |
@@ -251,14 +251,17 @@ Where it fits, measured against LMDB, RocksDB and file-per-block in
 [doc/kv-cache-benchmark.md](doc/kv-cache-benchmark.md): a **node-local,
 multi-process tier for large blocks (2–32 MiB)** that evicts on its own. On
 Linux/NVMe it reads cold 8–32 MiB blocks faster than every peer (3.0–3.4
-GB/s), serves four reader processes 1.3× faster than LMDB, and under
-concurrent churn keeps a 3–4× lower hit-latency tail than LMDB with an LRU;
-with wrap retention on (now the default), a bounded tier meets the
-benchmark's pre-registered bar against LMDB on that latency clause. It is not a general LMDB
-replacement: warm reads are in the same class, small blocks read cold
-behind LMDB (512 KiB at 0.7× its rate; below 256 KiB, where no readahead
-hint is issued, far behind), writes run at about 1 GB/s per thread behind
-file-per-block, and single-threaded churn serves 0.7–0.8× LMDB.
+GB/s), serves four reader processes 1.2× faster than LMDB, and under
+churn serves 1.1–1.3× what LMDB with an LRU serves, at one thread and at
+four. At four threads its hit-latency tail is 0.38–0.45× LMDB's, and with
+wrap retention on (the default) a bounded tier meets the benchmark's
+pre-registered bar against LMDB on that latency clause, with a thin margin
+on plain Zipf. It is not a general LMDB replacement: warm reads are in the
+same class, blocks up to 2 MiB read cold behind LMDB (512 KiB at 0.76× its
+rate; below 256 KiB, where no readahead hint is issued, far behind),
+writes match file-per-block at 2 MiB (about 1.5 GB/s per thread) but trail
+it at 8–32 MiB, and a one-thread insert has a 24 ms p99 against 6–16 ms
+for the peers.
 
 - **Zero-copy loads.** On a disk hit `content()` aliases the mapped volume;
   acquiring a view costs about 0.4 µs regardless of size. For device
@@ -282,7 +285,7 @@ file-per-block, and single-threaded churn serves 0.7–0.8× LMDB.
   lap actually needs its bytes, so a stripe holds close to its full capacity.
   The disk tier has no scan resistance (CLFUS covers only the RAM tier, which
   a KV tier normally disables), so under churn it still trails an LRU by
-  3.5-4 hit-ratio points. The opt-out, `wrap_retention = false` (flush
+  about 4 hit-ratio points. The opt-out, `wrap_retention = false` (flush
   mode), drops the whole previous lap at the wrap and costs about 9 points:
   on a 2 MiB-block, 4 GiB churn run the hit ratio was 0.788 with retention
   and 0.726 flushing (Zipf), 0.660 and 0.614 with scans.
@@ -315,7 +318,7 @@ is cheap with hardware CRC-32C, and multi-process mode forces it on. Cyclone
 is a node-local tier behind a KV connector — it is not a distributed store,
 has no GPU-direct or RDMA path, and ships no Python bindings today. Write
 bandwidth at 2 MiB is about 1.5 GB/s per thread on Linux/NVMe (`kv_bench`:
-1.52 GB/s, against 1.46 for one file per block). A producer that generates
+1.47 GB/s, against 1.52 for one file per block, same day). A producer that generates
 the blob itself can fill `w->reserve(n)` in place instead of calling
 `write_sync()`, which saves one copy of it.
 

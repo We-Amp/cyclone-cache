@@ -1,0 +1,48 @@
+trace span 60.0 s
+
+waiting for                                  via                      n  total ms   >5ms  >10ms  >20ms  max ms
+other sleep                                  futex/sleep            298     59629    298    298    298   200.4
+read I/O in a buffered read (pread)          pread/preadv         24222     23231   1013    507    212    89.2
+preempted (runnable)                         pread/preadv          9183        90      0      0      0     0.2
+preempted (runnable)                         writev/write          9445        85      0      0      0     0.2
+jbd2 / journal                               rename/unlink/open      17        43      2      2      1    21.0
+preempted (runnable)                         other                  434        10      0      0      0     0.2
+read of a partial page before the write (write_begin) pread/preadv             5         4      0      0      0     2.0
+preempted (runnable)                         rename/unlink/open     149         3      0      0      0     0.2
+read of a partial page before the write (write_begin) rename/unlink/open      13         1      0      0      0     0.2
+jbd2 / journal                               writev/write             5         1      0      0      0     0.3
+
+stacks with the most intervals over 10 ms (tid, innermost first):
+  tid 2017654 n=24229 total=23231 ms >10ms=507 max=89.2 ms
+    wait_on_page_bit_common <- filemap_update_page <- filemap_get_pages <- filemap_read <- generic_file_read_iter <- ext4_file_read_iter <- do_iter_readv_writev <- do_iter_read <- vfs_readv <- __x64_sys_preadv <- x64_sys_call <- do_syscall_64 <- entry_SYSCALL_64_after_hwframe <- preadv64
+  tid 2017651 n=298 total=59629 ms >10ms=298 max=200.4 ms
+    do_nanosleep <- hrtimer_nanosleep <- common_nsleep <- __x64_sys_clock_nanosleep <- x64_sys_call <- do_syscall_64 <- entry_SYSCALL_64_after_hwframe <- clock_nanosleep@GLIBC_2.2.5 <- [unknown] <- std::basic_ifstream<char, std::char_traits<char> >::~basic_ifstream <- [unknown]
+  tid 2017654 n=1 total=21 ms >10ms=1 max=21.0 ms
+    bit_wait_io <- __wait_on_bit <- out_of_line_wait_on_bit <- do_get_write_access <- jbd2_journal_get_write_access <- __ext4_journal_get_write_access <- ext4_reserve_inode_write <- __ext4_mark_inode_dirty <- __ext4_unlink <- ext4_unlink <- vfs_unlink <- do_unlinkat <- __x64_sys_unlink <- x64_sys_call <- do_syscall_64 <- entry_SYSCALL_64_after_hwframe <- __GI___unlink <- [unknown]
+  tid 2017654 n=2 total=12 ms >10ms=1 max=12.0 ms
+    bit_wait_io <- __wait_on_bit <- out_of_line_wait_on_bit <- do_get_write_access <- jbd2_journal_get_write_access <- __ext4_journal_get_write_access <- ext4_reserve_inode_write <- __ext4_mark_inode_dirty <- add_dirent_to_buf <- ext4_dx_add_entry <- ext4_add_entry <- ext4_rename <- ext4_rename2 <- vfs_rename <- do_renameat2 <- __x64_sys_rename <- x64_sys_call <- do_syscall_64 <- entry_SYSCALL_64_afte
+  tid 2017654 n=7702 total=53 ms >10ms=0 max=0.1 ms
+    __cond_resched <- kmem_cache_alloc <- alloc_buffer_head <- alloc_page_buffers <- create_empty_buffers <- ext4_block_write_begin <- ext4_da_write_begin <- generic_perform_write <- ext4_buffered_write_iter <- ext4_file_write_iter <- do_iter_readv_writev <- do_iter_write <- vfs_writev <- do_writev <- __x64_sys_writev <- x64_sys_call <- do_syscall_64 <- entry_SYSCALL_64_after_hwframe <- __GI___writev
+  tid 2017654 n=3965 total=28 ms >10ms=0 max=0.1 ms
+    __cond_resched <- __alloc_pages <- alloc_pages <- __page_cache_alloc <- page_cache_ra_unbounded <- ondemand_readahead <- page_cache_sync_ra <- filemap_get_pages <- filemap_read <- generic_file_read_iter <- ext4_file_read_iter <- do_iter_readv_writev <- do_iter_read <- vfs_readv <- __x64_sys_preadv <- x64_sys_call <- do_syscall_64 <- entry_SYSCALL_64_after_hwframe <- preadv64
+  tid 2017654 n=976 total=21 ms >10ms=0 max=0.2 ms
+    __cond_resched <- copy_page_to_iter <- filemap_read <- generic_file_read_iter <- ext4_file_read_iter <- do_iter_readv_writev <- do_iter_read <- vfs_readv <- __x64_sys_preadv <- x64_sys_call <- do_syscall_64 <- entry_SYSCALL_64_after_hwframe <- preadv64
+  tid 2017654 n=2719 total=17 ms >10ms=0 max=0.1 ms
+    __cond_resched <- __alloc_pages <- alloc_pages <- __page_cache_alloc <- page_cache_ra_unbounded <- ondemand_readahead <- page_cache_async_ra <- filemap_get_pages <- filemap_read <- generic_file_read_iter <- ext4_file_read_iter <- do_iter_readv_writev <- do_iter_read <- vfs_readv <- __x64_sys_preadv <- x64_sys_call <- do_syscall_64 <- entry_SYSCALL_64_after_hwframe <- preadv64
+  tid 2017654 n=733 total=12 ms >10ms=0 max=0.2 ms
+    __cond_resched <- shrink_node_memcgs <- shrink_node <- do_try_to_free_pages <- try_to_free_mem_cgroup_pages <- try_charge_memcg <- charge_memcg <- __mem_cgroup_charge <- __add_to_page_cache_locked <- add_to_page_cache_lru <- pagecache_get_page <- grab_cache_page_write_begin <- ext4_da_write_begin <- generic_perform_write <- ext4_buffered_write_iter <- ext4_file_write_iter <- do_iter_readv_writev <
+  tid 2017654 n=595 total=9 ms >10ms=0 max=0.1 ms
+    __cond_resched <- shrink_node_memcgs <- shrink_node <- do_try_to_free_pages <- try_to_free_mem_cgroup_pages <- try_charge_memcg <- charge_memcg <- __mem_cgroup_charge <- __add_to_page_cache_locked <- add_to_page_cache_lru <- page_cache_ra_unbounded <- ondemand_readahead <- page_cache_sync_ra <- filemap_get_pages <- filemap_read <- generic_file_read_iter <- ext4_file_read_iter <- do_iter_readv_writ
+
+balance_dirty_pages events (pause in ms, per event):
+  none
+
+device reads issued (block_rq_issue, R), benchmark threads by origin, then the busiest other tasks:
+  kvchurn              read I/O in a buffered read (pread)                    121004
+  kvchurn              other                                                  26
+  kvchurn              read of a partial page before the write (write_begin)  1
+  (other) git          915
+  (other) .NET TP Worker 626
+  (other) docker-buildx 483
+  (other) docker-compose 455
+  (other) Runner.Worker 332

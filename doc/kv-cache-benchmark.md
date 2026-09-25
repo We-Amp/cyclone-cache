@@ -2,12 +2,12 @@
 
 ## Summary
 
-Six rounds of measurements, taken 2026-09-21 to 2026-09-25 on two laptops.
-One is an Apple M5 running macOS, where only a warm page cache can be
-measured. The other is an i7-8750H with a Samsung 970 PRO NVMe running Linux,
-where the page cache is dropped before each cold phase. The peers are LMDB,
-RocksDB (BlobDB) and one file per block (`filedir`). The Cyclone trees
-measured, in order:
+Seven rounds of measurements, plus two fix studies, taken 2026-09-21 to
+2026-09-25 on two laptops. One is an Apple M5 running macOS, where only a
+warm page cache can be measured. The other is an i7-8750H with a Samsung
+970 PRO NVMe running Linux, where the page cache is dropped before each
+cold phase. The peers are LMDB, RocksDB (BlobDB) and one file per block
+(`filedir`). The Cyclone trees measured, in order:
 
 - **Rounds 1 and 2:** the stock tree (macOS warm, then Linux cold). This is
   the baseline every later Cyclone number is compared against.
@@ -27,68 +27,76 @@ measured, in order:
   writes the content from the handle's buffer instead of assembling a
   contiguous document and adds `WriteHandle::reserve()`. Put, churn at
   T=1 and T=4, and same-day file-per-block and LMDB at T=1.
+- **Round 6:** main at b5c31e8, which includes both fixes and has wrap
+  retention on by default. The round-5 matrix was repeated with three
+  interleaved runs per point and same-day LMDB, file-per-block and RocksDB
+  for every comparison. Churn was run in both retention modes and with
+  `--reserve`, at one and four threads for every store. The round also
+  traced the one-thread insert tail.
 
 Each number is one machine's reading. Treat differences under about 20 % as
 noise unless a section says otherwise.
 
-Where Cyclone stands now:
+Where Cyclone stands now (round 6, Linux, same-day peers):
 
 - **Warm reads:** same class as LMDB. Both return a span into a mapping that
-  already exists, with no syscall per get. This is not a differentiator.
-- **Cold reads, Linux/NVMe:** against a same-day LMDB, ahead at 8 and
-  32 MiB (3.01 and 3.40 GB/s against 2.82 and 2.94), 1.16× behind at 2 MiB
-  (2.38 against 2.77) and 1.39× behind at 512 KiB (1.70 against 2.37, up
-  from 0.81 before the readahead-chunking fix). Checksum verified. Below the
-  256 KiB readahead threshold, cold reads are far behind (64 KiB: 0.04
-  against 1.56 GB/s). Today's LMDB reads 23–34 % faster than the round-2
-  LMDB figures used elsewhere in this file.
-- **Writes:** since the insert-path fix, 1.5 GB/s per thread at 2 MiB on
-  Linux, 4 % ahead of a same-day file-per-block (1.52 vs 1.46 GB/s).
-  Before it, a put assembled the document in two fresh heap buffers and
-  paid about 1,000 page faults for them; the rate was 0.6–1.1 GB/s
-  depending on the allocator's state
-  ([Insert path](#insert-path-profile-issue-16)).
-- **Bounded tier under churn:** with wrap retention on, Cyclone meets the
-  pre-registered "significantly better than LMDB" bar through the latency
-  clause. At 4 threads its hit p99 is 0.27–0.37× LMDB's while it serves
-  1.02–1.48× LMDB's throughput, on both patterns in two runs. Retention
-  lifts the hit ratio from 0.76 to 0.81 (`zipf`), which is still 3.5–4
-  points below LMDB with an LRU. Retention is now the default; in flush
-  mode, the opt-out (and the default when round 5 ran), the result is
-  still partial. At one thread, round 5 had Cyclone serving 0.7–0.8× of
-  LMDB. Since the insert-path fix its miss+insert p50 is 1.49 ms (was
-  4.41; file-per-block 1.43, LMDB 1.65, same day), and it serves 1.76 GB/s
-  against 1.48–1.54 for LMDB and 1.71–1.73 for file-per-block. Its insert
-  p99 at one thread is the worst of the three (24 ms, against 6 and 13).
+  already exists, with no syscall per get. At 2 MiB, `copy` reads 12.1
+  against 12.5 GB/s and `view` 265 k against 242 k gets/s. This is not a
+  differentiator.
+- **Cold reads:** ahead of every peer at 8 and 32 MiB (3.00 and 3.39 GB/s;
+  LMDB 2.76 and 2.76). Behind LMDB below that: 1.14× at 2 MiB (2.39 against
+  2.73), 1.32× at 512 KiB (1.70 against 2.25), 1.5× at 1 MiB and 1.9× at
+  256 KiB. Below the 256 KiB readahead threshold it is far behind (64 KiB:
+  0.04 against 1.61 GB/s, issue #29). The checksum is verified in every
+  case.
+- **Writes:** faster than round 5 at every size (×1.25–2.1). Against a
+  same-day file-per-block, Cyclone is ahead at 512 KiB (1.62 against 1.38
+  GB/s) and level at 2 MiB (1.47 against 1.52). It is behind at 8 MiB
+  (1.27 against 1.43) and at 32 MiB (0.88 against 1.41); those were not
+  profiled.
+- **Bounded tier under churn:** with wrap retention on, the default,
+  Cyclone meets the pre-registered "significantly better than LMDB" bar
+  through the latency clause on both patterns at 4 threads. Its hit p99
+  is 0.45× (`zipf`) and 0.38× (`zipf+scan`) of LMDB's, while it serves
+  1.24× and 1.14× as much. The `zipf` margin is thin: 0.45× against the
+  0.5× bar, and 0.52× in the worst pairing of runs. In round 5 it was
+  0.27–0.37×; Cyclone's tail did not move, LMDB's got shorter. At one
+  thread Cyclone now serves the most of the three stores: 1.22–1.28×
+  LMDB and 1.22–1.26× file-per-block. Its hit ratio is still 3.6–4.1
+  points below an LRU. Flush mode (`wrap_retention = false`) is partial:
+  at 4 threads it serves 0.88–0.89× LMDB, just under the 0.9× floor.
+- **The one-thread insert tail is explained:** the miss+insert p99 is
+  24 ms, against 6 ms for file-per-block and 16 ms for LMDB. Documents
+  sit at 8-byte-aligned offsets, so each one ends partway through a page
+  whose other bytes are old data. When that page is not cached, ext4
+  reads it synchronously inside the `pwrite`. About 1 % of inserts wait
+  over 10–20 ms for that 4 KiB read behind the device's other I/O. The
+  peers never do this read. Nothing was changed
+  ([round 6](#the-one-thread-insert-tail-24-ms-p99)).
 - **GPU transfer:** registering the whole volume mapping once reaches the
   PCIe ceiling (12.79 of 12.82 GB/s, 2.3× over staging). Pinning each
   returned span is slower than staging. LMDB also keeps every value in one
   mapping and reaches the same ceiling.
 
-| Current number (2 MiB unless stated) | Cyclone | Peers | Round |
+| Current number (2 MiB unless stated) | Cyclone | Peers (same day unless stated) | Round |
 |---|---:|---|---|
-| Warm GET copy, 1 thread, macOS | 63.6 GB/s | LMDB 64.9, filedir 18.0 | [3](#round-3-readahead-and-a-fast-crc32) |
-| Warm GET copy, 1 thread, Linux (DRAM-bound) | 13.1 GB/s | LMDB 12.9, filedir 6.5 | [3b](#round-3b-crc-32c-on-disk-format-v8) |
-| Cold first-touch GET, Linux | 2.38 GB/s | LMDB 2.77 (same day); round 2: LMDB 2.15, filedir 1.76 | [Readahead](#readahead-chunking-issue-18) |
-| Cold restart GET, Linux | 2.09 GB/s | LMDB 2.68 (same day); round 2: LMDB 2.16, filedir 1.73 | [Readahead](#readahead-chunking-issue-18) |
-| Cold first-touch, 512 KiB / 8 MiB / 32 MiB, Linux | 1.70 / 3.01 / 3.40 GB/s | LMDB 2.37 / 2.82 / 2.94 (same day) | [Readahead](#readahead-chunking-issue-18) |
-| PUT, 1 thread, Linux | 1.52 GB/s | filedir 1.46 (same day); round 3b: filedir 1.44, RocksDB 0.61 | [Insert path](#insert-path-profile-issue-16) |
-| 4 reader processes, `view`, Linux | 755 k gets/s | LMDB 585 k | [3b](#round-3b-crc-32c-on-disk-format-v8) |
-| Churn, `zipf`, 4 threads, retention on: hit ratio / served / hit p99 | 0.814 / 1.73–2.13 GB/s / 25–31 ms | LMDB 0.849 / 1.44–1.51 / 86–92 ms (same day) | [5](#round-5-re-benchmark-at-main-2aed24c) |
-| Churn, `zipf+scan`, 4 threads, retention on | 0.686 / 1.01–1.22 GB/s / 24–29 ms | LMDB 0.726 / 1.00–1.04 / 76–78 ms (same day) | [5](#round-5-re-benchmark-at-main-2aed24c) |
-| Churn, `zipf`, 1 thread: served / miss+insert p50 / p99 | 1.76 GB/s / 1.49 / 24.4 ms | filedir 1.71–1.73 / 1.43 / 6.3; LMDB 1.48–1.54 / 1.65 / 13.1 (same day) | [Insert path](#insert-path-profile-issue-16) |
+| Warm GET copy, 1 thread, macOS | 63.6 GB/s | LMDB 64.9, filedir 18.0 (round 1) | [3](#round-3-readahead-and-a-fast-crc32) |
+| Warm GET copy, 1 thread, Linux (DRAM-bound) | 12.1 GB/s | LMDB 12.5, filedir 6.9, RocksDB 2.9 | [6](#round-6-re-benchmark-at-main-b5c31e8) |
+| Cold first-touch GET, Linux | 2.39 GB/s | LMDB 2.73, filedir 1.77, RocksDB 0.81 | [6](#round-6-re-benchmark-at-main-b5c31e8) |
+| Cold restart GET, Linux | 2.08 GB/s | LMDB 2.71, filedir 1.77, RocksDB 0.83 | [6](#round-6-re-benchmark-at-main-b5c31e8) |
+| Cold first-touch, 512 KiB / 8 MiB / 32 MiB, Linux | 1.70 / 3.00 / 3.39 GB/s | LMDB 2.25 / 2.76 / 2.76 | [6](#round-6-re-benchmark-at-main-b5c31e8) |
+| Cold first-touch, 64 KiB / 256 KiB, Linux | 0.04 / 1.12 GB/s | LMDB 1.61 / 2.11 | [6](#cold-reads-from-64-kib-to-32-mib-issue-29-baseline) |
+| PUT, 1 thread, Linux, 512 KiB / 2 MiB / 32 MiB | 1.62 / 1.47 / 0.88 GB/s | filedir 1.38 / 1.52 / 1.41, RocksDB 0.52 / 0.44 / 0.41 | [6](#round-6-re-benchmark-at-main-b5c31e8) |
+| 4 reader processes, `view`, Linux | 743 k gets/s | LMDB 613 k | [6](#round-6-re-benchmark-at-main-b5c31e8) |
+| Churn, `zipf`, 4 threads, retention on: hit ratio / served / hit p99 | 0.814 / 2.40 GB/s / 29.9 ms | LMDB 0.850 / 1.94 / 67.0 ms; filedir 0.849 / 2.16 / 38.4 ms | [6](#churn-linux-2-mib-c--16-gib-4-gib-cgroup) |
+| Churn, `zipf+scan`, 4 threads, retention on | 0.685 / 1.45 GB/s / 22.9 ms | LMDB 0.726 / 1.27 / 60.8 ms; filedir 0.725 / 1.58 / 37.5 ms | [6](#churn-linux-2-mib-c--16-gib-4-gib-cgroup) |
+| Churn, `zipf`, 1 thread, retention on: served / miss+insert p50 / p99 | 1.78 GB/s / 1.49 / 24.4 ms | LMDB 1.46 / 1.66 / 15.6; filedir 1.41 / 1.46 / 6.4 | [6](#churn-linux-2-mib-c--16-gib-4-gib-cgroup) |
 | Host→GPU, mapping registered once (CUDA, batch 16) | 12.79 GB/s | LMDB 12.81, staged 5.51 | [CUDA](#device-transfer-cuda-gtx-1050-pcie) |
 
-Peer rows come from the round-1 and round-2 sweeps and were not re-run for
-the later rounds, except the cold LMDB rows, which the readahead-chunking
-section re-ran on the same day as its Cyclone runs. Round 4 has its own peers (LMDB and file-per-block, each
-with an LRU), and round 5 re-ran them at 4 threads. Round 5 re-measured the
-Cyclone cold rows at main: 2, 8 and 32 MiB are unchanged. At 512 KiB it
-read 0.80 GB/s, and a same-day run of the round-3b code read 0.86, so that
-shift comes from the machine, not the code. The two 4-thread churn rows
-predate the insert-path fix. Against same-day main, that fix raised
-Cyclone's 4-thread `zipf` served GB/s by 21 % and left its hit p99
-unchanged; LMDB was not re-run at 4 threads.
+All Linux rows are round-6 medians of three interleaved runs, with the
+peers run the same day. The macOS row and the CUDA row were not re-run.
+Churn rows are at 2 MiB, C = 16 GiB, in a 4 GiB cgroup; flush-mode and
+`--reserve` rows are in round 6.
 
 ## The role being benchmarked
 
@@ -178,7 +186,7 @@ a 4 GiB memory cgroup and is measured for 120 s after a warm-up that inserts
 
 Store versions, as recorded in the raw JSON lines:
 
-| Store | macOS (rounds 1, 3, 5; Metal) | Linux (rounds 2, 3, 3b, 4, 5; CUDA) |
+| Store | macOS (rounds 1, 3, 5; Metal) | Linux (rounds 2, 3, 3b, 4, 5, 6; CUDA) |
 |---|---|---|
 | LMDB | 1.0.2 | 0.9.24 |
 | RocksDB | 11.8.1 | 9.10.0 (not in round 4) |
@@ -221,6 +229,15 @@ cgroup:
 doc/kv-cache-benchmark/churn/run-churn.sh cyclone zipf+scan 4 17179869184 120 churn.jsonl churn.txt
 doc/kv-cache-benchmark/churn/run-churn.sh cyclone zipf 4 17179869184 120 churn.jsonl churn.txt --wrap-retention on
 ./build/kv_churn_policy                         # eviction-policy replay, no I/O
+```
+
+Round 6 ran the whole matrix through one driver, which waits for an idle
+machine before every point and samples the cgroup beside it:
+
+```bash
+SRC=$PWD PEER_BUILD=/path/to/peer/build doc/kv-cache-benchmark/round6/driver.sh sweep 3
+SRC=$PWD PEER_BUILD=/path/to/peer/build doc/kv-cache-benchmark/round6/driver.sh churn 3
+python3 doc/kv-cache-benchmark/round6/summarize.py "$R6/out" churn   # R6: the driver's output root
 ```
 
 The peer harness is not published. It contains the file-per-block, LMDB and
@@ -1453,6 +1470,337 @@ To reproduce the split:
 `./build/insert_bench --block-size 2097152 --capacity 4294967296 --laps 2`
 (add `--reserve` for the `reserve()` path).
 
+## Round 6: re-benchmark at main (b5c31e8)
+
+> 2026-09-25, Linux machine only. main at b5c31e8: since round 5, wrap
+> retention is on by default, the CRC-validation cache is keyed per
+> document (#24), a reader waits out a descheduled writer instead of
+> reporting a miss (#25), the Linux readahead hint goes out in 64 KiB
+> chunks (#28), a put no longer builds a contiguous document and
+> `WriteHandle::reserve()` exists (#31), and cross-process lock waits are
+> bounded by holder liveness (#30). Raw data, per-run load, logs and every
+> script are in [`kv-cache-benchmark/round6/`](kv-cache-benchmark/round6/).
+
+This round repeats the round-5 matrix at main, three interleaved runs per
+point, with same-day peers for every comparison. It adds four things:
+`kv_churn --reserve` as a Cyclone row, one-thread peers in the churn
+matrix, the 64 KiB and 256 KiB cold rows (the issue #29 baseline), and a
+trace of the one-thread insert tail that the insert-path section left open.
+
+**Method.** One clang-20 Release build (bundled SHA-256), kernel-default
+dirty limits (`vm.dirty_ratio = 20`, `dirty_background_ratio = 10`,
+recorded in `round6-machine.txt`), one benchmark at a time
+([`driver.sh`](kv-cache-benchmark/round6/driver.sh)). Before every point
+the driver waited until no GitHub Actions runner job was running and the
+1-minute load was below 1.0. A 1 Hz sampler
+([`sampler.sh`](kv-cache-benchmark/round6/sampler.sh)) ran beside every
+point and recorded the cgroup's dirty, writeback and reclaim counters and
+whether a runner job had started. Jobs did start mid-run: in 8 of the 60
+churn points and in 4 of the 21 sweep points. Each affected churn point
+was re-run as a fourth run. Churn medians leave out the runs a job
+started into ([`summarize.py`](kv-cache-benchmark/round6/summarize.py) marks
+them `*`). One point, Cyclone flush mode on `zipf+scan` at T=4, was hit
+again in its re-run, so its median is over two runs.
+Sweep medians keep all three runs; the affected ones are listed in
+`round6-sweep-runner-jobs.txt`. The reference vectors of `kv_churn` and the
+peer harness's `kvchurn` matched.
+
+### Cold sweep, all phases (Linux, page cache dropped)
+
+The round-5 command (`kv_bench --seconds 10 --drop-caches-cmd …`, four
+block sizes, all phases), the 2 MiB `--no-mmap-dir --no-verify` run, and
+the peer harness's full sweep for LMDB, file-per-block and RocksDB, with
+each store's three runs interleaved. GB/s, median of three; restart in
+parentheses. LMDB here is the durable default (one fsync per put), as in
+rounds 1 and 2.
+
+| | round 5 | **round 6** | LMDB | filedir | RocksDB |
+|---|---:|---:|---:|---:|---:|
+| Cold first touch, 512 KiB | 0.80 (0.70) | **1.70 (1.36)** | 2.25 (2.23) | 1.08 (1.04) | 0.84 (0.85) |
+| Cold first touch, 2 MiB | 2.16 (1.90) | **2.39 (2.08)** | 2.73 (2.71) | 1.77 (1.77) | 0.81 (0.83) |
+| Cold first touch, 8 MiB | 3.04 (2.85) | **3.00 (2.87)** | 2.76 (2.70) | 2.75 (2.72) | 0.85 (0.84) |
+| Cold first touch, 32 MiB | 3.40 (3.29) | **3.39 (3.27)** | 2.76 (2.75) | 2.88 (2.90) | 0.58 (0.59) |
+| Cold first touch, 2 MiB, verification off | 2.23 | **2.47** | — | — | — |
+| PUT, 512 KiB | 0.76 | **1.62** | 0.06 | 1.38 | 0.52 |
+| PUT, 2 MiB | 1.11 | **1.47** | 0.14 | 1.52 | 0.44 |
+| PUT, 8 MiB | 1.01 | **1.27** | 0.27 | 1.43 | 0.37 |
+| PUT, 32 MiB | 0.48 | **0.88** | 0.36 | 1.41 | 0.41 |
+| PUT, 2 MiB, verification off | 0.58 | **1.34** | — | — | — |
+| Warm GET `copy`, 2 MiB, 1 thread | 13.0 | **12.1** | 12.5 | 6.9 | 2.9 |
+| Warm GET `view`, 2 MiB, 1 thread (gets/s) | 265 k | **265 k** | 242 k | 7.2 k | 1.8 k |
+| Warm GET `view`, 512 KiB, 1 thread (gets/s) | 751 k | **776 k** | 678 k | 25 k | 9.7 k |
+| 4 reader processes, 2 MiB, `view` (gets/s) | 744 k | **743 k** | 613 k | 25 k | — |
+| 4 reader processes, 2 MiB, `copy` | 10.5 | **11.8** | 11.9 | 11.9 | — |
+
+Every Cyclone cell was compared with round 5
+([`round6-compare-round5.txt`](kv-cache-benchmark/round6/round6-compare-round5.txt)).
+No cell fell by more than 10 %. The largest drops are 6 %: 2 MiB warm
+`copy` at one thread, and 8 MiB warm `copy` at 4 and 8 threads. That copy
+is DRAM-bound, and LMDB's copy today reads within 3 % of Cyclone's. The
+cells that rose by more than 10 % are the ones the merged fixes
+target: 512 KiB cold, ×2.1 first touch and ×1.9 restart (#28); 2 MiB cold,
++11 % (#28); PUT at every size, ×1.25 to ×2.3 (#31); and 4-process `copy`,
++12 %. Three single slow-device runs (0.14 GB/s at 512 KiB, one each for
+Cyclone restart, filedir first touch and filedir restart) are inside
+these medians, as in the readahead section.
+
+### Cold reads from 64 KiB to 32 MiB (issue #29 baseline)
+
+`kv_bench --seconds 1 --threads 1 --skip-multiprocess` over seven block
+sizes, Cyclone and a same-day LMDB interleaved, three runs each (the
+readahead section's command). Median GB/s, first touch (restart):
+
+| block | Cyclone | LMDB | LMDB / Cyclone | readahead section: fix / LMDB |
+|---|---:|---:|---:|---:|
+| 64 KiB | 0.04 (0.04) | 1.61 (1.48) | 40× (37×) | 0.04 / 1.56 |
+| 256 KiB | 1.12 (0.85) | 2.11 (1.97) | 1.88× (2.32×) | 1.12 / 2.05 |
+| 512 KiB | 1.69 (1.40) | 2.19 (2.18) | 1.30× (1.56×) | 1.70 / 2.37 |
+| 1 MiB | 1.77 (1.47) | 2.65 (2.64) | 1.50× (1.80×) | 1.65 / 2.71 |
+| 2 MiB | 2.38 (2.07) | 2.65 (2.57) | 1.11× (1.24×) | 2.38 / 2.77 |
+| 8 MiB | 2.96 (2.83) | 2.62 (2.59) | 0.89× (0.92×) | 3.01 / 2.82 |
+| 32 MiB | 3.40 (3.30) | 2.75 (2.63) | 0.81× (0.80×) | 3.40 / 2.94 |
+
+Cyclone reproduces the readahead section's numbers to within 0.12 GB/s at
+every size. Below the 256 KiB readahead threshold nothing changed: 64 KiB
+still reads at 0.04 GB/s, 40× behind LMDB. At 256 KiB, the smallest size
+that gets the hint, it is 1.9× behind. One Cyclone run had a runner job
+for most of it (`cyclone-cold-3`: 1 MiB read 1.21 there); the medians
+absorb it.
+
+### Churn (Linux, 2 MiB, C = 16 GiB, 4 GiB cgroup)
+
+The round-5 configuration through `run-churn.sh`
+(`--block-size 2097152 --max-warmup-seconds 1800`), 120 s measured, three
+runs per point. Cyclone ran with retention on (the default), in flush mode
+(`--wrap-retention off`), and with retention on plus `--reserve`, which
+generates each missed block straight into `WriteHandle::reserve()`. LMDB
+and file-per-block ran at both thread counts with the round-4 peer build
+and flags. Medians; latencies in µs. The `kv_churn_policy` replay is
+unchanged from round 5
+([`policy-replay.txt`](kv-cache-benchmark/round6/policy-replay.txt)).
+
+**`zipf`**
+
+| T | store | hit ratio (replay) | served GB/s | round 5 | hit p50 / p99 | miss+insert p50 / p99 | reopen |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 1 | cyclone, flush | 0.759 (0.761) | 1.61 | 0.98 | 197 / 6 283 | 1 416 / 25 385 | 0.734 |
+| 1 | **cyclone, retention** | **0.815 (0.815)** | **1.78** | 1.14 | 194 / 6 649 | 1 489 / 24 432 | 0.812 |
+| 1 | cyclone, retention, `--reserve` | 0.815 | 1.78 | — | 192 / 7 288 | 1 381 / 25 195 | 0.812 |
+| 1 | lmdb | 0.851 (LRU 0.850) | 1.46 | — | 182 / 9 143 | 1 660 / 15 648 | 0.846 |
+| 1 | filedir | 0.851 (LRU 0.850) | 1.41 | — | 232 / 19 041 | 1 462 / 6 375 | 0.848 |
+| 4 | cyclone, flush | 0.757 (0.761) | 1.73 | 1.87 / 1.96 | 347 / 19 607 | 5 755 / 77 126 | 0.756 |
+| 4 | **cyclone, retention** | **0.814 (0.815)** | **2.40** | 1.73 / 2.13 | 398 / 29 916 | 4 968 / 54 280 | 0.812 |
+| 4 | cyclone, retention, `--reserve` | 0.814 | 2.28 | — | 372 / 33 584 | 4 897 / 57 204 | 0.815 |
+| 4 | lmdb | 0.850 (LRU 0.850) | 1.94 | 1.51 / 1.44 | 370 / 66 996 | 5 694 / 57 906 | 0.851 |
+| 4 | filedir | 0.849 (LRU 0.850) | 2.16 | 1.57 | 480 / 38 447 | 2 399 / 8 787 | 0.850 |
+
+**`zipf+scan`**
+
+| T | store | hit ratio (replay) | served GB/s | round 5 | hit p50 / p99 | miss+insert p50 / p99 | reopen |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 1 | cyclone, flush | 0.643 (0.644) | 1.13 | 0.65 | 202 / 7 419 | 1 320 / 24 153 | 0.741 |
+| 1 | **cyclone, retention** | **0.686 (0.685)** | **1.24** | 0.75 | 202 / 9 352 | 1 366 / 25 059 | 0.764 |
+| 1 | cyclone, retention, `--reserve` | 0.686 | 1.17 | — | 200 / 11 202 | 1 279 / 27 235 | 0.762 |
+| 1 | lmdb | 0.727 (LRU 0.725) | 0.97 | — | 184 / 29 470 | 1 580 / 18 589 | 0.806 |
+| 1 | filedir | 0.727 (LRU 0.725) | 1.02 | — | 242 / 21 993 | 1 451 / 6 292 | 0.805 |
+| 4 | cyclone, flush | 0.642 (0.644) | 1.12 | 1.01 / 0.83 | 300 / 15 543 | 5 863 / 78 826 | 0.696 |
+| 4 | **cyclone, retention** | **0.685 (0.685)** | **1.45** | 1.01 / 1.22 | 332 / 22 949 | 5 529 / 64 083 | 0.756 |
+| 4 | cyclone, retention, `--reserve` | 0.686 | 1.38 | — | 306 / 25 193 | 5 677 / 68 087 | 0.760 |
+| 4 | lmdb | 0.726 (LRU 0.725) | 1.27 | 1.00 / 1.04 | 299 / 60 828 | 7 411 / 61 021 | 0.803 |
+| 4 | filedir | 0.725 (LRU 0.725) | 1.58 | 1.16 | 405 / 37 467 | 2 091 / 76 761 | 0.804 |
+
+The round-5 column is that round's served GB/s ("first / repeat" at T=4);
+round 5 ran no peers at T=1. Per-run values are in
+[`round6-churn-summary.txt`](kv-cache-benchmark/round6/round6-churn-summary.txt).
+No run failed the content check or reported a read error. Peak cgroup
+memory was 4.00 GiB in every run. Cyclone dropped 0–7 inserts per run to a
+live lease, all at T=4, and evicted at most 23 entries per run on a tag
+collision. Write amplification was 1.003–1.010 in runs with no runner job
+(the device counter covers the whole partition, so runs a job wrote into
+read up to 1.11).
+
+What moved against round 5:
+
+- **Hit ratios are unchanged**: retention 0.814–0.815 (`zipf`) and
+  0.685–0.686 (`zipf+scan`), within 0.001 of the replay; flush
+  0.757–0.759 and 0.642–0.643, within 0.004. The gap to the LRU peers is
+  still 3.6 and 4.1 points with retention, and 9.2 and 8.4 points in
+  flush mode.
+- **One thread: Cyclone now serves the most.** With retention it serves
+  1.78 and 1.24 GB/s: 1.22× and 1.28× LMDB, and 1.26× and 1.22×
+  file-per-block. Round 5 had it at 0.7–0.8× of round 4's LMDB. The
+  insert-path fix did this (miss+insert p50 4.3 → 1.49 ms). Hit p50 is
+  unchanged at 194–202 µs.
+- **Four threads: served is up 13–44 % on round 5** (2.40 against
+  1.73 / 2.13 on `zipf`, 1.45 against 1.01 / 1.22 on `zipf+scan`), and the
+  peers rose as well (LMDB 1.94 against 1.44–1.51). Cyclone's hit p99 did
+  not move (29.9 ms against 24.9–31.3); LMDB's fell (67 against 86–92).
+- **`--reserve` buys nothing measurable under churn.** Insert p50 is 6–7 %
+  lower at T=1 (1 381 against 1 489 µs, 1 279 against 1 366). Served is
+  the same at T=1 on `zipf` and 5–6 % lower in the other three cells
+  (2.28 against 2.40, 1.38 against 1.45, 1.17 against 1.24), inside the
+  run-to-run spread. Hit p99 is 10–20 % higher in all four cells. The copy
+  it saves (about 0.1 ms per 2 MiB insert) is small next to the
+  page-cache work of the insert.
+
+### Verdict against the decision criteria
+
+The criteria are from [`kv-churn-spec.md`](kv-cache-benchmark/kv-churn-spec.md),
+quoted verbatim: *"Cyclone counts as "significantly better than LMDB" for
+this use only if, on Linux at 2 MiB with the 4 GiB cgroup, for BOTH patterns
+at T=4: served GB/s ≥ 1.5× LMDB's, OR hit-get p99 ≤ 0.5× LMDB's at no worse
+than 0.9× the served GB/s. A win at T=1 only, or on one pattern only, is
+reported as "partial"."*
+
+Ratios are Cyclone's median over the same-day LMDB median. Clause A is
+served ≥ 1.5×. Clause B is hit p99 ≤ 0.5× with served ≥ 0.9×. The range in
+brackets pairs every Cyclone run with every clean LMDB run.
+
+| mode | pattern | T | served | hit p99 | clause A | clause B |
+|---|---|---:|---:|---:|---|---|
+| retention (default) | `zipf` | 4 | 1.24× [1.12–1.70] | 0.45× [0.34–0.52] | no | **yes** |
+| retention (default) | `zipf+scan` | 4 | 1.14× [1.11–1.19] | 0.38× [0.32–0.41] | no | **yes** |
+| retention (default) | `zipf` | 1 | 1.22× | 0.73× | no | no |
+| retention (default) | `zipf+scan` | 1 | 1.28× | 0.32× | no | yes |
+| flush | `zipf` | 4 | 0.89× [0.82–1.46] | 0.29× | no | no (served < 0.9×) |
+| flush | `zipf+scan` | 4 | 0.88× [0.85–0.93] | 0.26× | no | no (served < 0.9×) |
+| flush | `zipf` | 1 | 1.10× | 0.69× | no | no |
+| flush | `zipf+scan` | 1 | 1.16× | 0.25× | no | yes |
+| retention + `--reserve` | `zipf` | 4 | 1.18× | 0.50× (0.501) | no | no (p99 > 0.5×) |
+| retention + `--reserve` | `zipf+scan` | 4 | 1.09× | 0.41× | no | yes |
+
+- **Retention, the default: WIN**, through clause B on both patterns at
+  T=4 (hit p99 0.45× and 0.38× of LMDB's at 1.24× and 1.14× its served
+  GB/s). The `zipf` margin is thin: 0.45× against the 0.5× bar, and the
+  worst run pairing is 0.52×, which would fail. In round 5 the same cell
+  was 0.27–0.37×. Cyclone's tail did not move; LMDB's got shorter. Clause
+  A (≥ 1.5×) is not met on the median of either pattern.
+- **Flush mode: PARTIAL.** At T=4 it fails the served floor on both
+  patterns (0.89× and 0.88×, against 0.9×), although its hit p99 is the
+  lowest of any store (0.26–0.29× LMDB's). It meets clause B only on
+  `zipf+scan` at T=1. Round 5 had flush mode passing `zipf` at T=4 (1.24×
+  / 1.36×). Cyclone's flush runs today served 2.21 / 1.63 / 1.73 GB/s
+  (round 5: 1.87 / 1.96), and LMDB is faster today, so this is the
+  day-to-day spread moving a cell that sits on the 0.9× line; no
+  flush-mode cost was measured.
+- **Retention with `--reserve`: PARTIAL.** `zipf` at T=4 misses clause B
+  by 0.001 (hit p99 33.6 against 67.0 ms). This row is not the product
+  default, but it is the path a producer that fills `reserve()` takes.
+
+Hit ratios, as the spec requires, separately: Cyclone with retention is
+3.6 points below LMDB's LRU on `zipf` and 4.1 on `zipf+scan`. That is
+FIFO against LRU (the replay's FIFO-per-stripe gives 0.817 and 0.687),
+and it is a real cost. Every served-GB/s ratio above already pays it. What
+each store needed is unchanged from
+[round 4](#what-each-store-needed): LMDB needs an application LRU, a
+volatile index rebuilt on open, a map size chosen up front and
+`MDB_NOSYNC`; file-per-block needs the same LRU and a rename protocol;
+Cyclone needs nothing on top, and gives up hit ratio.
+
+### The one-thread insert tail (24 ms p99)
+
+At one thread Cyclone's miss+insert p99 is 24.4 ms, against 6.4 ms for
+file-per-block and 15.6 ms for LMDB, while its p50 is level with both.
+The insert-path section left this open. Two measurements explain it.
+
+**The sampler rules out dirty throttling and reclaim stalls.** In every
+one-thread `zipf` run the cgroup held 250–405 MiB of dirty page cache on
+average, peaking at 463–596 MiB for all three stores, with
+under 10 MiB under writeback
+([`round6-samples-summary.txt`](kv-cache-benchmark/round6/round6-samples-summary.txt)).
+Cyclone dirties more per second than the peers (300–460 MB/s against
+210–250) because it inserts more; its dirty levels are no higher. No
+`balance_dirty_pages` call in the trace below slept.
+
+**A trace finds the stall.** [`diag.sh`](kv-cache-benchmark/round6/diag.sh)
+re-ran the one-thread `zipf` point for each store and, 10 s into the
+measured phase, recorded 60 s of `sched:sched_switch` with kernel call
+chains for the benchmark's threads, plus `writeback:balance_dirty_pages`
+and every device read. [`offcpu.py`](kv-cache-benchmark/round6/offcpu.py)
+turns that into off-CPU intervals by blocking stack. Tracing costs the
+Cyclone runs 4–7 % of their served GB/s; the traced runs are used for
+this section only. Their summaries are the
+`round6-diag/round6-offcpu-*.txt` files. A runner job started during the
+first traced Cyclone (both modes) and file-per-block runs; they were
+repeated (`-2`, used below). The file-per-block repeat saw a job start
+too, but its trace window shows no I/O from it.
+
+| 60 s traced, T=1 `zipf` | Cyclone, retention | Cyclone, flush | filedir | LMDB |
+|---|---:|---:|---:|---:|
+| inserts in the 120 s run | 19 595 | 25 011 | 15 995 | 13 814 |
+| miss+insert p99 / p99.9 in that run, ms | 26.7 / 59.3 | 27.7 / 60.4 | 6.3 / 6.9 | 13.3 / 37.5 |
+| synchronous 4 KiB reads inside `pwrite` (`ext4_block_write_begin`) | **6 417** | **10 269** | 0 | 0 |
+| … waits over 10 ms / over 20 ms / longest | 126 / 71 / 56 ms | 225 / 101 / 48 ms | — | — |
+| `balance_dirty_pages` calls that slept | 0 | 0 | 0 | 0 |
+| waits on page writeback | 0 | 0 | 0 | 0 |
+| longest stop in memcg reclaim inside a write (the page-cache charge) | ≤ 0.1 ms | ≤ 0.1 ms | ≤ 0.1 ms | ≤ 0.1 ms |
+
+Every slow Cyclone insert blocks in the same place:
+`pwrite → ext4_buffered_write_iter → ext4_da_write_begin →
+ext4_block_write_begin → __wait_on_buffer`. The kernel is reading a 4 KiB
+block from the device before it lets the write change part of it. Cyclone
+places documents at 8-byte-aligned offsets. A 2 MiB document with its
+~200-byte header therefore starts and ends in the middle of a page, and
+shares its first and last pages with the neighbouring bytes. When a
+shared page is not in the page cache, ext4 has to read it first, and it
+does so synchronously inside the `pwrite`. The first page's neighbour is
+the previous document in the same stripe, written moments earlier and
+normally still cached. The last page's neighbour is data from the
+previous lap, which usually is not. That gives at most one such read per
+insert: 0.65 per insert measured with retention, 0.82 in flush mode.
+(That it is the last page is inferred from this layout; the trace
+records sectors, not document offsets.)
+
+The read is 4 KiB, but it queues on the NVMe behind the thread's own
+readahead (about 4 000 hint-issued reads per second of up to 64 KiB) and
+behind writeback. About 1.3 % of inserts waited over 10 ms for it and
+0.7 % over 20 ms, which is where the 24–28 ms p99 sits. Device-side
+latency was not traced (no `block_rq_complete`), so the split between
+queueing and service time is not measured.
+
+The peers never pay it. File-per-block writes every block into a fresh
+file, so there is no old data under a partial page. LMDB writes whole
+pages. Both show 0 such reads. Their own tails come from the read side:
+file-per-block's hit p99 (19 ms) is `preadv` waiting for reads, and
+LMDB's is page faults on its map.
+
+Why the p99 rose with the insert-path fix (18.9 → 24.4 ms): the same
+partial pages are written before and after that change, so the number of
+reads per insert should not have changed. What changed is that Cyclone
+now inserts and serves about 47 % more bytes per second, which keeps more
+reads and writeback queued at the device for the synchronous read to wait
+behind. This is inferred; the pre-fix tree was not traced.
+
+Not tried here, because this round changes no code: aligning document
+starts to 4 KiB, which is an on-disk format change costing up to 4 KiB
+of padding per document (0.2 % at 2 MiB); or reading the boundary page
+ahead of the `pwrite`, for example with a hint when the slot is
+allocated. Padding the final write out to the page end is not an option
+with retention on: those bytes can belong to a previous-lap document
+that is still readable.
+
+### Regressions and losses since round 5
+
+- **No kv_bench cell regressed.** Nothing fell more than 6 % against
+  round 5, and every cell that moved more than 10 % moved up.
+- **The latency margin on `zipf` at T=4 shrank from 0.27–0.37× to 0.45×**
+  (worst run pairing 0.52×). This is LMDB's tail falling on the day,
+  not Cyclone's rising, but the verdict on that pattern now rests on a
+  thin margin.
+- **Flush mode dropped from "passes `zipf` at T=4" to "partial"**,
+  because its served ratio sits on the 0.9× floor (0.88–0.89× today).
+- **Large-block puts are behind file-per-block:** 8 MiB at 1.27 against
+  1.43 GB/s (0.89×), and 32 MiB at 0.88 against 1.41 (0.62×; p50 28 against
+  18 ms). Both are faster than in round 5 (1.01 and 0.48), and 2 MiB is
+  level (1.47 against 1.52), but the insert-path section measured only
+  2 MiB. Not profiled. `kv_bench` does not use `reserve()`, so each put
+  still copies the value into the handle buffer once.
+- **`--reserve` raises the T=4 hit tail by 10–20 %** and misses the
+  latency clause on `zipf` by 0.001. It is an opt-in path.
+- **Unchanged losses:** a hit ratio 3.6–4.1 points below an LRU, cold
+  reads 1.3–1.9× behind LMDB from 256 KiB to 1 MiB, and 40× behind at
+  64 KiB.
+
 ## Device transfer: does zero-copy pay off? (Metal, Apple silicon)
 
 The open question from rounds 1 and 2 is whether the zero-copy read pays
@@ -1893,14 +2241,16 @@ through nvcc in `kv_gpu_cuda.cu`, behind the plain-C seam in
 |---|---|---|
 | Readahead for large cold reads: a per-document hint, with a per-platform call | **Done** | [Round 3](#readahead-alone); mechanism in [architecture.md](architecture.md#memory-mapped-io) |
 | Readahead for medium cold reads: the Linux hint in 64 KiB chunks over a document's first 4 MiB, and no hint on a resident document | **Done** (#18) | [Readahead chunking](#readahead-chunking-issue-18): cold 512 KiB 0.81 → 1.70 GB/s, 1.39× behind a same-day LMDB; warm 512 KiB `view` +7 % |
-| Readahead below the 256 KiB threshold: a warm path cheap enough to lower it | Open; 64 KiB reads cold at 0.04 GB/s against LMDB's 1.56. A 64 KiB threshold lifts that to 0.24 but costs warm `view` 8–18 % | [Readahead chunking](#what-is-left-of-the-gap) |
+| Readahead below the 256 KiB threshold: a warm path cheap enough to lower it | Open (#29); 64 KiB reads cold at 0.04 GB/s against LMDB's 1.61 (round 6), and 256 KiB at 1.12 against 2.11. A 64 KiB threshold lifts 64 KiB to 0.24 but costs warm `view` 8–18 % | [Readahead chunking](#what-is-left-of-the-gap), [round 6](#cold-reads-from-64-kib-to-32-mib-issue-29-baseline) |
 | Fast document checksum: slice-by-16 / ARMv8 CRC32, then CRC-32C at format v8 | **Done** | [Round 3](#fast-crc32-alone), [Round 3b](#round-3b-crc-32c-on-disk-format-v8); [architecture.md](architecture.md#document-format) |
 | Verified state that outlives the process: keep the CRC-validation cache beside the mmap directory, so a restart and every peer process skip re-verification | Designed, then shelved ([design](design/verified-state.md)); the 512 KiB gap was tracked as a readahead item (#18, since [fixed](#readahead-chunking-issue-18)). Measured there: about half of a warm-page-cache first read (view) is the CRC pass, but only 2–9 % of a cold NVMe read. The 512 KiB cold gap to LMDB is the I/O pattern, not the CRC | [Design, section 2](design/verified-state.md#2-what-is-avoidable-measurement) |
 | `WriteHandle::reserve(n)` that returns the destination span, so the caller writes or DMAs straight into the record (three copies become one) | **Done** (#16), with the destination being the handle's buffer: a slot exists only at commit, under the write lock held across the fill. The larger win was dropping the contiguous-document build; puts went from 0.62 to 1.52 GB/s at 2 MiB, 4 % ahead of a same-day file-per-block, and `reserve()` takes a 2 MiB insert from 490 to 410 µs p50 | [Insert path](#insert-path-profile-issue-16) |
 | An entry point that gives an embedder the mapping identity for one-time GPU registration, instead of inferring it from `content()` / `content_file_offset()` / `volume_files()` | Open | [Metal](#device-transfer-does-zero-copy-pay-off-metal-apple-silicon), [CUDA](#device-transfer-cuda-gtx-1050-pcie) |
 | A zero-copy C read entry point and a Python binding, which is what a vLLM/SGLang connector would call | Open | — |
-| Keep the previous lap resolvable until it is actually overwritten ([design](design/wrap-retention.md)) | **Done**: implemented and on by default (`wrap_retention = false` is the flush opt-out); see [CHANGELOG](../CHANGELOG.md). Measured: at 16 GiB it meets the churn decision criteria (latency clause, both patterns, T=4); flush mode stays partial | [Round 5](#round-5-re-benchmark-at-main-2aed24c): hit ratio 0.758 → 0.814 (`zipf`) and 0.640 → 0.686 (`zipf+scan`), matching the replay within 0.002; served +16 % at T=1, within noise at T=4; hit p99 0.27–0.37× LMDB's; the round-5 cold sweep ran with it off (then the default) and was unchanged |
-| Profile insert latency (miss+insert p50 4.0 ms vs 1.4–1.6 ms for the peers) | **Done** (#16): two fresh 2 MiB heap buffers per put and their ~1,000 page faults were most of it. Removed; T=1 miss+insert p50 4.41 → 1.49 ms (file-per-block 1.43, same day). Still open: the T=1 insert p99 (24 ms against 6 for file-per-block) | [Insert path](#insert-path-profile-issue-16) |
+| Keep the previous lap resolvable until it is actually overwritten ([design](design/wrap-retention.md)) | **Done**: implemented and on by default (`wrap_retention = false` is the flush opt-out); see [CHANGELOG](../CHANGELOG.md). Measured: at 16 GiB it meets the churn decision criteria (latency clause, both patterns, T=4), in rounds 5 and 6; flush mode stays partial | [Round 5](#round-5-re-benchmark-at-main-2aed24c): hit ratio 0.758 → 0.814 (`zipf`) and 0.640 → 0.686 (`zipf+scan`), matching the replay within 0.002; served +16 % at T=1, within noise at T=4; hit p99 0.27–0.37× LMDB's. [Round 6](#round-6-re-benchmark-at-main-b5c31e8), with it on by default: hit p99 0.45× (`zipf`, worst run pairing 0.52×) and 0.38× LMDB's at 1.24× and 1.14× its served GB/s |
+| Profile insert latency (miss+insert p50 4.0 ms vs 1.4–1.6 ms for the peers) | **Done** (#16): two fresh 2 MiB heap buffers per put and their ~1,000 page faults were most of it. Removed; T=1 miss+insert p50 4.41 → 1.49 ms (file-per-block 1.43, same day) | [Insert path](#insert-path-profile-issue-16) |
+| The one-thread insert tail (miss+insert p99 24 ms against 6 for file-per-block and 16 for LMDB) | Explained, open. A document ends partway through a page that holds older data; when that page is not cached, ext4 reads 4 KiB synchronously inside the `pwrite`, and about 1 % of inserts wait 10–56 ms for it behind the device's other I/O. Candidates: 4 KiB-aligned document starts (a format change), or reading the boundary page ahead of the write | [Round 6](#the-one-thread-insert-tail-24-ms-p99) |
+| Large-block puts: 8 MiB and 32 MiB behind file-per-block (1.27 against 1.43, 0.88 against 1.41 GB/s) | Open; not profiled. Faster than round 5 at both sizes (1.01, 0.48) | [Round 6](#regressions-and-losses-since-round-5) |
 | Scan resistance or admission control on the disk tier | Open | [Round 4](#why-the-hit-ratio-and-where-it-comes-from): a scan costs every store about 12 points |
 
 GPUDirect Storage (`cuFileRead` at `content_file_offset()`, NVMe to GPU with
@@ -1939,6 +2289,10 @@ retraction is the honest fix:
 | Multi-process readers scale worse than threads | Rounds 1 and 2 | Round 3: 621 k gets/s on Linux, 1.67 M on macOS |
 | Writes at a third of file-per-block | Rounds 1 and 2 | Round 3b: 1.4× behind (1.01 vs 1.44 GB/s) |
 | The remaining cold-read gap to LMDB is the x86 CRC32 | Round 3 | Round 3b: level with LMDB at 2 MiB |
+| Writes about 1 GB/s, 1.4× behind file-per-block | Rounds 3b and 5 | Insert path, round 6: level at 2 MiB (1.47 vs 1.52), ahead at 512 KiB; behind at 8 and 32 MiB |
+| Single-thread churn serves 0.7–0.8× LMDB | Round 5 | Round 6: 1.22–1.28× a same-day LMDB |
+| Churn hit p99 0.27–0.37× LMDB's (retention, T=4) | Round 5 | Round 6: 0.38–0.45× against a same-day LMDB whose tail was shorter |
+| Flush mode passes on `zipf` at T=4 | Round 5 | Round 6: 0.89× served, under the 0.9× floor |
 
 Earlier drafts quoted the readahead-alone result as 0.449 GB/s and as
 0.140 → 0.427 GB/s. The median-of-three table in
@@ -2021,6 +2375,24 @@ Round 5:
 - The macOS runs shared the machine with a VM and other sessions on a 97 %
   full disk. Only their warm-path and hit-ratio numbers are comparable with
   earlier rounds.
+
+Round 6:
+
+- Three interleaved runs per point, medians. Every point waited for no
+  runner job and a 1-minute load below 1.0, but a job can start mid-run:
+  it did in 8 of 60 churn points (re-run, and left out of the churn
+  medians) and in 4 of 21 sweep points (kept; the medians absorb them).
+  The sampler detects a job's worker process, not its I/O.
+- T=4 served still varies by up to 36 % (fastest over slowest) between
+  runs of one point on the same day (Cyclone flush `zipf`: 1.63–2.21 GB/s;
+  LMDB `zipf`: 1.51–2.00). The retention verdict on `zipf` rests on a hit-p99 ratio of
+  0.45× whose worst run pairing is 0.52×; flush mode's T=4 served ratios
+  sit at 0.88–0.89× against a 0.9× floor.
+- The insert-tail trace is of separate traced runs (4–7 % slower), one
+  per store. It identifies where the thread blocks, not the device-side
+  latency of the blocking read. Which page of a document is read is
+  inferred from the layout.
+- Linux only; the macOS numbers were not re-run.
 
 ## Appendix A — macOS generated tables
 

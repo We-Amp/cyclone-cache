@@ -1,0 +1,2 @@
+[ perf record: Woken up 252 times to write data ]
+[ perf record: Captured and wrote 65,005 MB ~/round6/out/diag/perf-filedir.data (213388 samples) ]
