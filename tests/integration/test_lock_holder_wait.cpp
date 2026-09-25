@@ -378,7 +378,9 @@ constexpr auto kRelayHold = 10ms;
 // Slack over the cap for a loaded CI runner.
 constexpr auto kCapMargin = 750ms;
 // The waiter may still catch one of the relay's release-to-re-acquire gaps
-// (its brief spin after each sleep) and take the lock fairly; each attempt
+// (if one lands in its brief spin after a sleep) and take the lock fairly
+// -- rarely, now that the relay's releases are not timer-aligned with the
+// waiter's wakes (see Relay; issue #34); each attempt
 // must then have ended without a takeover, inside the bound.  Up to this
 // many attempts are made to observe the give-up itself (a slow runner may
 // catch several gaps in a row).
@@ -412,10 +414,22 @@ class Relay {
       // instead of hanging the test.
       const auto end = Clock::now() + 10s;
       while (!_stop.load() && Clock::now() < end) {
-        std::this_thread::sleep_for(kRelayHold);
+        // Hold by spinning on the clock, not by sleeping (issue #34).  A
+        // sleeping relay wakes on a timer, and an OS that services every
+        // due timer at the next timer interrupt (Windows, whose waiter's
+        // high-resolution backoff timer raises one) wakes it together with
+        // the waiter: it then released just as the waiter spun after its
+        // own wake, and the waiter caught a gap on every attempt.  Spinning,
+        // the release lands at a moment unrelated to the waiter's wakes.
+        const auto hold_until = Clock::now() + kRelayHold;
+        while (Clock::now() < hold_until && !_stop.load()) {
+          wait_detail::cpu_pause();
+        }
         if (!check(token)) {
           _lost.fetch_add(1);  // Taken from a live holder
         }
+        // Release and re-acquire back to back -- nothing in between, no
+        // sleep or yield -- so the lock is free for nanoseconds.
         give(token);
         token = take();
         _holds.fetch_add(1);
