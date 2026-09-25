@@ -315,8 +315,13 @@ The read hot path is lock-free (the read-path scaling series). Before refactorin
    are token-checked (`release_writer` CASes its own odd value to even), so
    a force-released holder's late release is a no-op. Applies to BOTH
    `Directory` and `MmapDirectory` (`src/core/directory.hpp`,
-   `src/core/mmap_directory.hpp`).
-   Guard: `tests/integration/test_seqlock_read_wait.cpp`.
+   `src/core/mmap_directory.hpp`). A writer waiting on a cross-process
+   bucket, phase lock or write lock waits by TIME per holder
+   (`LockHolderWait`: 250 ms bucket, 1 s phase lock, write lock only on a
+   proven-dead holder or after 5 s), never by a spin count, and every
+   release is a CAS on the holder's own token.
+   Guard: `tests/integration/test_seqlock_read_wait.cpp`,
+   `tests/integration/test_lock_holder_wait.cpp`.
 5. **HitTracker is a leaf lock** — never hold a stripe lock across
    `record_hit()` (the old AB/BA deadlock). 4096 stripes; key-striped so the
    pending bound stays exact.

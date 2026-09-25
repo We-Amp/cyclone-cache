@@ -215,6 +215,24 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Multi-process writers no longer take a cross-process lock from a peer that
+  is alive but descheduled (issue #27). The phase lock used to presume its
+  holder dead after about 33 µs of spinning (Apple M), and a directory
+  bucket after about 0.9 ms. Both are below a scheduler quantum. A waiter
+  now waits by time, with sleeping backoff, and recovers a lock only when
+  one holder kept it for the whole budget: 1 s for the phase lock, 250 ms
+  for a bucket. A new holder restarts the budget. The write lock also waits
+  by time: it waits on a live holder, as before, and takes one over only
+  after 5 s (previously 4096 liveness checks). Releases are CASes on the
+  holder's own token, so a recovered holder that resumes cannot free the
+  next holder's lock. The phase lock's token comes from a takeover
+  generation stored in the directory header bytes 34-35, which format
+  version 2 no longer used. The format version is unchanged, and an older
+  build of the same format still excludes a new one on both locks.
+- On Windows, the sleeps of the seqlock read wait and the lock waits use a
+  high-resolution waitable timer. At the default 15.6 ms timer resolution,
+  the first 10 µs sleep used to take about 15.6 ms, past the 5 ms read
+  budget. The process-wide timer resolution is left unchanged.
 - The per-process CRC-validation cache identified an already-verified
   document by its offset and the top 16 bits of its CRC. A later document at
   the same offset (rewritten after a wrap, torn by a usurped writer's late

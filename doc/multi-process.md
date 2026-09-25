@@ -148,6 +148,37 @@ if (!result && result.error() == CacheError::NotOwned) {
 }
 ```
 
+### Cross-Process Writer Locks
+
+Normally one process owns a stripe. During a graceful reload (nginx, Apache)
+or an overlapped recycle (IIS), an old and a new process can both own it, so
+writers in two processes contend on the stripe's shared locks: the write
+lock (write-cursor reservation), the phase lock (an insert's phase read and
+entry store against a phase toggle) and each directory bucket's seqlock.
+
+A waiter spins for about 20 µs, then sleeps with backoff (10 µs doubling to
+1 ms), spinning briefly after each wake. It treats a holder as stuck only
+when that same holder kept the lock for the whole budget. A new holder
+restarts the budget.
+
+| Lock | Budget | After the budget |
+|------|--------|------------------|
+| Bucket seqlock | 250 ms | The waiter forces the bucket to even. |
+| Phase lock | 1 s | The waiter recovers the lock. |
+| Write lock | 5 s | The waiter recovers the lock at once if `kill(pid, 0)` / `OpenProcess` proves the holder dead. It takes over a holder it cannot prove dead only after the budget. |
+
+The budgets are far above the longest live hold measured with 4.8 runnable
+threads per core (56 ms for a bucket, 112 ms for the phase lock). A holder
+that is only descheduled is therefore waited out. A larger budget only
+lengthens the one-time stall after a process died holding a lock.
+
+Every release is a CAS on the holder's own token. A holder that was
+recovered from under it and resumes later cannot free the next holder's
+lock. A usurped bucket or phase-lock holder can at worst publish a torn or
+stale directory entry. Full-key verification, the positional guard and the
+CRC turn that into a miss. The write lock guards overlapping writes, which
+readers cannot detect, so it never presumes a live holder stuck.
+
 ### Read Operations
 
 All processes can read from all stripes. Reads from non-owned stripes:

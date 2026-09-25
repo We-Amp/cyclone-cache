@@ -1254,6 +1254,28 @@ class Volume : public std::enable_shared_from_this<Volume> {
     }
     return 0;
   }
+  // Park a live holder inside `key`'s stripe's cross-process phase lock, as
+  // an insert does: the stripe mutex, then the phase lock (mmap directory
+  // only).  Held until end_phase_lock_for_test(key, token) on the SAME
+  // thread; a writer in another Volume on the same file then waits on it
+  // (issue #27).
+  [[nodiscard]] uint8_t begin_phase_lock_for_test(const CacheKey &key) {
+    Stripe *stripe = select_stripe(key);
+    stripe->mutex.lock();
+    return stripe->mmap_directory->acquire_phase_lock_for_test();
+  }
+  void end_phase_lock_for_test(const CacheKey &key, uint8_t token) {
+    Stripe *stripe = select_stripe(key);
+    stripe->mmap_directory->release_phase_lock_for_test(token);
+    stripe->mutex.unlock();
+  }
+  // `key`'s stripe's mmap directory (nullptr without one).
+  [[nodiscard]] MmapDirectory *mmap_directory_for_test(const CacheKey &key) {
+    Stripe *stripe = select_stripe(key);
+    return stripe->use_mmap_directory && stripe->mmap_directory
+               ? &*stripe->mmap_directory
+               : nullptr;
+  }
 #endif
 
   Volume(const Volume &) = delete;
@@ -1582,9 +1604,10 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // same stripe, and the cross-process write lock is released before the
   // directory insert.  So a bucket that stayed odd for the whole wait budget
   // belongs to a peer that is stuck -- dead mid-update, or alive but
-  // descheduled.  Either way, release it the way an insert would
-  // (touch_bucket runs acquire_writer's presumed-stuck recovery; a live
-  // usurped holder's token-checked release then becomes a no-op), then
+  // descheduled.  Either way, go through the bucket the way an insert would
+  // (touch_bucket runs acquire_writer, which waits the holder out and
+  // recovers the bucket only from one that kept it for kBucketWriterBudget;
+  // a usurped holder's token-checked release then becomes a no-op), then
   // `reset` the callback's accumulated state and probe once more.  Returns
   // whether a probe completed; false means the caller must report Busy.
   // Each exhausted probe is counted in directory_read_timeouts.
