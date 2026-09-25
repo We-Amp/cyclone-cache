@@ -333,11 +333,13 @@ class SeqlockReadWait {
 // (issue #27): the mmap directory's phase lock and per-bucket writer
 // seqlock, and, between liveness probes, its write lock.
 //
-// The waiter sees the holder only as a value in shared memory: an odd bucket
-// version, or a lock token.  Such a lock used to be taken over after a fixed
-// spin COUNT -- about 33 us for the phase lock on Apple M -- far below a
-// scheduler quantum, so a holder that was merely descheduled was routinely
-// treated as dead.  This bounds the wait by TIME instead, per holder:
+// The waiter sees the holder only as a value in shared memory that changes
+// with every acquisition: an odd bucket version, or a lock token plus the
+// lock's acquisition generation.  Such a lock used to be taken over after a
+// fixed spin COUNT -- about 33 us for the phase lock on Apple M -- far below
+// a scheduler quantum, so a holder that was merely descheduled was
+// routinely treated as dead.  This bounds the wait by TIME instead, per
+// holder:
 //   1. Spin for kSpinFor, re-attempting between pause hints (the clock is
 //      read once every kPollsPerClockRead polls).  A running holder's
 //      critical section is well under a microsecond to a few microseconds.
@@ -347,14 +349,17 @@ class SeqlockReadWait {
 //      than sampled once per sleep.  Sleeping, not spinning: a descheduled
 //      holder waits on a runqueue this thread's spinning cannot help, and
 //      the waiter's CPU belongs to other work.
-//   3. Only when the SAME holder has held the lock for the whole budget does
-//      wait() report kExpired; the caller may then recover the lock from
-//      exactly that holder value (a CAS), or, for the write lock, first
-//      consult its liveness proof.
-// A different holder value restarts all three phases: the budget measures
-// how long ONE holder has held the lock, not how long this waiter has been
-// queued, so a waiter that sat through several short holders never
-// presumes the latest one stuck.
+//   3. Once the SAME holder has held the lock for the whole budget, poll
+//      continuously for kConfirmFor (a holder change or a free lock, which
+//      the caller reports with restart(), still restarts everything).  Only
+//      then does wait() report kExpired; the caller may recover the lock
+//      from exactly that holder value (a CAS), or, for the write lock, first
+//      consult its liveness proof.  A dead holder pays the confirmation
+//      once.
+// A different holder value, or a lock seen free, restarts all phases: the
+// budget measures how long ONE holder has held the lock, not how long this
+// waiter has been queued, so a waiter that sat through several short
+// holders never presumes the latest one stuck.
 class LockHolderWait {
  public:
   enum class Step : uint8_t {
@@ -364,6 +369,7 @@ class LockHolderWait {
   };
   static constexpr std::chrono::microseconds kSpinFor{20};
   static constexpr std::chrono::microseconds kWakeSpinFor{5};
+  static constexpr std::chrono::microseconds kConfirmFor{2000};
   static constexpr uint32_t kPollsPerClockRead = 64;
 
   explicit LockHolderWait(std::chrono::steady_clock::duration budget)
@@ -381,6 +387,16 @@ class LockHolderWait {
     return new_holder(holder);
   }
 
+  // The lock was seen free (the caller then lost the race for it): whoever
+  // holds it next is a new holder.
+  void restart() { _started = false; }
+
+  // How long the current holder has been observed holding the lock.
+  [[nodiscard]] std::chrono::steady_clock::duration held() const {
+    return _started ? std::chrono::steady_clock::now() - _first_seen
+                    : std::chrono::steady_clock::duration::zero();
+  }
+
   // Sleeps taken so far, across holders (telemetry).
   [[nodiscard]] uint32_t sleeps() const { return _sleeps; }
 
@@ -388,8 +404,10 @@ class LockHolderWait {
   CYCLONE_SEQLOCK_COLD Step new_holder(uint64_t holder) {
     const auto now = std::chrono::steady_clock::now();
     _started = true;
+    _confirming = false;
     _holder = holder;
     _polls = 0;
+    _first_seen = now;
     _deadline = now + _budget;
     _spin_until = now + kSpinFor;
     _backoff.reset();
@@ -404,6 +422,13 @@ class LockHolderWait {
       return Step::kSpun;
     }
     if (now >= _deadline) {
+      if (!_confirming) {
+        // Budget spent: confirm by polling without a break.
+        _confirming = true;
+        _spin_until = now + kConfirmFor;
+        wait_detail::cpu_pause();
+        return Step::kSpun;
+      }
       return Step::kExpired;
     }
     _backoff.sleep(now, _deadline);
@@ -414,9 +439,11 @@ class LockHolderWait {
 
   std::chrono::steady_clock::duration _budget;
   bool _started = false;
+  bool _confirming = false;
   uint64_t _holder = 0;
   uint32_t _polls = 0;
   uint32_t _sleeps = 0;
+  std::chrono::steady_clock::time_point _first_seen{};
   std::chrono::steady_clock::time_point _deadline{};
   std::chrono::steady_clock::time_point _spin_until{};
   wait_detail::SleepBackoff<10, 1000> _backoff;

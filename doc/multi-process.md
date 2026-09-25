@@ -66,6 +66,11 @@ config.set_multi_process_config(mp_config);
 - **Checksums must be enabled** (`enable_checksum = true`, the default)
 - **Valid process index**: `process_index < total_processes`
 - **All processes must use the same** `total_processes` value
+- **All processes must share one host and one PID namespace.** A writer
+  recovers the write lock from a holder whose PID the OS reports gone
+  (`kill(pid, 0)` / `OpenProcess`). A live holder in another PID namespace,
+  such as another container sharing the volume, looks gone, and taking the
+  lock from it can overlap two writes.
 
 ## Architecture
 
@@ -160,19 +165,38 @@ entry store against a phase toggle) and each directory bucket's seqlock.
 
 A waiter spins for about 20 µs, then sleeps with backoff (10 µs doubling to
 1 ms), spinning briefly after each wake. It treats a holder as stuck only
-when that same holder kept the lock for the whole budget. A new holder
-restarts the budget.
+when that same holder kept the lock for the whole budget and then for a
+further 2 ms of continuous polling. A new holder, or the lock seen free,
+restarts the budget. Each bucket acquisition takes a new version. Each
+phase-lock and write-lock acquisition bumps that lock's generation counter.
+So a peer that releases and re-acquires at once still counts as a new
+holder.
 
 | Lock | Budget | After the budget |
 |------|--------|------------------|
 | Bucket seqlock | 250 ms | The waiter forces the bucket to even. |
 | Phase lock | 1 s | The waiter recovers the lock. |
-| Write lock | 5 s | The waiter recovers the lock at once if `kill(pid, 0)` / `OpenProcess` proves the holder dead. It takes over a holder it cannot prove dead only after the budget. |
+| Write lock | 5 s | Once one holder has kept the lock for 50 ms, the waiter checks after every sleep whether `kill(pid, 0)` / `OpenProcess` proves it dead, and recovers the lock if so. It takes over a holder it cannot prove dead only after the budget. |
 
 The budgets are far above the longest live hold measured with 5.2 runnable
 threads per core (56 ms for a bucket, 112 ms for the phase lock). A holder
 that is only descheduled is therefore waited out. A larger budget only
 lengthens the one-time stall after a process died holding a lock.
+
+These waits run on the writer side only: the stripe mutex is held, and a
+phase-lock wait can also run inside a wrap while the write lock is held.
+They are still reachable inline from a request thread. For example, the
+PageSpeed nginx module writes an alternate through `write_sync` /
+`close_sync` on its event loop, and the C API's miss-handler write-back
+also writes. After a peer crashes holding a lock, one write can stall for up
+to about 1.25 s (a bucket wait nested in a phase-lock wait). Under load, a
+write waits out a live holder instead of taking the lock from it: about
+106 ms at worst in the measurement above.
+
+The locks are not fair. A peer that releases and re-acquires within
+nanoseconds can keep a waiter waiting for as long as it keeps doing so. It
+is never taken over while it does, because every acquisition is a new
+holder.
 
 Every release is a CAS on the holder's own token. A holder that was
 recovered from under it and resumes later cannot free the next holder's
@@ -180,6 +204,13 @@ lock. A usurped bucket or phase-lock holder can at worst publish a torn or
 stale directory entry. Full-key verification, the positional guard and the
 CRC turn that into a miss. The write lock guards overlapping writes, which
 readers cannot detect, so it never presumes a live holder stuck.
+
+In a mixed-version overlap, a build from before issue #27 still takes over
+the phase lock after about 33 µs, and it releases both locks and takes them
+over with a blind store of 0. Builds of the same format still exclude each
+other in normal locking, because both treat any nonzero lock value as held.
+During an upgrade overlap, the pair therefore behaves like the older build,
+and no worse than before.
 
 ### Read Operations
 

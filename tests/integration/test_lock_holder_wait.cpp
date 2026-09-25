@@ -126,7 +126,7 @@ class ParkedPhasePeer {
       _thread.join();
     }
   }
-  [[nodiscard]] uint8_t token() const { return _token; }
+  [[nodiscard]] MmapDirectory::PhaseLockToken token() const { return _token; }
   ~ParkedPhasePeer() { release(); }
   ParkedPhasePeer(const ParkedPhasePeer &) = delete;
   ParkedPhasePeer &operator=(const ParkedPhasePeer &) = delete;
@@ -134,7 +134,7 @@ class ParkedPhasePeer {
  private:
   Volume &_peer;
   CacheKey _key;
-  uint8_t _token = 0;
+  MmapDirectory::PhaseLockToken _token;
   std::atomic<bool> _parked{false};
   std::atomic<bool> _release{false};
   std::thread _thread;
@@ -171,7 +171,7 @@ TEST_CASE(
 
   const auto t0 = Clock::now();
   ParkedPhasePeer parked(*peer, key, kHold);
-  REQUIRE(dir->phase_lock_value_for_test() == parked.token());
+  REQUIRE(dir->phase_lock_value_for_test() == parked.token().value);
   REQUIRE(write(*local, key, content));  // Its insert waits on the peer
   const auto waited = Clock::now() - t0;
   parked.release();
@@ -179,7 +179,8 @@ TEST_CASE(
   CAPTURE(std::chrono::duration_cast<std::chrono::microseconds>(waited));
   REQUIRE(waited >= kHold - 5ms);  // It did wait for the holder
   REQUIRE(MmapDirectory::s_phase_lock_recoveries_for_test.load() == recoveries);
-  REQUIRE(dir->phase_lock_gen_for_test() == gen);
+  // Two acquisitions (the peer's, the insert's), no recovery.
+  REQUIRE(dir->phase_lock_gen_for_test() == static_cast<uint16_t>(gen + 2));
   REQUIRE(dir->phase_lock_value_for_test() == 0);
   REQUIRE(read_content(*local, key) == content);
 }
@@ -205,7 +206,7 @@ TEST_CASE(
   const uint16_t gen = dir->phase_lock_gen_for_test();
 
   ParkedPhasePeer parked(*peer, key);  // Held until released
-  const uint8_t stale = parked.token();
+  const MmapDirectory::PhaseLockToken stale = parked.token();
   const auto t0 = Clock::now();
   REQUIRE(write(*local, key, second));  // Recovers the lock, then lands
   const auto waited = Clock::now() - t0;
@@ -213,17 +214,19 @@ TEST_CASE(
   REQUIRE(waited >= kBudget);
   REQUIRE(MmapDirectory::s_phase_lock_recoveries_for_test.load() ==
           recoveries + 1);
-  REQUIRE(dir->phase_lock_gen_for_test() == static_cast<uint16_t>(gen + 1));
+  // The peer's acquisition, the recovery, the insert's acquisition.
+  REQUIRE(dir->phase_lock_gen_for_test() == static_cast<uint16_t>(gen + 3));
   REQUIRE(read_content(*local, key) == second);
 
-  // A new holder takes the lock under the bumped generation's token ...
-  const uint8_t fresh = local->begin_phase_lock_for_test(key);
-  REQUIRE(fresh != stale);
-  REQUIRE(dir->phase_lock_value_for_test() == fresh);
+  // A new holder takes the lock under a later generation's token ...
+  const MmapDirectory::PhaseLockToken fresh =
+      local->begin_phase_lock_for_test(key);
+  REQUIRE(fresh.value != stale.value);
+  REQUIRE(dir->phase_lock_value_for_test() == fresh.value);
   // ... and the usurped holder's late release must not free it.  (A blind
   // store of 0 would, admitting a second holder into its critical section.)
   parked.release();
-  REQUIRE(dir->phase_lock_value_for_test() == fresh);
+  REQUIRE(dir->phase_lock_value_for_test() == fresh.value);
   local->end_phase_lock_for_test(key, fresh);
   REQUIRE(dir->phase_lock_value_for_test() == 0);
 
@@ -337,7 +340,7 @@ TEST_CASE(
     REQUIRE_FALSE(waiter.forced_release);
     REQUIRE_FALSE(waiter.escalated_takeover);
     REQUIRE(waiter.live_waits > 0);  // It slept, probing liveness
-    REQUIRE(waiter.generation == holder.generation);
+    REQUIRE(waiter.generation == static_cast<uint16_t>(holder.generation + 1));
     dir.release_write_lock(waiter);
     REQUIRE(dir.write_lock_value_for_test() == 0);
   }
@@ -365,6 +368,106 @@ TEST_CASE(
     dir.release_write_lock(next);
     REQUIRE(dir.write_lock_value_for_test() == 0);
   }
+}
+
+TEST_CASE(
+    "Lock holder wait: a phase-lock waiter never usurps a live peer that "
+    "keeps releasing and re-acquiring",
+    "[mmap_directory][multiprocess][concurrent][regression]") {
+  // Every holder re-acquires the instant it releases, so a sleeping waiter
+  // essentially never sees the lock free; only the acquisition generation
+  // tells it the holder changed.  The relay outlasts the budget three
+  // times over.  (Before the generation, every holder of a generation
+  // stored the same token and the waiter usurped the relay at the budget.)
+  constexpr auto kBudget = 150ms;
+  constexpr auto kHold = 20ms;
+  constexpr auto kRelay = 3 * kBudget;
+  BudgetOverride budget(MmapDirectory::s_phase_lock_budget_us_for_test,
+                        kBudget);
+  TempCacheDir tmp("phaserelay");
+  auto local = open_volume(tmp.path());
+  auto peer = open_volume(tmp.path());
+  const CacheKey key("phase-lock-relay");
+  const auto content = make_content(std::byte{0x41});
+  MmapDirectory *dir = local->mmap_directory_for_test(key);
+  MmapDirectory *peer_dir = peer->mmap_directory_for_test(key);
+  REQUIRE(dir != nullptr);
+  REQUIRE(peer_dir != nullptr);
+  const uint64_t recoveries =
+      MmapDirectory::s_phase_lock_recoveries_for_test.load();
+
+  std::atomic<bool> first_parked{false};
+  std::atomic<int> lost{0};
+  std::thread relay([&] {
+    auto token = peer_dir->acquire_phase_lock_for_test();
+    first_parked.store(true);
+    const auto end = Clock::now() + kRelay;
+    while (Clock::now() < end) {
+      std::this_thread::sleep_for(kHold);
+      if (peer_dir->phase_lock_gen_for_test() != token.generation ||
+          peer_dir->phase_lock_value_for_test() != token.value) {
+        lost.fetch_add(1);  // Recovered from under a live holder
+      }
+      peer_dir->release_phase_lock_for_test(token);
+      token = peer_dir->acquire_phase_lock_for_test();
+    }
+    peer_dir->release_phase_lock_for_test(token);
+  });
+  while (!first_parked.load()) {
+    std::this_thread::yield();
+  }
+  REQUIRE(write(*local, key, content));
+  relay.join();
+
+  REQUIRE(lost.load() == 0);
+  REQUIRE(MmapDirectory::s_phase_lock_recoveries_for_test.load() == recoveries);
+  REQUIRE(dir->phase_lock_value_for_test() == 0);
+  REQUIRE(read_content(*local, key) == content);
+}
+
+TEST_CASE(
+    "Lock holder wait: a write-lock waiter never takes over a live peer "
+    "that keeps releasing and re-acquiring",
+    "[mmap_directory][multiprocess][concurrent][regression][writelock]") {
+  // As the phase-lock relay, with the same PID on both sides (two threads
+  // of one peer look alike by PID and token): the escalation budget must
+  // restart with every acquisition.
+  constexpr auto kBudget = 150ms;
+  constexpr auto kHold = 20ms;
+  constexpr auto kRelay = 3 * kBudget;
+  BudgetOverride budget(MmapDirectory::s_write_lock_escalation_us_for_test,
+                        kBudget);
+  MappedDir d;
+  MmapDirectory &dir = d.dir;
+
+  std::atomic<bool> first_parked{false};
+  std::atomic<int> lost{0};
+  std::thread relay([&] {
+    auto token = dir.acquire_write_lock();
+    first_parked.store(true);
+    const auto end = Clock::now() + kRelay;
+    while (Clock::now() < end) {
+      std::this_thread::sleep_for(kHold);
+      if (!dir.revalidate_write_lock(token)) {
+        lost.fetch_add(1);  // Taken over: its fill would have been dropped
+      }
+      dir.release_write_lock(token);
+      token = dir.acquire_write_lock();
+    }
+    dir.release_write_lock(token);
+  });
+  while (!first_parked.load()) {
+    std::this_thread::yield();
+  }
+  const auto waiter = dir.acquire_write_lock();
+  relay.join();
+
+  REQUIRE(waiter.acquired);
+  REQUIRE_FALSE(waiter.escalated_takeover);
+  REQUIRE_FALSE(waiter.forced_release);
+  REQUIRE(lost.load() == 0);
+  dir.release_write_lock(waiter);
+  REQUIRE(dir.write_lock_value_for_test() == 0);
 }
 
 TEST_CASE(

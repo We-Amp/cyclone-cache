@@ -263,8 +263,9 @@ class MmapDirectory {
     uint8_t current_phase;  // GC phase (atomic access via std::atomic_ref)
     // Cross-process CAS lock serializing an insert's phase read + entry
     // store against a phase toggle.  0 = unlocked; otherwise the holder's
-    // token, derived from phase_lock_gen (offset 34; see
-    // acquire_phase_lock for the protocol).  A pre-#27 build of this same
+    // token, derived from the acquisition generation phase_lock_gen
+    // (offset 34; see acquire_phase_lock for the protocol).  A pre-#27
+    // build of this same
     // format (kVersion 2) takes it with CAS 0->1 and releases with a store
     // of 0, so both treat any nonzero value as held and exclude each other.
     uint8_t phase_lock;
@@ -277,11 +278,11 @@ class MmapDirectory {
     // skewed old-build peer degrades to today's presume-dead behavior on
     // the write lock, never to corruption (it simply won't publish an owner
     // or bump the generation).  See acquire_write_lock() for the protocol:
-    // a force-release bumps write_lock_gen (the sole "was I usurped" signal
-    // a usurped holder revalidates), write_lock_owner_pid carries the
+    // every acquisition and every force-release bumps write_lock_gen (the
+    // "was I usurped" signal a holder revalidates, and the holder identity
+    // a waiter watches), write_lock_owner_pid carries the
     // holder's PID so a waiter can PROVE it dead (kill(pid,0)) before ever
     // force-releasing, instead of presuming death after a spin count.
-    // write_lock_gen is bumped on every write-lock force-release;
     // write_lock_owner_pid is the current holder's PID (0 = none/unpublished).
     uint16_t write_lock_gen;
     uint32_t write_lock_owner_pid;
@@ -309,11 +310,11 @@ class MmapDirectory {
     // open — proof at Volume::allocate_write_slot (volume.cpp).
     uint8_t wrap_intent;
 
-    // Offsets 34-35.  In format version 2: phase_lock's takeover
-    // generation, bumped on every recovery of the phase lock from a holder
-    // that held it past the budget (acquire_phase_lock).  A holder's token
-    // is derived from it, so the usurper's token differs from the usurped
-    // holder's, and the usurped holder's late token-CAS release is a no-op.
+    // Offsets 34-35.  In format version 2: phase_lock's acquisition
+    // generation, bumped by every acquisition and every recovery of the
+    // phase lock (acquire_phase_lock).  It identifies the holder to a
+    // waiter, and a holder's token is derived from it, so a usurped
+    // holder's late release is a no-op.
     // Pre-#27 version-2 builds never read these bytes and wrote them (zero)
     // only in init() and on an exclusive open, where no holder can exist.
     //
@@ -658,9 +659,13 @@ class MmapDirectory {
   [[nodiscard]] uint32_t wrap_deferred_deadline_ms() const;
   void set_wrap_deferred_deadline_ms(uint32_t deadline_ms);
 
-  /// A phase-lock holder's token: the nonzero value its CAS stored into
-  /// Header::phase_lock (see acquire_phase_lock).
-  using PhaseLockToken = uint8_t;
+  /// A phase-lock holder's token: the acquisition generation it bumped
+  /// Header::phase_lock_gen to, and the nonzero value derived from it that
+  /// it stored into Header::phase_lock (see acquire_phase_lock).
+  struct PhaseLockToken {
+    uint16_t generation = 0;
+    uint8_t value = 0;
+  };
 
   // How long ONE holder may keep a cross-process lock before a waiter
   // presumes it stuck and recovers the lock (issue #27; LockHolderWait).
@@ -683,6 +688,12 @@ class MmapDirectory {
   // on the phase lock.  An inner wait must end well inside the outer budget.
   static_assert(kPhaseLockBudget >= 2 * kBucketWriterBudget);
   static_assert(kWriteLockEscalationBudget >= 2 * kPhaseLockBudget);
+  // The write lock consults the holder's liveness (kill(pid, 0) /
+  // OpenProcess) only once one holder has kept it this long, far past any
+  // ordinary contention, so a waiter does not probe on every short wait.
+  // (A holder in another PID namespace looks dead to that probe: every
+  // process sharing a volume must share a PID namespace.)
+  static constexpr std::chrono::milliseconds kWriteLockProbeAfter{50};
 
 #ifdef CYCLONE_TEST_SEAMS
   /// TEST-SEAM BUILDS ONLY.  Nonzero overrides kBucketWriterBudget /
@@ -721,13 +732,15 @@ class MmapDirectory {
 
   /// Proof that a write-lock acquisition still owns the lock.  Returned by
   /// acquire_write_lock(); passed to revalidate_write_lock()/
-  /// release_write_lock().  `generation` is the takeover counter observed at
-  /// acquire: a force-release by another process bumps it, so a holder whose
-  /// observed generation still matches has NOT been usurped.  The remaining
+  /// release_write_lock().  `generation` is the acquisition generation this
+  /// acquisition bumped write_lock_gen to: any later acquisition or
+  /// force-release bumps it again, so a holder whose generation still
+  /// matches has NOT been usurped.  The remaining
   /// fields are process-local telemetry (never read from shared memory).
   struct WriteLockToken {
-    // Takeover counter SAMPLED BEFORE the acquire CAS (ordering is
-    // load-bearing — see acquire_write_lock); a force-release bumps it.
+    // The acquisition generation this acquisition bumped write_lock_gen to
+    // (see acquire_write_lock).  Every later acquisition or force-release
+    // bumps it again, so while it still matches we have NOT been usurped.
     uint16_t generation = 0;
     // The value this acquisition's CAS stored into Header::write_lock,
     // derived from `generation` (see acquire_write_lock); the release is a
@@ -750,15 +763,15 @@ class MmapDirectory {
   /// Acquire cross-process write lock for write-pos allocation.
   /// Serializes the read-shared_write_pos → pwrite → update sequence
   /// across processes to prevent overlapping writes.  The hot uncontended
-  /// path is one generation load, a single CAS and a confirming generation
-  /// reload.  On contention the waiter (LockHolderWait: spin, then sleeping
-  /// backoff) never usurps a holder it cannot PROVE dead (kill(pid,0));
-  /// a genuinely dead holder is force-released so a crash cannot deadlock
-  /// the cache, and a holder that cannot be proven dead is taken over only
-  /// after it held the lock for kWriteLockEscalationBudget.
-  /// Returns a token the caller must feed to revalidate_write_lock() before
-  /// ANY shared side effect and to release_write_lock() when done —
-  /// discarding it leaks the lock until a waiter's escalation recovers it.
+  /// path is one generation load, a single CAS and a generation fetch_add.  On
+  /// contention the waiter (LockHolderWait: spin, then sleeping backoff) never
+  /// usurps a holder it cannot PROVE dead (kill(pid,0)); a genuinely dead
+  /// holder is force-released so a crash cannot deadlock the cache, and a
+  /// holder that cannot be proven dead is taken over only after it held the
+  /// lock for kWriteLockEscalationBudget. Returns a token the caller must feed
+  /// to revalidate_write_lock() before ANY shared side effect and to
+  /// release_write_lock() when done — discarding it leaks the lock until a
+  /// waiter's escalation recovers it.
   [[nodiscard]] WriteLockToken acquire_write_lock();
 
   /// Non-blocking single-CAS acquire for the in-place header RMW sites.
@@ -766,8 +779,8 @@ class MmapDirectory {
   /// and the caller applies its own policy (the hit path drops the delta —
   /// best-effort by contract; the control path retries then reports Busy).
   /// A blocking acquire on the hit path would park a request thread behind a
-  /// peer's pwrite+fsync.  A generation race with a recovery is resolved as
-  /// on the blocking path (confirm_write_lock), never by a leaked lock.
+  /// peer's pwrite+fsync.  A race with a recovery is resolved as on the
+  /// blocking path (try_take_token_lock), never by a leaked lock.
   [[nodiscard]] WriteLockToken try_acquire_write_lock();
 
   /// True iff this acquisition still holds the lock (no force-release has
@@ -782,14 +795,15 @@ class MmapDirectory {
   /// an unconditional release would free whoever currently holds the lock.
   void release_write_lock(const WriteLockToken &token);
 
-  /// TEST SEAM ONLY — never set in production.  When true, acquire_write_lock
+#ifdef CYCLONE_TEST_SEAMS
+  /// TEST-SEAM BUILDS ONLY.  When true, acquire_write_lock
   /// reverts to the pre-fix "presume the holder dead after the spin budget"
   /// behavior (no kill(2) liveness proof), so the multi-process regression
   /// test can exhibit the old live-holder usurpation and prove the fix
   /// removes it.
   static inline std::atomic<bool> s_write_lock_presume_dead_for_test{false};
 
-  /// TEST SEAM ONLY — never set in production.  When nonzero, escalates
+  /// TEST-SEAM BUILDS ONLY.  When nonzero, escalates
   /// after that many live waits (one per sleep of the wait) instead of
   /// kWriteLockEscalationBudget, so the F6-F test can force an
   /// escalated_takeover against a deliberately stalled LIVE holder in
@@ -797,6 +811,7 @@ class MmapDirectory {
   /// stay detectable; the usurped holder's commit is refused).  0 = use the
   /// production budget.
   static inline std::atomic<uint32_t> s_write_lock_max_live_waits_for_test{0};
+#endif
 
   /// Current seqlock version of the bucket this key hashes to.  Every
   /// COMPLETED directory mutation advances it by exactly 2
@@ -890,19 +905,8 @@ class MmapDirectory {
   /// was recovered from under us.
   void release_phase_lock(PhaseLockToken token);
 
-  /// After a winning acquire CAS that stored `token.value`: if a recovery
-  /// bumped the generation between the caller's sample and its CAS, move
-  /// the held lock to the current generation's value.  False: the lock was
-  /// lost in the meantime (the caller retries or reports not acquired).
-  bool confirm_write_lock(WriteLockToken &token);
-
   /// acquire_phase_lock's contended path, out of line.
   PhaseLockToken acquire_phase_lock_slow();
-
-  /// A token-CAS acquisition sampled phase_lock_gen before a recovery
-  /// bumped it: move the held lock to the current generation's token, or
-  /// report that it was lost (0).
-  PhaseLockToken retoken_phase_lock(PhaseLockToken held);
 
   /// Atomically increment entry count
   void increment_count();

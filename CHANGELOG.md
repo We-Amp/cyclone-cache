@@ -219,16 +219,31 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   is alive but descheduled (issue #27). The phase lock used to presume its
   holder dead after about 33 µs of spinning (Apple M), and a directory
   bucket after about 0.9 ms. Both are below a scheduler quantum. A waiter
-  now waits by time, with sleeping backoff, and recovers a lock only when
-  one holder kept it for the whole budget: 1 s for the phase lock, 250 ms
-  for a bucket. A new holder restarts the budget. The write lock also waits
-  by time: it waits on a live holder, as before, and takes one over only
-  after 5 s (previously 4096 liveness checks). Releases are CASes on the
-  holder's own token, so a recovered holder that resumes cannot free the
-  next holder's lock. The phase lock's token comes from a takeover
-  generation stored in the directory header bytes 34-35, which format
-  version 2 no longer used. The format version is unchanged, and an older
-  build of the same format still excludes a new one on both locks.
+  now waits by time, with sleeping backoff. It recovers a lock only when
+  one holder kept it for the whole budget (1 s for the phase lock, 250 ms
+  for a bucket) and a further 2 ms of continuous polling saw no release. A
+  new holder restarts the budget, and so does the lock seen free.
+  - Every phase-lock and write-lock acquisition now bumps that lock's
+    generation counter. So a peer that releases and re-acquires at once
+    still counts as a new holder, and is never taken over.
+  - The phase lock's counter is stored in directory header bytes 34-35,
+    which format version 2 no longer used.
+  - The write lock still waits on a live holder, as before. It checks the
+    holder's liveness only after one holder has kept the lock for 50 ms,
+    and takes over a live holder only after 5 s (previously 4096 liveness
+    checks).
+  - Releases are CASes on the holder's own token, so a recovered holder
+    that resumes cannot free the next holder's lock.
+  - The format version is unchanged. An older build of the same format
+    still excludes a new one in normal locking, but it still takes over the
+    phase lock after about 33 µs, so during an upgrade overlap the pair
+    behaves like the older build.
+  - These waits are writer-side, but a write can run on a request thread.
+    After a peer dies holding a lock, one write can stall for up to about
+    1.25 s.
+  - All processes sharing a volume must share one PID namespace (now
+    documented), because a live write-lock holder in another namespace
+    looks dead.
 - On Windows, the sleeps of the seqlock read wait and the lock waits use a
   high-resolution waitable timer. At the default 15.6 ms timer resolution,
   the first 10 µs sleep used to take about 15.6 ms, past the 5 ms read

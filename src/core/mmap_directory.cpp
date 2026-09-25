@@ -69,13 +69,19 @@ bool holder_is_dead(uint32_t pid) {
 #endif
 }
 
-// Cross-process CAS lock values (phase_lock, write_lock).  0 = free.  A
-// holder stores a token derived from the lock's takeover generation, which
-// only a recovery bumps: every acquisition within one generation stores the
-// same token, and a holder recovered from under us stores a DIFFERENT one
-// than the usurper, so the usurped holder's late CAS release (token -> 0)
-// fails instead of freeing the usurper.  Aliasing needs 253 recoveries
-// while the usurped holder stays descheduled, each after a full budget.
+// Cross-process token locks (phase_lock, write_lock), each a lock byte plus
+// a 16-bit acquisition generation.  The byte is 0 when free; a holder
+// stores a token derived from the generation it bumped the counter to, so
+//   - every acquisition and every recovery bumps the generation: a waiter
+//     that sees it change knows the lock changed hands, however briefly it
+//     was free (LockHolderWait's per-holder budget), and a holder whose
+//     generation is no longer current knows it was usurped;
+//   - a usurped holder's late release (a CAS from its token to 0, behind a
+//     check that its generation is still current) cannot free the next
+//     holder unless both the generation (65536 values) and the token (253
+//     values) alias.
+// Any nonzero value means held, exactly as for pre-#27 builds of the same
+// format (CAS 0 -> 1, store 0), so both builds still exclude each other.
 // Tokens are 1..253; 254 and 255 mark a lock being recovered (the claim
 // alternates so that two waiters recovering the same stuck value -- only
 // possible when a previous recoverer died mid-recovery -- cannot both win).
@@ -88,6 +94,73 @@ constexpr uint8_t lock_token(uint16_t generation) {
 
 constexpr uint8_t recovery_claim(uint8_t observed) {
   return observed == kLockRecoveringA ? kLockRecoveringB : kLockRecoveringA;
+}
+
+// The holder identity a waiter watches: token, generation and (write lock
+// only) owner PID.
+constexpr uint64_t token_lock_holder(uint8_t value, uint16_t generation,
+                                     uint32_t pid) {
+  return (uint64_t{value} << 48) | (uint64_t{generation} << 32) | pid;
+}
+
+// One acquisition attempt.  CAS the byte 0 -> the token of the generation we
+// expect to claim, then claim the generation (seq_cst fetch_add).  If
+// another bump landed in between (a recovery), move the byte to the token of
+// the generation actually claimed; if the byte is no longer ours by then,
+// the lock was recovered from us before the critical section: report it
+// lost, with `observed` as seen.  On success `generation` and `value` are
+// this holder's.
+bool try_take_token_lock(std::atomic_ref<uint8_t> lock,
+                         std::atomic_ref<uint16_t> gen, uint16_t &generation,
+                         uint8_t &value, uint8_t &observed) {
+  const auto expect =
+      static_cast<uint16_t>(gen.load(std::memory_order_relaxed) + 1);
+  uint8_t held = lock_token(expect);
+  uint8_t expected = 0;
+  if (!lock.compare_exchange_strong(expected, held, std::memory_order_seq_cst,
+                                    std::memory_order_relaxed)) {
+    observed = expected;
+    return false;
+  }
+  const auto claimed =
+      static_cast<uint16_t>(gen.fetch_add(1, std::memory_order_seq_cst) + 1);
+  if (claimed != expect && lock_token(claimed) != held) {
+    uint8_t current = held;
+    if (!lock.compare_exchange_strong(current, lock_token(claimed),
+                                      std::memory_order_seq_cst,
+                                      std::memory_order_relaxed)) {
+      observed = current;
+      return false;
+    }
+    held = lock_token(claimed);
+  }
+  generation = claimed;
+  value = held;
+  return true;
+}
+
+// Recover a token lock from a holder seen as {stuck, stuck_gen} for the
+// whole budget: only if that is still the holder, claim its byte (a CAS, so
+// a holder that just released, or a new holder, is never touched), retire
+// its generation, clear the owner PID (write lock), then free the lock.
+bool recover_token_lock(std::atomic_ref<uint8_t> lock,
+                        std::atomic_ref<uint16_t> gen, uint8_t stuck,
+                        uint16_t stuck_gen, std::atomic_ref<uint32_t> *owner) {
+  if (gen.load(std::memory_order_seq_cst) != stuck_gen) {
+    return false;
+  }
+  uint8_t expected = stuck;
+  if (!lock.compare_exchange_strong(expected, recovery_claim(stuck),
+                                    std::memory_order_seq_cst,
+                                    std::memory_order_relaxed)) {
+    return false;
+  }
+  gen.fetch_add(1, std::memory_order_seq_cst);
+  if (owner != nullptr) {
+    owner->store(0, std::memory_order_relaxed);
+  }
+  lock.store(0, std::memory_order_seq_cst);
+  return true;
 }
 
 std::chrono::steady_clock::duration bucket_writer_budget() {
@@ -746,12 +819,15 @@ void MmapDirectory::reset_reader_state_exclusive() {
 // Waiting (issue #27).  A holder that stays in the lock is either dead or
 // descheduled; a spin count cannot tell the two apart.  The waiter paces
 // itself with LockHolderWait (a short spin, then sleeping backoff) and only
-// presumes the holder stuck once that same holder has kept the lock for
-// kPhaseLockBudget.  The header has no room to publish the holder's PID for
-// a liveness proof like the write lock's, so the budget is what separates
-// "descheduled" from "stuck": it is set well above the longest live hold
-// measured under CPU oversubscription, and above kBucketWriterBudget, which
-// bounds the holder's own nested wait on a bucket (see the PR for #27).
+// presumes the holder stuck once that same holder -- identified by the
+// acquisition generation it bumped phase_lock_gen to -- has kept the lock
+// for kPhaseLockBudget, and a continuous confirmation poll saw neither a
+// release nor another holder.  The header has no room to publish the
+// holder's PID for a liveness proof like the write lock's, so the budget is
+// what separates "descheduled" from "stuck": it is set well above the
+// longest live hold measured under CPU oversubscription, and above
+// kBucketWriterBudget, which bounds the holder's own nested wait on a
+// bucket (see the PR for #27).
 //
 // Why presuming is acceptable here, unlike the write lock: what can a
 // usurped holder that is still executing do?  Its insert already read the
@@ -767,56 +843,19 @@ void MmapDirectory::reset_reader_state_exclusive() {
 // costs at most a spurious miss, while never recovering would let one
 // crashed process wedge every writer of the stripe.
 //
-// Release is token-checked: a holder recovered from under us finds a
-// different token (the generation was bumped) and its late release is a
-// no-op, so it can never free the usurper's -- or a later holder's --
-// critical section.
+// Release is checked twice: the generation must still be ours (any later
+// acquisition or recovery bumped it) and the lock byte is CASed from our
+// own token, so a holder recovered from under us can never free the
+// usurper's -- or a later holder's -- critical section.
 MmapDirectory::PhaseLockToken MmapDirectory::acquire_phase_lock() {
-  auto lock = std::atomic_ref<uint8_t>(_header->phase_lock);
-  auto gen = std::atomic_ref<uint16_t>(_header->phase_lock_gen);
-  // Hot uncontended path: generation load, CAS, generation reload (same
-  // cache line).  The reload catches a recovery that bumped the
-  // generation between the sample and the CAS: the CAS acquired the 0 that
-  // recovery (or a later release) stored AFTER its bump, so the bump
-  // happens-before the reload.
-  const uint16_t g = gen.load(std::memory_order_relaxed);
-  const PhaseLockToken token = lock_token(g);
-  uint8_t expected = 0;
-  if (lock.compare_exchange_strong(expected, token, std::memory_order_acquire,
-                                   std::memory_order_relaxed)) [[likely]] {
-    if (gen.load(std::memory_order_relaxed) == g) [[likely]] {
-      return token;
-    }
-    const PhaseLockToken moved = retoken_phase_lock(token);
-    if (moved != 0) {
-      return moved;
-    }
+  PhaseLockToken token;
+  uint8_t observed = 0;
+  if (try_take_token_lock(std::atomic_ref<uint8_t>(_header->phase_lock),
+                          std::atomic_ref<uint16_t>(_header->phase_lock_gen),
+                          token.generation, token.value, observed)) [[likely]] {
+    return token;
   }
   return acquire_phase_lock_slow();
-}
-
-MmapDirectory::PhaseLockToken MmapDirectory::retoken_phase_lock(
-    PhaseLockToken held) {
-  // We hold the lock with the token of a generation that a recovery has
-  // since retired -- the same token the usurped holder carries, whose late
-  // release would free us.  Move to the current generation's token; if the
-  // lock is no longer ours (that late release already happened), report it
-  // lost and the caller re-acquires.  We never entered the critical section
-  // on the stale token, so losing it here is harmless.
-  auto lock = std::atomic_ref<uint8_t>(_header->phase_lock);
-  auto gen = std::atomic_ref<uint16_t>(_header->phase_lock_gen);
-  for (;;) {
-    const PhaseLockToken want = lock_token(gen.load(std::memory_order_relaxed));
-    if (want == held) {
-      return held;
-    }
-    uint8_t expected = held;
-    if (!lock.compare_exchange_strong(expected, want, std::memory_order_acquire,
-                                      std::memory_order_relaxed)) {
-      return 0;
-    }
-    held = want;
-  }
 }
 
 MmapDirectory::PhaseLockToken MmapDirectory::acquire_phase_lock_slow() {
@@ -824,48 +863,41 @@ MmapDirectory::PhaseLockToken MmapDirectory::acquire_phase_lock_slow() {
   auto gen = std::atomic_ref<uint16_t>(_header->phase_lock_gen);
   LockHolderWait wait(phase_lock_budget());
   for (;;) {
-    const uint16_t g = gen.load(std::memory_order_relaxed);
+    PhaseLockToken token;
     uint8_t observed = 0;
-    if (lock.compare_exchange_weak(observed, lock_token(g),
-                                   std::memory_order_acquire,
-                                   std::memory_order_relaxed)) {
-      if (gen.load(std::memory_order_relaxed) == g) {
-        return lock_token(g);
-      }
-      const PhaseLockToken moved = retoken_phase_lock(lock_token(g));
-      if (moved != 0) {
-        return moved;
-      }
-      continue;
+    if (try_take_token_lock(lock, gen, token.generation, token.value,
+                            observed)) {
+      return token;
     }
     if (observed == 0) {
-      continue;  // Spurious CAS failure
-    }
-    if (wait.wait(observed) != LockHolderWait::Step::kExpired) {
+      wait.restart();  // Seen free: whoever holds it next is a new holder
       continue;
     }
-    // `observed` has held the lock for the whole budget: recover it from
-    // exactly that holder.  Claim first (a CAS, so a holder that just
-    // released, or a new holder, is never touched), retire its token by
-    // bumping the generation, then free the lock and contend again.
-    uint8_t stuck = observed;
-    if (lock.compare_exchange_strong(stuck, recovery_claim(observed),
-                                     std::memory_order_acq_rel,
-                                     std::memory_order_relaxed)) {
-      gen.fetch_add(1, std::memory_order_acq_rel);
-      lock.store(0, std::memory_order_release);
+    const uint16_t holder_gen = gen.load(std::memory_order_seq_cst);
+    if (wait.wait(token_lock_holder(observed, holder_gen, 0)) !=
+        LockHolderWait::Step::kExpired) {
+      continue;
+    }
+    // One holder has kept the lock for the whole budget and the
+    // confirmation window: recover it from exactly that holder.
+    if (recover_token_lock(lock, gen, observed, holder_gen, nullptr)) {
 #ifdef CYCLONE_TEST_SEAMS
       s_phase_lock_recoveries_for_test.fetch_add(1, std::memory_order_relaxed);
 #endif
     }
+    wait.restart();
   }
 }
 
 void MmapDirectory::release_phase_lock(PhaseLockToken token) {
-  // token -> 0, only if the lock is still ours (see acquire_phase_lock).
-  uint8_t expected = token;
+  // Only if the lock is still ours (see acquire_phase_lock).
+  if (std::atomic_ref<uint16_t>(_header->phase_lock_gen)
+          .load(std::memory_order_seq_cst) != token.generation) {
+    return;
+  }
+  uint8_t expected = token.value;
   (void)std::atomic_ref<uint8_t>(_header->phase_lock)
-      .compare_exchange_strong(expected, 0, std::memory_order_release,
+      .compare_exchange_strong(expected, 0, std::memory_order_seq_cst,
                                std::memory_order_relaxed);
 }
 
@@ -880,209 +912,148 @@ MmapDirectory::WriteLockToken MmapDirectory::acquire_write_lock() {
   // proves the holder dead before recovering it, and hands back a token the
   // caller revalidates before it publishes or lets its pwrite proceed.
   //
-  // The lock byte carries the holder's token, derived from write_lock_gen
-  // (lock_token), so the release is a CAS from exactly that value and a
-  // recovery claims exactly the value it gave up on.
+  // The lock byte carries the holder's token, derived from the acquisition
+  // generation it bumped write_lock_gen to (try_take_token_lock), so the
+  // release is a CAS from exactly that value, a recovery claims exactly the
+  // value it gave up on, and any later acquisition or recovery makes the
+  // holder's revalidate fail.
+  //
+  // TOKEN ORDERING IS LOAD-BEARING: the generation is claimed with a seq_cst
+  // fetch_add AFTER the winning CAS.  A recovery that claims our byte
+  // between our CAS and our fetch_add bumps the generation too; either our
+  // fetch_add sees that bump (our token then differs, the move to it fails
+  // and we report the lock lost before the critical section), or the bump
+  // lands after ours and our revalidate fails before any shared side effect.
   auto lock = std::atomic_ref<uint8_t>(_header->write_lock);
   auto gen = std::atomic_ref<uint16_t>(_header->write_lock_gen);
   auto owner = std::atomic_ref<uint32_t>(_header->write_lock_owner_pid);
 
   WriteLockToken token;
+  uint8_t observed = 0;
 
-  // TOKEN ORDERING IS LOAD-BEARING: sample the generation BEFORE the CAS,
-  // both seq_cst.  Sampling after the CAS reopens the bug through an
-  // acquire-tail stall: win the CAS, stall before the sample, get escalated
-  // (gen G -> G+1), resume and sample G+1 — a spuriously VALID token for a
-  // usurped acquisition, whose revalidate then passes and whose checked
-  // release frees the usurper's lock.  With the pre-CAS sample, seq_cst
-  // program order puts the sample before the CAS in the total order S, and
-  // the escalation's bump is seq_cst too — so ANY bump that lands after the
-  // sample (including one racing the CAS itself) makes revalidate fail.
-  // A bump landing BETWEEN sample and CAS, with us as the legitimate
-  // post-recovery acquirer, is caught by confirm_write_lock, which moves
-  // the held lock to the current generation's token (formerly: a spurious
-  // Busy, and a lock leaked until the next escalation).
-
-  // Hot uncontended path: one generation load, a single CAS, and the
-  // confirming reload.
-  token.generation = gen.load(std::memory_order_seq_cst);
-  token.value = lock_token(token.generation);
-  uint8_t expected = 0;
-  if (lock.compare_exchange_strong(expected, token.value,
-                                   std::memory_order_seq_cst,
-                                   std::memory_order_relaxed) &&
-      confirm_write_lock(token)) {
+  // Hot uncontended path: generation load, CAS, generation fetch_add.
+  if (try_take_token_lock(lock, gen, token.generation, token.value, observed)) {
     owner.store(self_pid(), std::memory_order_relaxed);
     token.acquired = true;
     return token;
   }
 
   // Contended path.  Wait with LockHolderWait (spin, then sleeping
-  // backoff); after every sleep, consult liveness.  Recovery from a
-  // genuinely dead holder is preserved (a crash must not deadlock the
-  // cache); usurpation of a live-but-stalled holder is removed.
+  // backoff).  Once one holder has kept the lock for kWriteLockProbeAfter
+  // (far past any ordinary contention), consult its liveness after every
+  // sleep.  Recovery from a genuinely dead holder is preserved (a crash
+  // must not deadlock the cache); usurpation of a live-but-stalled holder
+  // is removed.
   //
   // Last-resort deadlock breaker for the pathological case where kill(2)
   // keeps reporting the holder alive but it never releases (PID reuse, or a
-  // live holder wedged for many seconds): the same holder has held the lock
-  // for kWriteLockEscalationBudget.  If this ever fires on a truly live
-  // holder, the generation bump below makes that holder's revalidate fail,
-  // so it aborts before its overlapping publish/pwrite — corruption stays
-  // closed; only availability degrades.
+  // live holder wedged for many seconds): the same holder -- same token,
+  // generation and PID -- has held the lock for kWriteLockEscalationBudget
+  // and a continuous confirmation poll saw no release.  If this ever fires
+  // on a truly live holder, the generation bump below makes that holder's
+  // revalidate fail, so it aborts before its overlapping publish/pwrite —
+  // corruption stays closed; only availability degrades.
   LockHolderWait wait(write_lock_escalation_budget());
   for (;;) {
-    // Same pre-CAS sample discipline as the fast path (see above).
-    token.generation = gen.load(std::memory_order_seq_cst);
-    token.value = lock_token(token.generation);
-    expected = 0;
-    if (lock.compare_exchange_weak(expected, token.value,
-                                   std::memory_order_seq_cst,
-                                   std::memory_order_relaxed)) {
-      if (confirm_write_lock(token)) {
-        owner.store(self_pid(), std::memory_order_relaxed);
-        token.acquired = true;
-        return token;
-      }
+    if (try_take_token_lock(lock, gen, token.generation, token.value,
+                            observed)) {
+      owner.store(self_pid(), std::memory_order_relaxed);
+      token.acquired = true;
+      return token;
+    }
+    if (observed == 0) {
+      wait.restart();  // Seen free: whoever holds it next is a new holder
       continue;
     }
-    if (expected == 0) {
-      continue;  // Spurious CAS failure
-    }
+    const uint16_t holder_gen = gen.load(std::memory_order_seq_cst);
     const uint32_t holder = owner.load(std::memory_order_acquire);
-    // A holder is its lock value plus its published PID: another process
-    // taking the lock restarts the wait (LockHolderWait).
     const LockHolderWait::Step step =
-        wait.wait((uint64_t{expected} << 32) | holder);
+        wait.wait(token_lock_holder(observed, holder_gen, holder));
     if (step == LockHolderWait::Step::kSpun) {
       continue;
     }
 
     // Slept, or the escalation budget is spent: prove DEAD before we
     // recover, or WAIT.
-    const bool presume_dead =
-        s_write_lock_presume_dead_for_test.load(std::memory_order_relaxed);
-    const bool dead = presume_dead || holder_is_dead(holder);
+    bool dead = false;
     bool escalate = step == LockHolderWait::Step::kExpired;
     if (step == LockHolderWait::Step::kSlept) {
       ++token.live_waits;
-      // Test seam: a nonzero override escalates after that many live
-      // waits, so the last-resort takeover is reachable in test time (see
-      // the F6-F test).
-      const uint32_t max_live_waits_override =
-          s_write_lock_max_live_waits_for_test.load(std::memory_order_relaxed);
-      escalate = max_live_waits_override != 0 &&
-                 token.live_waits >= max_live_waits_override;
+    }
+#ifdef CYCLONE_TEST_SEAMS
+    // Test seams: presume the holder dead without a liveness proof (the
+    // pre-fix behaviour), or escalate after that many live waits.
+    dead = s_write_lock_presume_dead_for_test.load(std::memory_order_relaxed);
+    const uint32_t max_live_waits_override =
+        s_write_lock_max_live_waits_for_test.load(std::memory_order_relaxed);
+    if (step == LockHolderWait::Step::kSlept && max_live_waits_override != 0 &&
+        token.live_waits >= max_live_waits_override) {
+      escalate = true;
+    }
+#endif
+    if (!dead && wait.held() >= kWriteLockProbeAfter) {
+      dead = holder_is_dead(holder);
     }
     if (!dead && !escalate) {
       continue;  // Live holder (or an owner not yet published): WAIT
     }
 
-    // Recover the lock from exactly the holder value we gave up on: claim
-    // it (a CAS, so a holder that just released, or a new holder -- whose
-    // token differs once any recovery happened -- is never touched), bump
-    // the generation (seq_cst) so a holder that is (pathologically) still
-    // live sees the takeover at its revalidate and aborts before publishing
-    // shared_write_pos / pwriting, then free the lock.
-    uint8_t stuck = expected;
-    if (!lock.compare_exchange_strong(stuck, recovery_claim(expected),
-                                      std::memory_order_seq_cst,
-                                      std::memory_order_relaxed)) {
-      continue;  // The holder moved on; wait on whoever holds it now
+    // Recover the lock from exactly the holder we gave up on (claim, bump
+    // the generation so a pathologically live holder's revalidate fails
+    // before it publishes shared_write_pos / pwrites, clear the owner,
+    // free).  A holder that just released, or a new holder, is never
+    // touched.
+    if (recover_token_lock(lock, gen, observed, holder_gen, &owner)) {
+      // Telemetry split: recovering a PROVEN-dead holder is routine crash
+      // recovery; taking over a holder we could NOT prove dead (last-resort
+      // escalation) is the alertable event.
+      if (dead) {
+        token.forced_release = true;
+      } else {
+        token.escalated_takeover = true;
+      }
     }
-    gen.fetch_add(1, std::memory_order_seq_cst);
-    owner.store(0, std::memory_order_relaxed);
-    lock.store(0, std::memory_order_seq_cst);
-    // Telemetry split: recovering a PROVEN-dead holder is routine crash
-    // recovery; taking over a holder we could NOT prove dead (last-resort
-    // escalation) is the alertable event.
-    if (dead) {
-      token.forced_release = true;
-    } else {
-      token.escalated_takeover = true;
-    }
-    // Re-contend for the just-freed lock (another waiter may win the race;
-    // that is fine — the generation only advances).
-  }
-}
-
-bool MmapDirectory::confirm_write_lock(WriteLockToken &token) {
-  // Called right after a winning CAS stored token.value.  The CAS acquired
-  // the 0 that a recovery (or a later release) stored after its generation
-  // bump, so a bump that landed between our sample and our CAS is visible
-  // here.  We then hold the lock under a retired token -- the usurped
-  // holder's -- so move it to the current generation's (the same step as
-  // retoken_phase_lock).  A bump that recovers the lock from US instead
-  // claims our value first, so the move's CAS fails and we report the
-  // lock lost before entering the critical section.
-  auto lock = std::atomic_ref<uint8_t>(_header->write_lock);
-  auto gen = std::atomic_ref<uint16_t>(_header->write_lock_gen);
-  for (;;) {
-    const uint16_t now = gen.load(std::memory_order_seq_cst);
-    if (now == token.generation) {
-      return true;
-    }
-    const uint8_t want = lock_token(now);
-    uint8_t expected = token.value;
-    if (want != token.value &&
-        !lock.compare_exchange_strong(expected, want, std::memory_order_seq_cst,
-                                      std::memory_order_relaxed)) {
-      return false;
-    }
-    token.generation = now;
-    token.value = want;
+    // Re-contend for the lock (another waiter may win the race; that is
+    // fine — the generation only advances).
+    wait.restart();
   }
 }
 
 MmapDirectory::WriteLockToken MmapDirectory::try_acquire_write_lock() {
   // Non-blocking counterpart of acquire_write_lock for the two in-place
   // header RMW sites (update_hit_count_sync / remove_alternate_sync's chain
-  // repoint).  It is EXACTLY acquire_write_lock's uncontended fast path -- one
-  // pre-CAS generation sample, a single CAS and the confirming reload --
-  // with no wait, liveness probe, or usurpation.  On contention it returns
-  // {acquired=false} so the caller never blocks a request thread behind a
-  // peer's pwrite+fsync.
-  //
-  // A recovery that bumps the generation between the sample and the winning
-  // CAS is handled by confirm_write_lock like on the blocking path: the
-  // held lock moves to the current generation's token, or, if it was lost
-  // meanwhile, this reports {acquired=false} without entering the critical
-  // section.  (This used to be an accepted rare leak: the stale token failed
-  // revalidate, and the revalidate-gated release left the lock byte held
-  // until the next waiter's escalation.)
-  auto lock = std::atomic_ref<uint8_t>(_header->write_lock);
-  auto gen = std::atomic_ref<uint16_t>(_header->write_lock_gen);
-  auto owner = std::atomic_ref<uint32_t>(_header->write_lock_owner_pid);
-
+  // repoint).  It is EXACTLY acquire_write_lock's uncontended fast path --
+  // one attempt of try_take_token_lock -- with no wait, liveness probe, or
+  // usurpation.  On contention (or a lock lost to a racing recovery before
+  // the critical section) it returns {acquired=false} so the caller never
+  // blocks a request thread behind a peer's pwrite+fsync.
   WriteLockToken token;
-  token.generation = gen.load(std::memory_order_seq_cst);  // pre-CAS sample
-  token.value = lock_token(token.generation);
-  uint8_t expected = 0;
-  if (!lock.compare_exchange_strong(expected, token.value,
-                                    std::memory_order_seq_cst,
-                                    std::memory_order_relaxed) ||
-      !confirm_write_lock(token)) {
-    return token;  // Held by someone else — do not wait, do not usurp.
+  uint8_t observed = 0;
+  if (try_take_token_lock(std::atomic_ref<uint8_t>(_header->write_lock),
+                          std::atomic_ref<uint16_t>(_header->write_lock_gen),
+                          token.generation, token.value, observed)) {
+    std::atomic_ref<uint32_t>(_header->write_lock_owner_pid)
+        .store(self_pid(), std::memory_order_relaxed);
+    token.acquired = true;
   }
-  owner.store(self_pid(), std::memory_order_relaxed);
-  token.acquired = true;
   return token;
 }
 
 bool MmapDirectory::revalidate_write_lock(const WriteLockToken &token) const {
-  // Primary check: no force-release bumped the takeover generation since
-  // this acquisition SAMPLED it (the sample precedes the acquire CAS, and
-  // confirm_write_lock moved the token past any bump that preceded the
-  // CAS, so a bump seen here recovered the lock from US).  The caller
-  // then drops the fill as Busy.
+  // Primary check: the acquisition generation is still the one this
+  // acquisition claimed.  Every later acquisition and every force-release
+  // bumps it, and nobody else acquires while we hold, so a changed value
+  // means the lock was recovered from US.  The caller then drops the fill
+  // as Busy.
   //
   // Generation aliasing bound, stated honestly: a uint16 wraps after 2^16
-  // force-releases inside ONE stalled critical section.  A dead-holder
-  // recovery costs a wait and a liveness probe (single-digit ms), so
-  // aliasing needs ~65536 consecutive crash-recoveries — minutes of
-  // continuous holder deaths — while the stalled holder never runs: not a
-  // realistic schedule, but it is a schedule; the lock-value and owner-PID
-  // complements below break it unless the aliased takeover ALSO stored our
-  // exact token and re-published our exact PID.
+  // acquisitions + recoveries while ONE usurped holder stays stalled.  The
+  // complements below break that unless, at the moment of the check, the
+  // lock is also held under our exact token (implied by an aliased
+  // generation) AND by our exact PID.  Another holder with our PID would
+  // have to be a thread of this process writing the same stripe, which the
+  // stripe mutex the usurped holder still holds excludes; only two Volumes
+  // on one file in one process (tests) share a PID without sharing it.
   const bool gen_ok =
       std::atomic_ref<uint16_t>(const_cast<uint16_t &>(_header->write_lock_gen))
           .load(std::memory_order_acquire) == token.generation;

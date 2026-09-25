@@ -318,8 +318,10 @@ The read hot path is lock-free (the read-path scaling series). Before refactorin
    `src/core/mmap_directory.hpp`). A writer waiting on a cross-process
    bucket, phase lock or write lock waits by TIME per holder
    (`LockHolderWait`: 250 ms bucket, 1 s phase lock, write lock only on a
-   proven-dead holder or after 5 s), never by a spin count, and every
-   release is a CAS on the holder's own token.
+   proven-dead holder or after 5 s), never by a spin count. Every
+   phase/write-lock acquisition bumps that lock's generation, so a peer that
+   releases and re-acquires is a new holder, and every release is a CAS on
+   the holder's own token.
    Guard: `tests/integration/test_seqlock_read_wait.cpp`,
    `tests/integration/test_lock_holder_wait.cpp`.
 5. **HitTracker is a leaf lock** — never hold a stripe lock across

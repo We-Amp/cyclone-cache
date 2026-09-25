@@ -1259,12 +1259,14 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // only).  Held until end_phase_lock_for_test(key, token) on the SAME
   // thread; a writer in another Volume on the same file then waits on it
   // (issue #27).
-  [[nodiscard]] uint8_t begin_phase_lock_for_test(const CacheKey &key) {
+  [[nodiscard]] MmapDirectory::PhaseLockToken begin_phase_lock_for_test(
+      const CacheKey &key) {
     Stripe *stripe = select_stripe(key);
     stripe->mutex.lock();
     return stripe->mmap_directory->acquire_phase_lock_for_test();
   }
-  void end_phase_lock_for_test(const CacheKey &key, uint8_t token) {
+  void end_phase_lock_for_test(const CacheKey &key,
+                               MmapDirectory::PhaseLockToken token) {
     Stripe *stripe = select_stripe(key);
     stripe->mmap_directory->release_phase_lock_for_test(token);
     stripe->mutex.unlock();
