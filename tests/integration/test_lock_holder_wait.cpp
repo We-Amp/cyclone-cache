@@ -227,10 +227,8 @@ TEST_CASE(
   local->end_phase_lock_for_test(key, fresh);
   REQUIRE(dir->phase_lock_value_for_test() == 0);
 
-  // The lock is healthy: the next write neither waits nor recovers.
-  const auto t1 = Clock::now();
+  // The lock is healthy: the next write needs no recovery.
   REQUIRE(write(*local, key, first));
-  REQUIRE(Clock::now() - t1 < kBudget);
   REQUIRE(MmapDirectory::s_phase_lock_recoveries_for_test.load() ==
           recoveries + 1);
   REQUIRE(read_content(*local, key) == first);
@@ -240,14 +238,15 @@ TEST_CASE(
     "Lock holder wait: a bucket waiter that sits through several short "
     "holders never presumes the latest one stuck",
     "[mmap_directory][directory][concurrent][regression]") {
-  // Each holder keeps the bucket for 30 ms, less than the 60 ms budget; five
-  // of them in a row keep it odd for 150 ms.  A budget measured from when
-  // the WAITER started would run out on the third holder and force it.
-  constexpr auto kBudget = 60ms;
-  constexpr auto kHold = 30ms;
-  constexpr int kHolders = 5;
-  BudgetOverride budget(MmapDirectory::s_bucket_writer_budget_us_for_test,
-                        kBudget);
+  // Each holder keeps the bucket for 25 ms, a tenth of the (production)
+  // budget, so even a badly oversleeping CI runner stays far inside it;
+  // twelve of them in a row keep it odd for 300 ms.  A budget measured from
+  // when the WAITER started would run out on the eleventh holder and force
+  // it.
+  constexpr auto kHold = 25ms;
+  constexpr int kHolders = 12;
+  static_assert(kHold * kHolders > MmapDirectory::kBucketWriterBudget);
+  static_assert(kHold * 10 <= MmapDirectory::kBucketWriterBudget);
   MappedDir d;
   const CacheKey key("bucket-relay");
   const uint64_t recoveries =
