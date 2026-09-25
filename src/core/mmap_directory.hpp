@@ -667,7 +667,7 @@ class MmapDirectory {
   // Measured on macOS (10 cores): two processes writing one volume as
   // process 0 of 1, 2 writer threads each, plus CPU hogs.  Live holders held
   // a bucket for at most 0.6 ms with 12 hogs, but up to 56 ms with 24-48
-  // hogs (2.4-4.8 runnable threads per core); the phase lock, whose holder
+  // hogs (2.8-5.2 runnable threads per core); the phase lock, whose holder
   // also waits on a bucket, up to 112 ms.  The budgets sit well above
   // that: recovering a live holder costs a spurious miss, while a larger
   // budget only lengthens the one-time stall after a process died holding

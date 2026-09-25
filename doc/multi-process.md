@@ -98,7 +98,9 @@ area still starts 177 pages into the stripe. The retention region was added in
 directory **version 2** (`MmapDirectory::kVersion`). It holds the stripe's
 exposure generation `G = P * (N + 1) + f` and one `{generation:8, count:24}`
 borrow slot per frontier chunk. It replaces the version-1 stripe-wide borrow
-slot at header offset 34, which is retired and stays zero. `G` also replaces
+slot at header offset 34. Those two bytes now hold the phase lock's takeover
+generation (see [Cross-Process Writer Locks](#cross-process-writer-locks)).
+`G` also replaces
 the version-1 reader epoch, `{shared_wrap_count, current_phase}`. See
 [architecture.md](architecture.md#eviction-and-wrap-retention).
 
@@ -167,7 +169,7 @@ restarts the budget.
 | Phase lock | 1 s | The waiter recovers the lock. |
 | Write lock | 5 s | The waiter recovers the lock at once if `kill(pid, 0)` / `OpenProcess` proves the holder dead. It takes over a holder it cannot prove dead only after the budget. |
 
-The budgets are far above the longest live hold measured with 4.8 runnable
+The budgets are far above the longest live hold measured with 5.2 runnable
 threads per core (56 ms for a bucket, 112 ms for the phase lock). A holder
 that is only descheduled is therefore waited out. A larger budget only
 lengthens the one-time stall after a process died holding a lock.
