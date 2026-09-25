@@ -23,6 +23,10 @@ measured, in order:
   resident documents. The cold sweep ran against a same-day LMDB, and a
   shorter check repeated it after rebasing onto main with wrap retention
   on by default.
+- **Insert path (issue #16):** main at 6e2077e against the fix, which
+  writes the content from the handle's buffer instead of assembling a
+  contiguous document and adds `WriteHandle::reserve()`. Put, churn at
+  T=1 and T=4, and same-day file-per-block and LMDB at T=1.
 
 Each number is one machine's reading. Treat differences under about 20 % as
 noise unless a section says otherwise.
@@ -38,17 +42,24 @@ Where Cyclone stands now:
   256 KiB readahead threshold, cold reads are far behind (64 KiB: 0.04
   against 1.56 GB/s). Today's LMDB reads 23–34 % faster than the round-2
   LMDB figures used elsewhere in this file.
-- **Writes:** about 1 GB/s per thread at 2 MiB, 1.4× behind file-per-block
-  (1.01 vs 1.44 GB/s on Linux).
+- **Writes:** since the insert-path fix, 1.5 GB/s per thread at 2 MiB on
+  Linux, 4 % ahead of a same-day file-per-block (1.52 vs 1.46 GB/s).
+  Before it, a put assembled the document in two fresh heap buffers and
+  paid about 1,000 page faults for them; the rate was 0.6–1.1 GB/s
+  depending on the allocator's state
+  ([Insert path](#insert-path-profile-issue-16)).
 - **Bounded tier under churn:** with wrap retention on, Cyclone meets the
   pre-registered "significantly better than LMDB" bar through the latency
   clause. At 4 threads its hit p99 is 0.27–0.37× LMDB's while it serves
   1.02–1.48× LMDB's throughput, on both patterns in two runs. Retention
   lifts the hit ratio from 0.76 to 0.81 (`zipf`), which is still 3.5–4
-  points below LMDB with an LRU. At one thread Cyclone still serves less
-  than LMDB (about 0.7–0.8×). Retention is now the default; in flush
+  points below LMDB with an LRU. Retention is now the default; in flush
   mode, the opt-out (and the default when round 5 ran), the result is
-  still partial.
+  still partial. At one thread, round 5 had Cyclone serving 0.7–0.8× of
+  LMDB. Since the insert-path fix its miss+insert p50 is 1.49 ms (was
+  4.41; file-per-block 1.43, LMDB 1.65, same day), and it serves 1.76 GB/s
+  against 1.48–1.54 for LMDB and 1.71–1.73 for file-per-block. Its insert
+  p99 at one thread is the worst of the three (24 ms, against 6 and 13).
 - **GPU transfer:** registering the whole volume mapping once reaches the
   PCIe ceiling (12.79 of 12.82 GB/s, 2.3× over staging). Pinning each
   returned span is slower than staging. LMDB also keeps every value in one
@@ -61,10 +72,11 @@ Where Cyclone stands now:
 | Cold first-touch GET, Linux | 2.38 GB/s | LMDB 2.77 (same day); round 2: LMDB 2.15, filedir 1.76 | [Readahead](#readahead-chunking-issue-18) |
 | Cold restart GET, Linux | 2.09 GB/s | LMDB 2.68 (same day); round 2: LMDB 2.16, filedir 1.73 | [Readahead](#readahead-chunking-issue-18) |
 | Cold first-touch, 512 KiB / 8 MiB / 32 MiB, Linux | 1.70 / 3.01 / 3.40 GB/s | LMDB 2.37 / 2.82 / 2.94 (same day) | [Readahead](#readahead-chunking-issue-18) |
-| PUT, 1 thread, Linux | 1.01 GB/s | filedir 1.44, RocksDB 0.61 | [3b](#round-3b-crc-32c-on-disk-format-v8) |
+| PUT, 1 thread, Linux | 1.52 GB/s | filedir 1.46 (same day); round 3b: filedir 1.44, RocksDB 0.61 | [Insert path](#insert-path-profile-issue-16) |
 | 4 reader processes, `view`, Linux | 755 k gets/s | LMDB 585 k | [3b](#round-3b-crc-32c-on-disk-format-v8) |
 | Churn, `zipf`, 4 threads, retention on: hit ratio / served / hit p99 | 0.814 / 1.73–2.13 GB/s / 25–31 ms | LMDB 0.849 / 1.44–1.51 / 86–92 ms (same day) | [5](#round-5-re-benchmark-at-main-2aed24c) |
 | Churn, `zipf+scan`, 4 threads, retention on | 0.686 / 1.01–1.22 GB/s / 24–29 ms | LMDB 0.726 / 1.00–1.04 / 76–78 ms (same day) | [5](#round-5-re-benchmark-at-main-2aed24c) |
+| Churn, `zipf`, 1 thread: served / miss+insert p50 / p99 | 1.76 GB/s / 1.49 / 24.4 ms | filedir 1.71–1.73 / 1.43 / 6.3; LMDB 1.48–1.54 / 1.65 / 13.1 (same day) | [Insert path](#insert-path-profile-issue-16) |
 | Host→GPU, mapping registered once (CUDA, batch 16) | 12.79 GB/s | LMDB 12.81, staged 5.51 | [CUDA](#device-transfer-cuda-gtx-1050-pcie) |
 
 Peer rows come from the round-1 and round-2 sweeps and were not re-run for
@@ -73,7 +85,10 @@ section re-ran on the same day as its Cyclone runs. Round 4 has its own peers (L
 with an LRU), and round 5 re-ran them at 4 threads. Round 5 re-measured the
 Cyclone cold rows at main: 2, 8 and 32 MiB are unchanged. At 512 KiB it
 read 0.80 GB/s, and a same-day run of the round-3b code read 0.86, so that
-shift comes from the machine, not the code.
+shift comes from the machine, not the code. The two 4-thread churn rows
+predate the insert-path fix. Against same-day main, that fix raised
+Cyclone's 4-thread `zipf` served GB/s by 21 % and left its hit p99
+unchanged; LMDB was not re-run at 4 threads.
 
 ## The role being benchmarked
 
@@ -1232,6 +1247,212 @@ left as a follow-up.
   starts mid-run is not prevented; the sampler records one, and none was
   recorded in the runs where it was on (from the second full sweep on).
 
+## Insert path profile (issue #16)
+
+> 2026-09-25, Linux machine, with a 4 KiB check on the M5. main at 6e2077e
+> (wrap retention on by default) against this change. Before/after numbers
+> are medians of three interleaved runs unless a table says otherwise, and
+> every run waited for the 1-minute load to drop below 1.0 with no other
+> job running. Raw data, the drivers, the timing patch and the perf
+> reports are in
+> [`kv-cache-benchmark/insert-path/`](kv-cache-benchmark/insert-path/).
+
+Rounds 4 and 5 measured a miss+insert p50 of about 4 ms at one thread and
+2 MiB, against 1.4–1.6 ms for file-per-block and LMDB, and a 2 MiB PUT
+1.4× behind file-per-block. Both were put down to a three-copy write path;
+neither was profiled. This section profiles it, removes the cost it finds,
+and re-measures.
+
+### Where the time went
+
+The churn run at main reproduces the round-5 number: miss+insert p50
+4.41 ms at T=1 (round 5: 4.33). Two tools split it. `insert_bench` (new;
+one put timed as key / open / write / commit, with page faults per
+insert from `getrusage`) runs the same store configuration as `kv_churn`
+without a cgroup. A throwaway timing patch around each step of
+`Volume::commit_write` and `DocumentBuilder::build`
+([`insert-path-instr.patch`](kv-cache-benchmark/insert-path/insert-path-instr.patch))
+ran under both. `perf record -g` on `insert_bench` gave the call graph.
+
+Mean µs per 2 MiB insert at main:
+
+| step | `insert_bench`, no cgroup | `kv_churn` T=1, 4 GiB cgroup |
+|---|---:|---:|
+| key (SHA-256) + open the handle | 0.8 | — |
+| copy 1: caller buffer → handle buffer (`write_sync`) | 113 | not timed |
+| copy 2: handle buffer → `DocumentBuilder::_content`, with its fresh 2 MiB heap buffer and that buffer's free | ≈ 850 | ≈ 1 040 |
+| copy 3: header + content → one contiguous document, into another fresh 2 MiB buffer | 891 | 1 160 |
+| CRC-32C over 2 MiB | 134 | 136 |
+| stripe lock + `allocate_write_slot` (write lock, lease gate, wrap, retention frontier) | 2.0 | 3.3 |
+| `pwrite` of the document | 588 | 1 533 |
+| `commit_write_slot` (cursor publish, lock release) | 1.1 | 1.5 |
+| directory probe + insert | 2.4 | 6.3 |
+| free of the document buffer | 138 | 0.4 |
+| **sum** | **≈ 2 720** | **≈ 3 880** + copy 1 + the failed get |
+
+The `kv_churn` column averages 31 259 inserts, warm-up included; its
+measured miss+insert p50 in that run was 4.40 ms.
+
+- **Copies 2 and 3 are most of it, and it is the allocator, not memcpy.**
+  Each put allocates two more 2 MiB buffers for them. glibc hands memory of that size
+  back to the kernel on free, so every put faults 2 × 512 fresh zeroed
+  pages back in: 992 minor faults per insert. perf puts 24 % of all
+  samples in user-space `memmove` and another 25 % in the page-fault path
+  under it (fault entry, `clear_page_erms`, memcg charging), plus 4.6 % in
+  `brk` shrinking the heap. Copy 1 goes into a buffer the allocator does
+  reuse, and costs 113 µs for the same 2 MiB. On the M5 the allocator
+  keeps the buffers, and the same path takes 0.25 ms per put; the problem
+  is Linux-specific.
+- **`pwrite` is the kernel copy into the page cache** (ext4 delayed
+  allocation, page-cache page allocation, dirtying). Inside the full
+  4 GiB cgroup it takes 2.6× longer, 1.5 ms, which is consistent with the
+  page-cache pages the write needs being reclaimed first; it was not
+  profiled separately. File-per-block's whole insert, which writes the
+  same 2 MiB through `writev` in the same cgroup, was 1.43 ms p50 in
+  round 4.
+- **Not a cause:** nothing syncs (`sync_on_write` is false; perf shows
+  `fsync` at 0.01 %, from open and close). The wrap and lease gate and
+  the retention frontier advance cost 2–3 µs, the directory insert 2–6 µs,
+  key hashing 0.4 µs. HitTracker is off in the KV configuration. There
+  are no page faults on the write region: writes go through `pwrite`,
+  not the mapping. The first lap costs about 0.3 ms more than later laps
+  (2.8 against 2.5 ms p50), which is ext4 allocating blocks for a file
+  region written for the first time.
+
+### The fix
+
+1. **No contiguous document** (`Volume::commit_write`). The builder now
+   produces only the head, the 132-byte header plus the caller's header
+   bytes (`DocumentBuilder::build_head`), with the CRC-32C chained over
+   header bytes and then content, so the payload is never contiguous in
+   memory. The head and then the content, straight from the handle's
+   buffer, go to the file with two `pwrite` calls. The bytes on disk are
+   identical (a unit test compares `build_head(c) ++ c` with `build()`).
+   So is the commit order: the whole fill, then `sync_on_write`'s fsync,
+   then `commit_write_slot` and the directory insert (invariant 2).
+   Objects up to 64 KiB are still copied behind the head and written with
+   one `pwrite`, because below that the copy is cheaper than a second
+   syscall. This removes copies 2 and 3, both allocations and all the
+   faults: 992 faults per insert become 0.
+2. **`WriteHandle::reserve(n)`** (new, additive). It returns `n` bytes of
+   the handle's own buffer for the caller to fill, so a producer generates
+   the block where the commit will write it from, and copy 1 goes too. The
+   buffer grows without zero-filling. Contract: the span is valid until
+   the next write, reserve, close or abort; the checksum is taken at
+   close; an abort after a partial fill publishes nothing; the
+   `write_sync` limits apply. `kv_churn --reserve` and
+   `insert_bench --reserve` generate into it. It is not in the C API,
+   which has no streaming write handle.
+
+The destination is not the mapping itself: a slot is reserved only at
+commit, under the write lock held across the fill (F6), so the content
+cannot be written there before the commit. With both changes a 2 MiB put
+is one CRC pass over the caller's bytes and the kernel's copy into the page
+cache. The alternate write path (`commit_alternate_write`, which PageSpeed
+uses) still builds the contiguous document and was not changed.
+
+### Before and after
+
+**`insert_bench`** (no cgroup, C = 4 GiB, one lap then two, p50 µs;
+the first lap in parentheses):
+
+| block | main | this change | + `reserve()` |
+|---|---:|---:|---:|
+| 2 MiB | 2 500 (2 800) | 490 (860) | 410 (770) |
+| 512 KiB | 490 (580) | 120 (210) | 93 (190) |
+| 2 MiB, GB/s over the steady laps | 0.71 | 2.30 | 2.40 |
+
+**`kv_bench` PUT, 2 MiB** (single writer, fresh store): main 0.62 GB/s
+(p50 2.82 ms), this change 1.42 GB/s (p50 0.87 ms), interleaved. A second
+set later the same night, this change interleaved with file-per-block
+(the peer harness, `--store filedir`): Cyclone 1.52 GB/s (p50 0.87 ms),
+file-per-block 1.46 GB/s (p50 0.98 ms). The 1.4× PUT gap to
+file-per-block is gone; Cyclone is 4 % ahead.
+
+Main's 0.62 is the low reading round 5 could not explain (0.59 in its
+2 MiB re-run, 1.11 in its full sweep). It is the allocator. main's
+`kv_bench` run on 2 MiB alone reads 0.60–0.61 GB/s with 2.18 M minor
+faults per process; run after a 512 KiB size, as in a full sweep, its
+2 MiB PUT reads 0.99–1.08 GB/s, and the process takes 1.17 M faults over
+both sizes. So the heap state that the earlier size leaves behind decides
+whether the per-put 2 MiB buffers are faulted in afresh. Every earlier PUT
+number in this file comes from a full sweep, the lucky state. This change
+reads 1.46–1.55 GB/s at 2 MiB either way (two runs of each order; `/usr/bin/time -v`
+fault counts in
+[`insert-path-order.txt`](kv-cache-benchmark/insert-path/insert-path-order.txt)).
+
+**Churn, `zipf`, 2 MiB, C = 16 GiB, 4 GiB cgroup** (`run-churn.sh`,
+Cyclone with wrap retention on; latencies in µs). The peers ran after the
+Cyclone runs the same night, two runs each, with the round-4 peer build
+and flags:
+
+| T | store | hit ratio | served GB/s | miss+insert p50 / p99 | hit p50 / p99 | inserted GB/s |
+|---:|---|---:|---:|---:|---:|---:|
+| 1 | Cyclone, main | 0.815 | 1.20 | 4 414 / 18 850 | 185 / 5 717 | 0.27 |
+| 1 | Cyclone, this change | 0.815 | **1.76** | **1 486** / 24 408 | 196 / 7 216 | 0.40 |
+| 1 | Cyclone, this change, `--reserve` | 0.815 | **1.80** | **1 374** / 24 625 | 192 / 7 104 | 0.41 |
+| 1 | file-per-block | 0.850 | 1.71 / 1.73 | 1 433 / 6 275 | 219 / 14 742 | — |
+| 1 | LMDB | 0.851 | 1.54 / 1.48 | 1 653 / 13 073 | 180 / 7 292 | — |
+| 4 | Cyclone, main | 0.814 | 2.09 | 7 313 / 52 109 | 387 / 28 727 | 0.48 |
+| 4 | Cyclone, this change | 0.814 | **2.52** | **4 850** / 49 896 | 396 / 29 064 | 0.57 |
+
+Cyclone rows are medians of three; per run, served was
+1.26 / 1.20 / 1.20 → 1.97 / 1.75 / 1.76 at T=1 and
+2.09 / 2.12 / 1.87 → 2.42 / 2.52 / 2.55 at T=4. Peer rows give both
+served values and the first run's latencies. No run failed the content
+check; no Cyclone run dropped an insert to a lease or reported a read
+error.
+
+- **T=1: miss+insert p50 −66 % (4.41 → 1.49 ms), served +47 %.** The
+  insert p50 is now 1.04× file-per-block's and 0.90× LMDB's (it was 3.1×
+  file-per-block's; the issue's bar was 1.5×). Cyclone serves 1.02× what
+  file-per-block serves and 1.14–1.19× LMDB, with a hit ratio 3.5 points
+  lower. At one thread it no longer serves less than LMDB.
+- **T=4: miss+insert p50 −34 %, served +21 %.** The hit tail is unchanged
+  (29 ms).
+- **The T=1 tails rose**: miss+insert p99 18.9 → 24.4 ms and hit p99
+  5.7 → 7.2 ms. Cyclone now inserts 47 % more bytes per second into the
+  same 4 GiB of page cache, so every operation has more writeback and
+  reclaim to wait behind; the medians did not move up (hit p50 +6 %).
+  The insert tail is Cyclone's weak point at one thread: p99 24 ms against
+  6 ms for file-per-block and 13 ms for LMDB. It was not profiled here.
+
+**No regression elsewhere:**
+
+- `performance_baseline` 4 KiB writes (`--cache-size 512 --entries 5000
+  --content-size 4096`, five interleaved runs each): Linux p50 2.95 →
+  2.84 µs (320 k → 332 k ops/s); M5 p50 2.08 → 2.04 µs (462 k → 475 k
+  ops/s). An earlier Linux pass ran each point right after a multi-GiB
+  `insert_bench` run and read about 100 µs for both trees, because the
+  4 KiB writes waited behind writeback of the previous run's data; it is
+  kept in the raw data and not used. The head of an object of 64 KiB or
+  less is now built with room for its content, so folding the content in
+  no longer reallocates. A later five-round interleave of main, the tree
+  before that change and after it read p50 2.96 / 2.83 / 2.84 µs (319 k /
+  331 k / 335 k ops/s), within noise of each other on the change itself
+  (`insert-path-ab5-*`). main's first round read 100 µs and is excluded
+  from its median for the writeback reason above.
+- Read path, `concurrent_read_bench 20000 512 2 0 512 ramoff` (two runs
+  each; reads/s): 1 thread 1.89 M → 1.87 M, 4 threads 6.17 M → 6.13 M,
+  16 threads 12.0 M → 11.5 M. The read code is untouched. Only the 16-thread
+  point (on 12 hardware threads) moved by more than 1 %.
+
+### What is left
+
+perf over the final tree's `insert_bench` run (2 MiB, no cgroup): 71 % of
+an insert's samples are the `pwrite` (the kernel copy, ext4 delayed
+allocation, page-cache lookup and dirtying), 15 % the handle copy that
+`reserve()` removes, and 13 % the CRC-32C. Under the 4 GiB cgroup the
+`pwrite` alone measured 1.5 ms at main. That is about what a whole insert
+now takes (1.49 ms p50), and about what file-per-block's buffered insert
+takes (1.43 ms). What remains at the median is the page cache under
+memory pressure, not Cyclone's code. The one-thread insert tail (p99
+24 ms) is not explained by this profile and is left open.
+
+To reproduce the split:
+`./build/insert_bench --block-size 2097152 --capacity 4294967296 --laps 2`
+(add `--reserve` for the `reserve()` path).
+
 ## Device transfer: does zero-copy pay off? (Metal, Apple silicon)
 
 The open question from rounds 1 and 2 is whether the zero-copy read pays
@@ -1675,11 +1896,11 @@ through nvcc in `kv_gpu_cuda.cu`, behind the plain-C seam in
 | Readahead below the 256 KiB threshold: a warm path cheap enough to lower it | Open; 64 KiB reads cold at 0.04 GB/s against LMDB's 1.56. A 64 KiB threshold lifts that to 0.24 but costs warm `view` 8–18 % | [Readahead chunking](#what-is-left-of-the-gap) |
 | Fast document checksum: slice-by-16 / ARMv8 CRC32, then CRC-32C at format v8 | **Done** | [Round 3](#fast-crc32-alone), [Round 3b](#round-3b-crc-32c-on-disk-format-v8); [architecture.md](architecture.md#document-format) |
 | Verified state that outlives the process: keep the CRC-validation cache beside the mmap directory, so a restart and every peer process skip re-verification | Designed, then shelved ([design](design/verified-state.md)); the 512 KiB gap was tracked as a readahead item (#18, since [fixed](#readahead-chunking-issue-18)). Measured there: about half of a warm-page-cache first read (view) is the CRC pass, but only 2–9 % of a cold NVMe read. The 512 KiB cold gap to LMDB is the I/O pattern, not the CRC | [Design, section 2](design/verified-state.md#2-what-is-avoidable-measurement) |
-| `WriteHandle::reserve(n)` that returns the destination span, so the caller writes or DMAs straight into the record (three copies become one) | Open; puts are 1.4× behind file-per-block (1.01 vs 1.44 GB/s) | [Round 3b](#round-3b-crc-32c-on-disk-format-v8), insert latency in [Round 4](#round-4-bounded-capacity-under-churn) |
+| `WriteHandle::reserve(n)` that returns the destination span, so the caller writes or DMAs straight into the record (three copies become one) | **Done** (#16), with the destination being the handle's buffer: a slot exists only at commit, under the write lock held across the fill. The larger win was dropping the contiguous-document build; puts went from 0.62 to 1.52 GB/s at 2 MiB, 4 % ahead of a same-day file-per-block, and `reserve()` takes a 2 MiB insert from 490 to 410 µs p50 | [Insert path](#insert-path-profile-issue-16) |
 | An entry point that gives an embedder the mapping identity for one-time GPU registration, instead of inferring it from `content()` / `content_file_offset()` / `volume_files()` | Open | [Metal](#device-transfer-does-zero-copy-pay-off-metal-apple-silicon), [CUDA](#device-transfer-cuda-gtx-1050-pcie) |
 | A zero-copy C read entry point and a Python binding, which is what a vLLM/SGLang connector would call | Open | — |
 | Keep the previous lap resolvable until it is actually overwritten ([design](design/wrap-retention.md)) | **Done**: implemented and on by default (`wrap_retention = false` is the flush opt-out); see [CHANGELOG](../CHANGELOG.md). Measured: at 16 GiB it meets the churn decision criteria (latency clause, both patterns, T=4); flush mode stays partial | [Round 5](#round-5-re-benchmark-at-main-2aed24c): hit ratio 0.758 → 0.814 (`zipf`) and 0.640 → 0.686 (`zipf+scan`), matching the replay within 0.002; served +16 % at T=1, within noise at T=4; hit p99 0.27–0.37× LMDB's; the round-5 cold sweep ran with it off (then the default) and was unchanged |
-| Profile insert latency (miss+insert p50 4.0 ms vs 1.4–1.6 ms for the peers) | Open | [Round 4](#round-4-bounded-capacity-under-churn) |
+| Profile insert latency (miss+insert p50 4.0 ms vs 1.4–1.6 ms for the peers) | **Done** (#16): two fresh 2 MiB heap buffers per put and their ~1,000 page faults were most of it. Removed; T=1 miss+insert p50 4.41 → 1.49 ms (file-per-block 1.43, same day). Still open: the T=1 insert p99 (24 ms against 6 for file-per-block) | [Insert path](#insert-path-profile-issue-16) |
 | Scan resistance or admission control on the disk tier | Open | [Round 4](#why-the-hit-ratio-and-where-it-comes-from): a scan costs every store about 12 points |
 
 GPUDirect Storage (`cuFileRead` at `content_file_offset()`, NVMe to GPU with

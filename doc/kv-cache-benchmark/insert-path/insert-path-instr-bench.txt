@@ -1,0 +1,32 @@
+idle: 0.96 0.33 0.24 1/733 1535805
+=== 2026-09-25T02:10:31+02:00 ./build/insert_bench --block-size 2097152 --capacity 4294967296 --laps 2 --path ~/kvdata/insert-path
+INSTR   build.alloc      mean      2.7 us
+INSTR   build.copy       mean    891.5 us
+INSTR   build.crc        mean    133.9 us
+INSTR commit_write n=6141
+INSTR build            mean   1878.0 us
+INSTR lock+alloc_slot  mean      2.0 us
+INSTR pwrite           mean    587.5 us
+INSTR commit_slot      mean      1.1 us
+INSTR probe+insert     mean      2.4 us
+INSTR doc_free         mean    137.7 us
+insert_bench: block 2097152 B, capacity 4294967296 B, laps 2, mmap dir on, wrap retention default, write_sync()
+
+fill: 2047 inserts, 0.61 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       0.8       0.5
+  open         0.4       1.1       0.4
+  write      110.2     176.8     115.8
+  commit    2751.7    6534.6    2929.3
+  total     2864.1    6777.1    3045.4
+  per insert: minor faults 992.5, major faults 0.2, vol/invol ctx switches 0.01/0.01
+
+steady: 4094 inserts, 0.71 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       0.8       0.5
+  open         0.3       0.6       0.4
+  write      107.8     163.0     113.1
+  commit    2402.3    2800.2    2448.9
+  total     2516.5    2915.6    2562.3
+  per insert: minor faults 992.0, major faults 0.9, vol/invol ctx switches 0.00/0.01
+rc=0 load-after: 1.20 0.43 0.27 1/733 1535826

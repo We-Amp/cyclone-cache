@@ -170,7 +170,23 @@ class DocumentBuilder {
 
   [[nodiscard]] std::vector<std::byte> build() const;
 
+  // The document's head only: the kHeaderSize header followed by the header
+  // bytes, with the checksum computed over header bytes + `content`.  For a
+  // writer that writes `content` from its own buffer right behind the head
+  // (two writes, or a gathered one) instead of copying it into one
+  // contiguous document: head ++ content is byte-identical to build() after
+  // set_content(content).  Content given to set_content() is ignored.  Empty
+  // on overflow, like build().  `extra` reserves that many more bytes of
+  // capacity behind the head, for a caller that appends to it.
+  [[nodiscard]] std::vector<std::byte> build_head(
+      std::span<const std::byte> content, size_t extra = 0) const;
+
  private:
+  // The head of a document whose content is `content`, with `extra` more
+  // bytes of capacity reserved behind it (build() appends the content).
+  [[nodiscard]] std::vector<std::byte> serialize_head(
+      std::span<const std::byte> content, size_t extra) const;
+
   CacheKey _key;
   std::vector<std::byte> _header;
   std::vector<std::byte> _content;

@@ -559,6 +559,40 @@ Writes content data. Can be called multiple times for streaming writes.
 - `CacheError::Closed` if handle was closed or aborted
 
 ```cpp
+std::expected<std::span<std::byte>, CacheError> reserve(size_t length);
+```
+
+Appends `length` bytes to the object and returns them for the caller to
+fill in place: the zero-copy form of `write_sync()`, for a producer that
+generates the content itself (a KV engine staging tensors, a rewriter
+emitting output). `write_sync()` copies the caller's buffer into the
+handle; with `reserve()` the content is produced in the handle's buffer
+and that copy never happens. It mixes freely with `write_sync()`, in call
+order, and the bytes count toward `bytes_written()` as soon as it returns.
+
+- The span stays valid until the next `write_sync()`, `reserve()`, close or
+  abort on the handle.
+- Every write into the span must be complete before `close_sync()` is
+  called. No fill may still be in flight: not an async DMA, not io_uring,
+  not another thread. Close computes the checksum from the span first and
+  writes the bytes to the file afterwards, possibly after waiting on a wrap
+  or a reader lease. A byte that changes after close begins is stored under
+  a checksum that does not match it, and reads back as
+  `CacheError::Corrupted` or torn.
+- **Security:** the reserved bytes are not initialized. They hold whatever
+  the heap held before, which can be other data of the same process. Fill
+  every byte: an unfilled byte is persisted, and served to readers, as that
+  old heap content.
+- Nothing is visible to readers before the close commits. An abort, or
+  destroying the handle unclosed, after a partial fill discards everything.
+- Same limits as `write_sync()`: `CacheError::ObjectTooLarge` past
+  `max_object_size`, `CacheError::NoSpace` past the 4 GiB document limit,
+  `CacheError::Closed` on a closed or aborted handle. A refused `reserve()`
+  appends nothing.
+
+Not exposed in the C API, which has no streaming write handle.
+
+```cpp
 std::expected<void, CacheError> close_sync();
 ```
 
@@ -593,6 +627,18 @@ if (result) {
     auto close_result = handle.close_sync();
     if (!close_result) {
         // Handle write error
+    }
+}
+```
+
+Generating the content in place with `reserve()`:
+```cpp
+auto handle = cache->write_sync(key, block_size);
+if (handle) {
+    auto dst = handle->reserve(block_size);
+    if (dst) {
+        produce_block(*dst);  // writes all block_size bytes
+        auto committed = handle->close_sync();
     }
 }
 ```

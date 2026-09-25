@@ -1,0 +1,24 @@
+03:47:18 start perf_baseline base r1 load: 0.79 2.82 2.49 1/740 1543946
+03:47:19 start perf_baseline fix r1 load: 0.79 2.82 2.49 1/738 1543962
+03:47:19 start perf_baseline base r2 load: 0.79 2.82 2.49 1/738 1543978
+03:47:20 start perf_baseline fix r2 load: 0.79 2.82 2.49 1/738 1543994
+03:47:20 start perf_baseline base r3 load: 0.79 2.82 2.49 1/738 1544010
+03:47:20 start perf_baseline fix r3 load: 0.79 2.82 2.49 1/738 1544026
+03:47:21 start perf_baseline base r4 load: 0.79 2.82 2.49 1/738 1544042
+03:47:21 start perf_baseline fix r4 load: 0.79 2.82 2.49 1/738 1544058
+03:47:21 start perf_baseline base r5 load: 0.79 2.82 2.49 1/738 1544074
+03:47:21 start perf_baseline fix r5 load: 0.79 2.82 2.49 1/738 1544090
+03:47:22 start insert fix 2097152 r1 load: 0.81 2.79 2.48 1/737 1544105
+03:47:29 start insert fix-reserve 2097152 r1 load: 0.90 2.78 2.47 1/738 1544126
+03:47:36 start insert fix 524288 r1 load: 0.99 2.76 2.47 1/737 1544144
+03:47:58 start insert fix-reserve 524288 r1 load: 0.83 2.59 2.42 1/741 1544185
+03:48:05 start insert fix 2097152 r2 load: 0.93 2.58 2.42 1/742 1544203
+03:48:43 start insert fix-reserve 2097152 r2 load: 0.80 2.36 2.35 1/739 1544257
+03:48:50 start insert fix 524288 r2 load: 0.89 2.35 2.35 1/740 1544277
+03:49:13 start insert fix-reserve 524288 r2 load: 0.83 2.22 2.31 1/743 1544318
+03:49:20 start insert fix 2097152 r3 load: 0.92 2.22 2.31 1/740 1544335
+03:49:42 start insert fix-reserve 2097152 r3 load: 0.85 2.10 2.26 1/738 1544368
+03:49:49 start insert fix 524288 r3 load: 0.94 2.10 2.26 1/739 1544388
+03:50:12 start insert fix-reserve 524288 r3 load: 0.80 2.00 2.22 1/742 1544426
+03:50:34 perf fix load: 0.83 1.91 2.19 1/740 1544463
+03:50:43 all done load: 1.01 1.92 2.19 1/740 1544481

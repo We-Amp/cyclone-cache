@@ -1,0 +1,396 @@
+=== 2026-09-25T02:24:12+02:00 insert base 2097152 r1: ~/insert-path-base/build/insert_bench --block-size 2097152 --capacity 4294967296 --laps 2 --path ~/kvdata/insert-path --output ~/kvresults/insert-path/ab/insert-base.jsonl
+load: 0.24 0.39 0.42 1/729 1537135
+insert_bench: block 2097152 B, capacity 4294967296 B, laps 2, mmap dir on, wrap retention default, write_sync()
+
+fill: 2047 inserts, 0.62 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       0.8       0.5
+  open         0.3       0.9       0.4
+  write      105.3     169.6     111.5
+  commit    2735.9    5832.7    2881.3
+  total     2843.8    6270.0    2993.2
+  per insert: minor faults 992.5, major faults 0.2, vol/invol ctx switches 0.01/0.01
+
+steady: 4094 inserts, 0.71 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       0.8       0.5
+  open         0.3       0.7       0.4
+  write      103.2     157.9     108.7
+  commit    2366.8    2766.8    2462.2
+  total     2476.9    2873.2    2571.3
+  per insert: minor faults 992.0, major faults 0.9, vol/invol ctx switches 0.00/0.01
+rc=0 load-after: 0.52 0.45 0.44 1/731 1537150
+=== 2026-09-25T02:24:31+02:00 insert fix 2097152 r1: ~/insert-path-fix/build/insert_bench --block-size 2097152 --capacity 4294967296 --laps 2 --path ~/kvdata/insert-path --output ~/kvresults/insert-path/ab/insert-fix.jsonl
+load: 0.52 0.45 0.44 1/731 1537160
+insert_bench: block 2097152 B, capacity 4294967296 B, laps 2, mmap dir on, wrap retention default, write_sync()
+
+fill: 2047 inserts, 1.56 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       0.8       0.4
+  open         0.4       1.1       0.4
+  write       96.4     157.7     101.1
+  commit     764.6    2819.7     841.4
+  total      862.3    2938.0     942.9
+  per insert: minor faults 0.5, major faults 0.2, vol/invol ctx switches 0.01/0.01
+
+steady: 4094 inserts, 2.25 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       0.7       0.5
+  open         0.4       0.8       0.4
+  write       94.7     143.8      97.4
+  commit     412.8     797.9     436.9
+  total      507.8     906.3     534.7
+  per insert: minor faults 0.0, major faults 0.7, vol/invol ctx switches 0.00/0.01
+rc=0 load-after: 0.75 0.50 0.46 1/731 1537168
+=== 2026-09-25T02:24:39+02:00 insert fix-reserve 2097152 r1: ~/insert-path-fix/build/insert_bench --block-size 2097152 --capacity 4294967296 --laps 2 --path ~/kvdata/insert-path --reserve --output ~/kvresults/insert-path/ab/insert-fix-reserve.jsonl
+load: 0.75 0.50 0.46 1/731 1537178
+insert_bench: block 2097152 B, capacity 4294967296 B, laps 2, mmap dir on, wrap retention default, reserve()
+
+fill: 2047 inserts, 1.43 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       0.8       0.4
+  open         0.3       1.1       0.3
+  reserve    104.3     175.4     110.9
+  commit     867.1    3888.9     954.9
+  total      973.0    3998.8    1066.2
+  per insert: minor faults 0.5, major faults 0.2, vol/invol ctx switches 0.01/0.00
+
+steady: 4094 inserts, 2.05 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       0.6       0.4
+  open         0.3       0.5       0.3
+  reserve    104.5     154.7     107.4
+  commit     501.0     888.3     518.0
+  total      606.7     995.5     625.7
+  per insert: minor faults 0.0, major faults 0.7, vol/invol ctx switches 0.00/0.00
+rc=0 load-after: 0.85 0.53 0.47 1/731 1537185
+=== 2026-09-25T02:24:46+02:00 insert base 524288 r1: ~/insert-path-base/build/insert_bench --block-size 524288 --capacity 4294967296 --laps 2 --path ~/kvdata/insert-path --output ~/kvresults/insert-path/ab/insert-base.jsonl
+load: 0.85 0.53 0.47 1/730 1537195
+insert_bench: block 524288 B, capacity 4294967296 B, laps 2, mmap dir on, wrap retention default, write_sync()
+
+fill: 8184 inserts, 0.75 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       0.5       0.4
+  open         0.2       0.5       0.3
+  write       17.0      22.1      17.3
+  commit     557.9     679.0     584.2
+  total      575.1     700.4     601.8
+  per insert: minor faults 224.1, major faults 0.1, vol/invol ctx switches 0.00/0.00
+
+steady: 16368 inserts, 0.86 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       0.4       0.4
+  open         0.2       0.4       0.2
+  write       17.0      30.0      17.3
+  commit     471.2     562.7     496.1
+  total      488.5     580.9     513.6
+  per insert: minor faults 224.0, major faults 0.4, vol/invol ctx switches 0.00/0.00
+rc=0 load-after: 0.96 0.57 0.48 1/731 1537210
+=== 2026-09-25T02:25:03+02:00 insert fix 524288 r1: ~/insert-path-fix/build/insert_bench --block-size 524288 --capacity 4294967296 --laps 2 --path ~/kvdata/insert-path --output ~/kvresults/insert-path/ab/insert-fix.jsonl
+load: 0.96 0.57 0.49 1/729 1537220
+insert_bench: block 524288 B, capacity 4294967296 B, laps 2, mmap dir on, wrap retention default, write_sync()
+
+fill: 8184 inserts, 1.54 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       0.9       0.4
+  open         0.2       0.6       0.2
+  write       19.4      40.7      20.4
+  commit     190.6     388.5     218.4
+  total      210.2     429.4     239.1
+  per insert: minor faults 0.0, major faults 0.1, vol/invol ctx switches 0.00/0.00
+
+steady: 16368 inserts, 1.78 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       0.9       0.5
+  open         0.2       0.7       0.2
+  write       19.5      48.0      20.9
+  commit     103.3     286.7     170.3
+  total      123.2     346.8     191.4
+  per insert: minor faults 0.0, major faults 0.2, vol/invol ctx switches 0.00/0.00
+rc=0 load-after: 1.04 0.60 0.49 1/728 1537225
+=== 2026-09-25T02:25:26+02:00 insert fix-reserve 524288 r1: ~/insert-path-fix/build/insert_bench --block-size 524288 --capacity 4294967296 --laps 2 --path ~/kvdata/insert-path --reserve --output ~/kvresults/insert-path/ab/insert-fix-reserve.jsonl
+load: 0.81 0.57 0.48 1/730 1537250
+insert_bench: block 524288 B, capacity 4294967296 B, laps 2, mmap dir on, wrap retention default, reserve()
+
+fill: 8184 inserts, 1.68 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       0.5       0.4
+  open         0.2       0.4       0.2
+  reserve     17.3      33.5      17.7
+  commit     190.8     273.3     195.3
+  total      208.3     296.3     213.2
+  per insert: minor faults 0.0, major faults 0.1, vol/invol ctx switches 0.00/0.00
+
+steady: 16368 inserts, 1.83 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       0.5       0.4
+  open         0.2       0.4       0.2
+  reserve     17.3      30.7      17.6
+  commit      91.9     179.2     169.0
+  total      109.5     199.1     186.8
+  per insert: minor faults 0.0, major faults 0.1, vol/invol ctx switches 0.00/0.00
+rc=0 load-after: 1.00 0.62 0.50 1/731 1537259
+=== 2026-09-25T02:28:53+02:00 insert base 2097152 r2: ~/insert-path-base/build/insert_bench --block-size 2097152 --capacity 4294967296 --laps 2 --path ~/kvdata/insert-path --output ~/kvresults/insert-path/ab/insert-base.jsonl
+load: 0.84 0.91 0.65 1/731 1537586
+insert_bench: block 2097152 B, capacity 4294967296 B, laps 2, mmap dir on, wrap retention default, write_sync()
+
+fill: 2047 inserts, 0.62 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.5       0.8       0.5
+  open         0.3       1.0       0.3
+  write      106.2     166.2     112.4
+  commit    2735.0    5944.8    2893.0
+  total     2846.9    6094.8    3005.7
+  per insert: minor faults 992.5, major faults 0.2, vol/invol ctx switches 0.01/0.02
+
+steady: 4094 inserts, 0.71 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.5       0.8       0.5
+  open         0.3       0.6       0.3
+  write      103.1     160.1     108.9
+  commit    2374.7    2779.3    2433.9
+  total     2482.8    2884.1    2543.1
+  per insert: minor faults 992.0, major faults 0.9, vol/invol ctx switches 0.00/0.01
+rc=0 load-after: 1.11 0.97 0.67 1/729 1537597
+=== 2026-09-25T02:29:28+02:00 insert fix 2097152 r2: ~/insert-path-fix/build/insert_bench --block-size 2097152 --capacity 4294967296 --laps 2 --path ~/kvdata/insert-path --output ~/kvresults/insert-path/ab/insert-fix.jsonl
+load: 0.86 0.92 0.66 1/732 1537626
+insert_bench: block 2097152 B, capacity 4294967296 B, laps 2, mmap dir on, wrap retention default, write_sync()
+
+fill: 2047 inserts, 1.55 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.5       0.8       0.5
+  open         0.4       1.0       0.4
+  write       99.9     152.3     105.4
+  commit     774.5    2742.5     847.1
+  total      877.1    2850.7     952.9
+  per insert: minor faults 0.5, major faults 0.2, vol/invol ctx switches 0.01/0.00
+
+steady: 4094 inserts, 2.14 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.5       0.8       0.5
+  open         0.3       0.7       0.4
+  write       97.5     152.3     100.3
+  commit     421.5     820.8     480.3
+  total      519.7     937.8     581.0
+  per insert: minor faults 0.0, major faults 0.7, vol/invol ctx switches 0.00/0.00
+rc=0 load-after: 0.96 0.94 0.67 2/732 1537631
+=== 2026-09-25T02:29:36+02:00 insert fix-reserve 2097152 r2: ~/insert-path-fix/build/insert_bench --block-size 2097152 --capacity 4294967296 --laps 2 --path ~/kvdata/insert-path --reserve --output ~/kvresults/insert-path/ab/insert-fix-reserve.jsonl
+load: 0.96 0.94 0.67 1/732 1537641
+insert_bench: block 2097152 B, capacity 4294967296 B, laps 2, mmap dir on, wrap retention default, reserve()
+
+fill: 2047 inserts, 1.36 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       0.9       0.5
+  open         0.3       1.2       0.4
+  reserve     99.9     200.9     109.0
+  commit     864.3    4080.6    1026.9
+  total      965.4    4549.3    1136.3
+  per insert: minor faults 0.5, major faults 0.2, vol/invol ctx switches 0.01/0.00
+
+steady: 4094 inserts, 2.02 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       0.7       0.4
+  open         0.3       0.7       0.3
+  reserve    101.5     150.4     104.3
+  commit     502.5     870.9     539.0
+  total      605.7     973.1     643.6
+  per insert: minor faults 0.0, major faults 0.7, vol/invol ctx switches 0.00/0.00
+rc=0 load-after: 1.05 0.96 0.68 1/731 1537649
+=== 2026-09-25T02:29:59+02:00 insert base 524288 r2: ~/insert-path-base/build/insert_bench --block-size 524288 --capacity 4294967296 --laps 2 --path ~/kvdata/insert-path --output ~/kvresults/insert-path/ab/insert-base.jsonl
+load: 0.82 0.91 0.67 1/731 1537674
+insert_bench: block 524288 B, capacity 4294967296 B, laps 2, mmap dir on, wrap retention default, write_sync()
+
+fill: 8184 inserts, 0.74 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.5       0.7       0.5
+  open         0.3       0.6       0.3
+  write       17.0      35.7      17.6
+  commit     558.7     845.9     593.1
+  total      576.0     873.1     611.0
+  per insert: minor faults 224.1, major faults 0.1, vol/invol ctx switches 0.00/0.00
+
+steady: 16368 inserts, 0.86 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       0.5       0.4
+  open         0.2       0.5       0.3
+  write       17.0      30.4      17.3
+  commit     469.4     597.0     493.5
+  total      486.7     617.1     511.1
+  per insert: minor faults 224.0, major faults 0.4, vol/invol ctx switches 0.00/0.00
+rc=0 load-after: 0.92 0.93 0.68 1/729 1537685
+=== 2026-09-25T02:30:15+02:00 insert fix 524288 r2: ~/insert-path-fix/build/insert_bench --block-size 524288 --capacity 4294967296 --laps 2 --path ~/kvdata/insert-path --output ~/kvresults/insert-path/ab/insert-fix.jsonl
+load: 0.92 0.93 0.68 1/729 1537695
+insert_bench: block 524288 B, capacity 4294967296 B, laps 2, mmap dir on, wrap retention default, write_sync()
+
+fill: 8184 inserts, 1.50 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       0.8       0.4
+  open         0.2       0.6       0.2
+  write       19.8      46.9      20.7
+  commit     192.3     470.1     227.5
+  total      212.4     524.9     248.4
+  per insert: minor faults 0.0, major faults 0.1, vol/invol ctx switches 0.00/0.00
+
+steady: 16368 inserts, 2.14 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       0.6       0.4
+  open         0.2       0.4       0.2
+  write       19.9      38.8      20.4
+  commit     107.0     192.9     123.8
+  total      127.1     215.6     144.4
+  per insert: minor faults 0.0, major faults 0.3, vol/invol ctx switches 0.00/0.00
+rc=0 load-after: 1.01 0.95 0.68 1/730 1537701
+=== 2026-09-25T02:30:38+02:00 insert fix-reserve 524288 r2: ~/insert-path-fix/build/insert_bench --block-size 524288 --capacity 4294967296 --laps 2 --path ~/kvdata/insert-path --reserve --output ~/kvresults/insert-path/ab/insert-fix-reserve.jsonl
+load: 0.87 0.92 0.68 1/732 1537729
+insert_bench: block 524288 B, capacity 4294967296 B, laps 2, mmap dir on, wrap retention default, reserve()
+
+fill: 8184 inserts, 1.46 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       0.7       0.4
+  open         0.2       0.6       0.2
+  reserve     17.2      36.4      18.1
+  commit     192.1     433.0     238.1
+  total      209.5     470.5     256.4
+  per insert: minor faults 0.0, major faults 0.1, vol/invol ctx switches 0.00/0.00
+
+steady: 16368 inserts, 2.28 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       0.5       0.4
+  open         0.2       0.4       0.2
+  reserve     17.1      33.1      17.5
+  commit     106.8     189.2     112.3
+  total      124.2     208.6     130.0
+  per insert: minor faults 0.0, major faults 0.3, vol/invol ctx switches 0.00/0.00
+rc=0 load-after: 0.96 0.94 0.69 1/732 1537735
+=== 2026-09-25T02:33:44+02:00 insert base 2097152 r3: ~/insert-path-base/build/insert_bench --block-size 2097152 --capacity 4294967296 --laps 2 --path ~/kvdata/insert-path --output ~/kvresults/insert-path/ab/insert-base.jsonl
+load: 0.99 1.12 0.81 3/731 1538047
+insert_bench: block 2097152 B, capacity 4294967296 B, laps 2, mmap dir on, wrap retention default, write_sync()
+
+fill: 2047 inserts, 0.62 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.5       0.9       0.5
+  open         0.4       1.1       0.4
+  write      102.7     164.1     108.5
+  commit    2740.8    6086.1    2885.7
+  total     2846.8    6203.2    2994.6
+  per insert: minor faults 992.5, major faults 0.2, vol/invol ctx switches 0.02/0.01
+
+steady: 4094 inserts, 0.68 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.5       0.8       0.5
+  open         0.3       0.6       0.3
+  write       98.9     159.8     105.4
+  commit    2373.8    2753.0    2567.4
+  total     2475.7    2857.0    2673.1
+  per insert: minor faults 992.0, major faults 0.9, vol/invol ctx switches 0.00/0.01
+rc=0 load-after: 1.13 1.15 0.83 1/730 1538059
+=== 2026-09-25T02:34:19+02:00 insert fix 2097152 r3: ~/insert-path-fix/build/insert_bench --block-size 2097152 --capacity 4294967296 --laps 2 --path ~/kvdata/insert-path --output ~/kvresults/insert-path/ab/insert-fix.jsonl
+load: 0.88 1.09 0.81 1/728 1538085
+insert_bench: block 2097152 B, capacity 4294967296 B, laps 2, mmap dir on, wrap retention default, write_sync()
+
+fill: 2047 inserts, 1.36 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.5       1.4       0.5
+  open         0.4       1.4       0.4
+  write       96.4     256.4     105.3
+  commit     766.8    5352.9    1017.9
+  total      864.1    5808.5    1123.6
+  per insert: minor faults 0.5, major faults 0.2, vol/invol ctx switches 0.01/0.00
+
+steady: 4094 inserts, 2.05 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.5       0.9       0.5
+  open         0.3       0.7       0.4
+  write       96.1     146.1      98.9
+  commit     417.4     815.3     524.5
+  total      514.0     928.8     623.8
+  per insert: minor faults 0.0, major faults 0.7, vol/invol ctx switches 0.00/0.00
+rc=0 load-after: 1.05 1.12 0.83 1/730 1538092
+=== 2026-09-25T02:34:43+02:00 insert fix-reserve 2097152 r3: ~/insert-path-fix/build/insert_bench --block-size 2097152 --capacity 4294967296 --laps 2 --path ~/kvdata/insert-path --reserve --output ~/kvresults/insert-path/ab/insert-fix-reserve.jsonl
+load: 0.82 1.07 0.81 1/731 1538117
+insert_bench: block 2097152 B, capacity 4294967296 B, laps 2, mmap dir on, wrap retention default, reserve()
+
+fill: 2047 inserts, 1.31 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       1.4       0.5
+  open         0.3       1.3       0.4
+  reserve    103.4     271.8     115.9
+  commit     867.8    5100.0    1062.7
+  total      972.7    5481.8    1179.0
+  per insert: minor faults 0.5, major faults 0.2, vol/invol ctx switches 0.01/0.00
+
+steady: 4094 inserts, 2.02 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       0.7       0.4
+  open         0.3       0.6       0.3
+  reserve    105.1     157.2     108.0
+  commit     510.9     863.5     532.6
+  total      618.0     967.0     640.9
+  per insert: minor faults 0.0, major faults 0.8, vol/invol ctx switches 0.00/0.00
+rc=0 load-after: 0.92 1.08 0.82 1/730 1538126
+=== 2026-09-25T02:34:51+02:00 insert base 524288 r3: ~/insert-path-base/build/insert_bench --block-size 524288 --capacity 4294967296 --laps 2 --path ~/kvdata/insert-path --output ~/kvresults/insert-path/ab/insert-base.jsonl
+load: 0.92 1.08 0.82 1/731 1538137
+insert_bench: block 524288 B, capacity 4294967296 B, laps 2, mmap dir on, wrap retention default, write_sync()
+
+fill: 8184 inserts, 0.74 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       0.7       0.5
+  open         0.3       0.5       0.3
+  write       17.9      33.9      18.3
+  commit     561.0     762.9     591.5
+  total      579.3     794.8     610.1
+  per insert: minor faults 224.1, major faults 0.1, vol/invol ctx switches 0.00/0.00
+
+steady: 16368 inserts, 0.86 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       0.6       0.5
+  open         0.3       0.4       0.3
+  write       17.9      24.2      18.2
+  commit     475.3     564.5     490.0
+  total      493.6     583.7     508.4
+  per insert: minor faults 224.0, major faults 0.4, vol/invol ctx switches 0.00/0.00
+rc=0 load-after: 0.94 1.08 0.82 1/730 1538148
+=== 2026-09-25T02:35:08+02:00 insert fix 524288 r3: ~/insert-path-fix/build/insert_bench --block-size 524288 --capacity 4294967296 --laps 2 --path ~/kvdata/insert-path --output ~/kvresults/insert-path/ab/insert-fix.jsonl
+load: 0.94 1.08 0.82 1/730 1538158
+insert_bench: block 524288 B, capacity 4294967296 B, laps 2, mmap dir on, wrap retention default, write_sync()
+
+fill: 8184 inserts, 1.37 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       1.2       0.5
+  open         0.2       0.7       0.2
+  write       20.0      55.9      21.7
+  commit     192.7     693.1     255.0
+  total      213.0     760.5     276.9
+  per insert: minor faults 0.0, major faults 0.1, vol/invol ctx switches 0.00/0.00
+
+steady: 16368 inserts, 2.28 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       0.5       0.4
+  open         0.2       0.4       0.2
+  write       20.0      36.0      20.4
+  commit     106.9     181.5     109.7
+  total      127.1     207.3     130.3
+  per insert: minor faults 0.0, major faults 0.3, vol/invol ctx switches 0.00/0.00
+rc=0 load-after: 1.03 1.09 0.83 2/729 1538166
+=== 2026-09-25T02:35:30+02:00 insert fix-reserve 524288 r3: ~/insert-path-fix/build/insert_bench --block-size 524288 --capacity 4294967296 --laps 2 --path ~/kvdata/insert-path --reserve --output ~/kvresults/insert-path/ab/insert-fix-reserve.jsonl
+load: 0.80 1.04 0.82 1/733 1538193
+insert_bench: block 524288 B, capacity 4294967296 B, laps 2, mmap dir on, wrap retention default, reserve()
+
+fill: 8184 inserts, 1.56 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       0.8       0.4
+  open         0.2       0.6       0.2
+  reserve     17.4      36.9      18.2
+  commit     191.9     401.2     216.7
+  total      209.6     434.2     235.2
+  per insert: minor faults 0.0, major faults 0.1, vol/invol ctx switches 0.00/0.00
+
+steady: 16368 inserts, 2.17 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       0.5       0.4
+  open         0.2       0.4       0.2
+  reserve     17.4      33.4      17.8
+  commit     107.7     180.6     123.6
+  total      125.4     205.2     141.7
+  per insert: minor faults 0.0, major faults 0.3, vol/invol ctx switches 0.00/0.00
+rc=0 load-after: 0.90 1.05 0.82 1/733 1538198

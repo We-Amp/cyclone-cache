@@ -407,7 +407,7 @@ candidates:
   pass while `G` moves.
 - **Pass stamp (`write_serial`) plus offset**: the fill is monotone within
   a pass, so a pass writes a given offset at most once (6.2, L1). The stamp
-  is written in the same pwrite as the document (`Volume::patch_pass_stamp`)
+  is written in the same pwrite as the document header (`Volume::patch_pass_stamp`)
   in both modes, and it is what admission already compares against. This
   is the key.
 - **Plus `checksum`, `len` and a key prefix**: redundant under L1. They make

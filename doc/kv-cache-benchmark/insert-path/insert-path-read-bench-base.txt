@@ -1,0 +1,36 @@
+=== 2026-09-25T02:38:52+02:00 read_bench base r1: ~/insert-path-base/build/concurrent_read_bench 20000 512 2 0 512 ramoff
+load: 0.77 1.11 0.90 1/733 1538527
+Concurrent read scaling benchmark
+  entries=20000 content=512B (working set ~9 MB, RAM-resident), seconds/point=2
+
+  volume=512 MB (stripe floor 128MB => ~4 stripes)
+
+  wrap retention ON
+  RAM cache DISABLED (volume-only path, matches mps)
+ threads        reads/sec        vs 1T   scaling%
+       1          1906608        1.00x       100%
+       2          3455617        1.81x        91%
+       4          6177663        3.24x        81%
+       8         10462753        5.49x        69%
+      16         12152560        6.37x        40%
+
+(scaling% ~100 = linear scaling; collapsing scaling% = lock contention)
+rc=0 load-after: 1.05 1.15 0.92 1/733 1538569
+=== 2026-09-25T02:39:43+02:00 read_bench base r2: ~/insert-path-base/build/concurrent_read_bench 20000 512 2 0 512 ramoff
+load: 0.84 1.09 0.90 1/733 1538662
+Concurrent read scaling benchmark
+  entries=20000 content=512B (working set ~9 MB, RAM-resident), seconds/point=2
+
+  volume=512 MB (stripe floor 128MB => ~4 stripes)
+
+  wrap retention ON
+  RAM cache DISABLED (volume-only path, matches mps)
+ threads        reads/sec        vs 1T   scaling%
+       1          1874670        1.00x       100%
+       2          3462293        1.85x        92%
+       4          6164582        3.29x        82%
+       8          9837307        5.25x        66%
+      16         11907322        6.35x        40%
+
+(scaling% ~100 = linear scaling; collapsing scaling% = lock contention)
+rc=0 load-after: 1.11 1.13 0.92 1/732 1538706

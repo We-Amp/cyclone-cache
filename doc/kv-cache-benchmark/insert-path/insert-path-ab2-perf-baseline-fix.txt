@@ -1,0 +1,215 @@
+=== 2026-09-25T03:47:19+02:00 perf_baseline fix r1: ~/insert-path-fix2/build/performance_baseline --cache-size 512 --entries 5000 --content-size 4096
+load: 0.79 2.82 2.49 1/738 1543964
+Cyclone Cache Performance Baseline
+===================================
+Cache size: 512 MB
+Entries: 5000
+Content size: 4096 bytes
+
+Wrap retention: on
+
+Running benchmarks...
+  [1/7] Key generation...
+  [2/7] Sequential write...
+  [3/7] Sequential read...
+  [4/7] Random read...
+  [5/7] Exists check...
+  [6/7] Cache miss...
+  [7/7] Mixed workload...
+
+Benchmark                               Ops/sec   Avg(us)   P50(us)   P99(us)   P99.9(us)
+-----------------------------------------------------------------------------------------
+key_generation                          2473048      0.38      0.37      0.39        0.41
+sequential_write_4096B                   336879      2.91      2.81      3.46       24.60
+sequential_read                          601335      1.62      1.29      5.07       16.99
+random_read                             1106870      0.86      0.79      1.22       16.56
+exists_check                            2153602      0.44      0.43      0.52        0.78
+cache_miss                              1798379      0.54      0.51      0.84        0.92
+mixed_workload_70r_20e_10w              1056370      0.92      0.81      2.68        4.49
+-----------------------------------------------------------------------------------------
+
+Cache Statistics:
+  Entries: 5000
+  Bytes used: 34448320
+  RAM cache hits: 0
+  Disk cache hits: 32673
+  Evictions: 0
+  Wraps: 0
+  Frontier advances: 35
+  Advances deferred by lease: 0
+  Early advances skipped: 0
+  Retained hits: 0
+  Writes dropped by lease: 0
+rc=0 load-after: 0.79 2.82 2.49 1/738 1543969
+=== 2026-09-25T03:47:20+02:00 perf_baseline fix r2: ~/insert-path-fix2/build/performance_baseline --cache-size 512 --entries 5000 --content-size 4096
+load: 0.79 2.82 2.49 1/738 1543996
+Cyclone Cache Performance Baseline
+===================================
+Cache size: 512 MB
+Entries: 5000
+Content size: 4096 bytes
+
+Wrap retention: on
+
+Running benchmarks...
+  [1/7] Key generation...
+  [2/7] Sequential write...
+  [3/7] Sequential read...
+  [4/7] Random read...
+  [5/7] Exists check...
+  [6/7] Cache miss...
+  [7/7] Mixed workload...
+
+Benchmark                               Ops/sec   Avg(us)   P50(us)   P99(us)   P99.9(us)
+-----------------------------------------------------------------------------------------
+key_generation                          1861598      0.51      0.44      0.68        0.70
+sequential_write_4096B                   337077      2.91      2.80      3.55       27.07
+sequential_read                          599289      1.62      1.28      5.09       17.47
+random_read                             1124324      0.84      0.79      1.19        1.40
+exists_check                            2116520      0.45      0.43      0.51        0.86
+cache_miss                              1847460      0.52      0.51      0.81        0.87
+mixed_workload_70r_20e_10w              1046359      0.93      0.81      2.72        4.56
+-----------------------------------------------------------------------------------------
+
+Cache Statistics:
+  Entries: 5000
+  Bytes used: 34448320
+  RAM cache hits: 0
+  Disk cache hits: 32673
+  Evictions: 0
+  Wraps: 0
+  Frontier advances: 35
+  Advances deferred by lease: 0
+  Early advances skipped: 0
+  Retained hits: 0
+  Writes dropped by lease: 0
+rc=0 load-after: 0.79 2.82 2.49 1/738 1544001
+=== 2026-09-25T03:47:20+02:00 perf_baseline fix r3: ~/insert-path-fix2/build/performance_baseline --cache-size 512 --entries 5000 --content-size 4096
+load: 0.79 2.82 2.49 1/738 1544028
+Cyclone Cache Performance Baseline
+===================================
+Cache size: 512 MB
+Entries: 5000
+Content size: 4096 bytes
+
+Wrap retention: on
+
+Running benchmarks...
+  [1/7] Key generation...
+  [2/7] Sequential write...
+  [3/7] Sequential read...
+  [4/7] Random read...
+  [5/7] Exists check...
+  [6/7] Cache miss...
+  [7/7] Mixed workload...
+
+Benchmark                               Ops/sec   Avg(us)   P50(us)   P99(us)   P99.9(us)
+-----------------------------------------------------------------------------------------
+key_generation                          2155885      0.44      0.44      0.49        0.50
+sequential_write_4096B                   331685      2.96      2.84      3.69       32.86
+sequential_read                          602227      1.62      1.28      5.08       17.55
+random_read                             1111983      0.85      0.79      1.21        3.10
+exists_check                            2173349      0.44      0.43      0.51        0.79
+cache_miss                              1816922      0.53      0.51      0.82        0.99
+mixed_workload_70r_20e_10w              1053364      0.93      0.82      2.70        4.54
+-----------------------------------------------------------------------------------------
+
+Cache Statistics:
+  Entries: 5000
+  Bytes used: 34448320
+  RAM cache hits: 0
+  Disk cache hits: 32673
+  Evictions: 0
+  Wraps: 0
+  Frontier advances: 35
+  Advances deferred by lease: 0
+  Early advances skipped: 0
+  Retained hits: 0
+  Writes dropped by lease: 0
+rc=0 load-after: 0.79 2.82 2.49 1/738 1544033
+=== 2026-09-25T03:47:21+02:00 perf_baseline fix r4: ~/insert-path-fix2/build/performance_baseline --cache-size 512 --entries 5000 --content-size 4096
+load: 0.79 2.82 2.49 1/738 1544060
+Cyclone Cache Performance Baseline
+===================================
+Cache size: 512 MB
+Entries: 5000
+Content size: 4096 bytes
+
+Wrap retention: on
+
+Running benchmarks...
+  [1/7] Key generation...
+  [2/7] Sequential write...
+  [3/7] Sequential read...
+  [4/7] Random read...
+  [5/7] Exists check...
+  [6/7] Cache miss...
+  [7/7] Mixed workload...
+
+Benchmark                               Ops/sec   Avg(us)   P50(us)   P99(us)   P99.9(us)
+-----------------------------------------------------------------------------------------
+key_generation                          2388002      0.39      0.40      0.41        0.42
+sequential_write_4096B                   329962      2.97      2.84      3.59       32.37
+sequential_read                          599047      1.62      1.29      5.11       16.92
+random_read                             1109390      0.85      0.79      1.23        3.39
+exists_check                            2176066      0.44      0.43      0.51        0.80
+cache_miss                              1826628      0.53      0.51      0.83        0.87
+mixed_workload_70r_20e_10w              1043576      0.93      0.82      2.68        5.75
+-----------------------------------------------------------------------------------------
+
+Cache Statistics:
+  Entries: 5000
+  Bytes used: 34448320
+  RAM cache hits: 0
+  Disk cache hits: 32673
+  Evictions: 0
+  Wraps: 0
+  Frontier advances: 35
+  Advances deferred by lease: 0
+  Early advances skipped: 0
+  Retained hits: 0
+  Writes dropped by lease: 0
+rc=0 load-after: 0.79 2.82 2.49 1/738 1544065
+=== 2026-09-25T03:47:21+02:00 perf_baseline fix r5: ~/insert-path-fix2/build/performance_baseline --cache-size 512 --entries 5000 --content-size 4096
+load: 0.79 2.82 2.49 1/738 1544092
+Cyclone Cache Performance Baseline
+===================================
+Cache size: 512 MB
+Entries: 5000
+Content size: 4096 bytes
+
+Wrap retention: on
+
+Running benchmarks...
+  [1/7] Key generation...
+  [2/7] Sequential write...
+  [3/7] Sequential read...
+  [4/7] Random read...
+  [5/7] Exists check...
+  [6/7] Cache miss...
+  [7/7] Mixed workload...
+
+Benchmark                               Ops/sec   Avg(us)   P50(us)   P99(us)   P99.9(us)
+-----------------------------------------------------------------------------------------
+key_generation                          2393427      0.39      0.39      0.41        0.76
+sequential_write_4096B                   328356      2.99      2.86      3.48       32.51
+sequential_read                          602343      1.62      1.28      5.03       19.93
+random_read                             1114335      0.85      0.79      1.23        1.93
+exists_check                            2130617      0.44      0.43      0.51        0.84
+cache_miss                              1842628      0.52      0.51      0.83        0.88
+mixed_workload_70r_20e_10w              1048146      0.93      0.82      2.70        4.82
+-----------------------------------------------------------------------------------------
+
+Cache Statistics:
+  Entries: 5000
+  Bytes used: 34448320
+  RAM cache hits: 0
+  Disk cache hits: 32673
+  Evictions: 0
+  Wraps: 0
+  Frontier advances: 35
+  Advances deferred by lease: 0
+  Early advances skipped: 0
+  Retained hits: 0
+  Writes dropped by lease: 0
+rc=0 load-after: 0.81 2.79 2.48 1/738 1544097

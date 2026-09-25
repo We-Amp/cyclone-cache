@@ -1,0 +1,21 @@
+insert_bench: block 2097152 B, capacity 4294967296 B, laps 2, mmap dir on, wrap retention default, write_sync()
+
+fill: 2047 inserts, 1.56 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.5       0.8       0.5
+  open         0.4       0.8       0.4
+  write       99.4     147.3     103.5
+  commit     777.5    1022.8     840.2
+  total      877.8    1148.5     944.2
+  per insert: minor faults 0.5, major faults 0.2, vol/invol ctx switches 0.00/0.00
+
+steady: 4094 inserts, 2.06 GB/s wall (incl. fill), 0 failures
+  step      p50 us    p99 us   mean us
+  key          0.4       1.1       0.5
+  open         0.4       0.8       0.4
+  write       97.4     182.8     101.7
+  commit     424.2     857.4     509.2
+  total      521.9     988.6     611.3
+  per insert: minor faults 0.0, major faults 0.8, vol/invol ctx switches 0.00/0.00
+[ perf record: Woken up 12 times to write data ]
+[ perf record: Captured and wrote 3,101 MB ~/kvresults/insert-path/ab2/perf-fix.data (26106 samples) ]

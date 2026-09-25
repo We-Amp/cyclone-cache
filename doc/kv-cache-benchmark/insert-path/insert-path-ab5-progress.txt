@@ -1,0 +1,16 @@
+04:59:59 perf_baseline main r1 load: 0.80 0.26 0.24 1/729 1549273
+05:00:00 perf_baseline prev r1 load: 0.80 0.26 0.24 1/729 1549288
+05:00:00 perf_baseline new r1 load: 0.81 0.27 0.24 1/729 1549303
+05:00:01 perf_baseline main r2 load: 0.81 0.27 0.24 1/729 1549318
+05:00:01 perf_baseline prev r2 load: 0.81 0.27 0.24 1/729 1549336
+05:00:01 perf_baseline new r2 load: 0.81 0.27 0.24 1/729 1549351
+05:00:01 perf_baseline main r3 load: 0.81 0.27 0.24 1/729 1549366
+05:00:02 perf_baseline prev r3 load: 0.81 0.27 0.24 1/729 1549381
+05:00:02 perf_baseline new r3 load: 0.81 0.27 0.24 1/729 1549396
+05:00:02 perf_baseline main r4 load: 0.81 0.27 0.24 1/729 1549411
+05:00:03 perf_baseline prev r4 load: 0.81 0.27 0.24 1/729 1549426
+05:00:03 perf_baseline new r4 load: 0.81 0.27 0.24 1/729 1549441
+05:00:03 perf_baseline main r5 load: 0.81 0.27 0.24 1/729 1549456
+05:00:04 perf_baseline prev r5 load: 0.81 0.27 0.24 1/729 1549471
+05:00:04 perf_baseline new r5 load: 0.81 0.27 0.24 1/729 1549486
+05:00:04 all done load: 0.81 0.27 0.24 1/729 1549496

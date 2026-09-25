@@ -1,0 +1,59 @@
+# perf record -g, insert_bench --block-size 2097152 --capacity 4294967296 --laps 2 (this change, no cgroup)
+# self time (--no-children), >= 0.5 %
+    38.03%  [.] (anonymous namespace)::run_phase
+     9.43%  [k] copy_user_enhanced_fast_string
+     9.28%  [.] cyclone::(anonymous namespace)::VolumeWriteHandleBase::write
+     7.78%  [.] cyclone::(anonymous namespace)::sse42_3way_impl
+     2.13%  [k] clear_page_erms
+     1.86%  [k] __get_user_nocheck_1
+     1.73%  [k] mark_buffer_dirty
+     1.65%  [k] xas_load
+     1.61%  [k] pagecache_get_page
+     1.46%  [k] ext4_block_write_begin
+     1.33%  [k] __add_to_page_cache_locked
+     0.98%  [k] ext4_da_write_begin
+     0.77%  [k] balance_dirty_pages_ratelimited
+     0.71%  [k] __block_commit_write.constprop.0.isra.0
+     0.68%  [k] ext4_da_write_end
+     0.57%  [k] _raw_spin_lock_irqsave
+     0.52%  [k] copy_page_from_iter_atomic
+     0.51%  [k] generic_perform_write
+
+# inclusive (--children), >= 2 %
+    43.94%     0.05%  [k] entry_SYSCALL_64_after_hwframe
+    43.94%     0.00%  [.] __libc_pwrite
+    43.89%     0.00%  [k] do_syscall_64
+    43.89%     0.00%  [k] x64_sys_call
+    43.85%     0.00%  [k] __x64_sys_pwrite64
+    43.83%     0.02%  [k] vfs_write
+    43.79%     0.01%  [k] new_sync_write
+    43.78%     0.00%  [k] ext4_file_write_iter
+    43.77%     0.00%  [k] ext4_buffered_write_iter
+    43.09%     0.51%  [k] generic_perform_write
+    38.12%    38.03%  [.] (anonymous namespace)::run_phase
+    25.35%     0.00%  [.] 0x3fe1ba5e353f7cee
+    19.95%     0.98%  [k] ext4_da_write_begin
+    12.82%     0.00%  [.] 0x3fe49ba5e353f7cf
+    11.52%     0.12%  [k] grab_cache_page_write_begin
+    11.40%     1.61%  [k] pagecache_get_page
+     9.45%     9.43%  [k] copy_user_enhanced_fast_string
+     9.32%     9.28%  [.] cyclone::(anonymous namespace)::VolumeWriteHandleBase::write
+     8.68%     0.68%  [k] ext4_da_write_end
+     7.80%     7.78%  [.] cyclone::(anonymous namespace)::sse42_3way_impl
+     7.76%     0.42%  [k] generic_write_end
+     7.34%     0.71%  [k] __block_commit_write.constprop.0.isra.0
+     7.13%     1.46%  [k] ext4_block_write_begin
+     6.52%     1.73%  [k] mark_buffer_dirty
+     4.90%     0.09%  [k] add_to_page_cache_lru
+     4.04%     0.28%  [k] __set_page_dirty
+     3.94%     0.04%  [k] __page_cache_alloc
+     3.93%     0.14%  [k] alloc_pages
+     3.78%     0.25%  [k] __alloc_pages
+     3.67%     1.33%  [k] __add_to_page_cache_locked
+     3.47%     0.04%  [k] ext4_da_get_block_prep
+     3.40%     0.30%  [k] get_page_from_freelist
+     3.23%     0.45%  [k] ext4_da_map_blocks.constprop.0
+     2.23%     0.17%  [k] fault_in_iov_iter_readable
+     2.13%     2.13%  [k] clear_page_erms
+     2.02%     0.77%  [k] balance_dirty_pages_ratelimited
+     2.02%     0.25%  [k] create_empty_buffers

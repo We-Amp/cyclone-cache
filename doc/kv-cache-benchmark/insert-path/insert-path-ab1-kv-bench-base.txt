@@ -1,0 +1,180 @@
+=== 2026-09-25T02:25:50+02:00 kv_bench put base r1: ~/insert-path-base/build/kv_bench --block-size 2097152 --seconds 2 --skip-multiprocess --path ~/kvdata/insert-path --drop-caches-cmd sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null --output ~/kvresults/insert-path/ab/kv-bench-base-r1.jsonl
+load: 0.77 0.58 0.49 1/730 1537300
+Cyclone KV-cache storage-tier benchmark (workload spec v1)
+  cpu          : Intel(R) Core(TM) i7-8750H CPU @ 2.20GHz
+  cores        : 12 (hw_concurrency 12)
+  os           : Linux 5.15.0-191-generic
+  filesystem   : ext4
+  store        : cyclone 0.1.0 @ unknown
+  volume       : ~/kvdata/insert-path/cyclone_kv_bench.dat (8192 MiB)
+
+Cyclone tuning (spec allows store-specific tuning if printed):
+  max_object_size         = 0 (unbounded; blocks reach 32 MiB)
+  ram_cache_size          = 0 (the CLFUS RAM tier is irrelevant for
+                            multi-MB blobs; disk hits are zero-copy
+                            mmap spans served from the OS page cache)
+  enable_checksum         = true (mandatory in multi-process mode)
+  verify_checksum_on_read = true
+  mmap directory          = on (multi-process 0 of 1)
+  hit tracking            = off
+  optimization engine     = off
+  directory_sync_interval = 0 (no periodic fsync; the restart
+                            phase is a process restart, not a power-loss test)
+  sync_on_write           = false (no per-put fsync)
+  metadata                = 64-byte set_header() slot (a dedicated
+                            header, not a value prefix)
+  seconds/point           = 2 (after a 2s warm-up)
+
+=== block_size 2097152 (2048 KiB), n = 2048, dataset 4 GiB, stripe_size = auto ===
+  [1/5] put
+  content verify: ok
+  [2/5] get_first_touch
+        dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+        readahead hints issued so far: 2050 (after get_first_touch)
+  [3/5] get_warm (Zipf theta=0.99)
+        mode=view threads=1
+        mode=view threads=4
+        mode=view threads=8
+        mode=copy threads=1
+        mode=copy threads=4
+        mode=copy threads=8
+  [4/5] restart
+        dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+        readahead hints issued so far: 2048 (after restart)
+  [5/5] multiprocess_read: skipped (--skip-multiprocess)
+
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+|---|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|
+| cyclone | 2097152 | 2048 | put | - | 1 | 301.3 | 0.632 | 2816.3 | 3086.6 | 3944.1 | - |
+| cyclone | 2097152 | 2048 | get_first_touch | view | 1 | 1125.2 | 2.360 | 889.7 | 1096.6 | 1171.4 | 1.000 |
+| cyclone | 2097152 | 2048 | get_warm | view | 1 | 268819.5 | 563.755 | 4.0 | 5.1 | 22.4 | - |
+| cyclone | 2097152 | 2048 | get_warm | view | 4 | 784878.8 | 1646.010 | 5.4 | 7.9 | 26.9 | - |
+| cyclone | 2097152 | 2048 | get_warm | view | 8 | 861358.4 | 1806.399 | 9.1 | 19.0 | 22.2 | - |
+| cyclone | 2097152 | 2048 | get_warm | copy | 1 | 5883.5 | 12.339 | 177.0 | 225.1 | 240.6 | - |
+| cyclone | 2097152 | 2048 | get_warm | copy | 4 | 5936.5 | 12.450 | 714.4 | 810.8 | 856.6 | - |
+| cyclone | 2097152 | 2048 | get_warm | copy | 8 | 5794.9 | 12.153 | 1171.5 | 2262.2 | 2364.1 | - |
+| cyclone | 2097152 | 2048 | restart | view | 1 | 980.3 | 2.056 | 990.8 | 1776.8 | 2199.6 | 1.000 |
+
+(sink 498342127601)
+JSON lines written to ~/kvresults/insert-path/ab/kv-bench-base-r1.jsonl
+rc=0 load-after: 1.81 0.88 0.60 1/730 1537374
+=== 2026-09-25T02:30:46+02:00 kv_bench put base r2: ~/insert-path-base/build/kv_bench --block-size 2097152 --seconds 2 --skip-multiprocess --path ~/kvdata/insert-path --drop-caches-cmd sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null --output ~/kvresults/insert-path/ab/kv-bench-base-r2.jsonl
+load: 0.96 0.94 0.69 1/731 1537761
+Cyclone KV-cache storage-tier benchmark (workload spec v1)
+  cpu          : Intel(R) Core(TM) i7-8750H CPU @ 2.20GHz
+  cores        : 12 (hw_concurrency 12)
+  os           : Linux 5.15.0-191-generic
+  filesystem   : ext4
+  store        : cyclone 0.1.0 @ unknown
+  volume       : ~/kvdata/insert-path/cyclone_kv_bench.dat (8192 MiB)
+
+Cyclone tuning (spec allows store-specific tuning if printed):
+  max_object_size         = 0 (unbounded; blocks reach 32 MiB)
+  ram_cache_size          = 0 (the CLFUS RAM tier is irrelevant for
+                            multi-MB blobs; disk hits are zero-copy
+                            mmap spans served from the OS page cache)
+  enable_checksum         = true (mandatory in multi-process mode)
+  verify_checksum_on_read = true
+  mmap directory          = on (multi-process 0 of 1)
+  hit tracking            = off
+  optimization engine     = off
+  directory_sync_interval = 0 (no periodic fsync; the restart
+                            phase is a process restart, not a power-loss test)
+  sync_on_write           = false (no per-put fsync)
+  metadata                = 64-byte set_header() slot (a dedicated
+                            header, not a value prefix)
+  seconds/point           = 2 (after a 2s warm-up)
+
+=== block_size 2097152 (2048 KiB), n = 2048, dataset 4 GiB, stripe_size = auto ===
+  [1/5] put
+  content verify: ok
+  [2/5] get_first_touch
+        dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+        readahead hints issued so far: 2048 (after get_first_touch)
+  [3/5] get_warm (Zipf theta=0.99)
+        mode=view threads=1
+        mode=view threads=4
+        mode=view threads=8
+        mode=copy threads=1
+        mode=copy threads=4
+        mode=copy threads=8
+  [4/5] restart
+        dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+        readahead hints issued so far: 2048 (after restart)
+  [5/5] multiprocess_read: skipped (--skip-multiprocess)
+
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+|---|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|
+| cyclone | 2097152 | 2048 | put | - | 1 | 297.7 | 0.624 | 2815.7 | 6303.7 | 13781.6 | - |
+| cyclone | 2097152 | 2048 | get_first_touch | view | 1 | 1133.1 | 2.376 | 883.7 | 1088.4 | 1357.6 | 1.000 |
+| cyclone | 2097152 | 2048 | get_warm | view | 1 | 270464.5 | 567.205 | 4.0 | 4.9 | 19.7 | - |
+| cyclone | 2097152 | 2048 | get_warm | view | 4 | 784631.9 | 1645.492 | 5.4 | 7.9 | 26.8 | - |
+| cyclone | 2097152 | 2048 | get_warm | view | 8 | 864249.1 | 1812.462 | 9.1 | 18.9 | 22.3 | - |
+| cyclone | 2097152 | 2048 | get_warm | copy | 1 | 5812.9 | 12.191 | 179.0 | 240.0 | 275.3 | - |
+| cyclone | 2097152 | 2048 | get_warm | copy | 4 | 5796.3 | 12.156 | 730.8 | 836.0 | 877.7 | - |
+| cyclone | 2097152 | 2048 | get_warm | copy | 8 | 5753.4 | 12.066 | 1267.5 | 2043.7 | 2175.0 | - |
+| cyclone | 2097152 | 2048 | restart | view | 1 | 978.8 | 2.053 | 991.1 | 1981.5 | 2235.8 | 1.000 |
+
+(sink 499719368068)
+JSON lines written to ~/kvresults/insert-path/ab/kv-bench-base-r2.jsonl
+rc=0 load-after: 2.15 1.23 0.80 1/731 1537838
+=== 2026-09-25T02:35:39+02:00 kv_bench put base r3: ~/insert-path-base/build/kv_bench --block-size 2097152 --seconds 2 --skip-multiprocess --path ~/kvdata/insert-path --drop-caches-cmd sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null --output ~/kvresults/insert-path/ab/kv-bench-base-r3.jsonl
+load: 0.91 1.05 0.82 1/733 1538227
+Cyclone KV-cache storage-tier benchmark (workload spec v1)
+  cpu          : Intel(R) Core(TM) i7-8750H CPU @ 2.20GHz
+  cores        : 12 (hw_concurrency 12)
+  os           : Linux 5.15.0-191-generic
+  filesystem   : ext4
+  store        : cyclone 0.1.0 @ unknown
+  volume       : ~/kvdata/insert-path/cyclone_kv_bench.dat (8192 MiB)
+
+Cyclone tuning (spec allows store-specific tuning if printed):
+  max_object_size         = 0 (unbounded; blocks reach 32 MiB)
+  ram_cache_size          = 0 (the CLFUS RAM tier is irrelevant for
+                            multi-MB blobs; disk hits are zero-copy
+                            mmap spans served from the OS page cache)
+  enable_checksum         = true (mandatory in multi-process mode)
+  verify_checksum_on_read = true
+  mmap directory          = on (multi-process 0 of 1)
+  hit tracking            = off
+  optimization engine     = off
+  directory_sync_interval = 0 (no periodic fsync; the restart
+                            phase is a process restart, not a power-loss test)
+  sync_on_write           = false (no per-put fsync)
+  metadata                = 64-byte set_header() slot (a dedicated
+                            header, not a value prefix)
+  seconds/point           = 2 (after a 2s warm-up)
+
+=== block_size 2097152 (2048 KiB), n = 2048, dataset 4 GiB, stripe_size = auto ===
+  [1/5] put
+  content verify: ok
+  [2/5] get_first_touch
+        dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+        readahead hints issued so far: 2048 (after get_first_touch)
+  [3/5] get_warm (Zipf theta=0.99)
+        mode=view threads=1
+        mode=view threads=4
+        mode=view threads=8
+        mode=copy threads=1
+        mode=copy threads=4
+        mode=copy threads=8
+  [4/5] restart
+        dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+        readahead hints issued so far: 2048 (after restart)
+  [5/5] multiprocess_read: skipped (--skip-multiprocess)
+
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+|---|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|
+| cyclone | 2097152 | 2048 | put | - | 1 | 293.9 | 0.616 | 2827.0 | 7289.5 | 18756.3 | - |
+| cyclone | 2097152 | 2048 | get_first_touch | view | 1 | 1135.8 | 2.382 | 877.4 | 1094.0 | 2183.7 | 1.000 |
+| cyclone | 2097152 | 2048 | get_warm | view | 1 | 269416.0 | 565.006 | 4.0 | 4.9 | 19.9 | - |
+| cyclone | 2097152 | 2048 | get_warm | view | 4 | 786887.7 | 1650.223 | 5.4 | 7.8 | 25.4 | - |
+| cyclone | 2097152 | 2048 | get_warm | view | 8 | 859462.4 | 1802.423 | 9.1 | 19.1 | 22.7 | - |
+| cyclone | 2097152 | 2048 | get_warm | copy | 1 | 5851.9 | 12.272 | 178.1 | 227.8 | 254.6 | - |
+| cyclone | 2097152 | 2048 | get_warm | copy | 4 | 5733.7 | 12.024 | 739.4 | 842.9 | 920.1 | - |
+| cyclone | 2097152 | 2048 | get_warm | copy | 8 | 5765.4 | 12.091 | 1272.9 | 2031.0 | 2137.8 | - |
+| cyclone | 2097152 | 2048 | restart | view | 1 | 994.7 | 2.086 | 979.1 | 1706.9 | 2169.2 | 1.000 |
+
+(sink 498631420822)
+JSON lines written to ~/kvresults/insert-path/ab/kv-bench-base-r3.jsonl
+rc=0 load-after: 2.21 1.34 0.93 1/729 1538297

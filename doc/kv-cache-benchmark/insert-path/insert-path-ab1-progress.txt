@@ -1,0 +1,50 @@
+02:24:12 start insert base 2097152 r1 load: 0.24 0.39 0.42 1/729 1537133
+02:24:31 start insert fix 2097152 r1 load: 0.52 0.45 0.44 1/731 1537158
+02:24:39 start insert fix-reserve 2097152 r1 load: 0.75 0.50 0.46 1/731 1537176
+02:24:46 start insert base 524288 r1 load: 0.85 0.53 0.47 1/730 1537193
+02:25:03 start insert fix 524288 r1 load: 0.96 0.57 0.49 1/729 1537218
+02:25:26 start insert fix-reserve 524288 r1 load: 0.81 0.57 0.48 1/730 1537248
+02:25:49 start perf_baseline base r1 load: 0.77 0.58 0.49 1/731 1537283
+02:25:50 start kv_bench put base r1 load: 0.77 0.58 0.49 1/730 1537298
+02:27:16 start perf_baseline fix r1 load: 0.85 0.75 0.56 2/730 1537425
+02:27:17 start kv_bench put fix r1 load: 0.85 0.75 0.56 1/729 1537440
+02:28:53 start insert base 2097152 r2 load: 0.84 0.91 0.65 1/731 1537584
+02:29:28 start insert fix 2097152 r2 load: 0.86 0.92 0.66 1/732 1537624
+02:29:36 start insert fix-reserve 2097152 r2 load: 0.96 0.94 0.67 1/732 1537639
+02:29:59 start insert base 524288 r2 load: 0.82 0.91 0.67 1/731 1537672
+02:30:15 start insert fix 524288 r2 load: 0.92 0.93 0.68 1/729 1537693
+02:30:38 start insert fix-reserve 524288 r2 load: 0.87 0.92 0.68 1/732 1537727
+02:30:46 start perf_baseline base r2 load: 0.96 0.94 0.69 1/732 1537744
+02:30:46 start kv_bench put base r2 load: 0.96 0.94 0.69 1/731 1537759
+02:32:24 start perf_baseline fix r2 load: 0.79 1.01 0.75 1/730 1537904
+02:32:25 start kv_bench put fix r2 load: 0.79 1.01 0.75 1/729 1537919
+02:33:44 start insert base 2097152 r3 load: 0.99 1.12 0.81 1/731 1538045
+02:34:19 start insert fix 2097152 r3 load: 0.88 1.09 0.81 1/728 1538083
+02:34:43 start insert fix-reserve 2097152 r3 load: 0.82 1.07 0.81 1/731 1538115
+02:34:51 start insert base 524288 r3 load: 0.92 1.08 0.82 1/731 1538135
+02:35:08 start insert fix 524288 r3 load: 0.94 1.08 0.82 1/730 1538156
+02:35:30 start insert fix-reserve 524288 r3 load: 0.80 1.04 0.82 1/733 1538191
+02:35:39 start perf_baseline base r3 load: 0.91 1.05 0.82 1/734 1538207
+02:35:39 start kv_bench put base r3 load: 0.91 1.05 0.82 1/733 1538225
+02:37:17 start perf_baseline fix r3 load: 0.81 1.09 0.87 1/733 1538368
+02:37:18 start kv_bench put fix r3 load: 0.81 1.09 0.87 1/732 1538383
+02:38:52 start read_bench base r1 load: 0.77 1.11 0.90 1/733 1538525
+02:39:18 start read_bench fix r1 load: 0.82 1.10 0.90 1/731 1538591
+02:39:43 start read_bench base r2 load: 0.84 1.09 0.90 1/733 1538660
+02:40:08 start read_bench fix r2 load: 0.94 1.09 0.91 1/731 1538728
+02:40:34 churn base T=1 r1 load: 0.80 1.05 0.90 1/732 1538796
+02:44:49 churn fix T=1 r1 load: 0.90 1.04 0.94 1/731 1539010
+02:48:21 churn fix-reserve T=1 r1 load: 0.83 1.02 0.97 1/731 1539201
+02:52:06 churn base T=4 r1 load: 0.99 1.15 1.05 1/736 1539440
+02:57:06 churn fix T=4 r1 load: 0.88 2.04 1.57 1/735 1539747
+03:01:45 churn base T=1 r2 load: 0.85 2.22 1.85 1/740 1540035
+03:06:12 churn fix T=1 r2 load: 0.80 1.47 1.62 1/735 1540298
+03:10:12 churn fix-reserve T=1 r2 load: 0.82 1.27 1.51 1/732 1540554
+03:14:27 churn base T=4 r2 load: 0.86 1.17 1.42 1/734 1540812
+03:19:10 churn fix T=4 r2 load: 0.89 1.91 1.76 1/734 1541103
+03:23:45 churn base T=1 r3 load: 0.84 2.14 1.97 1/735 1541385
+03:28:09 churn fix T=1 r3 load: 0.81 1.48 1.74 1/732 1541626
+03:31:52 churn fix-reserve T=1 r3 load: 0.96 1.33 1.63 1/735 1541845
+03:35:36 churn base T=4 r3 load: 0.94 1.25 1.54 1/737 1542074
+03:40:32 churn fix T=4 r3 load: 0.80 2.01 1.89 1/734 1542375
+03:43:37 all done load: 3.93 3.05 2.33 1/730 1542550

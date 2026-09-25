@@ -1,0 +1,9 @@
+04:13:56 start kv_bench base 2MiB-only r1 load: 0.95 1.17 1.41 1/730 1546214
+04:14:54 start kv_bench base 512KiB-then-2MiB r1 load: 0.88 1.14 1.39 1/733 1546329
+04:16:43 start kv_bench fix 2MiB-only r1 load: 0.88 1.24 1.41 1/732 1546525
+04:17:52 start kv_bench fix 512KiB-then-2MiB r1 load: 0.90 1.22 1.39 1/733 1546654
+04:19:39 start kv_bench base 2MiB-only r2 load: 0.79 1.24 1.39 1/733 1546850
+04:21:08 start kv_bench base 512KiB-then-2MiB r2 load: 0.86 1.26 1.39 1/734 1546995
+04:23:13 start kv_bench fix 2MiB-only r2 load: 0.82 1.31 1.40 1/733 1547209
+04:24:24 start kv_bench fix 512KiB-then-2MiB r2 load: 0.83 1.26 1.38 1/735 1547338
+04:25:07 all done load: 1.90 1.47 1.45 1/740 1547478

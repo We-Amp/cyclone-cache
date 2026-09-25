@@ -36,3 +36,7 @@ churn-.*\.txt
 policy-replay\.txt
 round5-.*\.txt
 readahead-.*\.txt
+insert-path-.*\.txt
+# Throwaway timing patch kept with the insert-path raw data (a diff, applied
+# with patch(1); not shipped source).
+insert-path-.*\.patch

@@ -1,0 +1,11 @@
+03:50:58 start kv_bench put fix r1 load: 0.79 1.82 2.15 1/737 1544509
+03:52:17 start kvpeer filedir put r1 load: 0.93 1.71 2.09 1/739 1544681
+03:52:53 start kv_bench put fix r2 load: 0.84 1.60 2.04 1/737 1544743
+03:54:33 start kvpeer filedir put r2 load: 0.83 1.51 1.97 1/736 1544902
+03:55:05 start kv_bench put fix r3 load: 0.95 1.48 1.94 1/735 1544958
+03:56:24 start kvpeer filedir put r3 load: 0.99 1.46 1.90 1/735 1545096
+03:56:57 churn filedir T=1 r1 load: 0.82 1.37 1.86 1/734 1545157
+04:01:15 churn lmdb T=1 r1 load: 0.82 1.27 1.71 1/738 1545423
+04:05:16 churn filedir T=1 r2 load: 0.92 1.17 1.57 1/741 1545684
+04:09:50 churn lmdb T=1 r2 load: 0.93 1.18 1.48 1/735 1545963
+04:13:41 all done load: 1.22 1.23 1.43 2/733 1546192

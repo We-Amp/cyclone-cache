@@ -213,6 +213,7 @@ if(CYCLONE_BUILD_TESTS)
     tests/integration/test_wrap_retention.cpp
     tests/integration/test_publish_after_snapshot.cpp
     tests/integration/test_seqlock_read_wait.cpp
+    tests/integration/test_write_reserve.cpp
   )
   # Compile guard: cyclone_c.h is the C ABI header, so it must stay valid C11
   # (it once used C++ alias declarations and did not compile as C).  Built as
@@ -285,6 +286,10 @@ if(CYCLONE_BUILD_BENCHMARKS)
   target_include_directories(kv_churn PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   add_executable(kv_churn_policy benchmarks/kv_churn_policy.cpp)
   target_link_libraries(kv_churn_policy PRIVATE cyclone-cache)
+
+  # Insert-path micro-benchmark (issue #16): open / write / commit split.
+  add_executable(insert_bench benchmarks/insert_bench.cpp)
+  target_link_libraries(insert_bench PRIVATE cyclone-cache)
 
   add_executable(crc32c_bench benchmarks/crc32c_bench.cpp)
   target_link_libraries(crc32c_bench PRIVATE cyclone-cache)

@@ -314,8 +314,10 @@ and let the OS page cache be the RAM tier. First-read checksum verification
 is cheap with hardware CRC-32C, and multi-process mode forces it on. Cyclone
 is a node-local tier behind a KV connector — it is not a distributed store,
 has no GPU-direct or RDMA path, and ships no Python bindings today. Write
-bandwidth at 2 MiB is about 1 GB/s per thread (`kv_bench`: 1.01 GB/s on
-Linux/NVMe, 0.7–1.3 GB/s across runs on an Apple M5).
+bandwidth at 2 MiB is about 1.5 GB/s per thread on Linux/NVMe (`kv_bench`:
+1.52 GB/s, against 1.46 for one file per block). A producer that generates
+the blob itself can fill `w->reserve(n)` in place instead of calling
+`write_sync()`, which saves one copy of it.
 
 ## Concepts
 
@@ -475,6 +477,7 @@ class WriteHandle {                        // RAII: an unclosed handle aborts
   void set_header(std::span<const std::byte>);
   std::expected<size_t, CacheError> write_sync(std::span<const std::byte>);
   Task<std::expected<size_t, CacheError>> write(std::span<const std::byte>);
+  std::expected<std::span<std::byte>, CacheError> reserve(size_t);  // fill in place
   std::expected<void, CacheError> close_sync();   // makes the entry visible
   Task<std::expected<void, CacheError>> close();
   void abort() noexcept;
@@ -712,9 +715,9 @@ otherwise); a warm read re-runs no CRC and copies nothing, so its cost does
 not grow with the object. These runs are short and stay in the page cache
 (500 × 1 MB is 0.5 GB). Write throughput varied up to 6× between runs as
 writeback kicked in, so read the write p50 as the steadier figure. A
-sustained multi-GiB write stream measures about 1 GB/s at 2 MiB (1.01 GB/s
-on Linux/NVMe; 0.7–1.3 GB/s across runs on this Mac) — see the
-[KV benchmark](doc/kv-cache-benchmark.md).
+sustained multi-GiB write stream measures about 1.5 GB/s at 2 MiB on
+Linux/NVMe (1.52 GB/s) — see the
+[KV benchmark](doc/kv-cache-benchmark.md#insert-path-profile-issue-16).
 
 ### Read scaling (`concurrent_read_bench`, 512 B objects, RAM tier off)
 

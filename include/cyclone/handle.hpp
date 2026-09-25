@@ -85,6 +85,12 @@ struct WriteHandleImpl {
   virtual std::expected<void, CacheError> close() = 0;
   virtual void abort() = 0;
   [[nodiscard]] virtual size_t bytes_written() const = 0;
+  // Appended last (see WriteHandle::reserve).  The default serves
+  // implementations that predate it.
+  virtual std::expected<std::span<std::byte>, CacheError> reserve(
+      size_t /*length*/) {
+    return make_unexpected(CacheError::InvalidArgument);
+  }
 };
 
 struct UpdateHandleImpl {
@@ -262,6 +268,38 @@ class WriteHandle {
   std::expected<size_t, CacheError> write_sync(
       std::span<const std::byte> data) {
     if (_impl) return _impl->write(data);
+    return make_unexpected(CacheError::InvalidArgument);
+  }
+
+  // Append `length` bytes to the object and return them for the caller to
+  // fill in place: the zero-copy form of write_sync() for a producer that
+  // generates the content itself (a KV engine staging tensors, a rewriter
+  // emitting output), so it is not first built in a caller buffer and then
+  // copied into the handle.  Mixes freely with write_sync(); the bytes count
+  // as written as soon as reserve() returns.
+  //
+  // Contract:
+  //  - The span is valid until the next write_sync(), reserve(), close or
+  //    abort on this handle.
+  //  - EVERY write into the span must be complete before close is called:
+  //    no fill may still be in flight (an async DMA, io_uring, another
+  //    thread).  Close computes the checksum from the span first and writes
+  //    the bytes to the file later (after waiting for a write slot, which
+  //    can wait on a wrap or a reader lease), so a byte changed after close
+  //    begins is stored under a checksum that does not match it and reads
+  //    back as Corrupted, or is stored torn.
+  //  - The reserved bytes are NOT initialized: they hold whatever the heap
+  //    held before (possibly other data of this process).  Fill all of
+  //    them; any byte left unfilled is persisted, and served to readers, as
+  //    that old heap content.
+  //  - Nothing is visible to readers before close commits, exactly as with
+  //    write_sync().  An abort (or destroying the handle unclosed) after a
+  //    partial fill discards everything; nothing is published.
+  //  - Same limits and errors as write_sync(): ObjectTooLarge past
+  //    max_object_size, NoSpace past the 4 GiB document limit, Closed on a
+  //    closed or aborted handle.  A failed reserve() appends nothing.
+  std::expected<std::span<std::byte>, CacheError> reserve(size_t length) {
+    if (_impl) return _impl->reserve(length);
     return make_unexpected(CacheError::InvalidArgument);
   }
 

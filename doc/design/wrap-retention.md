@@ -573,8 +573,9 @@ slots for the exposed chunks. That is the same 64 lines it sums today.
 
 ### 4.11 Document sizes
 
-Cyclone has no aggregation buffer. Each commit is one pwrite of one
-document, so advances happen per document, and a document larger than the
+Cyclone has no aggregation buffer. Each commit writes one document (a
+plain write above 64 KiB as two pwrites, the header and then the content
+from the caller's buffer, into one reservation), so advances happen per document, and a document larger than the
 runway advances by as many chunks as it needs in one gated step. Otherwise
 behaviour is unchanged:
 
@@ -706,7 +707,8 @@ under D1.
    that replaces the existing borrow CAS one for one. The stamp is a 4-byte
    compare on a header the reader already maps.
 2. **Commit ordering.** Unchanged. The stamp travels in the same pwrite as
-   the document. Reordered persistence of `G` and the fill downgrades to a
+   the document header, which completes with the rest of the fill before
+   the entry publishes. Reordered persistence of `G` and the fill downgrades to a
    miss (4.12).
 3. **Dekker.** Same shape, quantified per chunk.
    - Writer: `intent := 1` → load the counts of chunks `[f, t)` and the

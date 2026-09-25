@@ -1,0 +1,51 @@
+=== base r1 load: { 3.02 3.20 3.90 }
+sequential_write_4096B                    42941     23.24      2.58    102.25      189.92
+sequential_read                         1287043      0.74      0.62      1.46        3.17
+random_read                             2662939      0.34      0.33      0.46        0.54
+mixed_workload_70r_20e_10w               864283      1.14      0.38      2.75       97.54
+=== fix r1 load: { 3.02 3.20 3.90 }
+sequential_write_4096B                   395974      2.47      2.42      3.17        5.08
+sequential_read                         1217693      0.78      0.67      1.42        3.46
+random_read                             2300459      0.40      0.38      0.54        0.62
+mixed_workload_70r_20e_10w              1798712      0.54      0.38      2.12        2.46
+=== base r2 load: { 3.02 3.20 3.90 }
+sequential_write_4096B                   465537      2.10      2.04      2.46        3.54
+sequential_read                         1407889      0.67      0.58      1.21        2.92
+random_read                             2548718      0.36      0.33      0.50        1.96
+mixed_workload_70r_20e_10w              1865851      0.52      0.38      2.04        2.33
+=== fix r2 load: { 3.02 3.20 3.90 }
+sequential_write_4096B                   482561      2.04      2.00      2.38        3.67
+sequential_read                         1386225      0.68      0.58      1.25        2.75
+random_read                             2543963      0.36      0.33      0.46        0.62
+mixed_workload_70r_20e_10w              1834442      0.53      0.38      2.04        3.62
+=== base r3 load: { 3.02 3.20 3.90 }
+sequential_write_4096B                   466585      2.10      2.08      2.50        3.75
+sequential_read                         1419413      0.67      0.58      1.21        2.79
+random_read                             2608752      0.35      0.33      0.46        0.58
+mixed_workload_70r_20e_10w              1826617      0.53      0.38      2.12        4.79
+=== fix r3 load: { 3.02 3.20 3.90 }
+sequential_write_4096B                   467208      2.10      2.04      2.67        3.79
+sequential_read                         1355748      0.70      0.58      1.29        2.67
+random_read                             2521882      0.36      0.33      0.50        0.62
+mixed_workload_70r_20e_10w              1836463      0.53      0.38      2.08        3.17
+=== base r4 load: { 3.02 3.20 3.90 }
+sequential_write_4096B                   461929      2.12      2.08      2.54        3.79
+sequential_read                         1389227      0.68      0.58      1.29        2.79
+random_read                             2530765      0.36      0.33      0.50        0.58
+mixed_workload_70r_20e_10w              1842582      0.53      0.38      2.04        2.38
+=== fix r4 load: { 3.02 3.20 3.90 }
+sequential_write_4096B                   481284      2.03      2.00      2.38        3.67
+sequential_read                         1403854      0.68      0.58      1.25        2.71
+random_read                             2525625      0.36      0.38      0.46        0.58
+mixed_workload_70r_20e_10w              1844236      0.53      0.38      2.04        2.42
+=== base r5 load: { 3.02 3.20 3.90 }
+sequential_write_4096B                   453920      2.17      2.08      3.75        7.33
+sequential_read                         1398699      0.68      0.58      1.25        2.83
+random_read                             2552052      0.36      0.33      0.46        0.58
+mixed_workload_70r_20e_10w              1845507      0.53      0.38      2.04        2.54
+=== fix r5 load: { 3.02 3.20 3.90 }
+sequential_write_4096B                   475492      2.07      2.04      2.46        3.46
+sequential_read                         1365266      0.70      0.58      1.33        2.79
+random_read                             2488516      0.37      0.38      0.50        0.58
+mixed_workload_70r_20e_10w              1825589      0.53      0.38      2.04        2.42
+DONE
