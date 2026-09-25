@@ -18,6 +18,7 @@
 //     nothing;
 //   * the alternate write path has it too.
 
+#include <algorithm>
 #include <catch2/catch_test_macros.hpp>
 #include <cstddef>
 #include <cstdint>
@@ -25,6 +26,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "cyclone/alternate.hpp"
@@ -285,4 +287,58 @@ TEST_CASE("WriteHandle::reserve on the alternate write path",
   REQUIRE(rh->content().size() == size);
   REQUIRE(matches_pattern(rh->content()));
   cache->stop();
+}
+
+// commit_write writes objects up to 64 KiB as ONE contiguous buffer (the
+// content folded in behind the head) and larger ones as head + content in two
+// pwrites.  Both sides of that boundary, plus odd sizes and non-empty
+// headers, must commit the same document and verify on read, through
+// write_sync() and reserve(), in both directory modes.
+TEST_CASE("commit_write across the 64 KiB coalesce boundary",
+          "[write_reserve][write][document]") {
+  constexpr size_t kBoundary = size_t{64} * 1024;
+  for (const bool mmap_dir : {false, true}) {
+    TempCacheDir tmp(mmap_dir ? "coalesce_mmap" : "coalesce_mem");
+    auto cache = make_cache(tmp, mmap_dir);
+    size_t n = 0;
+    for (const size_t size :
+         {size_t{0}, size_t{1}, size_t{4099}, kBoundary - 1, kBoundary,
+          kBoundary + 1, kBoundary + 7, (3 * kBoundary) + 1}) {
+      for (const size_t header_len : {size_t{0}, size_t{3}, size_t{4095}}) {
+        for (const bool use_reserve : {false, true}) {
+          CAPTURE(mmap_dir, size, header_len, use_reserve);
+          const CacheKey key("coalesce-" + std::to_string(n++));
+          std::vector<std::byte> header(header_len);
+          for (size_t i = 0; i < header.size(); ++i) {
+            header[i] = static_cast<std::byte>((i * 7 + 3) & 0xFF);
+          }
+          auto wh = cache->write_sync(key, size);
+          REQUIRE(wh.has_value());
+          wh->set_header(header);
+          if (use_reserve) {
+            auto span = wh->reserve(size);
+            REQUIRE(span.has_value());
+            fill_pattern(*span, 0);
+          } else {
+            std::vector<std::byte> content(size);
+            fill_pattern(content, 0);
+            REQUIRE(wh->write_sync(std::span<const std::byte>(content))
+                        .has_value());
+          }
+          REQUIRE(wh->close_sync().has_value());
+
+          // verify_checksum_on_read is on: a checksum over anything but
+          // exactly these header bytes + content reads back as Corrupted.
+          auto rh = cache->read_sync(key);
+          REQUIRE(rh.has_value());
+          REQUIRE(rh->content().size() == size);
+          REQUIRE(matches_pattern(rh->content()));
+          REQUIRE(rh->header().size() == header_len);
+          REQUIRE(
+              std::equal(header.begin(), header.end(), rh->header().begin()));
+        }
+      }
+    }
+    cache->stop();
+  }
 }

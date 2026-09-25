@@ -4170,12 +4170,20 @@ std::expected<void, CacheError> Volume::commit_write(
   // the caller's buffer behind it, never copied into one contiguous document:
   // at 2 MiB that copy and the fresh heap buffers it faulted in were most of
   // an insert (issue #16).
+  //
+  // A small object is still filled from ONE contiguous buffer by one pwrite:
+  // below this size copying it behind the head costs less than a second
+  // write syscall does (4 KiB objects measurably).  The head is then built
+  // with room for the content, so the fold-in below does not reallocate.
+  // `tail` is what goes to the file behind doc_head, empty once folded in.
+  constexpr size_t kCoalesceMaxBytes = size_t{64} * 1024;
+  const bool coalesce = content.size() <= kCoalesceMaxBytes;
   auto doc_head = DocumentBuilder()
                       .set_key(key)
                       .set_header(header)
                       .set_type(Document::Type::SingleFrag)
                       .enable_checksum(true)
-                      .build_head(content);
+                      .build_head(content, coalesce ? content.size() : 0);
 
   if (doc_head.empty()) {
     return make_unexpected(CacheError::InvalidArgument);
@@ -4183,13 +4191,8 @@ std::expected<void, CacheError> Volume::commit_write(
 
   size_t doc_size = doc_head.size() + content.size();
 
-  // A small object is still filled from ONE contiguous buffer by one pwrite:
-  // below this size copying it behind the head costs less than a second
-  // write syscall does (4 KiB objects measurably).  `tail` is what goes to
-  // the file behind doc_head, empty once folded in.
-  constexpr size_t kCoalesceMaxBytes = size_t{64} * 1024;
   std::span<const std::byte> tail = content;
-  if (content.size() <= kCoalesceMaxBytes) {
+  if (coalesce) {
     doc_head.insert(doc_head.end(), content.begin(), content.end());
     tail = {};
   }
@@ -4204,7 +4207,8 @@ std::expected<void, CacheError> Volume::commit_write(
     return make_unexpected(slot_res.error());
   }
   const WriteSlot slot = *slot_res;
-  // Pass stamp: part of the same pwrite as the document (design 5.1(2)).
+  // Pass stamp: part of the same pwrite as the document header (design
+  // 5.1(2)).
   patch_pass_stamp(doc_head, slot.pass);
   uint64_t write_offset = slot.write_offset;
   // Release the held lock on any unexpected unwind before commit_write_slot

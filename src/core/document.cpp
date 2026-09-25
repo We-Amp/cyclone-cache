@@ -245,8 +245,8 @@ std::vector<std::byte> DocumentBuilder::build() const {
 }
 
 std::vector<std::byte> DocumentBuilder::build_head(
-    std::span<const std::byte> content) const {
-  return serialize_head(content, 0);
+    std::span<const std::byte> content, size_t extra) const {
+  return serialize_head(content, extra);
 }
 
 std::vector<std::byte> DocumentBuilder::serialize_head(

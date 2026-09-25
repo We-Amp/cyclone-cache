@@ -571,9 +571,18 @@ and that copy never happens. It mixes freely with `write_sync()`, in call
 order, and the bytes count toward `bytes_written()` as soon as it returns.
 
 - The span stays valid until the next `write_sync()`, `reserve()`, close or
-  abort on the handle. Fill all of it before closing: the bytes are not
-  zeroed, and whatever they hold at close is what is stored.
-- The checksum is computed at close, over the final content.
+  abort on the handle.
+- Every write into the span must be complete before `close_sync()` is
+  called. No fill may still be in flight: not an async DMA, not io_uring,
+  not another thread. Close computes the checksum from the span first and
+  writes the bytes to the file afterwards, possibly after waiting on a wrap
+  or a reader lease. A byte that changes after close begins is stored under
+  a checksum that does not match it, and reads back as
+  `CacheError::Corrupted` or torn.
+- **Security:** the reserved bytes are not initialized. They hold whatever
+  the heap held before, which can be other data of the same process. Fill
+  every byte: an unfilled byte is persisted, and served to readers, as that
+  old heap content.
 - Nothing is visible to readers before the close commits. An abort, or
   destroying the handle unclosed, after a partial fill discards everything.
 - Same limits as `write_sync()`: `CacheError::ObjectTooLarge` past

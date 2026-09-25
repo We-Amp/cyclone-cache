@@ -280,10 +280,18 @@ class WriteHandle {
   //
   // Contract:
   //  - The span is valid until the next write_sync(), reserve(), close or
-  //    abort on this handle.  Fill all of it before closing: the bytes are
-  //    NOT zeroed, and whatever they hold at close is what is stored.
-  //  - The checksum is computed at close, over the final content, so writes
-  //    into the span up to close are covered.
+  //    abort on this handle.
+  //  - EVERY write into the span must be complete before close is called:
+  //    no fill may still be in flight (an async DMA, io_uring, another
+  //    thread).  Close computes the checksum from the span first and writes
+  //    the bytes to the file later (after waiting for a write slot, which
+  //    can wait on a wrap or a reader lease), so a byte changed after close
+  //    begins is stored under a checksum that does not match it and reads
+  //    back as Corrupted, or is stored torn.
+  //  - The reserved bytes are NOT initialized: they hold whatever the heap
+  //    held before (possibly other data of this process).  Fill all of
+  //    them; any byte left unfilled is persisted, and served to readers, as
+  //    that old heap content.
   //  - Nothing is visible to readers before close commits, exactly as with
   //    write_sync().  An abort (or destroying the handle unclosed) after a
   //    partial fill discards everything; nothing is published.

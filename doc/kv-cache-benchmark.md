@@ -1425,7 +1425,13 @@ error.
   ops/s). An earlier Linux pass ran each point right after a multi-GiB
   `insert_bench` run and read about 100 µs for both trees, because the
   4 KiB writes waited behind writeback of the previous run's data; it is
-  kept in the raw data and not used.
+  kept in the raw data and not used. The head of an object of 64 KiB or
+  less is now built with room for its content, so folding the content in
+  no longer reallocates. A later five-round interleave of main, the tree
+  before that change and after it read p50 2.96 / 2.83 / 2.84 µs (319 k /
+  331 k / 335 k ops/s), within noise of each other on the change itself
+  (`insert-path-ab5-*`). main's first round read 100 µs and is excluded
+  from its median for the writeback reason above.
 - Read path, `concurrent_read_bench 20000 512 2 0 512 ramoff` (two runs
   each; reads/s): 1 thread 1.89 M → 1.87 M, 4 threads 6.17 M → 6.13 M,
   16 threads 12.0 M → 11.5 M. The read code is untouched. Only the 16-thread

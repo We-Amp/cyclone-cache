@@ -176,9 +176,10 @@ class DocumentBuilder {
   // (two writes, or a gathered one) instead of copying it into one
   // contiguous document: head ++ content is byte-identical to build() after
   // set_content(content).  Content given to set_content() is ignored.  Empty
-  // on overflow, like build().
+  // on overflow, like build().  `extra` reserves that many more bytes of
+  // capacity behind the head, for a caller that appends to it.
   [[nodiscard]] std::vector<std::byte> build_head(
-      std::span<const std::byte> content) const;
+      std::span<const std::byte> content, size_t extra = 0) const;
 
  private:
   // The head of a document whose content is `content`, with `extra` more
