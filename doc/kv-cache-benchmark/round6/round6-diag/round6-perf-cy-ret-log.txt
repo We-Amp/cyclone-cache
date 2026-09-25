@@ -1,0 +1,2 @@
+[ perf record: Woken up 361 times to write data ]
+[ perf record: Captured and wrote 92,789 MB ~/round6/out/diag/perf-cy-ret.data (353829 samples) ]

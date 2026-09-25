@@ -1,0 +1,22 @@
+# kv_bench / kvpeer sweep points: 1 Hz samples during which a GitHub runner job was running (sampler.sh column 2)
+cyclone-full-1: samples 415, with a runner job 50
+cyclone-full-2: samples 430, with a runner job 0
+cyclone-full-3: samples 416, with a runner job 0
+filedir-full-1: samples 420, with a runner job 0
+filedir-full-2: samples 413, with a runner job 0
+filedir-full-3: samples 437, with a runner job 0
+lmdb-full-1: samples 485, with a runner job 0
+lmdb-full-2: samples 490, with a runner job 0
+lmdb-full-3: samples 480, with a runner job 0
+rocksdb-full-1: samples 369, with a runner job 177
+rocksdb-full-2: samples 355, with a runner job 0
+rocksdb-full-3: samples 361, with a runner job 30
+cyclone-cold-1: samples 99, with a runner job 0
+cyclone-cold-2: samples 99, with a runner job 0
+cyclone-cold-3: samples 104, with a runner job 73
+lmdb-cold-1: samples 254, with a runner job 0
+lmdb-cold-2: samples 259, with a runner job 0
+lmdb-cold-3: samples 259, with a runner job 0
+cyclone-noverify-1: samples 78, with a runner job 0
+cyclone-noverify-2: samples 79, with a runner job 0
+cyclone-noverify-3: samples 78, with a runner job 0

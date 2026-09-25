@@ -40,3 +40,7 @@ insert-path-.*\.txt
 # Throwaway timing patch kept with the insert-path raw data (a diff, applied
 # with patch(1); not shipped source).
 insert-path-.*\.patch
+# Round 6 KV benchmark raw output and logs (doc/kv-cache-benchmark/round6/),
+# and its per-run 1 Hz sampler files (round6-samples/<run tag>.txt).
+round6-.*\.txt
+round6-samples

@@ -1,0 +1,2 @@
+[ perf record: Woken up 250 times to write data ]
+[ perf record: Captured and wrote 65,116 MB ~/round6/out/diag/perf-cy-flush.data (238205 samples) ]

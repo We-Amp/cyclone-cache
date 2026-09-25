@@ -1,0 +1,46 @@
+trace span 60.0 s
+
+waiting for                                  via                      n  total ms   >5ms  >10ms  >20ms  max ms
+other sleep                                  futex/sleep            299     59831    299    299    299   200.6
+read I/O in a page fault (mmap)              page fault           17691     14479    582    382    190   113.2
+read of a partial page before the write (write_begin) pwrite                6417      4209    176    126     71    56.0
+preempted (runnable)                         pwrite               12957        66      0      0      0     0.1
+preempted (runnable)                         madvise              10716        49      0      0      0     0.1
+preempted (runnable)                         other                  893        12      0      0      0     0.1
+other sleep                                  page fault               3         8      1      0      0     7.2
+memcg reclaim                                madvise                  1         2      0      0      0     1.7
+preempted (runnable)                         page fault              76         1      0      0      0     0.0
+preempted (runnable)                         rename/unlink/open      11         0      0      0      0     0.0
+
+stacks with the most intervals over 10 ms (tid, innermost first):
+  tid 2087081 n=299 total=59831 ms >10ms=299 max=200.6 ms
+    do_nanosleep <- hrtimer_nanosleep <- common_nsleep <- __x64_sys_clock_nanosleep <- x64_sys_call <- do_syscall_64 <- entry_SYSCALL_64_after_hwframe <- clock_nanosleep@GLIBC_2.2.5 <- [unknown] <- [unknown]
+  tid 2087082 n=8781 total=5600 ms >10ms=168 max=49.4 ms
+    wait_on_page_bit_common <- filemap_read_page <- filemap_fault <- __do_fault <- do_read_fault <- do_fault <- handle_pte_fault <- __handle_mm_fault <- handle_mm_fault <- do_user_addr_fault <- exc_page_fault <- asm_exc_page_fault <- __memmove_avx_unaligned_erms <- [unknown] <- [unknown] <- cyclone::PosixMappedFile::~PosixMappedFile <- [unknown]
+  tid 2087082 n=6417 total=4209 ms >10ms=126 max=56.0 ms
+    bit_wait_io <- __wait_on_bit <- out_of_line_wait_on_bit <- __wait_on_buffer <- ext4_block_write_begin <- ext4_da_write_begin <- generic_perform_write <- ext4_buffered_write_iter <- ext4_file_write_iter <- new_sync_write <- vfs_write <- __x64_sys_pwrite64 <- x64_sys_call <- do_syscall_64 <- entry_SYSCALL_64_after_hwframe <- __libc_pwrite <- [unknown]
+  tid 2087082 n=4848 total=2932 ms >10ms=90 max=48.8 ms
+    wait_on_page_bit_common <- filemap_read_page <- filemap_fault <- __do_fault <- do_read_fault <- do_fault <- handle_pte_fault <- __handle_mm_fault <- handle_mm_fault <- do_user_addr_fault <- exc_page_fault <- asm_exc_page_fault <- cyclone::Volume::read_sync
+  tid 2087082 n=273 total=1864 ms >10ms=64 max=113.2 ms
+    wait_on_page_bit_common <- filemap_fault <- __do_fault <- do_read_fault <- do_fault <- handle_pte_fault <- __handle_mm_fault <- handle_mm_fault <- do_user_addr_fault <- exc_page_fault <- asm_exc_page_fault <- cyclone::(anonymous namespace)::sse42_3way_impl <- [unknown] <- [unknown] <- cyclone::PosixMappedFile::~PosixMappedFile <- [unknown]
+  tid 2087082 n=1536 total=2644 ms >10ms=59 max=76.3 ms
+    wait_on_page_bit_common <- filemap_fault <- __do_fault <- do_read_fault <- do_fault <- handle_pte_fault <- __handle_mm_fault <- handle_mm_fault <- do_user_addr_fault <- exc_page_fault <- asm_exc_page_fault <- __memmove_avx_unaligned_erms
+  tid 2087082 n=2189 total=1426 ms >10ms=1 max=12.9 ms
+    wait_on_page_bit_common <- filemap_fault <- __do_fault <- do_read_fault <- do_fault <- handle_pte_fault <- __handle_mm_fault <- handle_mm_fault <- do_user_addr_fault <- exc_page_fault <- asm_exc_page_fault <- cyclone::(anonymous namespace)::sse42_3way_impl
+  tid 2087082 n=9009 total=39 ms >10ms=0 max=0.0 ms
+    __cond_resched <- kmem_cache_alloc <- alloc_buffer_head <- alloc_page_buffers <- create_empty_buffers <- ext4_block_write_begin <- ext4_da_write_begin <- generic_perform_write <- ext4_buffered_write_iter <- ext4_file_write_iter <- new_sync_write <- vfs_write <- __x64_sys_pwrite64 <- x64_sys_call <- do_syscall_64 <- entry_SYSCALL_64_after_hwframe <- __libc_pwrite <- [unknown]
+  tid 2087082 n=7323 total=29 ms >10ms=0 max=0.0 ms
+    __cond_resched <- __alloc_pages <- alloc_pages <- __page_cache_alloc <- page_cache_ra_unbounded <- force_page_cache_ra <- generic_fadvise <- vfs_fadvise <- do_madvise.part.0 <- __x64_sys_madvise <- x64_sys_call <- do_syscall_64 <- entry_SYSCALL_64_after_hwframe <- __madvise <- [unknown]
+  tid 2087082 n=3211 total=20 ms >10ms=0 max=0.1 ms
+    __cond_resched <- shrink_node_memcgs <- shrink_node <- do_try_to_free_pages <- try_to_free_mem_cgroup_pages <- try_charge_memcg <- charge_memcg <- __mem_cgroup_charge <- __add_to_page_cache_locked <- add_to_page_cache_lru <- pagecache_get_page <- grab_cache_page_write_begin <- ext4_da_write_begin <- generic_perform_write <- ext4_buffered_write_iter <- ext4_file_write_iter <- new_sync_write <- vfs_
+
+balance_dirty_pages events (pause in ms, per event):
+  kv_churn: n=1 sum=0 ms pause>0: 0 max=0
+
+device reads issued (block_rq_issue, R), benchmark threads by origin, then the busiest other tasks:
+  kv_churn             readahead hint (madvise)                               241828
+  kv_churn             read I/O in a page fault (mmap)                        13694
+  kv_churn             read of a partial page before the write (write_begin)  6417
+  kv_churn             other                                                  1
+  (other) perf-exec    2
+  (other) kworker/8:1H-kb 1

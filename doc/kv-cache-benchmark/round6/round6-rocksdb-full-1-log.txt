@@ -1,0 +1,111 @@
+=== machine ===
+cpu          : Intel(R) Core(TM) i7-8750H CPU @ 2.20GHz (6 physical / 12 logical)
+memory       : 23 GiB
+os           : Ubuntu 22.04.5 LTS (5.15.0-191-generic)
+filesystem   : ext4 on / (path ~/kvdata/round6)
+store        : rocksdb 9.10.0
+tuning       : BlobDB: enable_blob_files = true, min_blob_size = 0, blob_file_size = 256 MiB; compression = kNoCompression and blob_compression_type = kNoCompression; no_block_cache = true (block cache disabled); WAL on, WriteOptions.sync = false; ReadOptions default (verify_checksums on, fill_cache n/a); key = raw 32-byte digest; value = 64 B header followed by the block; get() copies into a std::string -- so 'view' mode is also a copy
+workload     : kv-workload-spec v1; zipf theta 0.99, seed 42+tid; 10 s per phase-3 point after a 2 s warm-up
+capacity     : spec asks for 8 GiB; none of the peer stores has a capacity knob (no eviction configured, dataset <= 4 GiB)
+
+--- block_size 524288 (512 KiB), n = 4096, dataset 2048 MiB ---
+  put              : 690.1 puts/s, 0.362 GB/s, p50 347.243 us, p99 2224.311 us
+  content verify   : ok
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  get_first_touch  : 1601.2 gets/s, 0.839 GB/s, p50 533.927 us, p99 1059.138 us
+  get_warm T=1 view  : 9651.4 gets/s, 5.060 GB/s, p50 106.714 us, p99 147.519 us
+  get_warm T=1 copy  : 8107.9 gets/s, 4.251 GB/s, p50 125.814 us, p99 170.329 us
+  get_warm T=4 view  : 24554.3 gets/s, 12.874 GB/s, p50 163.718 us, p99 225.240 us
+  get_warm T=4 copy  : 13982.4 gets/s, 7.331 GB/s, p50 284.530 us, p99 364.911 us
+  get_warm T=8 view  : 11449.5 gets/s, 6.003 GB/s, p50 505.367 us, p99 1400.515 us
+  get_warm T=8 copy  : 6829.2 gets/s, 3.580 GB/s, p50 867.488 us, p99 2105.757 us
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  restart          : hit_fraction 1.0000, 1696.9 gets/s, 0.890 GB/s
+  multiprocess     : skipped -- RocksDB allows only one read-write process per directory; a secondary/read-only instance has a different (catch-up) read path and is not comparable, so phase 5 is skipped.
+
+--- block_size 2097152 (2048 KiB), n = 2048, dataset 4096 MiB ---
+  put              : 164.0 puts/s, 0.344 GB/s, p50 1888.369 us, p99 137914.311 us
+  content verify   : ok
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  get_first_touch  : 388.2 gets/s, 0.814 GB/s, p50 2535.498 us, p99 4537.665 us
+  get_warm T=1 view  : 1823.4 gets/s, 3.824 GB/s, p50 548.630 us, p99 641.865 us
+  get_warm T=1 copy  : 1334.9 gets/s, 2.800 GB/s, p50 748.310 us, p99 864.093 us
+  get_warm T=4 view  : 1732.3 gets/s, 3.633 GB/s, p50 2295.981 us, p99 2709.747 us
+  get_warm T=4 copy  : 1303.8 gets/s, 2.734 GB/s, p50 3062.774 us, p99 3353.157 us
+  get_warm T=8 view  : 1559.6 gets/s, 3.271 GB/s, p50 4091.003 us, p99 7512.148 us
+  get_warm T=8 copy  : 1204.3 gets/s, 2.526 GB/s, p50 5408.741 us, p99 9623.597 us
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  restart          : hit_fraction 1.0000, 404.3 gets/s, 0.848 GB/s
+  multiprocess     : skipped -- RocksDB allows only one read-write process per directory; a secondary/read-only instance has a different (catch-up) read path and is not comparable, so phase 5 is skipped.
+
+--- block_size 8388608 (8192 KiB), n = 512, dataset 4096 MiB ---
+  put              : 44.5 puts/s, 0.373 GB/s, p50 7597.184 us, p99 144462.530 us
+  content verify   : ok
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  get_first_touch  : 102.1 gets/s, 0.856 GB/s, p50 9712.528 us, p99 16179.640 us
+  get_warm T=1 view  : 302.8 gets/s, 2.540 GB/s, p50 3276.177 us, p99 4257.440 us
+  get_warm T=1 copy  : 231.2 gets/s, 1.940 GB/s, p50 4277.817 us, p99 5114.362 us
+  get_warm T=4 view  : 334.4 gets/s, 2.806 GB/s, p50 11276.025 us, p99 22045.273 us
+  get_warm T=4 copy  : 219.8 gets/s, 1.844 GB/s, p50 17995.249 us, p99 31385.686 us
+  get_warm T=8 view  : 298.5 gets/s, 2.504 GB/s, p50 28866.963 us, p99 38901.176 us
+  get_warm T=8 copy  : 232.7 gets/s, 1.952 GB/s, p50 38013.032 us, p99 46691.259 us
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  restart          : hit_fraction 1.0000, 91.1 gets/s, 0.764 GB/s
+  multiprocess     : skipped -- RocksDB allows only one read-write process per directory; a secondary/read-only instance has a different (catch-up) read path and is not comparable, so phase 5 is skipped.
+
+--- block_size 33554432 (32768 KiB), n = 128, dataset 4096 MiB ---
+  put              : 9.0 puts/s, 0.301 GB/s, p50 73880.926 us, p99 376661.315 us
+  content verify   : ok
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  get_first_touch  : 17.3 gets/s, 0.582 GB/s, p50 56862.763 us, p99 69843.236 us
+  get_warm T=1 view  : 26.0 gets/s, 0.874 GB/s, p50 38328.880 us, p99 40927.136 us
+  get_warm T=1 copy  : 25.4 gets/s, 0.851 GB/s, p50 39425.722 us, p99 41252.201 us
+  get_warm T=4 view  : 66.8 gets/s, 2.243 GB/s, p50 59137.719 us, p99 70763.802 us
+  get_warm T=4 copy  : 56.3 gets/s, 1.889 GB/s, p50 69649.229 us, p99 86215.554 us
+  get_warm T=8 view  : 67.4 gets/s, 2.260 GB/s, p50 118472.566 us, p99 150015.328 us
+  get_warm T=8 copy  : 56.9 gets/s, 1.910 GB/s, p50 139847.697 us, p99 170964.731 us
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  restart          : hit_fraction 1.0000, 17.6 gets/s, 0.592 GB/s
+  multiprocess     : skipped -- RocksDB allows only one read-write process per directory; a secondary/read-only instance has a different (catch-up) read path and is not comparable, so phase 5 is skipped.
+
+## Results (rocksdb)
+
+| phase | mode | block | threads | ops/s | GB/s | p50 us | p99 us | p99.9 us | hit |
+|---|---|---|---|---|---|---|---|---|---|
+| put | - | 512 KiB | 1 | 690.1 | 0.362 | 347.2 | 2224.3 | 140052.3 | - |
+| get_first_touch | view | 512 KiB | 1 | 1601.2 | 0.839 | 533.9 | 1059.1 | 1487.6 | 1.000 |
+| get_warm | view | 512 KiB | 1 | 9651.4 | 5.060 | 106.7 | 147.5 | 174.0 | 1.000 |
+| get_warm | copy | 512 KiB | 1 | 8107.9 | 4.251 | 125.8 | 170.3 | 199.1 | 1.000 |
+| get_warm | view | 512 KiB | 4 | 24554.3 | 12.874 | 163.7 | 225.2 | 262.9 | 1.000 |
+| get_warm | copy | 512 KiB | 4 | 13982.4 | 7.331 | 284.5 | 364.9 | 423.7 | 1.000 |
+| get_warm | view | 512 KiB | 8 | 11449.5 | 6.003 | 505.4 | 1400.5 | 1463.6 | 1.000 |
+| get_warm | copy | 512 KiB | 8 | 6829.2 | 3.580 | 867.5 | 2105.8 | 2203.0 | 1.000 |
+| restart | view | 512 KiB | 1 | 1696.9 | 0.890 | 502.9 | 1165.7 | 1723.3 | 1.000 |
+| put | - | 2048 KiB | 1 | 164.0 | 0.344 | 1888.4 | 137914.3 | 159293.5 | - |
+| get_first_touch | view | 2048 KiB | 1 | 388.2 | 0.814 | 2535.5 | 4537.7 | 4693.4 | 1.000 |
+| get_warm | view | 2048 KiB | 1 | 1823.4 | 3.824 | 548.6 | 641.9 | 706.0 | 1.000 |
+| get_warm | copy | 2048 KiB | 1 | 1334.9 | 2.800 | 748.3 | 864.1 | 975.5 | 1.000 |
+| get_warm | view | 2048 KiB | 4 | 1732.3 | 3.633 | 2296.0 | 2709.7 | 2865.7 | 1.000 |
+| get_warm | copy | 2048 KiB | 4 | 1303.8 | 2.734 | 3062.8 | 3353.2 | 3571.7 | 1.000 |
+| get_warm | view | 2048 KiB | 8 | 1559.6 | 3.271 | 4091.0 | 7512.1 | 7644.6 | 1.000 |
+| get_warm | copy | 2048 KiB | 8 | 1204.3 | 2.526 | 5408.7 | 9623.6 | 9764.8 | 1.000 |
+| restart | view | 2048 KiB | 1 | 404.3 | 0.848 | 2506.2 | 4332.7 | 4525.9 | 1.000 |
+| put | - | 8192 KiB | 1 | 44.5 | 0.373 | 7597.2 | 144462.5 | 164205.4 | - |
+| get_first_touch | view | 8192 KiB | 1 | 102.1 | 0.856 | 9712.5 | 16179.6 | 17458.5 | 1.000 |
+| get_warm | view | 8192 KiB | 1 | 302.8 | 2.540 | 3276.2 | 4257.4 | 4567.8 | 1.000 |
+| get_warm | copy | 8192 KiB | 1 | 231.2 | 1.940 | 4277.8 | 5114.4 | 5616.0 | 1.000 |
+| get_warm | view | 8192 KiB | 4 | 334.4 | 2.806 | 11276.0 | 22045.3 | 25785.1 | 1.000 |
+| get_warm | copy | 8192 KiB | 4 | 219.8 | 1.844 | 17995.2 | 31385.7 | 33607.9 | 1.000 |
+| get_warm | view | 8192 KiB | 8 | 298.5 | 2.504 | 28867.0 | 38901.2 | 39918.9 | 1.000 |
+| get_warm | copy | 8192 KiB | 8 | 232.7 | 1.952 | 38013.0 | 46691.3 | 48075.7 | 1.000 |
+| restart | view | 8192 KiB | 1 | 91.1 | 0.764 | 10811.4 | 14346.9 | 14998.7 | 1.000 |
+| put | - | 32768 KiB | 1 | 9.0 | 0.301 | 73880.9 | 376661.3 | 383784.9 | - |
+| get_first_touch | view | 32768 KiB | 1 | 17.3 | 0.582 | 56862.8 | 69843.2 | 73737.9 | 1.000 |
+| get_warm | view | 32768 KiB | 1 | 26.0 | 0.874 | 38328.9 | 40927.1 | 41410.3 | 1.000 |
+| get_warm | copy | 32768 KiB | 1 | 25.4 | 0.851 | 39425.7 | 41252.2 | 41293.6 | 1.000 |
+| get_warm | view | 32768 KiB | 4 | 66.8 | 2.243 | 59137.7 | 70763.8 | 75590.2 | 1.000 |
+| get_warm | copy | 32768 KiB | 4 | 56.3 | 1.889 | 69649.2 | 86215.6 | 95767.8 | 1.000 |
+| get_warm | view | 32768 KiB | 8 | 67.4 | 2.260 | 118472.6 | 150015.3 | 159202.2 | 1.000 |
+| get_warm | copy | 32768 KiB | 8 | 56.9 | 1.910 | 139847.7 | 170964.7 | 177655.8 | 1.000 |
+| restart | view | 32768 KiB | 1 | 17.6 | 0.592 | 54375.5 | 77689.5 | 78771.9 | 1.000 |
+

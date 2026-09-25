@@ -1,0 +1,14 @@
+13:53:51 diag cy-ret load: 0.83 2.02 2.17 1/738 1987480
+13:57:27 diag cy-ret done load: 2.03 1.91 2.08 2/923 1992481
+14:04:23 diag filedir load: 0.92 2.67 2.44 1/746 2017619
+14:08:23 diag filedir done load: 2.05 2.23 2.30 1/842 2021942
+14:09:18 diag lmdb load: 0.86 1.87 2.17 1/752 2022351
+14:13:22 diag lmdb done load: 1.39 1.68 2.02 1/744 2024949
+14:13:52 diag cy-flush load: 0.84 1.51 1.96 1/743 2024988
+14:17:21 diag cy-flush done load: 2.12 1.81 1.98 2/818 2029253
+14:23:32 diag cy-flush-2 load: 0.99 1.83 1.96 1/766 2082191
+14:26:56 diag cy-flush-2 done load: 1.32 1.59 1.83 1/740 2084347
+14:27:26 diag filedir-2 load: 0.80 1.43 1.77 1/737 2084385
+14:31:20 diag filedir-2 done load: 1.74 1.55 1.74 1/743 2087001
+14:32:01 diag cy-ret-2 load: 0.89 1.35 1.66 1/740 2087047
+14:35:35 diag cy-ret-2 done load: 1.17 1.27 1.56 1/740 2089301
