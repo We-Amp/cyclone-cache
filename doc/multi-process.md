@@ -66,6 +66,11 @@ config.set_multi_process_config(mp_config);
 - **Checksums must be enabled** (`enable_checksum = true`, the default)
 - **Valid process index**: `process_index < total_processes`
 - **All processes must use the same** `total_processes` value
+- **All processes must share one host and one PID namespace.** A writer
+  recovers the write lock from a holder whose PID the OS reports gone
+  (`kill(pid, 0)` / `OpenProcess`). A live holder in another PID namespace,
+  such as another container sharing the volume, looks gone, and taking the
+  lock from it can overlap two writes.
 
 ## Architecture
 
@@ -98,7 +103,9 @@ area still starts 177 pages into the stripe. The retention region was added in
 directory **version 2** (`MmapDirectory::kVersion`). It holds the stripe's
 exposure generation `G = P * (N + 1) + f` and one `{generation:8, count:24}`
 borrow slot per frontier chunk. It replaces the version-1 stripe-wide borrow
-slot at header offset 34, which is retired and stays zero. `G` also replaces
+slot at header offset 34. Those two bytes now hold the phase lock's takeover
+generation (see [Cross-Process Writer Locks](#cross-process-writer-locks)).
+`G` also replaces
 the version-1 reader epoch, `{shared_wrap_count, current_phase}`. See
 [architecture.md](architecture.md#eviction-and-wrap-retention).
 
@@ -147,6 +154,95 @@ if (!result && result.error() == CacheError::NotOwned) {
     // Option 2: Use a different cache key
 }
 ```
+
+### Cross-Process Writer Locks
+
+Normally one process owns a stripe. During a graceful reload (nginx, Apache)
+or an overlapped recycle (IIS), an old and a new process can both own it, so
+writers in two processes contend on the stripe's shared locks: the write
+lock (write-cursor reservation), the phase lock (an insert's phase read and
+entry store against a phase toggle) and each directory bucket's seqlock.
+
+A waiter spins for about 20 µs, then sleeps with backoff (10 µs doubling to
+1 ms), spinning briefly after each wake. It treats a holder as stuck only
+when that same holder kept the lock for the whole budget and then for a
+further 2 ms of continuous polling. A new holder, or the lock seen free,
+restarts the budget. Each bucket acquisition takes a new version. Each
+phase-lock and write-lock acquisition bumps that lock's generation counter.
+So a peer that releases and re-acquires at once still counts as a new
+holder.
+
+| Lock | Budget | After the budget |
+|------|--------|------------------|
+| Bucket seqlock | 250 ms | The waiter forces the bucket to even. |
+| Phase lock | 1 s | The waiter recovers the lock. |
+| Write lock | 5 s | Once one holder has kept the lock for 50 ms, the waiter checks after every sleep whether `kill(pid, 0)` / `OpenProcess` proves it dead, and recovers the lock if so. It takes over a holder it cannot prove dead only after the budget. |
+
+The budgets are far above the longest live hold measured with 5.2 runnable
+threads per core (56 ms for a bucket, 112 ms for the phase lock). A holder
+that is only descheduled is therefore waited out. A larger budget only
+lengthens the one-time stall after a process died holding a lock.
+
+These waits run on the writer side only: the stripe mutex is held, and a
+phase-lock wait can also run inside a wrap while the write lock is held.
+They are still reachable inline from a request thread. For example, the
+PageSpeed nginx module writes an alternate through `write_sync` /
+`close_sync` on its event loop, and the C API's miss-handler write-back
+also writes. Under load, a write waits out a live holder instead of taking
+the lock from it: about 106 ms at worst in the measurement above.
+
+The locks are not fair. A peer that releases and re-acquires within
+nanoseconds wins against a sleeping waiter every time. Such a peer is never
+taken over, because every acquisition is a new holder. So that it cannot
+stall a writer indefinitely either, most waits are **capped**:
+
+- **What gives up:** inserts, removes, hit-count updates and write-slot
+  reservation.
+- **When:** once the holders a waiter has seen come and go add up to
+  `kLockWaitCap` (250 ms), the waiter gives up.
+- **What happens then:** the operation returns `CacheError::Busy`
+  (`CYCLONE_BUSY` in the C API) and publishes nothing. An abandoned write
+  leaves its document unreachable, like any fill whose insert never ran.
+  The cap never takes a lock over.
+
+Time spent on the current holder does not count toward the cap, so a stuck
+holder is still governed by its per-holder budget alone, and a dead holder
+is still recovered. The cap is 250 ms because that is over twice the longest
+total phase-lock wait measured at 5.2 runnable threads per core (103 ms),
+so ordinary contention does not give up.
+
+The longest one capped acquisition can wait is about the cap plus one
+holder's budget plus the 2 ms confirmation:
+
+| Lock | Longest capped wait |
+|------|---------------------|
+| Bucket seqlock | About 0.5 s. |
+| Phase lock | About 1.25 s. An insert takes the phase lock, then a bucket, so an insert can wait about 1.75 s. |
+| Write lock | About 0.3 s behind a dead holder. About 5.25 s behind a live holder it cannot prove dead, the pathological case the escalation exists for. |
+
+Three waits stay uncapped, because giving up there would leave work half
+done:
+
+- the phase toggle and the phase re-derivation, which run inside a wrap
+  under the write lock (a peer needs that lock before it can start another
+  insert, so contention drains);
+- `clear()`;
+- the RAM-coherence signal published after an alternate's chain was
+  already repointed.
+
+Every release is a CAS on the holder's own token. A holder that was
+recovered from under it and resumes later cannot free the next holder's
+lock. A usurped bucket or phase-lock holder can at worst publish a torn or
+stale directory entry. Full-key verification, the positional guard and the
+CRC turn that into a miss. The write lock guards overlapping writes, which
+readers cannot detect, so it never presumes a live holder stuck.
+
+In a mixed-version overlap, a build from before issue #27 still takes over
+the phase lock after about 33 µs, and it releases both locks and takes them
+over with a blind store of 0. Builds of the same format still exclude each
+other in normal locking, because both treat any nonzero lock value as held.
+During an upgrade overlap, the pair therefore behaves like the older build,
+and no worse than before.
 
 ### Read Operations
 

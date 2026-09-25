@@ -727,11 +727,13 @@ struct Stripe {
               bool *collision_evicted = nullptr,
               bool *bucket_full_evicted = nullptr,
               InsertAdmission *admission = nullptr,
-              std::span<const uint64_t> clear_offsets = {}) {
+              std::span<const uint64_t> clear_offsets = {},
+              bool *busy = nullptr) {
     if (use_mmap_directory && mmap_directory) {
+      // *busy: a capped cross-process lock wait gave up; nothing published.
       return mmap_directory->insert(key, offset, size, verified_offset,
                                     collision_evicted, bucket_full_evicted,
-                                    admission, clear_offsets);
+                                    admission, clear_offsets, busy);
     } else if (directory) {
       return directory->insert(key, offset, size, verified_offset,
                                collision_evicted, bucket_full_evicted,
@@ -746,13 +748,37 @@ struct Stripe {
   // deferred to the periodic sync_directory() pass.  A removal or chain
   // repoint lost to power failure is benign: the old entry still points at
   // valid, checksummed data.
-  bool remove_entry_at(const CacheKey &key, uint64_t offset) {
+  bool remove_entry_at(const CacheKey &key, uint64_t offset,
+                       bool *busy = nullptr) {
     if (use_mmap_directory && mmap_directory) {
-      return mmap_directory->remove_at(key, offset);
+      // *busy: a capped bucket wait gave up; nothing removed.
+      return mmap_directory->remove_at(key, offset, busy);
     } else if (directory) {
       return directory->remove_at(key, offset);
     }
     return false;
+  }
+
+  // Remove every entry of `key`'s bucket with its tag at any of `offsets`
+  // (at most one bucket's worth), in ONE writer bracket: all or nothing.
+  // Bit i of the result is set when offsets[i] was found and removed.
+  // *busy: a capped bucket wait gave up; nothing removed.
+  uint32_t remove_entries_at(const CacheKey &key,
+                             std::span<const uint64_t> offsets, bool *busy) {
+    if (use_mmap_directory && mmap_directory) {
+      return mmap_directory->remove_all_at(key, offsets, busy);
+    }
+    uint32_t mask = 0;
+    if (directory) {
+      // In memory: one process, every mutator holds the stripe mutex, so
+      // there is no wait to give up and the loop cannot be interrupted.
+      for (size_t i = 0; i < offsets.size(); ++i) {
+        if (directory->remove_at(key, offsets[i])) {
+          mask |= 1U << i;
+        }
+      }
+    }
+    return mask;
   }
 
   // Cross-process invalidation signal for the key's directory bucket.
@@ -1254,6 +1280,30 @@ class Volume : public std::enable_shared_from_this<Volume> {
     }
     return 0;
   }
+  // Park a live holder inside `key`'s stripe's cross-process phase lock, as
+  // an insert does: the stripe mutex, then the phase lock (mmap directory
+  // only).  Held until end_phase_lock_for_test(key, token) on the SAME
+  // thread; a writer in another Volume on the same file then waits on it
+  // (issue #27).
+  [[nodiscard]] MmapDirectory::PhaseLockToken begin_phase_lock_for_test(
+      const CacheKey &key) {
+    Stripe *stripe = select_stripe(key);
+    stripe->mutex.lock();
+    return stripe->mmap_directory->acquire_phase_lock_for_test();
+  }
+  void end_phase_lock_for_test(const CacheKey &key,
+                               MmapDirectory::PhaseLockToken token) {
+    Stripe *stripe = select_stripe(key);
+    stripe->mmap_directory->release_phase_lock_for_test(token);
+    stripe->mutex.unlock();
+  }
+  // `key`'s stripe's mmap directory (nullptr without one).
+  [[nodiscard]] MmapDirectory *mmap_directory_for_test(const CacheKey &key) {
+    Stripe *stripe = select_stripe(key);
+    return stripe->use_mmap_directory && stripe->mmap_directory
+               ? &*stripe->mmap_directory
+               : nullptr;
+  }
 #endif
 
   Volume(const Volume &) = delete;
@@ -1582,9 +1632,10 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // same stripe, and the cross-process write lock is released before the
   // directory insert.  So a bucket that stayed odd for the whole wait budget
   // belongs to a peer that is stuck -- dead mid-update, or alive but
-  // descheduled.  Either way, release it the way an insert would
-  // (touch_bucket runs acquire_writer's presumed-stuck recovery; a live
-  // usurped holder's token-checked release then becomes a no-op), then
+  // descheduled.  Either way, go through the bucket the way an insert would
+  // (touch_bucket runs acquire_writer, which waits the holder out and
+  // recovers the bucket only from one that kept it for kBucketWriterBudget;
+  // a usurped holder's token-checked release then becomes a no-op), then
   // `reset` the callback's accumulated state and probe once more.  Returns
   // whether a probe completed; false means the caller must report Busy.
   // Each exhausted probe is counted in directory_read_timeouts.
@@ -1599,7 +1650,11 @@ class Volume : public std::enable_shared_from_this<Volume> {
     if (!(stripe->use_mmap_directory && stripe->mmap_directory)) {
       return false;  // Unreachable: in-memory mutators all hold the mutex
     }
-    stripe->mmap_directory->touch_bucket(key);
+    // Capped: behind live holders that keep changing, give up as Busy.
+    if (!stripe->mmap_directory->touch_bucket(key)) {
+      _directory_read_timeouts.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
     reset();
     if (stripe->probe_each(key, snap, callback)) {
       return true;

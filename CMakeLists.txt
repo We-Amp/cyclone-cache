@@ -214,6 +214,7 @@ if(CYCLONE_BUILD_TESTS)
     tests/integration/test_publish_after_snapshot.cpp
     tests/integration/test_seqlock_read_wait.cpp
     tests/integration/test_write_reserve.cpp
+    tests/integration/test_lock_holder_wait.cpp
   )
   # Compile guard: cyclone_c.h is the C ABI header, so it must stay valid C11
   # (it once used C++ alias declarations and did not compile as C).  Built as

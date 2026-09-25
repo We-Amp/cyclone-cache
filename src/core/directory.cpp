@@ -3,9 +3,66 @@
 
 #include "directory.hpp"
 
+#include <algorithm>
 #include <cstring>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX  // windows.h min/max macros would break std::min/std::max
+#endif
+#include <windows.h>
+// Older SDK headers lack the flag (Windows 10 1803+ honours it).
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+#endif
+
 namespace cyclone {
+
+namespace wait_detail {
+
+#if defined(_WIN32)
+namespace {
+// One high-resolution waitable timer per thread, created on first use and
+// closed at thread exit.  A null handle means this Windows cannot create
+// one (pre-1803); sleep_for then falls back to the coarse sleep.
+struct HighResolutionTimer {
+  HANDLE handle = ::CreateWaitableTimerExW(
+      nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+      TIMER_ALL_ACCESS);
+  HighResolutionTimer() = default;
+  ~HighResolutionTimer() {
+    if (handle != nullptr) {
+      ::CloseHandle(handle);
+    }
+  }
+  HighResolutionTimer(const HighResolutionTimer &) = delete;
+  HighResolutionTimer &operator=(const HighResolutionTimer &) = delete;
+};
+}  // namespace
+
+void sleep_for(std::chrono::nanoseconds d) {
+  thread_local HighResolutionTimer timer;
+  if (timer.handle != nullptr) {
+    // Relative due time, in 100 ns units, negative.  At least one unit.
+    LARGE_INTEGER due;
+    due.QuadPart = -std::max<LONGLONG>(1, d.count() / 100);
+    if (::SetWaitableTimerEx(timer.handle, &due, 0, nullptr, nullptr, nullptr,
+                             0) != 0 &&
+        ::WaitForSingleObject(timer.handle, INFINITE) == WAIT_OBJECT_0) {
+      return;
+    }
+  }
+  std::this_thread::sleep_for(d);
+}
+#else
+void sleep_for(std::chrono::nanoseconds d) { std::this_thread::sleep_for(d); }
+#endif
+
+}  // namespace wait_detail
 
 // DirEntry bit layout (10 bytes = 5 x 16-bit words):
 // w[0]: offset bits 0-15
