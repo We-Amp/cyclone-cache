@@ -256,6 +256,12 @@ enum class ResetProvenance : std::uint8_t {
 // actually gating anything.
 constexpr std::uint64_t kInitLockByte = 0x7FFFFFFFFFFFFFFEULL;
 constexpr std::uint64_t kLifetimeLockByte = 0x7FFFFFFFFFFFFFFDULL;
+#ifndef _WIN32
+static_assert(sizeof(off_t) == 8,
+              "the lock bytes are cast to off_t at the fcntl call; a 32-bit "
+              "off_t would truncate them (_FILE_OFFSET_BITS=64 on 32-bit "
+              "targets)");
+#endif
 static_assert(kInitLockByte != kLifetimeLockByte,
               "the init and lifetime locks must sit on DISTINCT bytes or the "
               "reset-gate probe self-succeeds against our own init lock");

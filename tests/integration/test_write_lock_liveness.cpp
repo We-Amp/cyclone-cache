@@ -179,7 +179,9 @@ TEST_CASE(
 #include <span>
 #include <thread>
 #include <utility>
+#include <vector>
 
+#include "cyclone/key.hpp"
 #include "support/liveness_file.hpp"
 
 #if defined(__linux__)
@@ -506,6 +508,87 @@ TEST_CASE(
   CHECK(d.live().slot_of() == parent_slot);
   CHECK(d.live().probe(static_cast<unsigned>(parent_slot)) ==
         WriterLiveness::Verdict::kAlive);
+}
+
+TEST_CASE(
+    "Write-lock liveness: fork() while other threads claim or probe never "
+    "leaves the child's liveness mutex locked",
+    "[writelock][multiprocess][liveness][fork]") {
+  // Regression: the liveness mutex used to be per object and was held
+  // across a probe; a fork() at that instant gave the child a locked copy,
+  // and the child's first write-lock acquisition (which claims its own
+  // slot under that mutex) hung forever.  Here the parent keeps 16 threads
+  // probing a live holder while it forks; every child must take the write
+  // lock path and exit within a deadline, or the test fails (never hangs).
+  TempCacheDir tmp("wll_fork");
+  const std::string path = tmp.path();
+  const auto open_volume = [&] {
+    cyclone::VolumeConfig vc;
+    vc.path = path;
+    vc.size = size_t{16} << 20;
+    cyclone::MultiProcessConfig mp;
+    mp.set_enabled(true).set_process_index(0).set_total_processes(1);
+    auto v = std::make_unique<cyclone::Volume>(vc, mp);
+    REQUIRE(v->open().has_value());
+    return v;
+  };
+  auto a = open_volume();
+  auto b = open_volume();
+  const cyclone::CacheKey key(std::string_view("fork-probe"));
+  MmapDirectory *dir_a = a->mmap_directory_for_test(key);
+  MmapDirectory *dir_b = b->mmap_directory_for_test(key);
+  REQUIRE(dir_a != nullptr);
+  REQUIRE(dir_b != nullptr);
+  auto held = dir_b->acquire_write_lock(/*capped=*/false);
+  REQUIRE(held.acquired);
+
+  std::atomic<bool> stop{false};
+  std::vector<std::thread> waiters;
+  for (int i = 0; i < 16; ++i) {
+    waiters.emplace_back([&] {
+      while (!stop.load(std::memory_order_relaxed)) {
+        auto t = dir_a->acquire_write_lock(/*capped=*/true);
+        if (t.acquired) {
+          dir_a->release_write_lock(t);
+        }
+      }
+    });
+  }
+  std::this_thread::sleep_for(Ms{100});  // past the 50 ms probe gate
+
+  constexpr int kForks = 300;
+  constexpr auto kChildDeadline = Ms{2000};
+  int hung = 0;
+  int bad_exit = 0;
+  for (int n = 0; n < kForks && hung == 0; ++n) {
+    const pid_t child = ::fork();
+    REQUIRE(child >= 0);
+    if (child == 0) {
+      ::alarm(5);  // belt and braces: never outlive the parent's deadline
+      auto t = dir_a->try_acquire_write_lock();
+      _exit(t.liveness_slot >= 0 ? 0 : 3);
+    }
+    int status = 0;
+    const auto deadline = Clock::now() + kChildDeadline;
+    pid_t done = 0;
+    while ((done = ::waitpid(child, &status, WNOHANG)) == 0 &&
+           Clock::now() < deadline) {
+      std::this_thread::sleep_for(Ms{1});
+    }
+    if (done != child) {
+      ++hung;
+      kill_and_reap(child);
+    } else if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+      ++bad_exit;
+    }
+  }
+  stop.store(true);
+  for (auto &w : waiters) {
+    w.join();
+  }
+  dir_b->release_write_lock(held);
+  CHECK(hung == 0);
+  CHECK(bad_exit == 0);  // every child claimed a slot of its own
 }
 
 #if defined(__linux__)

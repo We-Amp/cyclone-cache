@@ -294,6 +294,25 @@ descriptor of its own, so its lock dies with it and not with the family.
 The claim reopens the file read-only, so a worker that dropped privileges
 can still claim.
 
+**Keep the slot's descriptor open.** On Linux and macOS the slot lock lives
+on a descriptor the cache opened. An application that closes every
+descriptor after opening the cache (a `closefrom()`-style daemonize step, or
+a child that closes inherited descriptors) drops its slot lock while it
+still stores slot tokens, and a waiter could then take over one of its live
+write-lock holders. Open the cache after daemonizing, and never close
+descriptors behind its back. `fork()` itself is safe: the claim, probe and
+release run under one process-wide mutex that a `pthread_atfork` handler
+takes around `fork()`, so a child never inherits it locked; everything done
+under it is non-blocking (`F_OFD_GETLK`, `F_OFD_SETLK`, never `SETLKW`), so
+a fork waits for at most a few syscalls.
+
+**Network filesystems.** Byte-range lock behaviour on NFS and SMB shares is
+unverified. The one-host requirement above already rules out sharing a
+volume between hosts; on a network mount used by one host, a claim that
+fails leaves the process without a slot (5 s escalation), but a server that
+accepts locks without keeping them across a client or server restart is
+not detected.
+
 **Without a slot.** A process that holds no slot (all 251 taken,
 byte-range locks unsupported on the filesystem, the file replaced by name)
 stores the plain token. A waiter never probes such a holder: it is never

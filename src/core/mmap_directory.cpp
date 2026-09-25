@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -366,19 +367,51 @@ bool set_slot_lock(int fd, unsigned slot, short type) {
 }
 #endif
 
+// Slot offsets go to fcntl as off_t: a 32-bit off_t would truncate them
+// into the data range (same guard as the reset-gate bytes in volume.cpp).
+#if !defined(_WIN32)
+static_assert(sizeof(off_t) == 8,
+              "liveness slot offsets need a 64-bit off_t "
+              "(_FILE_OFFSET_BITS=64 on 32-bit targets)");
+#endif
+
 // Bumped in every forked child (pthread_atfork), so a WriterLiveness can
 // tell that it runs in a new process whatever PIDs say.  Windows has no
 // fork: it stays 0 there.
 std::atomic<uint32_t> g_fork_epoch{0};
 
+// ONE mutex for every WriterLiveness of the process: claim, probe and detach
+// run under it.  It is fork-safe by construction: the pthread_atfork
+// PREPARE handler takes it, so no other thread can hold it at the instant of
+// fork(), and the parent and child handlers release it -- a child never
+// inherits it locked.  (A per-object mutex held by another thread across
+// fork() used to hang the child's first write-lock acquisition forever.)
+// Everything done under it is non-blocking by design: F_OFD_GETLK,
+// F_OFD_SETLK (never SETLKW), LockFileEx with LOCKFILE_FAIL_IMMEDIATELY,
+// open/fstat/close of the volume file.  So a fork waits in PREPARE only for
+// a few syscalls -- on a hung network filesystem, as long as that open()
+// takes.  It is taken only on cold paths (claims, and probes after 50 ms
+// behind one holder), so sharing it between volumes costs nothing on the
+// hot path.
+std::mutex &liveness_mutex() {
+  static std::mutex mu;
+  return mu;
+}
+
 #if !defined(_WIN32)
-void on_fork_child() { g_fork_epoch.fetch_add(1, std::memory_order_relaxed); }
+void on_fork_prepare() { liveness_mutex().lock(); }
+void on_fork_parent() { liveness_mutex().unlock(); }
+void on_fork_child() {
+  g_fork_epoch.fetch_add(1, std::memory_order_relaxed);
+  liveness_mutex().unlock();  // Taken by this thread in on_fork_prepare
+}
 #endif
 
 void install_fork_hook() {
 #if !defined(_WIN32)
   static const bool installed = [] {
-    return ::pthread_atfork(nullptr, nullptr, &on_fork_child) == 0;
+    return ::pthread_atfork(&on_fork_prepare, &on_fork_parent,
+                            &on_fork_child) == 0;
   }();
   (void)installed;
 #endif
@@ -403,14 +436,14 @@ uint32_t WriterLiveness::current_pid() {
 void WriterLiveness::attach(int probe_fd, const std::string &path) {
   install_fork_hook();
   detach();
-  std::lock_guard<std::mutex> lock(_mu);
+  std::lock_guard<std::mutex> lock(liveness_mutex());
   _probe_fd = probe_fd;
   _path = path;
   (void)claim_locked(g_fork_epoch.load(std::memory_order_relaxed));
 }
 
 void WriterLiveness::detach() {
-  std::lock_guard<std::mutex> lock(_mu);
+  std::lock_guard<std::mutex> lock(liveness_mutex());
   const uint64_t state = _state.load(std::memory_order_relaxed);
 #if defined(_WIN32)
   // The slot lock is on the volume handle itself; the caller closes that
@@ -467,7 +500,7 @@ int WriterLiveness::slot_for() {
     return slot_in(state);
   }
   // First acquisition in a forked child (or nothing is attached).
-  std::lock_guard<std::mutex> lock(_mu);
+  std::lock_guard<std::mutex> lock(liveness_mutex());
   const uint64_t again = _state.load(std::memory_order_relaxed);
   if (known(again)) {
     return slot_in(again);
@@ -575,7 +608,7 @@ bool WriterLiveness::claim_locked(uint32_t fork_epoch) {
 }
 
 WriterLiveness::Verdict WriterLiveness::probe(unsigned slot) const {
-  std::lock_guard<std::mutex> lock(_mu);
+  std::lock_guard<std::mutex> lock(liveness_mutex());
   if (_probe_fd < 0 || slot >= kSlots) {
     return Verdict::kUnknown;
   }

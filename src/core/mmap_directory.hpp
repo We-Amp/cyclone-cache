@@ -7,7 +7,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -248,8 +247,10 @@ class WriterLiveness {
 
   /// The slot this process holds, or kNoSlot.  The hot path is two atomic
   /// loads and a compare.  The first call in a forked child (which inherited
-  /// its parent's claim) claims a slot of the child's own, once, under a
-  /// mutex; a failed claim is remembered and not retried in that process.
+  /// its parent's claim) claims a slot of the child's own, once, under the
+  /// process-wide liveness mutex (fork-safe: pthread_atfork takes it around
+  /// fork(), so a child never inherits it locked); a failed claim is
+  /// remembered and not retried in that process.
   /// Forks are told apart by a pthread_atfork counter, not by PID: a child
   /// in a new PID namespace can have its parent's PID number.
   [[nodiscard]] int slot_for();
@@ -283,7 +284,8 @@ class WriterLiveness {
   static constexpr uint64_t kClaimed = uint64_t{1} << 40;
   static constexpr uint64_t kFailed = uint64_t{1} << 41;
   std::atomic<uint64_t> _state{0};
-  mutable std::mutex _mu;  // claim, probe and detach
+  // Claim, probe and detach run under one process-wide, fork-safe mutex
+  // (liveness_mutex() in mmap_directory.cpp), not a per-object one.
   int _probe_fd = -1;
   int _claim_fd = -1;  // POSIX: the descriptor holding the slot lock
   std::string _path;
