@@ -1,0 +1,124 @@
+--- src/core/volume.cpp	2026-09-25 01:52:26.000000000 +0200
++++ src/core/volume.cpp	2026-09-25 02:09:56.000000000 +0200
+@@ -12,6 +12,7 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstring>
++#include <cstdio>
+ #include <ctime>
+ #include <filesystem>
+ #include <functional>
+@@ -4077,6 +4078,16 @@
+ };
+ }  // namespace
+ 
++
++// INSTR (temporary, not committed): insert-path attribution.
++namespace cyclone_instr {
++struct Acc { std::atomic<uint64_t> ns[8]{}; std::atomic<uint64_t> n{0};
++  ~Acc() { const char* names[8]={"build","lock+alloc_slot","pwrite","commit_slot","probe+insert","doc_free","",""};
++    if (n.load()==0) return; std::fprintf(stderr,"INSTR commit_write n=%llu\n",(unsigned long long)n.load());
++    for (int i=0;i<6;++i) std::fprintf(stderr,"INSTR %-16s mean %8.1f us\n",names[i],ns[i].load()/1e3/n.load()); } };
++inline Acc g;
++inline uint64_t now() { return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
++}
+ std::expected<void, CacheError> Volume::commit_write(
+     Stripe* stripe, const CacheKey& key, std::span<const std::byte> header,
+     std::span<const std::byte> content) {
+@@ -4089,6 +4100,7 @@
+     return make_unexpected(CacheError::NotOwned);
+   }
+ 
++  const uint64_t _i0 = cyclone_instr::now();
+   // Build the document
+   auto doc_data = DocumentBuilder()
+                       .set_key(key)
+@@ -4103,6 +4115,8 @@
+   }
+ 
+   size_t doc_size = doc_data.size();
++  const uint64_t _i1 = cyclone_instr::now();
++  cyclone_instr::g.ns[0] += _i1 - _i0;
+ 
+   std::unique_lock lock(stripe->mutex);
+ 
+@@ -4114,6 +4128,8 @@
+     return make_unexpected(slot_res.error());
+   }
+   const WriteSlot slot = *slot_res;
++  const uint64_t _i2 = cyclone_instr::now();
++  cyclone_instr::g.ns[1] += _i2 - _i1;
+   // Pass stamp: part of the same pwrite as the document (design 5.1(2)).
+   patch_pass_stamp(doc_data, slot.pass);
+   uint64_t write_offset = slot.write_offset;
+@@ -4168,8 +4184,12 @@
+   // already-landed pwrite may have torn the usurper's span (detectable-only
+   // residual; see commit_write_slot); on fill failure it advances nothing and
+   // we surface IoError below.
++  const uint64_t _i3 = cyclone_instr::now();
++  cyclone_instr::g.ns[2] += _i3 - _i2;
+   auto committed = commit_write_slot(stripe, slot, fill_ok);
+   slot_releaser.disarm();  // lock released (or usurped) by commit_write_slot
++  const uint64_t _i4 = cyclone_instr::now();
++  cyclone_instr::g.ns[3] += _i4 - _i3;
+   if (!committed) {
+     return make_unexpected(committed.error());
+   }
+@@ -4315,6 +4335,15 @@
+ 
+   // Update stats
+   ++_writes;
++  {
++    const uint64_t _i5 = cyclone_instr::now();
++    cyclone_instr::g.ns[4] += _i5 - _i4;
++    std::vector<std::byte> tmp;
++    tmp.swap(doc_data);
++    { auto dead = std::move(tmp); }
++    cyclone_instr::g.ns[5] += cyclone_instr::now() - _i5;
++    cyclone_instr::g.n++;
++  }
+ 
+   // Write-around: do NOT populate RAM cache on writes.
+   // In multi-process mode, only the writing process would benefit;
+--- src/core/document.cpp	2026-09-25 01:52:26.000000000 +0200
++++ src/core/document.cpp	2026-09-25 02:09:50.000000000 +0200
+@@ -7,6 +7,9 @@
+ #include <cstdint>
+ #include <cstring>
+ #include <limits>
++#include <atomic>
++#include <chrono>
++#include <cstdio>
+ 
+ #include "crc32c.hpp"
+ 
+@@ -235,6 +238,11 @@
+   return *this;
+ }
+ 
++std::atomic<uint64_t> g_instr_doc_ns[4];
++static uint64_t instr_now() { return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
++struct InstrDocPrint { ~InstrDocPrint() { if (g_instr_doc_ns[3].load()==0) return; double n=g_instr_doc_ns[3].load();
++  std::fprintf(stderr,"INSTR   build.alloc      mean %8.1f us\nINSTR   build.copy       mean %8.1f us\nINSTR   build.crc        mean %8.1f us\n", g_instr_doc_ns[0]/1e3/n, g_instr_doc_ns[1]/1e3/n, g_instr_doc_ns[2]/1e3/n);} };
++static InstrDocPrint g_instr_doc_print;
+ std::vector<std::byte> DocumentBuilder::build() const {
+   // Check for 32-bit overflow before casting
+   size_t total_size = Document::kHeaderSize + _header.size() + _content.size();
+@@ -263,12 +271,17 @@
+   std::memcpy(doc.first_key.data(), digest.data(), digest.size());
+   std::memcpy(doc.fragment_key.data(), digest.data(), digest.size());
+ 
++  const uint64_t a0 = instr_now();
+   std::vector<std::byte> result;
+   result.reserve(doc.len);
++  const uint64_t a1 = instr_now();
+ 
+   doc.serialize(result);
+   result.insert(result.end(), _header.begin(), _header.end());
+   result.insert(result.end(), _content.begin(), _content.end());
++  const uint64_t a2 = instr_now();
++  g_instr_doc_ns[0] += a1 - a0; g_instr_doc_ns[1] += a2 - a1; g_instr_doc_ns[3]++;
++  struct CrcT { uint64_t t = instr_now(); ~CrcT() { g_instr_doc_ns[2] += instr_now() - t; } } crc_timer;
+ 
+   if (_enable_checksum) {
+     uint32_t crc = Document::compute_checksum(

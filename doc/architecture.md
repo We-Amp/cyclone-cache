@@ -761,13 +761,14 @@ sequenceDiagram
     participant WH as WriteHandle
     participant St as Stripe
     Cl->>WH: write_sync(key, len) → handle (bound to owned stripe)
-    Cl->>WH: write(data)…
+    Cl->>WH: write(data)… or reserve(n) and fill in place
     Cl->>WH: close()
-    WH->>St: build Document (+CRC)
+    WH->>St: build the document head (+CRC over header bytes + content)
     WH->>St: acquire stripe->mutex EXCLUSIVE  (the only stripe lock)
     WH->>St: allocate_write_slot
     Note over St: flush: if wrap needed: set_wrap_intent → lease gate →<br/>DEFER (NoSpace) or publish_wrap_phase (O(1)) + store G<br/>retention: ungated wrap, then gated frontier advance(s)
-    WH->>St: pwrite data (outside write_lock)
+    WH->>St: pwrite head, then content from the handle's buffer
+    Note over St: objects ≤ 64 KiB: head + content in one pwrite
     Note over St: INVARIANT: data durable BEFORE directory insert
     WH->>St: in-place-update election (full-key verify each candidate)
     WH->>St: directory insert (bumps bucket seqlock version)

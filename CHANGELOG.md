@@ -7,6 +7,19 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `WriteHandle::reserve(length)`: appends `length` bytes to the object and
+  returns them as a writable span, so a producer generates the content in
+  the handle's buffer instead of in its own buffer that `write_sync()` then
+  copies. Mixes with `write_sync()`; the checksum is taken at close; an
+  abort after a partial fill publishes nothing; the `write_sync()` limits
+  apply. Additive: `WriteHandleImpl` gains a virtual with a default body,
+  appended after its existing members. Not in the C API, which has no
+  streaming write handle.
+- `insert_bench` benchmark target: one put split into key / open / write /
+  commit, over a first lap and steady-state laps, with page faults per
+  insert (`--reserve` for the `reserve()` path). `kv_churn --reserve`
+  inserts through `reserve()`.
+
 - `CacheConfig::readahead_min_bytes` (and `VolumeConfig::readahead_min_bytes`,
   fluent `set_readahead_min_bytes()`): a readahead hint over exactly a
   document's byte range on the disk read path (`read_sync` and the
@@ -109,6 +122,19 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Plain writes no longer assemble the document in a second and third
+  buffer** (issue #16). `commit_write` used to copy the content into the
+  document builder and again into one contiguous document, two fresh heap
+  buffers per put whose page faults and frees cost more than the copies:
+  at 2 MiB on the Linux benchmark machine they were about 1.9 of the
+  2.5 ms a put took. It now builds only the 132-byte header plus the
+  caller's header bytes, with the CRC-32C chained over header bytes and
+  content, and writes the content from the handle's buffer right behind
+  it. Objects up to 64 KiB are still joined behind the head and written
+  with one `pwrite`, where the copy is cheaper than a second syscall. The
+  bytes on disk are unchanged, and so is the commit order (the whole fill,
+  then `sync_on_write`'s fsync, then the directory insert). The alternate
+  write path is unchanged.
 - **Wrap retention is the default** (`kDefaultWrapRetention = true`, so
   `CacheConfig::wrap_retention` and `VolumeConfig::wrap_retention` default
   to `true`, and a zero-initialised `CycloneCacheConfig` retains). Flush is

@@ -103,6 +103,31 @@ namespace cyclone {
 
 namespace {
 
+#ifndef _WIN32
+// Write `parts` back to back at `offset`: the fill of one document written as
+// its head and its content from the caller's buffer, never joined into one
+// contiguous copy first.  Retries short writes and EINTR; false on any other
+// error.
+bool pwrite_parts(int fd, std::span<const std::span<const std::byte>> parts,
+                  uint64_t offset) {
+  for (auto part : parts) {
+    while (!part.empty()) {
+      const ssize_t n =
+          pwrite(fd, part.data(), part.size(), static_cast<off_t>(offset));
+      if (n < 0 && errno == EINTR) {
+        continue;
+      }
+      if (n <= 0) {
+        return false;
+      }
+      part = part.subspan(static_cast<size_t>(n));
+      offset += static_cast<uint64_t>(n);
+    }
+  }
+  return true;
+}
+#endif
+
 // --- Cross-process lock substrate (init lock + reset gate) --------
 //
 // TWO advisory locks live on the volume fd, both fcntl OFD byte-range locks at
@@ -802,6 +827,29 @@ class VolumeReadHandleImpl : public ReadHandleImpl {
   }
 };
 
+// A std::allocator that default-initializes on resize(): growing a write
+// handle's buffer for WriteHandle::reserve() must not zero megabytes the
+// caller is about to overwrite anyway.
+template <class T>
+struct DefaultInitAllocator : std::allocator<T> {
+  template <class U>
+  struct rebind {
+    using other = DefaultInitAllocator<U>;
+  };
+  DefaultInitAllocator() noexcept = default;
+  template <class U>
+  explicit DefaultInitAllocator(
+      const DefaultInitAllocator<U>& /*other*/) noexcept {}
+  template <class U>
+  void construct(U* p) noexcept(std::is_nothrow_default_constructible_v<U>) {
+    ::new (static_cast<void*>(p)) U;
+  }
+  template <class U, class... Args>
+  void construct(U* p, Args&&... args) {
+    std::construct_at(p, std::forward<Args>(args)...);
+  }
+};
+
 // Common base class for write handle implementations
 // Eliminates code duplication between regular and alternate write handles
 class VolumeWriteHandleBase : public WriteHandleImpl {
@@ -832,7 +880,7 @@ class VolumeWriteHandleBase : public WriteHandleImpl {
   Stripe* stripe = nullptr;
   CacheKey key;
   std::vector<std::byte> header;
-  std::vector<std::byte> content;
+  std::vector<std::byte, DefaultInitAllocator<std::byte>> content;
   uint64_t expected_length = 0;
   size_t written = 0;
   bool closed = false;
@@ -874,43 +922,29 @@ class VolumeWriteHandleBase : public WriteHandleImpl {
 
   std::expected<size_t, CacheError> write(
       std::span<const std::byte> data) override {
-    if (aborted || closed) {
-      return make_unexpected(CacheError::Closed);
-    }
-    // Pin the Volume for this call: it may have been destroyed while this
-    // handle stayed open.  Nothing below may touch it (or `stripe`) without
-    // this.
-    const VolumeRef vol = acquire_volume();
-    if (!vol) {
-      return make_unexpected(CacheError::Closed);
-    }
-    // Configured per-object bound, checked on the running total
-    // BEFORE anything is buffered, so a streamed write fails at the first
-    // chunk that would cross the bound.  Covers both the plain and the
-    // alternate write paths (they share this base).  0 = unbounded.
-    // When max_object_size is set above the kMaxContentSize guard below
-    // (~4 GB), kMaxContentSize fires first with NoSpace instead of
-    // ObjectTooLarge — both reject; the ordering only picks which error
-    // the caller sees.
-    const size_t max_object_size = vol->config().max_object_size;
-    if (max_object_size > 0 && written + data.size() > max_object_size) {
-      return make_unexpected(CacheError::ObjectTooLarge);
-    }
-    // Enforce size limit: Document::len is uint32_t, so the maximum
-    // content size is bounded.  Also prevents unbounded memory
-    // accumulation from a malicious origin that never ends a response.
-    constexpr size_t kMaxContentSize =
-        std::numeric_limits<uint32_t>::max() - Document::kHeaderSize;
-    if (written + data.size() > kMaxContentSize) {
-      return make_unexpected(CacheError::NoSpace);
-    }
-    // Reserve space if we know the expected length to avoid reallocations
-    if (content.empty() && expected_length > 0) {
-      content.reserve(expected_length);
+    auto admitted = admit_append(data.size());
+    if (!admitted) {
+      return make_unexpected(admitted.error());
     }
     content.insert(content.end(), data.begin(), data.end());
     written += data.size();
     return data.size();
+  }
+
+  // WriteHandle::reserve: grow the buffer by `length` bytes, without zeroing
+  // them (DefaultInitAllocator), and hand them to the caller to fill.  The
+  // commit takes the buffer as it stands at close, so the checksum covers
+  // whatever the caller wrote into the span.
+  std::expected<std::span<std::byte>, CacheError> reserve(
+      size_t length) override {
+    auto admitted = admit_append(length);
+    if (!admitted) {
+      return make_unexpected(admitted.error());
+    }
+    const size_t start = content.size();
+    content.resize(start + length);
+    written += length;
+    return std::span<std::byte>(content).subspan(start, length);
   }
 
   std::expected<void, CacheError> close() override {
@@ -937,6 +971,48 @@ class VolumeWriteHandleBase : public WriteHandleImpl {
   [[nodiscard]] size_t bytes_written() const override { return written; }
 
  protected:
+  // The checks every append (write or reserve) passes BEFORE anything is
+  // buffered, and the one-time buffer reservation from the declared length.
+  std::expected<void, CacheError> admit_append(size_t length) {
+    if (aborted || closed) {
+      return make_unexpected(CacheError::Closed);
+    }
+    // Pin the Volume for this call: it may have been destroyed while this
+    // handle stayed open.  Nothing below may touch it (or `stripe`) without
+    // this.
+    const VolumeRef vol = acquire_volume();
+    if (!vol) {
+      return make_unexpected(CacheError::Closed);
+    }
+    // Configured per-object bound, checked on the running total
+    // BEFORE anything is buffered, so a streamed write fails at the first
+    // chunk that would cross the bound.  Covers both the plain and the
+    // alternate write paths (they share this base).  0 = unbounded.
+    // When max_object_size is set above the kMaxContentSize guard below
+    // (~4 GB), kMaxContentSize fires first with NoSpace instead of
+    // ObjectTooLarge — both reject; the ordering only picks which error
+    // the caller sees.
+    const size_t max_object_size = vol->config().max_object_size;
+    if (max_object_size > 0 && written + length > max_object_size) {
+      return make_unexpected(CacheError::ObjectTooLarge);
+    }
+    // Enforce size limit: Document::len is uint32_t, so the maximum
+    // content size is bounded.  Also prevents unbounded memory
+    // accumulation from a malicious origin that never ends a response.
+    // (Checked as `length > max - written` so a huge reserve() length
+    // cannot wrap the sum.)
+    constexpr size_t kMaxContentSize =
+        std::numeric_limits<uint32_t>::max() - Document::kHeaderSize;
+    if (written > kMaxContentSize || length > kMaxContentSize - written) {
+      return make_unexpected(CacheError::NoSpace);
+    }
+    // Reserve space if we know the expected length to avoid reallocations
+    if (content.empty() && expected_length > 0) {
+      content.reserve(expected_length);
+    }
+    return {};
+  }
+
   // Subclasses implement this to perform the actual commit
   virtual std::expected<void, CacheError> do_commit(Volume& vol) = 0;
 };
@@ -4089,20 +4165,34 @@ std::expected<void, CacheError> Volume::commit_write(
     return make_unexpected(CacheError::NotOwned);
   }
 
-  // Build the document
-  auto doc_data = DocumentBuilder()
+  // Build only the document's head (fixed header + header bytes, checksum
+  // over header bytes + content).  The content goes to the file straight from
+  // the caller's buffer behind it, never copied into one contiguous document:
+  // at 2 MiB that copy and the fresh heap buffers it faulted in were most of
+  // an insert (issue #16).
+  auto doc_head = DocumentBuilder()
                       .set_key(key)
                       .set_header(header)
-                      .set_content(content)
                       .set_type(Document::Type::SingleFrag)
                       .enable_checksum(true)
-                      .build();
+                      .build_head(content);
 
-  if (doc_data.empty()) {
+  if (doc_head.empty()) {
     return make_unexpected(CacheError::InvalidArgument);
   }
 
-  size_t doc_size = doc_data.size();
+  size_t doc_size = doc_head.size() + content.size();
+
+  // A small object is still filled from ONE contiguous buffer by one pwrite:
+  // below this size copying it behind the head costs less than a second
+  // write syscall does (4 KiB objects measurably).  `tail` is what goes to
+  // the file behind doc_head, empty once folded in.
+  constexpr size_t kCoalesceMaxBytes = size_t{64} * 1024;
+  std::span<const std::byte> tail = content;
+  if (content.size() <= kCoalesceMaxBytes) {
+    doc_head.insert(doc_head.end(), content.begin(), content.end());
+    tail = {};
+  }
 
   std::unique_lock lock(stripe->mutex);
 
@@ -4115,7 +4205,7 @@ std::expected<void, CacheError> Volume::commit_write(
   }
   const WriteSlot slot = *slot_res;
   // Pass stamp: part of the same pwrite as the document (design 5.1(2)).
-  patch_pass_stamp(doc_data, slot.pass);
+  patch_pass_stamp(doc_head, slot.pass);
   uint64_t write_offset = slot.write_offset;
   // Release the held lock on any unexpected unwind before commit_write_slot
   // (see HeldWriteSlotReleaser above).
@@ -4129,24 +4219,30 @@ std::expected<void, CacheError> Volume::commit_write(
     s_write_tear_gate_for_test(slot.write_offset, slot.new_write_pos);
   }
 
-  // Write data.  F6: the cross-process write lock is STILL HELD across this
-  // pwrite (released by commit_write_slot below, after the fill is durable) --
-  // no peer can allocate an overlapping range, and the guard-visible cursor is
-  // advanced only once the bytes exist.
+  // Write data: the head, then the tail behind it.  F6: the cross-process
+  // write lock is STILL HELD across this pwrite (released by
+  // commit_write_slot below, after the fill is durable) -- no peer can
+  // allocate an overlapping range, and the guard-visible cursor is advanced
+  // only once the bytes exist.
 #ifdef _WIN32
   auto map_result = _mapped_file->map_region(write_offset, doc_size,
                                              MappedFile::MapMode::ReadWrite);
   bool fill_ok = map_result.has_value();
   if (fill_ok) {
-    std::memcpy(map_result->data(), doc_data.data(), doc_size);
+    std::memcpy(map_result->data(), doc_head.data(), doc_head.size());
+    if (!tail.empty()) {
+      std::memcpy(map_result->data() + doc_head.size(), tail.data(),
+                  tail.size());
+    }
     if (_config.sync_on_write) {
       _mapped_file->sync(*map_result, MappedFile::SyncMode::Sync);
     }
     _mapped_file->unmap_region(*map_result);
   }
 #else
-  ssize_t written = pwrite(_fd, doc_data.data(), doc_size, write_offset);
-  bool fill_ok = !(written < 0 || static_cast<size_t>(written) != doc_size);
+  const std::array<std::span<const std::byte>, 2> fill_parts{
+      std::span<const std::byte>(doc_head), tail};
+  bool fill_ok = pwrite_parts(_fd, fill_parts, write_offset);
 #endif
 
   // Sync to ensure data is visible to mmap readers (if configured).

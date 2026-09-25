@@ -236,8 +236,23 @@ DocumentBuilder &DocumentBuilder::set_last_access(int64_t timestamp_ms) {
 }
 
 std::vector<std::byte> DocumentBuilder::build() const {
+  auto result = serialize_head(_content, _content.size());
+  if (result.empty()) {
+    return result;
+  }
+  result.insert(result.end(), _content.begin(), _content.end());
+  return result;
+}
+
+std::vector<std::byte> DocumentBuilder::build_head(
+    std::span<const std::byte> content) const {
+  return serialize_head(content, 0);
+}
+
+std::vector<std::byte> DocumentBuilder::serialize_head(
+    std::span<const std::byte> content, size_t extra) const {
   // Check for 32-bit overflow before casting
-  size_t total_size = Document::kHeaderSize + _header.size() + _content.size();
+  size_t total_size = Document::kHeaderSize + _header.size() + content.size();
   if (total_size > std::numeric_limits<uint32_t>::max()) {
     return {};  // Overflow: document too large for 32-bit len field
   }
@@ -247,7 +262,7 @@ std::vector<std::byte> DocumentBuilder::build() const {
 
   Document doc;
   doc.len = static_cast<uint32_t>(total_size);
-  doc.total_len = _total_len > 0 ? _total_len : _content.size();
+  doc.total_len = _total_len > 0 ? _total_len : content.size();
   doc.header_len = static_cast<uint32_t>(_header.size());
   doc.doc_type = _type;
   doc.flags = _flags;
@@ -264,15 +279,16 @@ std::vector<std::byte> DocumentBuilder::build() const {
   std::memcpy(doc.fragment_key.data(), digest.data(), digest.size());
 
   std::vector<std::byte> result;
-  result.reserve(doc.len);
+  result.reserve(Document::kHeaderSize + _header.size() + extra);
 
   doc.serialize(result);
   result.insert(result.end(), _header.begin(), _header.end());
-  result.insert(result.end(), _content.begin(), _content.end());
 
   if (_enable_checksum) {
-    uint32_t crc = Document::compute_checksum(
-        std::span<const std::byte>(result).subspan(Document::kHeaderSize));
+    // Header bytes, then content: crc32c_update chains, so this is the CRC
+    // of the contiguous payload without the payload ever being contiguous.
+    const uint32_t crc =
+        crc32c_update(crc32c(std::span<const std::byte>(_header)), content);
     std::byte *checksum_location = result.data() + Document::kChecksumOffset;
     std::memcpy(checksum_location, &crc, sizeof(crc));
   }

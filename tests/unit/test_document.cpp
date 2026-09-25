@@ -89,6 +89,44 @@ TEST_CASE("DocumentBuilder with different types", "[document]") {
   REQUIRE_FALSE(last_reader.document().is_first());
 }
 
+// commit_write writes build_head(content) and then the caller's content
+// buffer behind it, instead of one build()'d copy (issue #16).  The bytes on
+// disk must not change: head ++ content == build(), checksum included.
+TEST_CASE("DocumentBuilder::build_head plus content equals build()",
+          "[document]") {
+  CacheKey key("head-key");
+  for (const size_t header_len : {size_t{0}, size_t{3}, size_t{64}}) {
+    for (const size_t content_len :
+         {size_t{0}, size_t{1}, size_t{255}, size_t{8193}, size_t{65536}}) {
+      std::vector<std::byte> header(header_len);
+      for (size_t i = 0; i < header.size(); ++i) {
+        header[i] = std::byte((i * 7 + 1) & 0xFF);
+      }
+      std::vector<std::byte> content(content_len);
+      for (size_t i = 0; i < content.size(); ++i) {
+        content[i] = std::byte((i * 31 + 5) & 0xFF);
+      }
+      DocumentBuilder builder;
+      builder.set_key(key)
+          .set_header(header)
+          .set_type(Document::Type::SingleFrag)
+          .enable_checksum(true);
+      const auto head = builder.build_head(content);
+      REQUIRE(head.size() == Document::kHeaderSize + header_len);
+      std::vector<std::byte> joined = head;
+      joined.insert(joined.end(), content.begin(), content.end());
+
+      const auto whole = builder.set_content(content).build();
+      REQUIRE(joined == whole);
+
+      DocumentReader reader(joined);
+      REQUIRE(reader.is_valid());
+      REQUIRE(reader.document().verify_checksum(reader.payload()));
+      REQUIRE(reader.content().size() == content_len);
+    }
+  }
+}
+
 TEST_CASE("Document header size is 132 bytes", "[document][alternate]") {
   REQUIRE(Document::kHeaderSize == 132);
   // Deliberate tripwire: a version bump is a cross-release decision (cold

@@ -1,0 +1,79 @@
+# perf record -g, insert_bench --block-size 2097152 --capacity 4294967296 --laps 2 (main 6e2077e, no cgroup)
+# self time (--no-children), >= 0.5 %
+    24.21%  [.] __memmove_avx_unaligned_erms
+    13.00%  [.] (anonymous namespace)::run_phase
+     8.91%  [k] __irqentry_text_end
+     4.61%  [k] copy_user_enhanced_fast_string
+     4.44%  [k] error_entry
+     4.27%  [.] cyclone::(anonymous namespace)::sse42_3way_impl
+     3.62%  [k] clear_page_erms
+     2.68%  [k] native_irq_return_iret
+     1.93%  [k] sync_regs
+     1.45%  [k] __get_user_nocheck_1
+     1.26%  [k] __handle_mm_fault
+     1.24%  [k] cgroup_rstat_updated
+     1.02%  [k] release_pages
+     0.93%  [k] __pagevec_lru_add_fn
+     0.82%  [k] zap_pte_range
+     0.71%  [k] rmqueue
+     0.65%  [k] __alloc_pages
+     0.62%  [k] do_anonymous_page
+     0.61%  [k] xas_load
+     0.58%  [k] mark_buffer_dirty
+     0.57%  [k] handle_mm_fault
+     0.56%  [k] __mod_lruvec_page_state
+     0.53%  [k] pagecache_get_page
+     0.51%  [k] __mod_node_page_state
+     0.51%  [k] __mod_memcg_lruvec_state
+     0.51%  [k] handle_pte_fault
+
+# inclusive (--children), >= 2 %
+    60.37%    24.21%  [.] __memmove_avx_unaligned_erms
+    24.92%     0.27%  [k] asm_exc_page_fault
+    21.83%     0.03%  [k] entry_SYSCALL_64_after_hwframe
+    21.80%     0.00%  [k] do_syscall_64
+    21.79%     0.00%  [k] x64_sys_call
+    17.91%     0.27%  [k] exc_page_fault
+    17.27%     0.00%  [.] __libc_pwrite
+    17.25%     0.00%  [k] __x64_sys_pwrite64
+    17.25%     0.01%  [k] vfs_write
+    17.23%     0.00%  [k] new_sync_write
+    17.23%     0.00%  [k] ext4_file_write_iter
+    17.23%     0.00%  [k] ext4_buffered_write_iter
+    17.02%     0.40%  [k] do_user_addr_fault
+    17.00%     0.19%  [k] generic_perform_write
+    15.93%     0.57%  [k] handle_mm_fault
+    14.82%     1.26%  [k] __handle_mm_fault
+    13.46%     0.51%  [k] handle_pte_fault
+    13.02%    13.00%  [.] (anonymous namespace)::run_phase
+    12.44%     0.62%  [k] do_anonymous_page
+     8.91%     8.91%  [k] __irqentry_text_end
+     6.79%     0.26%  [k] ext4_da_write_begin
+     6.09%     0.65%  [k] __alloc_pages
+     5.40%     0.40%  [k] alloc_pages_vma
+     5.11%     0.48%  [k] get_page_from_freelist
+     4.62%     4.61%  [k] copy_user_enhanced_fast_string
+     4.61%     0.01%  [.] __brk
+     4.52%     0.00%  [k] __x64_sys_brk
+     4.52%     0.00%  [k] __do_sys_brk
+     4.51%     4.44%  [k] error_entry
+     4.47%     0.00%  [k] __do_munmap
+     4.43%     0.00%  [k] unmap_region
+     4.30%     0.01%  [k] 0000000000000000
+     4.27%     4.27%  [.] cyclone::(anonymous namespace)::sse42_3way_impl
+     3.97%     0.04%  [k] grab_cache_page_write_begin
+     3.93%     0.53%  [k] pagecache_get_page
+     3.63%     3.62%  [k] clear_page_erms
+     2.95%     0.19%  [k] ext4_da_write_end
+     2.69%     2.68%  [k] native_irq_return_iret
+     2.67%     0.13%  [k] generic_write_end
+     2.67%     0.29%  [k] lru_cache_add
+     2.59%     1.02%  [k] release_pages
+     2.55%     0.23%  [k] __block_commit_write.constprop.0.isra.0
+     2.53%     0.01%  [k] tlb_finish_mmu
+     2.44%     0.49%  [k] ext4_block_write_begin
+     2.42%     0.13%  [k] lru_cache_add_inactive_or_unevictable
+     2.38%     0.01%  [k] free_pages_and_swap_cache
+     2.36%     0.25%  [k] __pagevec_lru_add
+     2.33%     0.09%  [k] __mem_cgroup_charge
+     2.28%     0.58%  [k] mark_buffer_dirty

@@ -85,6 +85,12 @@ struct WriteHandleImpl {
   virtual std::expected<void, CacheError> close() = 0;
   virtual void abort() = 0;
   [[nodiscard]] virtual size_t bytes_written() const = 0;
+  // Appended last (see WriteHandle::reserve).  The default serves
+  // implementations that predate it.
+  virtual std::expected<std::span<std::byte>, CacheError> reserve(
+      size_t /*length*/) {
+    return make_unexpected(CacheError::InvalidArgument);
+  }
 };
 
 struct UpdateHandleImpl {
@@ -262,6 +268,30 @@ class WriteHandle {
   std::expected<size_t, CacheError> write_sync(
       std::span<const std::byte> data) {
     if (_impl) return _impl->write(data);
+    return make_unexpected(CacheError::InvalidArgument);
+  }
+
+  // Append `length` bytes to the object and return them for the caller to
+  // fill in place: the zero-copy form of write_sync() for a producer that
+  // generates the content itself (a KV engine staging tensors, a rewriter
+  // emitting output), so it is not first built in a caller buffer and then
+  // copied into the handle.  Mixes freely with write_sync(); the bytes count
+  // as written as soon as reserve() returns.
+  //
+  // Contract:
+  //  - The span is valid until the next write_sync(), reserve(), close or
+  //    abort on this handle.  Fill all of it before closing: the bytes are
+  //    NOT zeroed, and whatever they hold at close is what is stored.
+  //  - The checksum is computed at close, over the final content, so writes
+  //    into the span up to close are covered.
+  //  - Nothing is visible to readers before close commits, exactly as with
+  //    write_sync().  An abort (or destroying the handle unclosed) after a
+  //    partial fill discards everything; nothing is published.
+  //  - Same limits and errors as write_sync(): ObjectTooLarge past
+  //    max_object_size, NoSpace past the 4 GiB document limit, Closed on a
+  //    closed or aborted handle.  A failed reserve() appends nothing.
+  std::expected<std::span<std::byte>, CacheError> reserve(size_t length) {
+    if (_impl) return _impl->reserve(length);
     return make_unexpected(CacheError::InvalidArgument);
   }
 

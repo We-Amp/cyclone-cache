@@ -1,0 +1,102 @@
+=== 2026-09-25T03:52:17+02:00 kvpeer filedir put r1: ~/cyclone-kv-bench/build/kvpeer --store filedir --block-size 2097152 --seconds 2 --threads 1 --skip-multiprocess --path ~/kvdata/insert-path --drop-caches-cmd sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null --output ~/kvresults/insert-path/ab3/kv-bench-filedir-r1.jsonl
+load: 0.93 1.71 2.09 1/739 1544683
+=== machine ===
+cpu          : Intel(R) Core(TM) i7-8750H CPU @ 2.20GHz (6 physical / 12 logical)
+memory       : 23 GiB
+os           : Ubuntu 22.04.5 LTS (5.15.0-191-generic)
+filesystem   : ext4 on / (path ~/kvdata/insert-path)
+store        : filedir n/a (plain files on the host filesystem)
+tuning       : one file per block, name = hex(sha256 digest); record = 64 B header followed by the value; put = open(O_CREAT|O_WRONLY|O_TRUNC) + writev + close, NO fsync (page-cache durability only); get = open + mmap(PROT_READ, MAP_SHARED) + munmap per get
+workload     : kv-workload-spec v1; zipf theta 0.99, seed 42+tid; 2 s per phase-3 point after a 2 s warm-up
+capacity     : spec asks for 8 GiB; none of the peer stores has a capacity knob (no eviction configured, dataset <= 4 GiB)
+
+--- block_size 2097152 (2048 KiB), n = 2048, dataset 4096 MiB ---
+  put              : 684.7 puts/s, 1.436 GB/s, p50 984.996 us, p99 1464.361 us
+  content verify   : ok
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  get_first_touch  : 846.0 gets/s, 1.774 GB/s, p50 808.078 us, p99 2408.262 us
+  get_warm T=1 view  : 7219.6 gets/s, 15.141 GB/s, p50 133.188 us, p99 202.182 us
+  get_warm T=1 copy  : 3191.1 gets/s, 6.692 GB/s, p50 317.355 us, p99 388.168 us
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  restart          : hit_fraction 1.0000, 835.7 gets/s, 1.753 GB/s
+  multiprocess     : skipped (--skip-multiprocess)
+
+## Results (filedir)
+
+| phase | mode | block | threads | ops/s | GB/s | p50 us | p99 us | p99.9 us | hit |
+|---|---|---|---|---|---|---|---|---|---|
+| put | - | 2048 KiB | 1 | 684.7 | 1.436 | 985.0 | 1464.4 | 4628.6 | - |
+| get_first_touch | view | 2048 KiB | 1 | 846.0 | 1.774 | 808.1 | 2408.3 | 2773.5 | 1.000 |
+| get_warm | view | 2048 KiB | 1 | 7219.6 | 15.141 | 133.2 | 202.2 | 243.2 | 1.000 |
+| get_warm | copy | 2048 KiB | 1 | 3191.1 | 6.692 | 317.4 | 388.2 | 422.6 | 1.000 |
+| restart | view | 2048 KiB | 1 | 835.7 | 1.753 | 834.0 | 2568.9 | 2894.0 | 1.000 |
+
+rc=0 load-after: 1.08 1.68 2.07 1/736 1544718
+=== 2026-09-25T03:54:33+02:00 kvpeer filedir put r2: ~/cyclone-kv-bench/build/kvpeer --store filedir --block-size 2097152 --seconds 2 --threads 1 --skip-multiprocess --path ~/kvdata/insert-path --drop-caches-cmd sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null --output ~/kvresults/insert-path/ab3/kv-bench-filedir-r2.jsonl
+load: 0.83 1.51 1.97 1/736 1544904
+=== machine ===
+cpu          : Intel(R) Core(TM) i7-8750H CPU @ 2.20GHz (6 physical / 12 logical)
+memory       : 23 GiB
+os           : Ubuntu 22.04.5 LTS (5.15.0-191-generic)
+filesystem   : ext4 on / (path ~/kvdata/insert-path)
+store        : filedir n/a (plain files on the host filesystem)
+tuning       : one file per block, name = hex(sha256 digest); record = 64 B header followed by the value; put = open(O_CREAT|O_WRONLY|O_TRUNC) + writev + close, NO fsync (page-cache durability only); get = open + mmap(PROT_READ, MAP_SHARED) + munmap per get
+workload     : kv-workload-spec v1; zipf theta 0.99, seed 42+tid; 2 s per phase-3 point after a 2 s warm-up
+capacity     : spec asks for 8 GiB; none of the peer stores has a capacity knob (no eviction configured, dataset <= 4 GiB)
+
+--- block_size 2097152 (2048 KiB), n = 2048, dataset 4096 MiB ---
+  put              : 695.7 puts/s, 1.459 GB/s, p50 977.407 us, p99 1380.513 us
+  content verify   : ok
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  get_first_touch  : 232.1 gets/s, 0.487 GB/s, p50 2222.965 us, p99 12005.100 us
+  get_warm T=1 view  : 7162.5 gets/s, 15.021 GB/s, p50 134.268 us, p99 202.949 us
+  get_warm T=1 copy  : 3297.9 gets/s, 6.916 GB/s, p50 308.462 us, p99 373.252 us
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  restart          : hit_fraction 1.0000, 229.3 gets/s, 0.481 GB/s
+  multiprocess     : skipped (--skip-multiprocess)
+
+## Results (filedir)
+
+| phase | mode | block | threads | ops/s | GB/s | p50 us | p99 us | p99.9 us | hit |
+|---|---|---|---|---|---|---|---|---|---|
+| put | - | 2048 KiB | 1 | 695.7 | 1.459 | 977.4 | 1380.5 | 3295.5 | - |
+| get_first_touch | view | 2048 KiB | 1 | 232.1 | 0.487 | 2223.0 | 12005.1 | 12581.8 | 1.000 |
+| get_warm | view | 2048 KiB | 1 | 7162.5 | 15.021 | 134.3 | 202.9 | 231.6 | 1.000 |
+| get_warm | copy | 2048 KiB | 1 | 3297.9 | 6.916 | 308.5 | 373.3 | 397.9 | 1.000 |
+| restart | view | 2048 KiB | 1 | 229.3 | 0.481 | 2320.1 | 12200.8 | 15731.8 | 1.000 |
+
+rc=0 load-after: 0.95 1.48 1.94 1/736 1544950
+=== 2026-09-25T03:56:24+02:00 kvpeer filedir put r3: ~/cyclone-kv-bench/build/kvpeer --store filedir --block-size 2097152 --seconds 2 --threads 1 --skip-multiprocess --path ~/kvdata/insert-path --drop-caches-cmd sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null --output ~/kvresults/insert-path/ab3/kv-bench-filedir-r3.jsonl
+load: 0.99 1.46 1.90 1/735 1545098
+=== machine ===
+cpu          : Intel(R) Core(TM) i7-8750H CPU @ 2.20GHz (6 physical / 12 logical)
+memory       : 23 GiB
+os           : Ubuntu 22.04.5 LTS (5.15.0-191-generic)
+filesystem   : ext4 on / (path ~/kvdata/insert-path)
+store        : filedir n/a (plain files on the host filesystem)
+tuning       : one file per block, name = hex(sha256 digest); record = 64 B header followed by the value; put = open(O_CREAT|O_WRONLY|O_TRUNC) + writev + close, NO fsync (page-cache durability only); get = open + mmap(PROT_READ, MAP_SHARED) + munmap per get
+workload     : kv-workload-spec v1; zipf theta 0.99, seed 42+tid; 2 s per phase-3 point after a 2 s warm-up
+capacity     : spec asks for 8 GiB; none of the peer stores has a capacity knob (no eviction configured, dataset <= 4 GiB)
+
+--- block_size 2097152 (2048 KiB), n = 2048, dataset 4096 MiB ---
+  put              : 700.8 puts/s, 1.470 GB/s, p50 985.323 us, p99 1378.351 us
+  content verify   : ok
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  get_first_touch  : 853.1 gets/s, 1.789 GB/s, p50 846.688 us, p99 2458.406 us
+  get_warm T=1 view  : 7150.5 gets/s, 14.996 GB/s, p50 134.345 us, p99 203.415 us
+  get_warm T=1 copy  : 3298.1 gets/s, 6.917 GB/s, p50 308.077 us, p99 374.828 us
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  restart          : hit_fraction 1.0000, 851.0 gets/s, 1.785 GB/s
+  multiprocess     : skipped (--skip-multiprocess)
+
+## Results (filedir)
+
+| phase | mode | block | threads | ops/s | GB/s | p50 us | p99 us | p99.9 us | hit |
+|---|---|---|---|---|---|---|---|---|---|
+| put | - | 2048 KiB | 1 | 700.8 | 1.470 | 985.3 | 1378.4 | 4581.6 | - |
+| get_first_touch | view | 2048 KiB | 1 | 853.1 | 1.789 | 846.7 | 2458.4 | 2827.5 | 1.000 |
+| get_warm | view | 2048 KiB | 1 | 7150.5 | 14.996 | 134.3 | 203.4 | 242.3 | 1.000 |
+| get_warm | copy | 2048 KiB | 1 | 3298.1 | 6.917 | 308.1 | 374.8 | 389.2 | 1.000 |
+| restart | view | 2048 KiB | 1 | 851.0 | 1.785 | 862.1 | 2436.1 | 2677.9 | 1.000 |
+
+rc=0 load-after: 1.05 1.44 1.89 1/733 1545133

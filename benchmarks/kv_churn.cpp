@@ -116,6 +116,10 @@ struct Options {
   std::string output;
   std::string drop_caches_cmd;
   std::optional<bool> wrap_retention;  // unset = the library default
+  // Insert through WriteHandle::reserve(): the block is generated straight
+  // into the handle's buffer instead of a harness buffer that write_sync()
+  // copies.  Generation stays untimed either way.
+  bool reserve = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -488,19 +492,34 @@ class Worker {
     }
     if (!insert_on_miss) return true;
 
-    fill_block(_gen, idx);  // "compute" the block: harness work, not timed
+    if (!_opts.reserve) {
+      fill_block(_gen, idx);  // "compute" the block: harness work, not timed
+    }
     const auto meta = meta_for(key);
     const auto p0 = Clock::now();
     _stats.harness_s += micros(t1, p0) / 1e6;
     bool ok = false;
+    double gen_in_put_us = 0.0;  // --reserve: generation inside the put
     auto wh = _cache.write_sync(key, _opts.block_size);
     if (wh) {
       wh->set_header(std::span<const std::byte>(meta));
-      auto w = wh->write_sync(std::span<const std::byte>(_gen));
+      bool w = false;
+      if (_opts.reserve) {
+        auto dst = wh->reserve(_opts.block_size);
+        w = dst.has_value();
+        if (w) {
+          const auto g0 = Clock::now();
+          fill_block(*dst, idx);
+          gen_in_put_us = micros(g0, Clock::now());
+        }
+      } else {
+        w = wh->write_sync(std::span<const std::byte>(_gen)).has_value();
+      }
       auto c = wh->close_sync();
-      ok = w.has_value() && c.has_value();
+      ok = w && c.has_value();
     }
     const auto p1 = Clock::now();
+    _stats.harness_s += gen_in_put_us / 1e6;
     if (ok) {
       ++_stats.inserts;
       _shared.inserted_bytes.fetch_add(_opts.block_size,
@@ -508,7 +527,9 @@ class Worker {
     } else {
       ++_stats.put_failures;
     }
-    if (record) _stats.miss_us.push_back(micros(t0, t1) + micros(p0, p1));
+    if (record) {
+      _stats.miss_us.push_back(micros(t0, t1) + micros(p0, p1) - gen_in_put_us);
+    }
     return true;
   }
 
@@ -579,6 +600,8 @@ void usage(const char* argv0) {
             << "  --drop-caches-cmd CMD   run before the warm-up\n"
             << "  --wrap-retention on|off eviction mode (default: the "
                "library default)\n"
+            << "  --reserve               insert via WriteHandle::reserve() "
+               "(generate in place)\n"
             << "  --print-vectors         print the stream heads and exit\n";
 }
 
@@ -645,6 +668,8 @@ int main(int argc, char* argv[]) {
       opts.drop_caches_cmd = argv[++i];
     } else if (a == "--wrap-retention" && has) {
       opts.wrap_retention = std::string(argv[++i]) == "on";
+    } else if (a == "--reserve") {
+      opts.reserve = true;
     } else if (a == "--print-vectors") {
       vectors_only = true;
     } else {
@@ -737,6 +762,9 @@ int main(int argc, char* argv[]) {
                                      : kDefaultWrapRetention)
                     ? "ON"
                     : "OFF")
+            << "\n  insert                  = "
+            << (opts.reserve ? "WriteHandle::reserve() + generate in place"
+                             : "write_sync() of a generated block")
             << "\n";
 
   // Warm-up + measured phase.
@@ -877,6 +905,7 @@ int main(int argc, char* argv[]) {
     << ((opts.wrap_retention ? *opts.wrap_retention : kDefaultWrapRetention)
             ? "true"
             : "false")
+    << ",\"cy_insert_reserve\":" << (opts.reserve ? "true" : "false")
     << ",\"cy_frontier_advances\":"
     << (st1.frontier_advances - st0.frontier_advances)
     << ",\"cy_advances_deferred_by_lease\":"
