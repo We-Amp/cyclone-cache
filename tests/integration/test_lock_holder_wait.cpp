@@ -380,8 +380,9 @@ constexpr auto kCapMargin = 750ms;
 // The waiter may still catch one of the relay's release-to-re-acquire gaps
 // (its brief spin after each sleep) and take the lock fairly; each attempt
 // must then have ended without a takeover, inside the bound.  Up to this
-// many attempts are made to observe the give-up itself.
-constexpr int kRelayAttempts = 5;
+// many attempts are made to observe the give-up itself (a slow runner may
+// catch several gaps in a row).
+constexpr int kRelayAttempts = 20;
 // Under ThreadSanitizer every release-to-re-acquire gap is wide enough that
 // the waiter nearly always catches one before the cap; there only the bound
 // and the absence of a takeover are checked.
@@ -680,4 +681,76 @@ TEST_CASE(
   std::nth_element(took.begin(), took.begin() + 10, took.end());
   CAPTURE(std::chrono::duration_cast<std::chrono::microseconds>(took[10]));
   REQUIRE(took[10] < 5ms);
+}
+
+TEST_CASE(
+    "Lock holder wait: a remove whose bucket wait gives up leaves the key "
+    "exactly as it was, never an older version readable",
+    "[mmap_directory][concurrent][regression]") {
+  // Two entries for one key: the current version and an older one (the
+  // shape a retained previous-pass entry or a stale survivor gives).  The
+  // remove must take both in one bucket bracket: if the capped wait gives
+  // up, nothing is removed and reads still return what they did; if it
+  // succeeds, nothing is left.  Removing them one bracket at a time, a
+  // give-up after the current entry went left the older one serving.
+  TempCacheDir tmp("removecap");
+  auto volume = open_volume(tmp.path());
+  const CacheKey key("remove-all-or-nothing");
+  const auto older = make_content(std::byte{0x51});
+  const auto current = make_content(std::byte{0x52});
+  MmapDirectory *dir = volume->mmap_directory_for_test(key);
+  REQUIRE(dir != nullptr);
+
+  auto entry_offsets = [&] {
+    std::vector<uint64_t> offsets;
+    (void)dir->probe_each_all_phases(key, [&](const DirEntry &e) {
+      offsets.push_back(e.offset());
+      return true;
+    });
+    std::sort(offsets.begin(), offsets.end());
+    return offsets;
+  };
+
+  REQUIRE(write(*volume, key, older));
+  const auto first = entry_offsets();
+  REQUIRE(first.size() == 1);
+  REQUIRE(write(*volume, key, current));  // Replaces the entry in place
+  REQUIRE(entry_offsets().size() == 1);
+  // Re-add an entry for the older document beside it.
+  REQUIRE(
+      dir->insert(key, first[0], older.size(), Directory::kNoVerifiedEntry));
+  const auto both = entry_offsets();
+  REQUIRE(both.size() == 2);
+  const auto served = read_content(*volume, key);
+  REQUIRE_FALSE(served.empty());
+
+  struct GiveUpAfter {
+    explicit GiveUpAfter(int n) {
+      MmapDirectory::s_bucket_give_up_after_for_test.store(n);
+    }
+    ~GiveUpAfter() { MmapDirectory::s_bucket_give_up_after_for_test.store(-1); }
+    GiveUpAfter(const GiveUpAfter &) = delete;
+    GiveUpAfter &operator=(const GiveUpAfter &) = delete;
+  };
+
+  SECTION("the first bucket wait gives up: nothing removed") {
+    GiveUpAfter give_up(0);
+    auto removed = volume->remove_sync(key);
+    REQUIRE_FALSE(removed.has_value());
+    REQUIRE(removed.error() == CacheError::Busy);
+    REQUIRE(entry_offsets() == both);
+    REQUIRE(read_content(*volume, key) == served);
+  }
+  SECTION("a later bucket wait would give up: all or nothing") {
+    GiveUpAfter give_up(1);
+    auto removed = volume->remove_sync(key);
+    if (removed.has_value()) {
+      REQUIRE(entry_offsets().empty());
+      REQUIRE_FALSE(volume->read_sync(key).has_value());
+    } else {
+      REQUIRE(removed.error() == CacheError::Busy);
+      REQUIRE(entry_offsets() == both);
+      REQUIRE(read_content(*volume, key) == served);
+    }
+  }
 }

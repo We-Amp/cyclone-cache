@@ -759,6 +759,28 @@ struct Stripe {
     return false;
   }
 
+  // Remove every entry of `key`'s bucket with its tag at any of `offsets`
+  // (at most one bucket's worth), in ONE writer bracket: all or nothing.
+  // Bit i of the result is set when offsets[i] was found and removed.
+  // *busy: a capped bucket wait gave up; nothing removed.
+  uint32_t remove_entries_at(const CacheKey &key,
+                             std::span<const uint64_t> offsets, bool *busy) {
+    if (use_mmap_directory && mmap_directory) {
+      return mmap_directory->remove_all_at(key, offsets, busy);
+    }
+    uint32_t mask = 0;
+    if (directory) {
+      // In memory: one process, every mutator holds the stripe mutex, so
+      // there is no wait to give up and the loop cannot be interrupted.
+      for (size_t i = 0; i < offsets.size(); ++i) {
+        if (directory->remove_at(key, offsets[i])) {
+          mask |= 1U << i;
+        }
+      }
+    }
+    return mask;
+  }
+
   // Cross-process invalidation signal for the key's directory bucket.
   // 0 means "no shared signal available" — either this stripe is not backed
   // by the mmap directory (single-process mode) or the directory is invalid.

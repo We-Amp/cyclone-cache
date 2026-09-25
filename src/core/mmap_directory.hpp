@@ -545,6 +545,13 @@ class MmapDirectory {
   bool remove_at(const CacheKey &key, uint64_t target_offset,
                  bool *busy = nullptr);
 
+  /// remove_at for up to 32 offsets of one key in ONE writer bracket: all or
+  /// nothing.  Bit i of the result is set when offsets[i] was found and
+  /// removed.  A capped bucket wait that gave up sets *busy and removes
+  /// nothing.
+  uint32_t remove_all_at(const CacheKey &key, std::span<const uint64_t> offsets,
+                         bool *busy);
+
   /// Clear all entries
   void clear();
 
@@ -727,6 +734,9 @@ class MmapDirectory {
   static inline std::atomic<uint64_t> s_lock_wait_cap_us_for_test{0};
   /// Capped waits that gave up (process-wide, all three locks).
   static inline std::atomic<uint64_t> s_lock_give_ups_for_test{0};
+  /// When nonnegative: that many more capped bucket acquisitions succeed,
+  /// then every capped one gives up at once, as if its cap had run out.
+  static inline std::atomic<int> s_bucket_give_up_after_for_test{-1};
   /// Recoveries of a stuck holder, per lock kind (process-wide).
   static inline std::atomic<uint64_t> s_bucket_recoveries_for_test{0};
   static inline std::atomic<uint64_t> s_phase_lock_recoveries_for_test{0};

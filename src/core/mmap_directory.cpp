@@ -104,12 +104,27 @@ constexpr uint64_t token_lock_holder(uint8_t value, uint16_t generation,
 }
 
 // One acquisition attempt.  CAS the byte 0 -> the token of the generation we
-// expect to claim, then claim the generation (seq_cst fetch_add).  If
-// another bump landed in between (a recovery), move the byte to the token of
-// the generation actually claimed; if the byte is no longer ours by then,
-// the lock was recovered from us before the critical section: report it
-// lost, with `observed` as seen.  On success `generation` and `value` are
-// this holder's.
+// expect to claim, then claim the generation (seq_cst fetch_add).  On
+// success `generation` and `value` are this holder's; on failure the lock
+// is not ours and `observed` is the value seen.
+//
+// While the byte is ours, only a RECOVERY of the lock from us can bump the
+// generation (every other acquirer needs the byte free first).  So the
+// generation is re-read right after the winning CAS, and the claim must
+// land exactly one past it: if it does not, a recovery took the lock from
+// us between that read and our bump -- after a stall past the whole
+// budget -- and the lock is reported lost WITHOUT touching the byte.  That
+// check is load-bearing: tokens recycle every 253 generations, so the
+// byte's value alone cannot tell us apart from a later holder whose token
+// happens to match ours, and moving (or keeping) the byte on that basis
+// would let both believe they hold the lock.  Bumps that landed between
+// the pre-CAS sample and the CAS (a stale sample: other holders acquired
+// and released before our CAS) are harmless; we then only move the byte
+// from the provisional token to the claimed generation's, which is safe
+// because no recovery intervened.  The residual is a recovery landing in
+// the two instructions between the CAS and the re-read: it needs a waiter
+// whose budget and 2 ms confirmation window, spent watching an identical
+// holder value, expire in exactly that window.
 bool try_take_token_lock(std::atomic_ref<uint8_t> lock,
                          std::atomic_ref<uint16_t> gen, uint16_t &generation,
                          uint8_t &value, uint8_t &observed) {
@@ -122,14 +137,19 @@ bool try_take_token_lock(std::atomic_ref<uint8_t> lock,
     observed = expected;
     return false;
   }
+  const uint16_t after_cas = gen.load(std::memory_order_seq_cst);
   const auto claimed =
       static_cast<uint16_t>(gen.fetch_add(1, std::memory_order_seq_cst) + 1);
-  if (claimed != expect && lock_token(claimed) != held) {
+  if (claimed != static_cast<uint16_t>(after_cas + 1)) {
+    observed = lock.load(std::memory_order_relaxed);  // Recovered from us
+    return false;
+  }
+  if (lock_token(claimed) != held) {
     uint8_t current = held;
     if (!lock.compare_exchange_strong(current, lock_token(claimed),
                                       std::memory_order_seq_cst,
                                       std::memory_order_relaxed)) {
-      observed = current;
+      observed = current;  // Defensive: cannot happen without a recovery
       return false;
     }
     held = lock_token(claimed);
@@ -771,6 +791,52 @@ bool MmapDirectory::remove_at(const CacheKey &key, uint64_t target_offset,
   return removed != 0;
 }
 
+uint32_t MmapDirectory::remove_all_at(const CacheKey &key,
+                                      std::span<const uint64_t> offsets,
+                                      bool *busy) {
+  if (_header == nullptr || offsets.empty() || offsets.size() > 32) {
+    return 0;
+  }
+
+  uint32_t bucket_idx = key.bucket_hash() % _num_buckets;
+  uint16_t target_tag = key.tag();
+
+  DirEntry *bucket = &_entries[bucket_idx * kEntriesPerBucket];
+
+  uint32_t writer_token = 0;
+  if (!acquire_writer(bucket_idx, writer_token, /*capped=*/true)) {
+    if (busy != nullptr) {
+      *busy = true;  // Nothing removed
+    }
+    return 0;
+  }
+
+  // EVERY entry with this tag at one of the offsets goes (as remove_at).
+  uint32_t mask = 0;
+  size_t removed = 0;
+  for (size_t i = 0; i < kEntriesPerBucket; ++i) {
+    if (bucket[i].is_empty() || bucket[i].tag() != target_tag) {
+      continue;
+    }
+    for (size_t o = 0; o < offsets.size(); ++o) {
+      if (bucket[i].offset() == offsets[o]) {
+        bucket[i].clear();
+        ++removed;
+        mask |= 1U << o;
+        break;
+      }
+    }
+  }
+
+  release_writer(bucket_idx, writer_token);
+
+  for (size_t i = 0; i < removed; ++i) {
+    decrement_count();
+  }
+
+  return mask;
+}
+
 void MmapDirectory::clear() {
   if (_header == nullptr) {
     return;
@@ -947,7 +1013,13 @@ bool MmapDirectory::acquire_phase_lock_slow(PhaseLockToken &token,
 }
 
 void MmapDirectory::release_phase_lock(PhaseLockToken token) {
-  // Only if the lock is still ours (see acquire_phase_lock).
+  // Only if the lock is still ours (see acquire_phase_lock): our generation
+  // is still current -- any later acquisition or recovery bumped it -- and
+  // the byte still holds our token.  A late release by a holder recovered
+  // from under us fails the first check unless exactly 65536*k bumps landed
+  // meanwhile, and between the two checks a new holder would need a token
+  // equal to ours, i.e. 253*k bumps inside those two instructions: both
+  // negligible (and a phase-lock overlap is contained anyway, see above).
   if (std::atomic_ref<uint16_t>(_header->phase_lock_gen)
           .load(std::memory_order_seq_cst) != token.generation) {
     return;
@@ -978,9 +1050,10 @@ MmapDirectory::WriteLockToken MmapDirectory::acquire_write_lock(bool capped) {
   // TOKEN ORDERING IS LOAD-BEARING: the generation is claimed with a seq_cst
   // fetch_add AFTER the winning CAS.  A recovery that claims our byte
   // between our CAS and our fetch_add bumps the generation too; either our
-  // fetch_add sees that bump (our token then differs, the move to it fails
-  // and we report the lock lost before the critical section), or the bump
-  // lands after ours and our revalidate fails before any shared side effect.
+  // claim sees that bump (it does not land one past the post-CAS re-read,
+  // and try_take_token_lock reports the lock lost before the critical
+  // section), or the bump lands after ours and our revalidate fails before
+  // any shared side effect.
   auto lock = std::atomic_ref<uint8_t>(_header->write_lock);
   auto gen = std::atomic_ref<uint16_t>(_header->write_lock_gen);
   auto owner = std::atomic_ref<uint32_t>(_header->write_lock_owner_pid);
@@ -1188,6 +1261,21 @@ bool MmapDirectory::touch_bucket(const CacheKey &key, bool capped) {
 
 bool MmapDirectory::acquire_writer(size_t bucket_idx, uint32_t &token,
                                    bool capped) {
+#ifdef CYCLONE_TEST_SEAMS
+  if (capped) {
+    int left = s_bucket_give_up_after_for_test.load(std::memory_order_relaxed);
+    while (left >= 0) {
+      if (left == 0) {
+        count_give_up();
+        return false;  // As if the cap had run out
+      }
+      if (s_bucket_give_up_after_for_test.compare_exchange_weak(
+              left, left - 1, std::memory_order_relaxed)) {
+        break;
+      }
+    }
+  }
+#endif
   auto ref = std::atomic_ref<uint32_t>(_versions[bucket_idx]);
   // Hot path: the bucket is even (no writer); claim it with CAS even → odd.
   uint32_t v = ref.load(std::memory_order_acquire);

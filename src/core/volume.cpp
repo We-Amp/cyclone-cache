@@ -2865,13 +2865,11 @@ std::expected<void, CacheError> Volume::remove_sync(const CacheKey& key) {
   }
 
   // Phase 2: For each candidate, read the document to verify the full SHA-256
-  // key (not just the 12-bit tag), then remove the correct entry precisely.
-  bool removed_live = false;
-  // A capped bucket wait that gave up (live peers kept changing): stop and
-  // report Busy.  Entries already removed stay removed (and their RAM
-  // copies are invalidated below); the caller retries the rest.
-  bool remove_busy = false;
-  for (size_t ci = 0; ci < num_candidates && !remove_busy; ++ci) {
+  // key (not just the 12-bit tag); then remove every verified entry at once.
+  std::array<uint64_t, Directory::kEntriesPerBucket> verified_offsets{};
+  std::array<bool, Directory::kEntriesPerBucket> verified_live{};
+  size_t num_verified = 0;
+  for (size_t ci = 0; ci < num_candidates; ++ci) {
     const auto& candidate = candidates[ci];
 
     uint64_t doc_offset = stripe->offset + candidate.dir_offset;
@@ -2920,12 +2918,32 @@ std::expected<void, CacheError> Volume::remove_sync(const CacheKey& key) {
       continue;  // Tag collision — not our entry
     }
 
-    // Full key match — remove this specific entry using precise offset
-    // match.  EVERY same-key entry goes (B2d), retained ones included, and
-    // stale survivors of the key with it; each clear decrements the entry
-    // count, so count() stays exact.  Only a live one makes the key "found".
-    if (stripe->remove_entry_at(key, candidate.dir_offset, &remove_busy) &&
-        stamp_ok) {
+    // Full key match.  EVERY same-key entry goes (B2d), retained ones
+    // included, and stale survivors of the key with it.  Only a live one
+    // makes the key "found".
+    verified_offsets[num_verified] = candidate.dir_offset;
+    verified_live[num_verified] = stamp_ok;
+    ++num_verified;
+  }
+
+  // Remove them in ONE bucket bracket (all four slots share the bucket), by
+  // precise offset match; each clear decrements the entry count, so count()
+  // stays exact.  All-or-nothing matters since the bucket wait is capped
+  // (issue #27): removing them one bracket at a time, a wait that gave up
+  // after the current version's entry went could leave a retained or stale
+  // entry of the key behind -- and reads would then serve that OLDER
+  // version while the remove reported Busy.  Now a Busy remove changed
+  // nothing, and the key still reads as it did.
+  bool remove_busy = false;
+  const uint32_t removed_mask = stripe->remove_entries_at(
+      key, std::span<const uint64_t>(verified_offsets.data(), num_verified),
+      &remove_busy);
+  if (remove_busy) {
+    return make_unexpected(CacheError::Busy);
+  }
+  bool removed_live = false;
+  for (size_t i = 0; i < num_verified; ++i) {
+    if ((removed_mask & (1U << i)) != 0 && verified_live[i]) {
       removed_live = true;
     }
   }
@@ -2969,16 +2987,10 @@ std::expected<void, CacheError> Volume::remove_sync(const CacheKey& key) {
         stripe->remove_epoch.fetch_add(1, std::memory_order_acq_rel);
         _ram_cache->remove_all(key);
       }
-      if (remove_busy) {
-        return make_unexpected(CacheError::Busy);
-      }
       return {};
     }
   }
 
-  if (remove_busy) {
-    return make_unexpected(CacheError::Busy);
-  }
   return make_unexpected(CacheError::NotFound);
 }
 
