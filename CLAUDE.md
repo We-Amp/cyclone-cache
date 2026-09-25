@@ -318,14 +318,19 @@ The read hot path is lock-free (the read-path scaling series). Before refactorin
    `src/core/mmap_directory.hpp`). A writer waiting on a cross-process
    bucket, phase lock or write lock waits by TIME per holder
    (`LockHolderWait`: 250 ms bucket, 1 s phase lock, write lock only on a
-   proven-dead holder or after 5 s), never by a spin count. Every
+   proven-dead holder or after 5 s), never by a spin count. "Proven dead"
+   means the holder's token encodes a `WriterLiveness` slot and no process
+   holds that slot's byte-range lock on the volume file; never a PID probe
+   (`kill(pid, 0)` / `OpenProcess`), which is wrong across PID namespaces.
+   A holder without a slot is recovered only by the 5 s escalation. Every
    phase/write-lock acquisition bumps that lock's generation, so a peer that
    releases and re-acquires is a new holder, and every release is a CAS on
    the holder's own token. Writer waits are capped (`kLockWaitCap` =
    250 ms of changing holders): the operation reports Busy and publishes
    nothing, never a takeover on the cap.
    Guard: `tests/integration/test_seqlock_read_wait.cpp`,
-   `tests/integration/test_lock_holder_wait.cpp`.
+   `tests/integration/test_lock_holder_wait.cpp`,
+   `tests/integration/test_write_lock_liveness.cpp`.
 5. **HitTracker is a leaf lock** — never hold a stripe lock across
    `record_hit()` (the old AB/BA deadlock). 4096 stripes; key-striped so the
    pending bound stays exact.

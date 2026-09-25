@@ -34,6 +34,7 @@
 #include <unistd.h>
 
 #include "../../src/core/mmap_directory.hpp"
+#include "support/liveness_file.hpp"
 #endif
 
 #ifdef _WIN32
@@ -1170,6 +1171,10 @@ TEST_CASE("Write lock waits on a live holder and recovers a dead one",
   REQUIRE(dir_opt.has_value());
   MmapDirectory &dir = *dir_opt;
   dir.set_shared_write_pos(kWlReservationBase);
+  // The holder proves its liveness with a lock on this file (the volume
+  // file, in production).
+  LivenessFile liveness(dir);
+  REQUIRE(liveness.ok());
 
   // Fixed protocol: prove the holder dead before recovering it.
   MmapDirectory::s_write_lock_presume_dead_for_test.store(false);
@@ -1214,8 +1219,8 @@ TEST_CASE("Write lock waits on a live holder and recovers a dead one",
   CHECK_FALSE(done.load(std::memory_order_acquire));
   CHECK(dir.get_shared_write_pos() == kWlReservationBase);
 
-  // Now CRASH the holder mid-critical-section.  waitpid() reaps it so
-  // kill(pid,0) reports ESRCH; the waiter must then recover the lock.
+  // Now CRASH the holder mid-critical-section.  Its liveness lock dies with
+  // it; the waiter must then recover the lock.
   REQUIRE(::kill(pid, SIGKILL) == 0);
   int status = 0;
   ::waitpid(pid, &status, 0);

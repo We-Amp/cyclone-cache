@@ -107,6 +107,8 @@
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#include "support/liveness_file.hpp"
 #endif
 
 #ifdef _WIN32
@@ -2398,6 +2400,8 @@ TEST_CASE(
       kBuckets);
   REQUIRE(dir_opt.has_value());
   MmapDirectory &dir = *dir_opt;
+  LivenessFile liveness(dir);  // the holder's death is proven by its lock
+  REQUIRE(liveness.ok());
   const uint64_t kReservationBase = 0x8000;
   dir.set_shared_write_pos(kReservationBase);
   MmapDirectory::s_write_lock_presume_dead_for_test.store(false);
@@ -2424,7 +2428,7 @@ TEST_CASE(
           static_cast<ssize_t>(sizeof(child_base)));
   REQUIRE(child_base == kReservationBase);
   int status = 0;
-  ::waitpid(pid, &status, 0);  // reap -> kill(pid,0) reports ESRCH
+  ::waitpid(pid, &status, 0);  // its liveness lock died with it
 
   // F6 INVARIANT: the crash left the shared cursor un-advanced (the child never
   // reached the post-pwrite publish), so it still names the durable frontier.
@@ -2473,6 +2477,8 @@ TEST_CASE(
       kBuckets);
   REQUIRE(dir_opt.has_value());
   MmapDirectory &dir = *dir_opt;
+  LivenessFile liveness(dir);  // the stalled holder is PROVABLY alive
+  REQUIRE(liveness.ok());
   MmapDirectory::s_write_lock_presume_dead_for_test.store(false);
   MmapDirectory::s_write_lock_max_live_waits_for_test.store(0);
 

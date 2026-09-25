@@ -13,13 +13,16 @@
 #endif
 
 #if defined(_WIN32)
+#include <io.h>
 #include <process.h>
 #include <windows.h>
 #else
+#include <fcntl.h>
+#include <pthread.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cerrno>
-#include <csignal>
 #endif
 
 // TSan annotations are defined in mmap_directory.hpp
@@ -32,42 +35,17 @@ namespace cyclone {
 namespace {
 
 /// This process's PID as the value published into write_lock_owner_pid.
-uint32_t self_pid() {
-#if defined(_WIN32)
-  return static_cast<uint32_t>(::GetCurrentProcessId());
-#else
-  return static_cast<uint32_t>(::getpid());
-#endif
-}
+uint32_t self_pid() { return WriterLiveness::current_pid(); }
 
-/// Cross-process liveness probe for a write-lock holder.  Returns true ONLY
-/// when the OS positively reports the PID as gone; a holder we cannot prove
-/// dead is treated as alive and never usurped (the crux of the fix).  This
-/// is the robust-futex "owner-died" check without a futex: a live-but-
-/// stalled holder (page fault, scheduler preemption) is waited on, not
-/// force-released out from under its in-flight reservation.
-bool holder_is_dead(uint32_t pid) {
-  if (pid == 0) {
-    return false;  // owner not yet published — cannot prove death
-  }
 #if defined(_WIN32)
-  HANDLE h = ::OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(pid));
-  if (h == nullptr) {
-    // No such process => dead; ACCESS_DENIED etc. => exists, treat as alive.
-    return ::GetLastError() == ERROR_INVALID_PARAMETER;
-  }
-  DWORD wait = ::WaitForSingleObject(h, 0);
-  ::CloseHandle(h);
-  return wait == WAIT_OBJECT_0;  // signaled => the process has exited
-#else
-  // kill(pid, 0): 0 => alive; ESRCH => no such process (dead); EPERM =>
-  // exists but not ours (alive).  Only ESRCH proves death.
-  if (::kill(static_cast<pid_t>(pid), 0) == 0) {
-    return false;
-  }
-  return errno == ESRCH;
-#endif
+OVERLAPPED slot_overlapped(unsigned slot) {
+  const uint64_t byte = WriterLiveness::kLockBase + slot;
+  OVERLAPPED ov{};
+  ov.Offset = static_cast<DWORD>(byte & 0xFFFFFFFFULL);
+  ov.OffsetHigh = static_cast<DWORD>(byte >> 32);
+  return ov;
 }
+#endif
 
 // Cross-process token locks (phase_lock, write_lock), each a lock byte plus
 // a 16-bit acquisition generation.  The byte is 0 when free; a holder
@@ -91,6 +69,80 @@ constexpr uint8_t kLockRecoveringB = 255;
 constexpr uint8_t lock_token(uint16_t generation) {
   return static_cast<uint8_t>(1 + generation % 253);
 }
+
+// The token a write-lock holder that holds WriterLiveness slot `slot` stores
+// instead (issue #32), so a waiter can find the slot's lock.  The values
+// 2..253 form a ring of 252; for each generation, lock_token(generation) --
+// what holders without a slot and every build before #32 store -- takes one
+// position of it (or none, when it is 1), and the kSlots = 251 slot tokens
+// take the positions after it.  So a slot token never equals the plain token
+// of the same generation, and it is never 1 (the only value builds before
+// #27 store), 0 (free) or a recovery claim (254, 255).  A waiter decodes a
+// slot only from a slot token of the generation it read: a holder that took
+// no slot, or an older build's, is never proven dead by the absence of a
+// lock it never took.
+constexpr unsigned kTokenRing = 252;
+static_assert(WriterLiveness::kSlots == kTokenRing - 1,
+              "every ring position but the plain token's is a slot");
+
+constexpr unsigned plain_ring_index(uint16_t generation) {
+  // lock_token 2..253 -> 0..251; lock_token 1 (outside the ring) -> 251.
+  return (lock_token(generation) + kTokenRing - 2) % kTokenRing;
+}
+
+constexpr uint8_t slot_lock_token(uint16_t generation, unsigned slot) {
+  return static_cast<uint8_t>(2 + (plain_ring_index(generation) + 1 + slot) %
+                                      kTokenRing);
+}
+
+// The slot a lock value encodes for `generation`, or kNoSlot.
+constexpr int slot_of_token(uint8_t value, uint16_t generation) {
+  if (value < 2 || value > 253) {
+    return WriterLiveness::kNoSlot;
+  }
+  const unsigned slot =
+      (value - 2U + 2 * kTokenRing - plain_ring_index(generation) - 1) %
+      kTokenRing;
+  return slot < WriterLiveness::kSlots ? static_cast<int>(slot)
+                                       : WriterLiveness::kNoSlot;
+}
+
+// Tokens depend on the generation only through generation % 253.  Checked
+// exhaustively at run time (test_write_lock_liveness.cpp); here, every
+// generation at the edge slots and every slot at the edge generations.
+constexpr bool slot_token_ok(uint16_t gen, unsigned slot) {
+  const uint8_t v = slot_lock_token(gen, slot);
+  return v >= 2 && v <= 253 && v != lock_token(gen) &&
+         slot_of_token(v, gen) == static_cast<int>(slot);
+}
+constexpr bool slot_tokens_are_distinct() {
+  for (uint32_t g = 0; g < 253; ++g) {
+    const auto gen = static_cast<uint16_t>(g);
+    if (slot_of_token(lock_token(gen), gen) != WriterLiveness::kNoSlot ||
+        slot_of_token(1, gen) != WriterLiveness::kNoSlot ||
+        slot_of_token(0, gen) != WriterLiveness::kNoSlot ||
+        slot_of_token(254, gen) != WriterLiveness::kNoSlot ||
+        slot_of_token(255, gen) != WriterLiveness::kNoSlot) {
+      return false;
+    }
+    for (unsigned slot : {0U, 1U, 125U, WriterLiveness::kSlots - 1}) {
+      if (!slot_token_ok(gen, slot)) {
+        return false;
+      }
+    }
+  }
+  for (uint32_t g : {0U, 1U, 251U, 252U, 65535U}) {
+    for (unsigned slot = 0; slot < WriterLiveness::kSlots; ++slot) {
+      if (!slot_token_ok(static_cast<uint16_t>(g), slot)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+static_assert(slot_tokens_are_distinct(),
+              "a slot token must decode to its slot and never equal the plain "
+              "token of its generation, 0, 1 or a recovery claim");
 
 constexpr uint8_t recovery_claim(uint8_t observed) {
   return observed == kLockRecoveringA ? kLockRecoveringB : kLockRecoveringA;
@@ -125,12 +177,19 @@ constexpr uint64_t token_lock_holder(uint8_t value, uint16_t generation,
 // the two instructions between the CAS and the re-read: it needs a waiter
 // whose budget and 2 ms confirmation window, spent watching an identical
 // holder value, expire in exactly that window.
+// A `slot` (write lock of a process holding a WriterLiveness slot only)
+// selects slot_lock_token over lock_token.
 bool try_take_token_lock(std::atomic_ref<uint8_t> lock,
                          std::atomic_ref<uint16_t> gen, uint16_t &generation,
-                         uint8_t &value, uint8_t &observed) {
+                         uint8_t &value, uint8_t &observed,
+                         int slot = WriterLiveness::kNoSlot) {
+  const auto token_of = [slot](uint16_t g) {
+    return slot < 0 ? lock_token(g)
+                    : slot_lock_token(g, static_cast<unsigned>(slot));
+  };
   const auto expect =
       static_cast<uint16_t>(gen.load(std::memory_order_relaxed) + 1);
-  uint8_t held = lock_token(expect);
+  uint8_t held = token_of(expect);
   uint8_t expected = 0;
   if (!lock.compare_exchange_strong(expected, held, std::memory_order_seq_cst,
                                     std::memory_order_relaxed)) {
@@ -144,15 +203,15 @@ bool try_take_token_lock(std::atomic_ref<uint8_t> lock,
     observed = lock.load(std::memory_order_relaxed);  // Recovered from us
     return false;
   }
-  if (lock_token(claimed) != held) {
+  if (token_of(claimed) != held) {
     uint8_t current = held;
-    if (!lock.compare_exchange_strong(current, lock_token(claimed),
+    if (!lock.compare_exchange_strong(current, token_of(claimed),
                                       std::memory_order_seq_cst,
                                       std::memory_order_relaxed)) {
       observed = current;  // Defensive: cannot happen without a recovery
       return false;
     }
-    held = lock_token(claimed);
+    held = token_of(claimed);
   }
   generation = claimed;
   value = held;
@@ -239,6 +298,314 @@ std::chrono::steady_clock::duration write_lock_escalation_budget() {
 }
 
 }  // namespace
+
+// --- WriterLiveness (issue #32) --------------------------------------------
+
+namespace {
+
+// How many slots a claim may use.
+unsigned claimable_slots() {
+#ifdef CYCLONE_TEST_SEAMS
+  const unsigned n =
+      WriterLiveness::s_slots_for_test.load(std::memory_order_relaxed);
+  if (n != 0) {
+    return n < WriterLiveness::kSlots ? n : WriterLiveness::kSlots;
+  }
+#endif
+  return WriterLiveness::kSlots;
+}
+
+// Where a claim starts looking: a pseudo-random slot, so that a slot freed
+// by a crash is rarely re-claimed before a waiter has probed it.
+unsigned first_slot_to_try(uint32_t pid, unsigned slots) {
+#ifdef CYCLONE_TEST_SEAMS
+  if (WriterLiveness::s_slots_for_test.load(std::memory_order_relaxed) != 0) {
+    return 0;
+  }
+#endif
+  const auto now = static_cast<uint64_t>(
+      std::chrono::steady_clock::now().time_since_epoch().count());
+  uint64_t x = (uint64_t{pid} << 32) ^ now;
+  x ^= x >> 33;
+  x *= 0xFF51AFD7ED558CCDULL;
+  x ^= x >> 33;
+  return static_cast<unsigned>(x % slots);
+}
+
+#if !defined(_WIN32) && defined(F_OFD_GETLK)
+// Is a lock held on `slot` through an open file description other than
+// fd's?  1 yes, 0 no, -1 the query failed.
+int slot_locked_elsewhere(int fd, unsigned slot) {
+  struct flock fl{};
+  fl.l_type = F_WRLCK;
+  fl.l_whence = SEEK_SET;
+  fl.l_start = static_cast<off_t>(WriterLiveness::kLockBase + slot);
+  fl.l_len = 1;
+  fl.l_pid = 0;
+  int rc = 0;
+  do {
+    rc = ::fcntl(fd, F_OFD_GETLK, &fl);
+  } while (rc != 0 && errno == EINTR);
+  if (rc != 0) {
+    return -1;
+  }
+  return fl.l_type == F_UNLCK ? 0 : 1;
+}
+
+bool set_slot_lock(int fd, unsigned slot, short type) {
+  struct flock fl{};
+  fl.l_type = type;
+  fl.l_whence = SEEK_SET;
+  fl.l_start = static_cast<off_t>(WriterLiveness::kLockBase + slot);
+  fl.l_len = 1;
+  int rc = 0;
+  do {
+    rc = ::fcntl(fd, F_OFD_SETLK, &fl);
+  } while (rc != 0 && errno == EINTR);
+  return rc == 0;
+}
+#endif
+
+// Bumped in every forked child (pthread_atfork), so a WriterLiveness can
+// tell that it runs in a new process whatever PIDs say.  Windows has no
+// fork: it stays 0 there.
+std::atomic<uint32_t> g_fork_epoch{0};
+
+#if !defined(_WIN32)
+void on_fork_child() { g_fork_epoch.fetch_add(1, std::memory_order_relaxed); }
+#endif
+
+void install_fork_hook() {
+#if !defined(_WIN32)
+  static const bool installed = [] {
+    return ::pthread_atfork(nullptr, nullptr, &on_fork_child) == 0;
+  }();
+  (void)installed;
+#endif
+}
+
+}  // namespace
+
+uint32_t WriterLiveness::current_pid() {
+#ifdef CYCLONE_TEST_SEAMS
+  const uint32_t pid = s_pid_override_for_test.load(std::memory_order_relaxed);
+  if (pid != 0) {
+    return pid;
+  }
+#endif
+#if defined(_WIN32)
+  return static_cast<uint32_t>(::GetCurrentProcessId());
+#else
+  return static_cast<uint32_t>(::getpid());
+#endif
+}
+
+void WriterLiveness::attach(int probe_fd, const std::string &path) {
+  install_fork_hook();
+  detach();
+  std::lock_guard<std::mutex> lock(_mu);
+  _probe_fd = probe_fd;
+  _path = path;
+  (void)claim_locked(g_fork_epoch.load(std::memory_order_relaxed));
+}
+
+void WriterLiveness::detach() {
+  std::lock_guard<std::mutex> lock(_mu);
+  const uint64_t state = _state.load(std::memory_order_relaxed);
+#if defined(_WIN32)
+  // The slot lock is on the volume handle itself; the caller closes that
+  // handle after us, which would release it too.
+  if ((state & kClaimed) != 0 && _probe_fd >= 0) {
+    HANDLE handle = reinterpret_cast<HANDLE>(_get_osfhandle(_probe_fd));
+    if (handle != INVALID_HANDLE_VALUE) {
+      OVERLAPPED ov =
+          slot_overlapped(static_cast<unsigned>((state >> kSlotShift) & 0xFFU));
+      (void)::UnlockFileEx(handle, 0, 1, 0, &ov);
+    }
+  }
+#else
+  (void)state;
+  if (_claim_fd >= 0) {
+    ::close(_claim_fd);  // Releases the slot (last close of its OFD)
+    _claim_fd = -1;
+  }
+#endif
+  _probe_fd = -1;
+  _path.clear();
+  _state.store(0, std::memory_order_release);
+}
+
+namespace {
+
+constexpr uint64_t kSlotMask = 0xFF;
+
+}  // namespace
+
+int WriterLiveness::slot_of() const {
+  const uint64_t state = _state.load(std::memory_order_acquire);
+  if (static_cast<uint32_t>(state) !=
+          g_fork_epoch.load(std::memory_order_relaxed) ||
+      (state & kClaimed) == 0) {
+    return kNoSlot;
+  }
+  return static_cast<int>((state >> kSlotShift) & kSlotMask);
+}
+
+int WriterLiveness::slot_for() {
+  const uint32_t epoch = g_fork_epoch.load(std::memory_order_relaxed);
+  const auto known = [epoch](uint64_t state) {
+    return static_cast<uint32_t>(state) == epoch &&
+           (state & (kClaimed | kFailed)) != 0;
+  };
+  const auto slot_in = [](uint64_t state) {
+    return (state & kClaimed) != 0
+               ? static_cast<int>((state >> kSlotShift) & kSlotMask)
+               : kNoSlot;
+  };
+  const uint64_t state = _state.load(std::memory_order_acquire);
+  if (known(state)) {
+    return slot_in(state);
+  }
+  // First acquisition in a forked child (or nothing is attached).
+  std::lock_guard<std::mutex> lock(_mu);
+  const uint64_t again = _state.load(std::memory_order_relaxed);
+  if (known(again)) {
+    return slot_in(again);
+  }
+  if (_probe_fd < 0) {
+    return kNoSlot;
+  }
+  (void)claim_locked(epoch);
+  return slot_in(_state.load(std::memory_order_relaxed));
+}
+
+bool WriterLiveness::claim_locked(uint32_t fork_epoch) {
+  int claimed = kNoSlot;
+#ifdef CYCLONE_TEST_SEAMS
+  const bool fail = s_claims_fail_for_test.load(std::memory_order_relaxed);
+#else
+  constexpr bool fail = false;
+#endif
+  const unsigned slots = claimable_slots();
+  const unsigned first = first_slot_to_try(current_pid(), slots);
+#if defined(_WIN32)
+  // No fork on Windows, so the slot lock can live on the volume handle: it
+  // is this process's alone, and closing the handle (or exiting) releases
+  // it.  An exclusive lock makes the claim atomic; a slot held by a live
+  // process, or probed by a waiter at this very moment, is skipped.
+  HANDLE handle = reinterpret_cast<HANDLE>(_get_osfhandle(_probe_fd));
+  if (!fail && handle != INVALID_HANDLE_VALUE) {
+    for (unsigned i = 0; i < slots && claimed < 0; ++i) {
+      const unsigned slot = (first + i) % slots;
+      OVERLAPPED ov = slot_overlapped(slot);
+      if (::LockFileEx(handle,
+                       LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0,
+                       1, 0, &ov) != 0) {
+        claimed = static_cast<int>(slot);
+      } else if (::GetLastError() != ERROR_LOCK_VIOLATION) {
+        break;  // No byte-range locks here: stay without a slot
+      }
+    }
+  }
+#elif defined(F_OFD_SETLK) && defined(F_OFD_GETLK)
+  // A descriptor of our own, not the volume fd, for two reasons.  A forked
+  // child shares its parent's descriptors and their OFD locks, so a lock
+  // taken through one of them would last as long as ANY process of the
+  // family: a dead child would look alive.  And the volume fd is what
+  // probe() queries, and a query never reports a lock held through the
+  // querying OFD itself.
+  //
+  // Read-only, so that a worker that dropped the privileges its master
+  // opened the volume with can still claim.  A read-only descriptor can
+  // take only a shared lock, so a claim is "query free, take it shared,
+  // query again": a second claimer racing us onto the same slot shows up in
+  // the second query, and we back off to another slot.  (Should two keep a
+  // slot anyway, it is merely shared: a dead holder in it looks alive while
+  // the other lives, and the waiter falls back to the escalation.  Never
+  // the unsafe way.)
+  int fd = -1;
+  if (!fail) {
+    do {
+      fd = ::open(_path.c_str(), O_RDONLY | O_CLOEXEC);
+    } while (fd < 0 && errno == EINTR);
+  }
+  if (fd >= 0) {
+    struct stat ours{};
+    struct stat volume{};
+    // The name may have been replaced since the volume was opened: a lock
+    // on another inode would be invisible to every peer.
+    const bool same_inode =
+        ::fstat(fd, &ours) == 0 && ::fstat(_probe_fd, &volume) == 0 &&
+        ours.st_dev == volume.st_dev && ours.st_ino == volume.st_ino;
+    for (unsigned i = 0; same_inode && i < slots && claimed < 0; ++i) {
+      const unsigned slot = (first + i) % slots;
+      const int before = slot_locked_elsewhere(fd, slot);
+      if (before < 0) {
+        break;  // No OFD locks here: stay without a slot
+      }
+      if (before != 0 || !set_slot_lock(fd, slot, F_RDLCK)) {
+        continue;
+      }
+      if (slot_locked_elsewhere(fd, slot) != 0) {
+        (void)set_slot_lock(fd, slot, F_UNLCK);  // A racing claimer
+        continue;
+      }
+      claimed = static_cast<int>(slot);
+    }
+    if (claimed >= 0) {
+      if (_claim_fd >= 0) {
+        // A forked child's inherited copy of its parent's claim: closing
+        // our copy leaves the parent's slot to the parent.
+        ::close(_claim_fd);
+      }
+      _claim_fd = fd;
+    } else {
+      ::close(fd);
+    }
+  }
+#else
+  (void)fail;
+  (void)first;
+#endif
+  const uint64_t outcome =
+      claimed >= 0 ? (static_cast<uint64_t>(claimed) << kSlotShift) | kClaimed
+                   : kFailed;
+  _state.store(uint64_t{fork_epoch} | outcome, std::memory_order_release);
+  return claimed >= 0;
+}
+
+WriterLiveness::Verdict WriterLiveness::probe(unsigned slot) const {
+  std::lock_guard<std::mutex> lock(_mu);
+  if (_probe_fd < 0 || slot >= kSlots) {
+    return Verdict::kUnknown;
+  }
+#if defined(_WIN32)
+  HANDLE handle = reinterpret_cast<HANDLE>(_get_osfhandle(_probe_fd));
+  if (handle == INVALID_HANDLE_VALUE) {
+    return Verdict::kUnknown;
+  }
+  OVERLAPPED ov = slot_overlapped(slot);
+  if (::LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                   0, 1, 0, &ov) != 0) {
+    (void)::UnlockFileEx(handle, 0, 1, 0, &ov);
+    return Verdict::kDead;
+  }
+  return ::GetLastError() == ERROR_LOCK_VIOLATION ? Verdict::kAlive
+                                                  : Verdict::kUnknown;
+#elif defined(F_OFD_GETLK)
+  switch (slot_locked_elsewhere(_probe_fd, slot)) {
+    case 0:
+      return Verdict::kDead;
+    case 1:
+      return Verdict::kAlive;
+    default:
+      return Verdict::kUnknown;
+  }
+#else
+  (void)slot;
+  return Verdict::kUnknown;
+#endif
+}
 
 std::optional<MmapDirectory> MmapDirectory::init(std::span<std::byte> region,
                                                  size_t num_buckets) {
@@ -389,7 +756,8 @@ MmapDirectory::MmapDirectory(MmapDirectory &&other) noexcept
       _versions(other._versions),
       _entries(other._entries),
       _retention(other._retention),
-      _num_buckets(other._num_buckets) {
+      _num_buckets(other._num_buckets),
+      _liveness(other._liveness) {
   other._header = nullptr;
   other._versions = nullptr;
   other._entries = nullptr;
@@ -404,6 +772,7 @@ MmapDirectory &MmapDirectory::operator=(MmapDirectory &&other) noexcept {
     _entries = other._entries;
     _retention = other._retention;
     _num_buckets = other._num_buckets;
+    _liveness = other._liveness;
 
     other._header = nullptr;
     other._versions = nullptr;
@@ -1060,10 +1429,18 @@ MmapDirectory::WriteLockToken MmapDirectory::acquire_write_lock(bool capped) {
 
   WriteLockToken token;
   uint8_t observed = 0;
+  // The PID we publish (the same getpid() every acquisition always made; only
+  // builds before #32 read it, for their kill(pid, 0) probe) and the
+  // WriterLiveness slot we hold, which our token encodes: after the first
+  // acquisition of a process, one atomic load and a compare, no syscall.
+  const uint32_t pid = self_pid();
+  token.liveness_slot =
+      _liveness != nullptr ? _liveness->slot_for() : WriterLiveness::kNoSlot;
 
   // Hot uncontended path: generation load, CAS, generation fetch_add.
-  if (try_take_token_lock(lock, gen, token.generation, token.value, observed)) {
-    owner.store(self_pid(), std::memory_order_relaxed);
+  if (try_take_token_lock(lock, gen, token.generation, token.value, observed,
+                          token.liveness_slot)) {
+    owner.store(pid, std::memory_order_relaxed);
     token.acquired = true;
     return token;
   }
@@ -1071,23 +1448,25 @@ MmapDirectory::WriteLockToken MmapDirectory::acquire_write_lock(bool capped) {
   // Contended path.  Wait with LockHolderWait (spin, then sleeping
   // backoff).  Once one holder has kept the lock for kWriteLockProbeAfter
   // (far past any ordinary contention), consult its liveness after every
-  // sleep.  Recovery from a genuinely dead holder is preserved (a crash
-  // must not deadlock the cache); usurpation of a live-but-stalled holder
-  // is removed.
+  // sleep (write_lock_holder_proven_dead).  Recovery from a genuinely dead
+  // holder is preserved (a crash must not deadlock the cache); usurpation of
+  // a live-but-stalled holder is removed.
   //
-  // Last-resort deadlock breaker for the pathological case where kill(2)
-  // keeps reporting the holder alive but it never releases (PID reuse, or a
-  // live holder wedged for many seconds): the same holder -- same token,
-  // generation and PID -- has held the lock for kWriteLockEscalationBudget
-  // and a continuous confirmation poll saw no release.  If this ever fires
+  // Last-resort deadlock breaker for the cases the liveness proof cannot
+  // decide (a holder without a liveness slot -- an older build, a process
+  // that found none --, a dead holder whose slot a new process re-claimed at
+  // once, or a live holder wedged for many seconds): the same holder -- same
+  // token, generation and PID -- has held the lock for
+  // kWriteLockEscalationBudget and a continuous confirmation poll saw no
+  // release.  If this ever fires
   // on a truly live holder, the generation bump below makes that holder's
   // revalidate fail, so it aborts before its overlapping publish/pwrite —
   // corruption stays closed; only availability degrades.
   LockHolderWait wait(write_lock_escalation_budget(), lock_wait_cap(capped));
   for (;;) {
-    if (try_take_token_lock(lock, gen, token.generation, token.value,
-                            observed)) {
-      owner.store(self_pid(), std::memory_order_relaxed);
+    if (try_take_token_lock(lock, gen, token.generation, token.value, observed,
+                            token.liveness_slot)) {
+      owner.store(pid, std::memory_order_relaxed);
       token.acquired = true;
       return token;
     }
@@ -1129,7 +1508,7 @@ MmapDirectory::WriteLockToken MmapDirectory::acquire_write_lock(bool capped) {
     }
 #endif
     if (!dead && wait.held() >= kWriteLockProbeAfter) {
-      dead = holder_is_dead(holder);
+      dead = write_lock_holder_proven_dead(observed, holder_gen, holder);
     }
     if (!dead && !escalate) {
       continue;  // Live holder (or an owner not yet published): WAIT
@@ -1166,14 +1545,62 @@ MmapDirectory::WriteLockToken MmapDirectory::try_acquire_write_lock() {
   // blocks a request thread behind a peer's pwrite+fsync.
   WriteLockToken token;
   uint8_t observed = 0;
+  const uint32_t pid = self_pid();
+  token.liveness_slot =
+      _liveness != nullptr ? _liveness->slot_for() : WriterLiveness::kNoSlot;
   if (try_take_token_lock(std::atomic_ref<uint8_t>(_header->write_lock),
                           std::atomic_ref<uint16_t>(_header->write_lock_gen),
-                          token.generation, token.value, observed)) {
+                          token.generation, token.value, observed,
+                          token.liveness_slot)) {
     std::atomic_ref<uint32_t>(_header->write_lock_owner_pid)
-        .store(self_pid(), std::memory_order_relaxed);
+        .store(pid, std::memory_order_relaxed);
     token.acquired = true;
   }
   return token;
+}
+
+#ifdef CYCLONE_TEST_SEAMS
+uint8_t MmapDirectory::write_lock_token_for_test(uint16_t generation,
+                                                 int slot) {
+  return slot < 0 ? lock_token(generation)
+                  : slot_lock_token(generation, static_cast<unsigned>(slot));
+}
+
+int MmapDirectory::write_lock_slot_for_test(uint8_t value,
+                                            uint16_t generation) {
+  return slot_of_token(value, generation);
+}
+#endif
+
+bool MmapDirectory::write_lock_holder_proven_dead(uint8_t value,
+                                                  uint16_t generation,
+                                                  uint32_t pid) const {
+  // Only a holder whose token encodes a WriterLiveness slot has a lock to
+  // look for.  Any other holder (an older build, which may still sit in
+  // another PID namespace, or a process that holds no slot) is never proven
+  // dead: the absence of a lock it never took proves nothing.
+  //
+  // The value and generation come from one stable observation
+  // (LockHolderWait saw the same {value, generation, pid} for
+  // kWriteLockProbeAfter).  A nonzero PID means the holder got past its
+  // generation claim and token fix-up (it publishes the PID last, and a
+  // release or recovery clears it before freeing the byte), so the value
+  // is the final token of that generation, not the provisional one a holder
+  // stalled between its CAS and its fetch_add would show -- which could
+  // decode to another slot.
+  if (pid == 0 || _liveness == nullptr) {
+    return false;
+  }
+  const int slot = slot_of_token(value, generation);
+  if (slot < 0) {
+    return false;
+  }
+  // Our own slot: this process is alive.
+  if (slot == _liveness->slot_of()) {
+    return false;
+  }
+  return _liveness->probe(static_cast<unsigned>(slot)) ==
+         WriterLiveness::Verdict::kDead;
 }
 
 bool MmapDirectory::revalidate_write_lock(const WriteLockToken &token) const {

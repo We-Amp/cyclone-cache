@@ -7,8 +7,10 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <span>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -187,6 +189,106 @@ bool force_reset(AtomicWord &slot) {
 
 }  // namespace borrow_slot
 
+/// Kernel-guaranteed liveness of cross-process write-lock holders (issue
+/// #32), independent of PID namespaces.
+///
+/// Every process that can hold a volume's write lock first CLAIMS a slot:
+/// one of kSlots bytes of the volume file at kLockBase + slot, on which it
+/// holds a byte-range lock for as long as it lives.  The OS drops that lock
+/// when the process dies, whatever PID namespace or container it ran in: the
+/// lock belongs to the file (the inode), not to a PID.  A write-lock holder
+/// encodes its slot in the token it stores in the lock byte (see
+/// MmapDirectory::acquire_write_lock), and a waiter decides the holder is
+/// dead iff no live process holds a lock on that slot's byte:
+///   - POSIX: an fcntl F_OFD_GETLK query on the volume fd, which never holds
+///     a slot lock itself (claims use their own descriptor, see attach), so
+///     every claim shows up as a conflict;
+///   - Windows: an exclusive LockFileEx try on the volume handle, undone at
+///     once when it succeeds.
+///
+/// No PID is involved, so nothing aliases across namespaces.  The one reuse
+/// is a slot re-claimed by a new process in the moments after its previous
+/// owner died holding the write lock: the dead holder then looks alive, and
+/// the waiter falls back to the time-based escalation (the safe direction).
+/// Claims start at a pseudo-random slot to make that unlikely.  A live
+/// holder can never look dead.
+///
+/// A process that holds no slot (all kSlots taken, byte-range locks
+/// unsupported on this filesystem, the volume file replaced by name) stores
+/// the plain token, as builds before #32 do; a waiter never probes such a
+/// holder, and only the time-based escalation recovers it.
+class WriterLiveness {
+ public:
+  // Slots per volume file: the processes that can register at once.  Bound
+  // by the lock byte's token encoding (MmapDirectory, slot_lock_token).
+  static constexpr unsigned kSlots = 251;
+  // Slot s is byte kLockBase + s: past any real volume offset and below the
+  // two volume.cpp lock bytes (0x7FFF...FD/FE).
+  static constexpr uint64_t kLockBase = 0x7FFFFFFE00000000ULL;
+  static constexpr int kNoSlot = -1;
+
+  enum class Verdict : uint8_t { kAlive, kDead, kUnknown };
+
+  WriterLiveness() = default;
+  ~WriterLiveness() { detach(); }
+  WriterLiveness(const WriterLiveness &) = delete;
+  WriterLiveness &operator=(const WriterLiveness &) = delete;
+
+  /// Attach to the shared file: `probe_fd` is an open descriptor of it (the
+  /// volume fd, owned by the caller and never locked in the slot range),
+  /// `path` names it.  On POSIX a claim opens its own descriptor of `path`
+  /// (checked to be the same inode as `probe_fd`), so that a forked child,
+  /// which shares the parent's descriptors, can claim a slot of its own
+  /// whose lock dies with the child.  Claims a slot for this process at once.
+  void attach(int probe_fd, const std::string &path);
+
+  /// Release this process's slot and forget the file.  The caller must not
+  /// use a directory whose liveness this is afterwards.
+  void detach();
+
+  /// The slot this process holds, or kNoSlot.  The hot path is two atomic
+  /// loads and a compare.  The first call in a forked child (which inherited
+  /// its parent's claim) claims a slot of the child's own, once, under a
+  /// mutex; a failed claim is remembered and not retried in that process.
+  /// Forks are told apart by a pthread_atfork counter, not by PID: a child
+  /// in a new PID namespace can have its parent's PID number.
+  [[nodiscard]] int slot_for();
+
+  /// As slot_for, without attempting a claim.
+  [[nodiscard]] int slot_of() const;
+
+  /// Does a live process hold `slot`?  kDead only when the OS reports no
+  /// lock on its byte; kUnknown when the query itself failed.
+  [[nodiscard]] Verdict probe(unsigned slot) const;
+
+  /// This process's PID, as a write-lock holder publishes it.
+  [[nodiscard]] static uint32_t current_pid();
+
+#ifdef CYCLONE_TEST_SEAMS
+  /// TEST-SEAM BUILDS ONLY.  Nonzero: current_pid() reports this instead, so
+  /// a forked child can pose as a process whose PID reads dead or aliased
+  /// (a peer in another PID namespace).
+  static inline std::atomic<uint32_t> s_pid_override_for_test{0};
+  /// When true, every claim fails (locking unavailable).
+  static inline std::atomic<bool> s_claims_fail_for_test{false};
+  /// Nonzero: only slots [0, n) are claimable, starting at slot 0.
+  static inline std::atomic<unsigned> s_slots_for_test{0};
+#endif
+
+ private:
+  bool claim_locked(uint32_t fork_epoch);
+
+  // {fork epoch:32, slot:8, claimed:1, failed:1} of the last claim attempt.
+  static constexpr unsigned kSlotShift = 32;
+  static constexpr uint64_t kClaimed = uint64_t{1} << 40;
+  static constexpr uint64_t kFailed = uint64_t{1} << 41;
+  std::atomic<uint64_t> _state{0};
+  mutable std::mutex _mu;  // claim, probe and detach
+  int _probe_fd = -1;
+  int _claim_fd = -1;  // POSIX: the descriptor holding the slot lock
+  std::string _path;
+};
+
 /// Memory-mapped directory for cross-process cache sharing.
 ///
 /// MmapDirectory stores directory entries directly in mmap'd memory,
@@ -281,8 +383,13 @@ class MmapDirectory {
     // every acquisition and every force-release bumps write_lock_gen (the
     // "was I usurped" signal a holder revalidates, and the holder identity
     // a waiter watches), write_lock_owner_pid carries the
-    // holder's PID so a waiter can PROVE it dead (kill(pid,0)) before ever
-    // force-releasing, instead of presuming death after a spin count.
+    // holder's PID so a waiter can PROVE it dead before ever
+    // force-releasing, instead of presuming death after a spin count.  Since
+    // #32 the proof is the WriterLiveness slot the holder's token encodes,
+    // not the PID: only builds before #32 probe the PID (kill(pid,0) /
+    // OpenProcess), and a new holder keeps publishing it for them.  A waiter
+    // of this build reads it only as "nonzero: the holder is past its
+    // generation claim".
     // write_lock_owner_pid is the current holder's PID (0 = none/unpublished).
     uint16_t write_lock_gen;
     uint32_t write_lock_owner_pid;
@@ -704,11 +811,10 @@ class MmapDirectory {
   // on the phase lock.  An inner wait must end well inside the outer budget.
   static_assert(kPhaseLockBudget >= 2 * kBucketWriterBudget);
   static_assert(kWriteLockEscalationBudget >= 2 * kPhaseLockBudget);
-  // The write lock consults the holder's liveness (kill(pid, 0) /
-  // OpenProcess) only once one holder has kept it this long, far past any
-  // ordinary contention, so a waiter does not probe on every short wait.
-  // (A holder in another PID namespace looks dead to that probe: every
-  // process sharing a volume must share a PID namespace.)
+  // The write lock consults the holder's liveness (WriterLiveness::probe,
+  // one fcntl / LockFileEx) only once one holder has kept it this long, far
+  // past any ordinary contention, so a waiter does not probe on every short
+  // wait.
   static constexpr std::chrono::milliseconds kWriteLockProbeAfter{50};
   // Capped waits (inserts, removes, hit-count updates, write-slot
   // reservation): once the holders a waiter has seen COME AND GO add up to
@@ -761,6 +867,13 @@ class MmapDirectory {
                const_cast<uint16_t &>(_header->phase_lock_gen))
         .load(std::memory_order_acquire);
   }
+  /// The write-lock token a holder in liveness slot `slot` (kNoSlot: none)
+  /// stores for `generation`, and the slot a lock value encodes for a
+  /// generation (kNoSlot: none).
+  [[nodiscard]] static uint8_t write_lock_token_for_test(uint16_t generation,
+                                                         int slot);
+  [[nodiscard]] static int write_lock_slot_for_test(uint8_t value,
+                                                    uint16_t generation);
   /// The raw write-lock byte (0 = free).
   [[nodiscard]] uint8_t write_lock_value_for_test() const {
     return std::atomic_ref<uint8_t>(const_cast<uint8_t &>(_header->write_lock))
@@ -795,6 +908,9 @@ class MmapDirectory {
     bool escalated_takeover = false;
     // True when a capped wait gave up (acquired stays false).
     bool gave_up = false;
+    // The WriterLiveness slot this holder's process holds and encoded in
+    // its token, so a waiter can prove it dead; kNoSlot for none.
+    int liveness_slot = WriterLiveness::kNoSlot;
     // Number of liveness re-checks spent waiting on a still-live holder
     // (one per sleep of the wait; see LockHolderWait).
     uint32_t live_waits = 0;
@@ -805,7 +921,7 @@ class MmapDirectory {
   /// across processes to prevent overlapping writes.  The hot uncontended
   /// path is one generation load, a single CAS and a generation fetch_add.  On
   /// contention the waiter (LockHolderWait: spin, then sleeping backoff) never
-  /// usurps a holder it cannot PROVE dead (kill(pid,0)); a genuinely dead
+  /// usurps a holder it cannot PROVE dead (WriterLiveness); a genuinely dead
   /// holder is force-released so a crash cannot deadlock the cache, and a
   /// holder that cannot be proven dead is taken over only after it held the
   /// lock for kWriteLockEscalationBudget. Returns a token the caller must feed
@@ -841,7 +957,7 @@ class MmapDirectory {
 #ifdef CYCLONE_TEST_SEAMS
   /// TEST-SEAM BUILDS ONLY.  When true, acquire_write_lock
   /// reverts to the pre-fix "presume the holder dead after the spin budget"
-  /// behavior (no kill(2) liveness proof), so the multi-process regression
+  /// behavior (no liveness proof), so the multi-process regression
   /// test can exhibit the old live-holder usurpation and prove the fix
   /// removes it.
   static inline std::atomic<bool> s_write_lock_presume_dead_for_test{false};
@@ -877,6 +993,13 @@ class MmapDirectory {
   /// Capped by default: false when it gave up behind live, changing
   /// holders (nothing was published).
   [[nodiscard]] bool touch_bucket(const CacheKey &key, bool capped = true);
+
+  /// Attach the liveness registry of the volume file this directory lives in
+  /// (owned by the caller, which must outlive every write-lock call on this
+  /// directory).  Without one, this process's write-lock holds carry no
+  /// slot and no holder is ever proven dead: a stuck write lock is then
+  /// recovered only by the last-resort escalation.
+  void set_liveness(WriterLiveness *liveness) noexcept { _liveness = liveness; }
 
   /// Full mapped byte range backing this directory (header + version
   /// counters + entries).  Used for explicit flushes of the directory
@@ -956,6 +1079,13 @@ class MmapDirectory {
   /// acquire_phase_lock's contended path, out of line.
   bool acquire_phase_lock_slow(PhaseLockToken &token, bool capped);
 
+  /// True iff the write-lock holder seen as {value, generation, pid} holds
+  /// a WriterLiveness slot (its token encodes one) whose lock the OS reports
+  /// gone (WriterLiveness::probe).  Contended path only.
+  [[nodiscard]] bool write_lock_holder_proven_dead(uint8_t value,
+                                                   uint16_t generation,
+                                                   uint32_t pid) const;
+
   /// Atomically increment entry count
   void increment_count();
 
@@ -967,6 +1097,7 @@ class MmapDirectory {
   DirEntry *_entries;
   RetentionRegion *_retention;  // after the entries (see RetentionRegion)
   size_t _num_buckets;
+  WriterLiveness *_liveness = nullptr;  // see set_liveness
 };
 
 // Template implementation
