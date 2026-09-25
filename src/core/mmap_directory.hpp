@@ -495,7 +495,10 @@ class MmapDirectory {
   /// window.  The caller provides the writer serialization, as production
   /// mutators do.
   [[nodiscard]] uint32_t begin_bucket_write_for_test(const CacheKey &key) {
-    return acquire_writer(key.bucket_hash() % _num_buckets);
+    uint32_t token = 0;
+    (void)acquire_writer(key.bucket_hash() % _num_buckets, token,
+                         /*capped=*/false);
+    return token;
   }
   void end_bucket_write_for_test(const CacheKey &key, uint32_t token) {
     release_writer(key.bucket_hash() % _num_buckets, token);
@@ -518,12 +521,15 @@ class MmapDirectory {
   /// With `admission`: the victim order and the in-bracket uniqueness
   /// cleanup of Directory::insert (see there); the admission view is
   /// refreshed INSIDE the bracket, under phase_lock.
+  /// A capped wait on the phase lock or the bucket that gave up (see
+  /// kLockWaitCap) sets *busy and publishes nothing.
   bool insert(const CacheKey &key, uint64_t offset, uint64_t size,
               uint64_t verified_offset = kMatchAnyTag,
               bool *collision_evicted = nullptr,
               bool *bucket_full_evicted = nullptr,
               InsertAdmission *admission = nullptr,
-              std::span<const uint64_t> clear_offsets = {});
+              std::span<const uint64_t> clear_offsets = {},
+              bool *busy = nullptr);
 
   /// Remove an entry
   /// Returns true if entry was found and removed
@@ -534,7 +540,10 @@ class MmapDirectory {
   bool remove(const CacheKey &key);
 
   /// Remove an entry matching both tag and offset (precise removal)
-  bool remove_at(const CacheKey &key, uint64_t target_offset);
+  /// A capped wait on the bucket that gave up sets *busy and removes
+  /// nothing (see kLockWaitCap).
+  bool remove_at(const CacheKey &key, uint64_t target_offset,
+                 bool *busy = nullptr);
 
   /// Clear all entries
   void clear();
@@ -694,6 +703,19 @@ class MmapDirectory {
   // (A holder in another PID namespace looks dead to that probe: every
   // process sharing a volume must share a PID namespace.)
   static constexpr std::chrono::milliseconds kWriteLockProbeAfter{50};
+  // Capped waits (inserts, removes, hit-count updates, write-slot
+  // reservation): once the holders a waiter has seen COME AND GO add up to
+  // this, it gives up and its operation reports Busy -- never a takeover.
+  // The locks are not fair, so without a cap a peer that re-acquires within
+  // nanoseconds could stall a writer (inline on an nginx event loop, say)
+  // for as long as it kept doing so.  Time on the current holder does not
+  // count, so a stuck holder is still recovered by the per-holder budget:
+  // a capped acquisition waits at most about cap + budget + 2 ms (bucket
+  // ~0.5 s, phase lock ~1.25 s, write lock ~5.25 s for a live holder it
+  // cannot prove dead, ~0.3 s for a dead one).  250 ms is over twice the
+  // longest total phase-lock wait measured under 5.2 runnable threads per
+  // core (103 ms), so ordinary contention does not give up.
+  static constexpr std::chrono::milliseconds kLockWaitCap{250};
 
 #ifdef CYCLONE_TEST_SEAMS
   /// TEST-SEAM BUILDS ONLY.  Nonzero overrides kBucketWriterBudget /
@@ -701,6 +723,10 @@ class MmapDirectory {
   static inline std::atomic<uint64_t> s_bucket_writer_budget_us_for_test{0};
   static inline std::atomic<uint64_t> s_phase_lock_budget_us_for_test{0};
   static inline std::atomic<uint64_t> s_write_lock_escalation_us_for_test{0};
+  /// Nonzero overrides kLockWaitCap, in microseconds.
+  static inline std::atomic<uint64_t> s_lock_wait_cap_us_for_test{0};
+  /// Capped waits that gave up (process-wide, all three locks).
+  static inline std::atomic<uint64_t> s_lock_give_ups_for_test{0};
   /// Recoveries of a stuck holder, per lock kind (process-wide).
   static inline std::atomic<uint64_t> s_bucket_recoveries_for_test{0};
   static inline std::atomic<uint64_t> s_phase_lock_recoveries_for_test{0};
@@ -708,7 +734,9 @@ class MmapDirectory {
   /// Take / release the phase lock as insert() does, so a test can park a
   /// live holder inside it.
   [[nodiscard]] PhaseLockToken acquire_phase_lock_for_test() {
-    return acquire_phase_lock();
+    PhaseLockToken token;
+    (void)acquire_phase_lock(token, /*capped=*/false);
+    return token;
   }
   void release_phase_lock_for_test(PhaseLockToken token) {
     release_phase_lock(token);
@@ -755,6 +783,8 @@ class MmapDirectory {
     // dead via the last-resort escalation — the alertable event (PID reuse
     // or a live holder wedged for many seconds).
     bool escalated_takeover = false;
+    // True when a capped wait gave up (acquired stays false).
+    bool gave_up = false;
     // Number of liveness re-checks spent waiting on a still-live holder
     // (one per sleep of the wait; see LockHolderWait).
     uint32_t live_waits = 0;
@@ -772,7 +802,10 @@ class MmapDirectory {
   /// to revalidate_write_lock() before ANY shared side effect and to
   /// release_write_lock() when done — discarding it leaks the lock until a
   /// waiter's escalation recovers it.
-  [[nodiscard]] WriteLockToken acquire_write_lock();
+  /// Capped by default (kLockWaitCap): behind live holders that keep
+  /// changing it returns {acquired=false, gave_up=true} and the caller
+  /// reports Busy.
+  [[nodiscard]] WriteLockToken acquire_write_lock(bool capped = true);
 
   /// Non-blocking single-CAS acquire for the in-place header RMW sites.
   /// NEVER spins, waits, or usurps: on contention returns {acquired=false}
@@ -831,7 +864,9 @@ class MmapDirectory {
   /// crashed-holder recovery, and advances the counter by exactly 2 like
   /// every other mutation.  NEVER open-code this as a fetch_add: an odd
   /// delta breaks the even/odd parity the seqlock depends on.
-  void touch_bucket(const CacheKey &key);
+  /// Capped by default: false when it gave up behind live, changing
+  /// holders (nothing was published).
+  [[nodiscard]] bool touch_bucket(const CacheKey &key, bool capped = true);
 
   /// Full mapped byte range backing this directory (header + version
   /// counters + entries).  Used for explicit flushes of the directory
@@ -886,10 +921,12 @@ class MmapDirectory {
   /// LockHolderWait, and recovers the bucket from a holder that kept it odd
   /// for kBucketWriterBudget).  Returns the pre-lock (even) version: the
   /// token release_writer needs.
-  uint32_t acquire_writer(size_t bucket_idx);
+  /// False only for a capped wait that gave up (see kLockWaitCap).
+  [[nodiscard]] bool acquire_writer(size_t bucket_idx, uint32_t &token,
+                                    bool capped);
 
   /// acquire_writer's contended path, out of line.
-  uint32_t acquire_writer_slow(size_t bucket_idx);
+  bool acquire_writer_slow(size_t bucket_idx, uint32_t &token, bool capped);
 
   /// Release writer lock: CAS token+1 (odd) -> token+2 (even).  A no-op if
   /// the bucket was force-released from under us (see acquire_writer), so a
@@ -899,14 +936,15 @@ class MmapDirectory {
   /// Acquire cross-process phase lock (CAS on header->phase_lock).
   /// Prevents toggle_phase() from invalidating entries mid-insert.  Returns
   /// the holder token release_phase_lock needs.
-  PhaseLockToken acquire_phase_lock();
+  /// False only for a capped wait that gave up (see kLockWaitCap).
+  [[nodiscard]] bool acquire_phase_lock(PhaseLockToken &token, bool capped);
 
   /// Release cross-process phase lock: CAS token -> 0, a no-op if the lock
   /// was recovered from under us.
   void release_phase_lock(PhaseLockToken token);
 
   /// acquire_phase_lock's contended path, out of line.
-  PhaseLockToken acquire_phase_lock_slow();
+  bool acquire_phase_lock_slow(PhaseLockToken &token, bool capped);
 
   /// Atomically increment entry count
   void increment_count();

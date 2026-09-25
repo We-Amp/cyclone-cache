@@ -185,6 +185,28 @@ std::chrono::steady_clock::duration phase_lock_budget() {
   return MmapDirectory::kPhaseLockBudget;
 }
 
+// The changing-holder cap of a capped wait (LockHolderWait), or zero.
+std::chrono::steady_clock::duration lock_wait_cap(bool capped) {
+  if (!capped) {
+    return std::chrono::steady_clock::duration::zero();
+  }
+#ifdef CYCLONE_TEST_SEAMS
+  const uint64_t us = MmapDirectory::s_lock_wait_cap_us_for_test.load(
+      std::memory_order_relaxed);
+  if (us != 0) {
+    return std::chrono::microseconds(us);
+  }
+#endif
+  return MmapDirectory::kLockWaitCap;
+}
+
+void count_give_up() {
+#ifdef CYCLONE_TEST_SEAMS
+  MmapDirectory::s_lock_give_ups_for_test.fetch_add(1,
+                                                    std::memory_order_relaxed);
+#endif
+}
+
 std::chrono::steady_clock::duration write_lock_escalation_budget() {
 #ifdef CYCLONE_TEST_SEAMS
   const uint64_t us = MmapDirectory::s_write_lock_escalation_us_for_test.load(
@@ -447,7 +469,8 @@ bool MmapDirectory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
                            uint64_t verified_offset, bool *collision_evicted,
                            bool *bucket_full_evicted,
                            InsertAdmission *admission,
-                           std::span<const uint64_t> clear_offsets) {
+                           std::span<const uint64_t> clear_offsets,
+                           bool *busy) {
   if (_header == nullptr) {
     return false;
   }
@@ -461,11 +484,27 @@ bool MmapDirectory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
   // This ensures no phase toggle can happen between reading current_phase
   // and writing the entry with that phase — preventing the ABA race where
   // another process's evict_if_needed() invalidates our freshly-written entry.
-  const PhaseLockToken phase_token = acquire_phase_lock();
+  //
+  // Both waits are capped: behind live holders that keep changing, give up
+  // and publish nothing (*busy) rather than stall the writer.
+  PhaseLockToken phase_token;
+  if (!acquire_phase_lock(phase_token, /*capped=*/true)) {
+    if (busy != nullptr) {
+      *busy = true;
+    }
+    return false;
+  }
   bool cur_phase = current_phase();
 
-  // Acquire writer lock (CAS even → odd, spins if another writer holds it).
-  const uint32_t writer_token = acquire_writer(bucket_idx);
+  // Acquire writer lock (CAS even → odd, waits if another writer holds it).
+  uint32_t writer_token = 0;
+  if (!acquire_writer(bucket_idx, writer_token, /*capped=*/true)) {
+    release_phase_lock(phase_token);
+    if (busy != nullptr) {
+      *busy = true;
+    }
+    return false;
+  }
 
   if (admission != nullptr) {
     // Boundaries are loaded HERE, inside the bracket and under phase_lock:
@@ -669,8 +708,11 @@ bool MmapDirectory::remove(const CacheKey &key) {
 
   DirEntry *bucket = &_entries[bucket_idx * kEntriesPerBucket];
 
-  // Acquire writer lock (CAS even → odd, spins if another writer holds it).
-  const uint32_t writer_token = acquire_writer(bucket_idx);
+  // Acquire writer lock (CAS even → odd, waits if another writer holds it).
+  uint32_t writer_token = 0;
+  if (!acquire_writer(bucket_idx, writer_token, /*capped=*/true)) {
+    return false;
+  }
 
   bool found = false;
   for (size_t i = 0; i < kEntriesPerBucket; ++i) {
@@ -691,7 +733,8 @@ bool MmapDirectory::remove(const CacheKey &key) {
   return found;
 }
 
-bool MmapDirectory::remove_at(const CacheKey &key, uint64_t target_offset) {
+bool MmapDirectory::remove_at(const CacheKey &key, uint64_t target_offset,
+                              bool *busy) {
   if (_header == nullptr) {
     return false;
   }
@@ -701,7 +744,13 @@ bool MmapDirectory::remove_at(const CacheKey &key, uint64_t target_offset) {
 
   DirEntry *bucket = &_entries[bucket_idx * kEntriesPerBucket];
 
-  const uint32_t writer_token = acquire_writer(bucket_idx);
+  uint32_t writer_token = 0;
+  if (!acquire_writer(bucket_idx, writer_token, /*capped=*/true)) {
+    if (busy != nullptr) {
+      *busy = true;  // Nothing removed
+    }
+    return false;
+  }
 
   // EVERY entry with this tag at this offset goes (see Directory::remove_at).
   size_t removed = 0;
@@ -732,7 +781,7 @@ void MmapDirectory::clear() {
   // writers on other processes spin until we release.
   std::vector<uint32_t> writer_tokens(_num_buckets);
   for (size_t i = 0; i < _num_buckets; ++i) {
-    writer_tokens[i] = acquire_writer(i);
+    (void)acquire_writer(i, writer_tokens[i], /*capped=*/false);
   }
 
   // Clear all entries and reset count while holding all locks.
@@ -776,7 +825,10 @@ void MmapDirectory::toggle_phase() {
   // another process is mid-insert (reading current_phase + writing entry).
   // seq_cst (upgraded from release): the phase is the other half of the
   // reader's stamp-then-revalidate epoch.
-  const PhaseLockToken phase_token = acquire_phase_lock();
+  // Uncapped: this runs inside a wrap under the write lock, which a peer
+  // needs before it can start another insert, so contention drains.
+  PhaseLockToken phase_token;
+  (void)acquire_phase_lock(phase_token, /*capped=*/false);
   std::atomic_ref<uint8_t>(_header->current_phase)
       .fetch_xor(1, std::memory_order_seq_cst);
   release_phase_lock(phase_token);
@@ -788,7 +840,8 @@ void MmapDirectory::set_current_phase(bool phase) {
   }
   // Same lock and ordering as toggle_phase: an insert that read the phase
   // under phase_lock must not have it change underneath its entry store.
-  const PhaseLockToken phase_token = acquire_phase_lock();
+  PhaseLockToken phase_token;
+  (void)acquire_phase_lock(phase_token, /*capped=*/false);  // As toggle_phase
   std::atomic_ref<uint8_t>(_header->current_phase)
       .store(phase ? 1 : 0, std::memory_order_seq_cst);
   release_phase_lock(phase_token);
@@ -847,35 +900,39 @@ void MmapDirectory::reset_reader_state_exclusive() {
 // acquisition or recovery bumped it) and the lock byte is CASed from our
 // own token, so a holder recovered from under us can never free the
 // usurper's -- or a later holder's -- critical section.
-MmapDirectory::PhaseLockToken MmapDirectory::acquire_phase_lock() {
-  PhaseLockToken token;
+bool MmapDirectory::acquire_phase_lock(PhaseLockToken &token, bool capped) {
   uint8_t observed = 0;
   if (try_take_token_lock(std::atomic_ref<uint8_t>(_header->phase_lock),
                           std::atomic_ref<uint16_t>(_header->phase_lock_gen),
                           token.generation, token.value, observed)) [[likely]] {
-    return token;
+    return true;
   }
-  return acquire_phase_lock_slow();
+  return acquire_phase_lock_slow(token, capped);
 }
 
-MmapDirectory::PhaseLockToken MmapDirectory::acquire_phase_lock_slow() {
+bool MmapDirectory::acquire_phase_lock_slow(PhaseLockToken &token,
+                                            bool capped) {
   auto lock = std::atomic_ref<uint8_t>(_header->phase_lock);
   auto gen = std::atomic_ref<uint16_t>(_header->phase_lock_gen);
-  LockHolderWait wait(phase_lock_budget());
+  LockHolderWait wait(phase_lock_budget(), lock_wait_cap(capped));
   for (;;) {
-    PhaseLockToken token;
     uint8_t observed = 0;
     if (try_take_token_lock(lock, gen, token.generation, token.value,
                             observed)) {
-      return token;
+      return true;
     }
     if (observed == 0) {
       wait.restart();  // Seen free: whoever holds it next is a new holder
       continue;
     }
     const uint16_t holder_gen = gen.load(std::memory_order_seq_cst);
-    if (wait.wait(token_lock_holder(observed, holder_gen, 0)) !=
-        LockHolderWait::Step::kExpired) {
+    const LockHolderWait::Step step =
+        wait.wait(token_lock_holder(observed, holder_gen, 0));
+    if (step == LockHolderWait::Step::kGiveUp) {
+      count_give_up();
+      return false;  // Live, changing holders for the whole cap
+    }
+    if (step != LockHolderWait::Step::kExpired) {
       continue;
     }
     // One holder has kept the lock for the whole budget and the
@@ -901,7 +958,7 @@ void MmapDirectory::release_phase_lock(PhaseLockToken token) {
                                std::memory_order_relaxed);
 }
 
-MmapDirectory::WriteLockToken MmapDirectory::acquire_write_lock() {
+MmapDirectory::WriteLockToken MmapDirectory::acquire_write_lock(bool capped) {
   // The write lock serializes the shared_write_pos → reserve-byte-range
   // publish sequence.  Unlike phase_lock and the per-bucket writer seqlock
   // — whose torn writes a reader DETECTS (seqlock version change, full-key
@@ -953,7 +1010,7 @@ MmapDirectory::WriteLockToken MmapDirectory::acquire_write_lock() {
   // on a truly live holder, the generation bump below makes that holder's
   // revalidate fail, so it aborts before its overlapping publish/pwrite —
   // corruption stays closed; only availability degrades.
-  LockHolderWait wait(write_lock_escalation_budget());
+  LockHolderWait wait(write_lock_escalation_budget(), lock_wait_cap(capped));
   for (;;) {
     if (try_take_token_lock(lock, gen, token.generation, token.value,
                             observed)) {
@@ -971,6 +1028,13 @@ MmapDirectory::WriteLockToken MmapDirectory::acquire_write_lock() {
         wait.wait(token_lock_holder(observed, holder_gen, holder));
     if (step == LockHolderWait::Step::kSpun) {
       continue;
+    }
+    if (step == LockHolderWait::Step::kGiveUp) {
+      // Live holders kept changing for the whole cap: give up WITHOUT the
+      // lock (acquired stays false); the caller reports Busy.
+      count_give_up();
+      token.gave_up = true;
+      return token;
     }
 
     // Slept, or the escalation budget is spent: prove DEAD before we
@@ -1106,19 +1170,24 @@ uint32_t MmapDirectory::bucket_version(const CacheKey &key) const {
   return load_version(key.bucket_hash() % _num_buckets);
 }
 
-void MmapDirectory::touch_bucket(const CacheKey &key) {
+bool MmapDirectory::touch_bucket(const CacheKey &key, bool capped) {
   if (_header == nullptr || _num_buckets == 0) {
-    return;
+    return true;
   }
   const size_t bucket_idx = key.bucket_hash() % _num_buckets;
   // Empty writer bracket: +2, fenced and parity-preserving.  A reader inside
   // probe_each's seqlock loop observes the change and retries — a spurious
   // retry, never a wrong serve.
-  const uint32_t writer_token = acquire_writer(bucket_idx);
+  uint32_t writer_token = 0;
+  if (!acquire_writer(bucket_idx, writer_token, capped)) {
+    return false;
+  }
   release_writer(bucket_idx, writer_token);
+  return true;
 }
 
-uint32_t MmapDirectory::acquire_writer(size_t bucket_idx) {
+bool MmapDirectory::acquire_writer(size_t bucket_idx, uint32_t &token,
+                                   bool capped) {
   auto ref = std::atomic_ref<uint32_t>(_versions[bucket_idx]);
   // Hot path: the bucket is even (no writer); claim it with CAS even → odd.
   uint32_t v = ref.load(std::memory_order_acquire);
@@ -1132,12 +1201,14 @@ uint32_t MmapDirectory::acquire_writer(size_t bucket_idx) {
     // write_seqcount_begin) place a barrier here for the same reason.
     std::atomic_thread_fence(std::memory_order_seq_cst);
     TSAN_RELEASE(&_versions[bucket_idx]);
-    return v;
+    token = v;
+    return true;
   }
-  return acquire_writer_slow(bucket_idx);
+  return acquire_writer_slow(bucket_idx, token, capped);
 }
 
-uint32_t MmapDirectory::acquire_writer_slow(size_t bucket_idx) {
+bool MmapDirectory::acquire_writer_slow(size_t bucket_idx, uint32_t &token,
+                                        bool capped) {
   auto ref = std::atomic_ref<uint32_t>(_versions[bucket_idx]);
   // Another writer holds the bucket (odd version).  Every mutator holds its
   // stripe mutex, so that writer is in ANOTHER process -- or another Volume
@@ -1152,11 +1223,20 @@ uint32_t MmapDirectory::acquire_writer_slow(size_t bucket_idx) {
   // short holders never presumes the latest one stuck (issue #27).  Only a
   // holder that kept the bucket odd for kBucketWriterBudget -- far past any
   // scheduling delay measured for a live holder -- is presumed stuck.
-  LockHolderWait wait(bucket_writer_budget());
+  //
+  // Capped (every production mutator but clear()): behind live holders that
+  // keep changing for kLockWaitCap, give up (false) and let the operation
+  // report Busy; the bucket is never forced on the cap.
+  LockHolderWait wait(bucket_writer_budget(), lock_wait_cap(capped));
   for (;;) {
     uint32_t v = ref.load(std::memory_order_acquire);
     if ((v & 1) != 0) {
-      if (wait.wait(v) == LockHolderWait::Step::kExpired) {
+      const LockHolderWait::Step step = wait.wait(v);
+      if (step == LockHolderWait::Step::kGiveUp) {
+        count_give_up();
+        return false;
+      }
+      if (step == LockHolderWait::Step::kExpired) {
         // Holder presumed STUCK.  Force the version from exactly the odd
         // value we waited on to the next even one (a CAS, so a holder that
         // just released, or a new holder, is never overwritten).  A live
@@ -1188,7 +1268,8 @@ uint32_t MmapDirectory::acquire_writer_slow(size_t bucket_idx) {
       // Load-bearing fence: see acquire_writer.
       std::atomic_thread_fence(std::memory_order_seq_cst);
       TSAN_RELEASE(&_versions[bucket_idx]);
-      return v;
+      token = v;
+      return true;
     }
     // CAS failed (concurrent modification), retry.
   }

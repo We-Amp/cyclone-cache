@@ -727,11 +727,13 @@ struct Stripe {
               bool *collision_evicted = nullptr,
               bool *bucket_full_evicted = nullptr,
               InsertAdmission *admission = nullptr,
-              std::span<const uint64_t> clear_offsets = {}) {
+              std::span<const uint64_t> clear_offsets = {},
+              bool *busy = nullptr) {
     if (use_mmap_directory && mmap_directory) {
+      // *busy: a capped cross-process lock wait gave up; nothing published.
       return mmap_directory->insert(key, offset, size, verified_offset,
                                     collision_evicted, bucket_full_evicted,
-                                    admission, clear_offsets);
+                                    admission, clear_offsets, busy);
     } else if (directory) {
       return directory->insert(key, offset, size, verified_offset,
                                collision_evicted, bucket_full_evicted,
@@ -746,9 +748,11 @@ struct Stripe {
   // deferred to the periodic sync_directory() pass.  A removal or chain
   // repoint lost to power failure is benign: the old entry still points at
   // valid, checksummed data.
-  bool remove_entry_at(const CacheKey &key, uint64_t offset) {
+  bool remove_entry_at(const CacheKey &key, uint64_t offset,
+                       bool *busy = nullptr) {
     if (use_mmap_directory && mmap_directory) {
-      return mmap_directory->remove_at(key, offset);
+      // *busy: a capped bucket wait gave up; nothing removed.
+      return mmap_directory->remove_at(key, offset, busy);
     } else if (directory) {
       return directory->remove_at(key, offset);
     }
@@ -1624,7 +1628,11 @@ class Volume : public std::enable_shared_from_this<Volume> {
     if (!(stripe->use_mmap_directory && stripe->mmap_directory)) {
       return false;  // Unreachable: in-memory mutators all hold the mutex
     }
-    stripe->mmap_directory->touch_bucket(key);
+    // Capped: behind live holders that keep changing, give up as Busy.
+    if (!stripe->mmap_directory->touch_bucket(key)) {
+      _directory_read_timeouts.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
     reset();
     if (stripe->probe_each(key, snap, callback)) {
       return true;

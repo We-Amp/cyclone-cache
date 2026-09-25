@@ -239,8 +239,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     phase lock after about 33 µs, so during an upgrade overlap the pair
     behaves like the older build.
   - These waits are writer-side, but a write can run on a request thread.
-    After a peer dies holding a lock, one write can stall for up to about
-    1.25 s.
+    The locks are not fair, so waits by inserts, removes, hit-count updates
+    and write-slot reservation are capped. Once the holders a waiter has
+    seen come and go add up to 250 ms, the operation returns
+    `CacheError::Busy` (`CYCLONE_BUSY`) and publishes nothing; it never
+    takes a lock over on the cap. Time on one stuck holder does not count,
+    so dead holders are still recovered. A capped acquisition waits at most
+    about 0.5 s (bucket), 1.25 s (phase lock), or 0.3 s / 5.25 s (write
+    lock, behind a dead holder / a live one it cannot prove dead).
   - All processes sharing a volume must share one PID namespace (now
     documented), because a live write-lock holder in another namespace
     looks dead.

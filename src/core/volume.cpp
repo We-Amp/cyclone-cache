@@ -2867,7 +2867,11 @@ std::expected<void, CacheError> Volume::remove_sync(const CacheKey& key) {
   // Phase 2: For each candidate, read the document to verify the full SHA-256
   // key (not just the 12-bit tag), then remove the correct entry precisely.
   bool removed_live = false;
-  for (size_t ci = 0; ci < num_candidates; ++ci) {
+  // A capped bucket wait that gave up (live peers kept changing): stop and
+  // report Busy.  Entries already removed stay removed (and their RAM
+  // copies are invalidated below); the caller retries the rest.
+  bool remove_busy = false;
+  for (size_t ci = 0; ci < num_candidates && !remove_busy; ++ci) {
     const auto& candidate = candidates[ci];
 
     uint64_t doc_offset = stripe->offset + candidate.dir_offset;
@@ -2920,7 +2924,8 @@ std::expected<void, CacheError> Volume::remove_sync(const CacheKey& key) {
     // match.  EVERY same-key entry goes (B2d), retained ones included, and
     // stale survivors of the key with it; each clear decrements the entry
     // count, so count() stays exact.  Only a live one makes the key "found".
-    if (stripe->remove_entry_at(key, candidate.dir_offset) && stamp_ok) {
+    if (stripe->remove_entry_at(key, candidate.dir_offset, &remove_busy) &&
+        stamp_ok) {
       removed_live = true;
     }
   }
@@ -2964,10 +2969,16 @@ std::expected<void, CacheError> Volume::remove_sync(const CacheKey& key) {
         stripe->remove_epoch.fetch_add(1, std::memory_order_acq_rel);
         _ram_cache->remove_all(key);
       }
+      if (remove_busy) {
+        return make_unexpected(CacheError::Busy);
+      }
       return {};
     }
   }
 
+  if (remove_busy) {
+    return make_unexpected(CacheError::Busy);
+  }
   return make_unexpected(CacheError::NotFound);
 }
 
@@ -3681,6 +3692,11 @@ std::expected<Volume::WriteSlot, CacheError> Volume::allocate_write_slot(
   MmapDirectory::WriteLockToken write_token;
   if (stripe->use_mmap_directory && stripe->mmap_directory) {
     write_token = stripe->mmap_directory->acquire_write_lock();
+    if (!write_token.acquired) {
+      // The capped wait gave up behind live holders that kept changing
+      // (kLockWaitCap): nothing reserved, nothing published, no lock held.
+      return make_unexpected(CacheError::Busy);
+    }
     has_write_lock = true;
 
     // Write-lock recovery telemetry (see MmapDirectory::acquire_write_lock).
@@ -4385,11 +4401,16 @@ std::expected<void, CacheError> Volume::commit_write(
   bool collision_evicted = false;
   bool bucket_full_evicted = false;
   StripeAdmission admission(*this, *stripe);
+  bool insert_busy = false;
   if (!stripe->insert(
           key, relative_offset, doc_size, verified_offset, &collision_evicted,
           &bucket_full_evicted, &admission,
-          std::span<const uint64_t>(clear_offsets.data(), clear_count))) {
-    return make_unexpected(CacheError::InternalError);
+          std::span<const uint64_t>(clear_offsets.data(), clear_count),
+          &insert_busy)) {
+    // A capped lock wait that gave up published nothing: the document stays
+    // unreachable, like any fill whose insert never ran (the Busy above).
+    return make_unexpected(insert_busy ? CacheError::Busy
+                                       : CacheError::InternalError);
   }
   if (collision_evicted) {
     _tag_collision_evictions.fetch_add(1, std::memory_order_relaxed);
@@ -5509,12 +5530,16 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
   // leave the old head resolvable as a stale duplicate.  Every other
   // same-key entry found above is cleared in the same bracket.
   StripeAdmission admission(*this, *stripe);
+  bool insert_busy = false;
   if (!stripe->insert(
           key, relative_offset, doc_size,
           key_exists ? head_relative_offset : Directory::kNoVerifiedEntry,
           &collision_evicted, &bucket_full_evicted, &admission,
-          std::span<const uint64_t>(clear_offsets.data(), clear_count))) {
-    return make_unexpected(CacheError::InternalError);
+          std::span<const uint64_t>(clear_offsets.data(), clear_count),
+          &insert_busy)) {
+    // As in commit_write: a capped lock wait that gave up published nothing.
+    return make_unexpected(insert_busy ? CacheError::Busy
+                                       : CacheError::InternalError);
   }
   if (collision_evicted) {
     _tag_collision_evictions.fetch_add(1, std::memory_order_relaxed);
@@ -6651,7 +6676,11 @@ std::expected<void, CacheError> Volume::remove_alternate_sync(
     // bytes as fresh.  Dropping the key costs only the other alternates of
     // an entry that is on its way out anyway.
     if (head_cls == AdmitClass::kRetained) {
-      stripe->remove_entry_at(key, head_relative_offset);
+      bool busy = false;
+      stripe->remove_entry_at(key, head_relative_offset, &busy);
+      if (busy) {
+        return make_unexpected(CacheError::Busy);  // Nothing removed
+      }
       if (_ram_cache) {
         stripe->remove_epoch.fetch_add(1, std::memory_order_acq_rel);
         _ram_cache->remove_all(key);
@@ -6666,7 +6695,11 @@ std::expected<void, CacheError> Volume::remove_alternate_sync(
         // Only alternate - remove from directory entirely.
         // Use remove_entry_at for precise offset-based removal
         // (collision-safe).
-        stripe->remove_entry_at(key, head_relative_offset);
+        bool busy = false;
+        stripe->remove_entry_at(key, head_relative_offset, &busy);
+        if (busy) {
+          return make_unexpected(CacheError::Busy);  // Nothing removed
+        }
       } else {
         // Validate target_next_offset before following (security)
         if (stripe->admit_hop(target_next_offset, head_relative_offset,
@@ -6693,8 +6726,13 @@ std::expected<void, CacheError> Volume::remove_alternate_sync(
         // head_relative_offset was verified by full first_key comparison
         // above — repoint exactly that entry, never a same-tag collider.
         StripeAdmission admission(*this, *stripe);
+        bool busy = false;
         stripe->insert(key, target_next_offset, next_doc_size,
-                       head_relative_offset, nullptr, nullptr, &admission);
+                       head_relative_offset, nullptr, nullptr, &admission, {},
+                       &busy);
+        if (busy) {
+          return make_unexpected(CacheError::Busy);  // Nothing repointed
+        }
       }
 
       // Head was removed or changed - invalidate RAM cache.
@@ -6746,8 +6784,12 @@ std::expected<void, CacheError> Volume::remove_alternate_sync(
       // it matters most.  Ordering is already correct: repoint_chain_link has
       // released the directory write lock, and its release store is ordered
       // before acquire_writer's seq_cst fence.  Cost lands on a cold path.
+      //
+      // UNCAPPED: the repoint above is already committed, so this signal
+      // must not be dropped; a relaying peer on this one bucket can delay
+      // it (issue #27), which this rare control path accepts.
       if (stripe->use_mmap_directory && stripe->mmap_directory) {
-        stripe->mmap_directory->touch_bucket(key);
+        (void)stripe->mmap_directory->touch_bucket(key, /*capped=*/false);
       }
       // Same post-mutation invalidation as the head-removal path above, in
       // the same order: the repoint just unlinked the target from the

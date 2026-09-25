@@ -188,15 +188,47 @@ phase-lock wait can also run inside a wrap while the write lock is held.
 They are still reachable inline from a request thread. For example, the
 PageSpeed nginx module writes an alternate through `write_sync` /
 `close_sync` on its event loop, and the C API's miss-handler write-back
-also writes. After a peer crashes holding a lock, one write can stall for up
-to about 1.25 s (a bucket wait nested in a phase-lock wait). Under load, a
-write waits out a live holder instead of taking the lock from it: about
-106 ms at worst in the measurement above.
+also writes. Under load, a write waits out a live holder instead of taking
+the lock from it: about 106 ms at worst in the measurement above.
 
 The locks are not fair. A peer that releases and re-acquires within
-nanoseconds can keep a waiter waiting for as long as it keeps doing so. It
-is never taken over while it does, because every acquisition is a new
-holder.
+nanoseconds wins against a sleeping waiter every time. Such a peer is never
+taken over, because every acquisition is a new holder. So that it cannot
+stall a writer indefinitely either, most waits are **capped**:
+
+- **What gives up:** inserts, removes, hit-count updates and write-slot
+  reservation.
+- **When:** once the holders a waiter has seen come and go add up to
+  `kLockWaitCap` (250 ms), the waiter gives up.
+- **What happens then:** the operation returns `CacheError::Busy`
+  (`CYCLONE_BUSY` in the C API) and publishes nothing. An abandoned write
+  leaves its document unreachable, like any fill whose insert never ran.
+  The cap never takes a lock over.
+
+Time spent on the current holder does not count toward the cap, so a stuck
+holder is still governed by its per-holder budget alone, and a dead holder
+is still recovered. The cap is 250 ms because that is over twice the longest
+total phase-lock wait measured at 5.2 runnable threads per core (103 ms),
+so ordinary contention does not give up.
+
+The longest one capped acquisition can wait is about the cap plus one
+holder's budget plus the 2 ms confirmation:
+
+| Lock | Longest capped wait |
+|------|---------------------|
+| Bucket seqlock | About 0.5 s. |
+| Phase lock | About 1.25 s. An insert takes the phase lock, then a bucket, so an insert can wait about 1.75 s. |
+| Write lock | About 0.3 s behind a dead holder. About 5.25 s behind a live holder it cannot prove dead, the pathological case the escalation exists for. |
+
+Three waits stay uncapped, because giving up there would leave work half
+done:
+
+- the phase toggle and the phase re-derivation, which run inside a wrap
+  under the write lock (a peer needs that lock before it can start another
+  insert, so contention drains);
+- `clear()`;
+- the RAM-coherence signal published after an alternate's chain was
+  already repointed.
 
 Every release is a CAS on the holder's own token. A holder that was
 recovered from under it and resumes later cannot free the next holder's

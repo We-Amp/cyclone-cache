@@ -321,7 +321,9 @@ The read hot path is lock-free (the read-path scaling series). Before refactorin
    proven-dead holder or after 5 s), never by a spin count. Every
    phase/write-lock acquisition bumps that lock's generation, so a peer that
    releases and re-acquires is a new holder, and every release is a CAS on
-   the holder's own token.
+   the holder's own token. Writer waits are capped (`kLockWaitCap` =
+   250 ms of changing holders): the operation reports Busy and publishes
+   nothing, never a takeover on the cap.
    Guard: `tests/integration/test_seqlock_read_wait.cpp`,
    `tests/integration/test_lock_holder_wait.cpp`.
 5. **HitTracker is a leaf lock** — never hold a stripe lock across

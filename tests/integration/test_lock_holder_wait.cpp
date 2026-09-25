@@ -370,20 +370,97 @@ TEST_CASE(
   }
 }
 
+// Holds a lock through a test seam, releasing and re-acquiring it at once
+// every kRelayHold until stop(): a live peer that a sleeping waiter
+// essentially never sees free.  `take` returns a holder token, `check`
+// reports whether that holder still owns the lock, `give` releases it.
+constexpr auto kRelayHold = 10ms;
+// Slack over the cap for a loaded CI runner.
+constexpr auto kCapMargin = 750ms;
+// The waiter may still catch one of the relay's release-to-re-acquire gaps
+// (its brief spin after each sleep) and take the lock fairly; each attempt
+// must then have ended without a takeover, inside the bound.  Up to this
+// many attempts are made to observe the give-up itself.
+constexpr int kRelayAttempts = 5;
+// Under ThreadSanitizer every release-to-re-acquire gap is wide enough that
+// the waiter nearly always catches one before the cap; there only the bound
+// and the absence of a takeover are checked.
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define CYCLONE_TEST_UNDER_TSAN 1
+#endif
+#endif
+#if defined(__SANITIZE_THREAD__)
+#define CYCLONE_TEST_UNDER_TSAN 1
+#endif
+#ifdef CYCLONE_TEST_UNDER_TSAN
+constexpr bool kExpectGiveUp = false;
+#else
+constexpr bool kExpectGiveUp = true;
+#endif
+
+template <typename Token>
+class Relay {
+ public:
+  template <typename Take, typename Check, typename Give>
+  Relay(Take take, Check check, Give give) {
+    _thread = std::thread([this, take, check, give] {
+      Token token = take();
+      _parked.store(true);
+      // Bounded, so a waiter that never gives up fails its time check
+      // instead of hanging the test.
+      const auto end = Clock::now() + 10s;
+      while (!_stop.load() && Clock::now() < end) {
+        std::this_thread::sleep_for(kRelayHold);
+        if (!check(token)) {
+          _lost.fetch_add(1);  // Taken from a live holder
+        }
+        give(token);
+        token = take();
+        _holds.fetch_add(1);
+      }
+      give(token);
+    });
+    while (!_parked.load()) {
+      std::this_thread::yield();
+    }
+  }
+  void stop() {
+    if (_thread.joinable()) {
+      _stop.store(true);
+      _thread.join();
+    }
+  }
+  ~Relay() { stop(); }
+  Relay(const Relay &) = delete;
+  Relay &operator=(const Relay &) = delete;
+  [[nodiscard]] int lost() const { return _lost.load(); }
+  [[nodiscard]] int holds() const { return _holds.load(); }
+
+ private:
+  std::atomic<bool> _parked{false};
+  std::atomic<bool> _stop{false};
+  std::atomic<int> _lost{0};
+  std::atomic<int> _holds{0};
+  std::thread _thread;
+};
+
+using Ms = std::chrono::milliseconds;
+
 TEST_CASE(
-    "Lock holder wait: a phase-lock waiter never usurps a live peer that "
-    "keeps releasing and re-acquiring",
+    "Lock holder wait: a write behind a live peer relaying the phase lock "
+    "reports Busy within the cap, and never usurps it",
     "[mmap_directory][multiprocess][concurrent][regression]") {
-  // Every holder re-acquires the instant it releases, so a sleeping waiter
-  // essentially never sees the lock free; only the acquisition generation
-  // tells it the holder changed.  The relay outlasts the budget three
-  // times over.  (Before the generation, every holder of a generation
-  // stored the same token and the waiter usurped the relay at the budget.)
-  constexpr auto kBudget = 150ms;
-  constexpr auto kHold = 20ms;
-  constexpr auto kRelay = 3 * kBudget;
-  BudgetOverride budget(MmapDirectory::s_phase_lock_budget_us_for_test,
-                        kBudget);
+  // Every relay holder re-acquires the instant it releases.  Two things are
+  // pinned:
+  //   - no takeover: each hold (10 ms) is far inside the 100 ms per-holder
+  //     budget, and only the acquisition generation tells the waiter the
+  //     holder changed (before it, every holder of a generation looked the
+  //     same and the waiter usurped the relay at the budget);
+  //   - bounded stall: the lock is unfair, so the waiter gives up after
+  //     kLockWaitCap of changing holders and the write reports Busy (it
+  //     used to wait for as long as the relay ran).
+  BudgetOverride budget(MmapDirectory::s_phase_lock_budget_us_for_test, 100ms);
   TempCacheDir tmp("phaserelay");
   auto local = open_volume(tmp.path());
   auto peer = open_volume(tmp.path());
@@ -395,79 +472,175 @@ TEST_CASE(
   REQUIRE(peer_dir != nullptr);
   const uint64_t recoveries =
       MmapDirectory::s_phase_lock_recoveries_for_test.load();
+  const uint64_t give_ups = MmapDirectory::s_lock_give_ups_for_test.load();
 
-  std::atomic<bool> first_parked{false};
-  std::atomic<int> lost{0};
-  std::thread relay([&] {
-    auto token = peer_dir->acquire_phase_lock_for_test();
-    first_parked.store(true);
-    const auto end = Clock::now() + kRelay;
-    while (Clock::now() < end) {
-      std::this_thread::sleep_for(kHold);
-      if (peer_dir->phase_lock_gen_for_test() != token.generation ||
-          peer_dir->phase_lock_value_for_test() != token.value) {
-        lost.fetch_add(1);  // Recovered from under a live holder
-      }
-      peer_dir->release_phase_lock_for_test(token);
-      token = peer_dir->acquire_phase_lock_for_test();
+  Relay<MmapDirectory::PhaseLockToken> relay(
+      [&] { return peer_dir->acquire_phase_lock_for_test(); },
+      [&](const MmapDirectory::PhaseLockToken &t) {
+        return peer_dir->phase_lock_gen_for_test() == t.generation &&
+               peer_dir->phase_lock_value_for_test() == t.value;
+      },
+      [&](const MmapDirectory::PhaseLockToken &t) {
+        peer_dir->release_phase_lock_for_test(t);
+      });
+
+  bool gave_up = false;
+  for (int attempt = 0; attempt < kRelayAttempts && !gave_up; ++attempt) {
+    const CacheKey attempt_key("phase-lock-relay-" + std::to_string(attempt));
+    auto wh = local->write_sync(attempt_key, content.size());
+    REQUIRE(wh.has_value());
+    REQUIRE(wh->write_sync(content).has_value());
+    const auto t0 = Clock::now();
+    auto closed = wh->close_sync();  // The insert waits on the relay
+    const auto waited = Clock::now() - t0;
+    CAPTURE(attempt, std::chrono::duration_cast<Ms>(waited).count(),
+            relay.holds());
+    REQUIRE(waited < MmapDirectory::kLockWaitCap + kCapMargin);
+    if (closed.has_value()) {
+      REQUIRE(read_content(*local, attempt_key) == content);
+      continue;  // Caught a gap: acquired fairly
     }
-    peer_dir->release_phase_lock_for_test(token);
-  });
-  while (!first_parked.load()) {
-    std::this_thread::yield();
+    REQUIRE(closed.error() == CacheError::Busy);
+    REQUIRE(waited >= MmapDirectory::kLockWaitCap);
+    // The abandoned write published nothing.
+    REQUIRE_FALSE(local->read_sync(attempt_key).has_value());
+    gave_up = true;
   }
-  REQUIRE(write(*local, key, content));
-  relay.join();
-
-  REQUIRE(lost.load() == 0);
+  REQUIRE((gave_up || !kExpectGiveUp));
+  REQUIRE(MmapDirectory::s_lock_give_ups_for_test.load() ==
+          give_ups + (gave_up ? 1 : 0));
   REQUIRE(MmapDirectory::s_phase_lock_recoveries_for_test.load() == recoveries);
+  relay.stop();
+  REQUIRE(relay.lost() == 0);  // The peer was never disturbed
   REQUIRE(dir->phase_lock_value_for_test() == 0);
+
+  // Once the relay stops, the next write lands.
+  REQUIRE(write(*local, key, content));
   REQUIRE(read_content(*local, key) == content);
 }
 
 TEST_CASE(
-    "Lock holder wait: a write-lock waiter never takes over a live peer "
-    "that keeps releasing and re-acquiring",
+    "Lock holder wait: a write-lock waiter behind a live relaying peer gives "
+    "up within the cap, and never takes it over",
     "[mmap_directory][multiprocess][concurrent][regression][writelock]") {
   // As the phase-lock relay, with the same PID on both sides (two threads
   // of one peer look alike by PID and token): the escalation budget must
-  // restart with every acquisition.
-  constexpr auto kBudget = 150ms;
-  constexpr auto kHold = 20ms;
-  constexpr auto kRelay = 3 * kBudget;
+  // restart with every acquisition, and the cap must end the wait.
   BudgetOverride budget(MmapDirectory::s_write_lock_escalation_us_for_test,
-                        kBudget);
+                        100ms);
   MappedDir d;
   MmapDirectory &dir = d.dir;
+  Relay<MmapDirectory::WriteLockToken> relay(
+      [&] { return dir.acquire_write_lock(/*capped=*/false); },
+      [&](const MmapDirectory::WriteLockToken &t) {
+        return dir.revalidate_write_lock(t);
+      },
+      [&](const MmapDirectory::WriteLockToken &t) {
+        dir.release_write_lock(t);
+      });
 
-  std::atomic<bool> first_parked{false};
-  std::atomic<int> lost{0};
-  std::thread relay([&] {
-    auto token = dir.acquire_write_lock();
-    first_parked.store(true);
-    const auto end = Clock::now() + kRelay;
-    while (Clock::now() < end) {
-      std::this_thread::sleep_for(kHold);
-      if (!dir.revalidate_write_lock(token)) {
-        lost.fetch_add(1);  // Taken over: its fill would have been dropped
-      }
-      dir.release_write_lock(token);
-      token = dir.acquire_write_lock();
+  bool gave_up = false;
+  for (int attempt = 0; attempt < kRelayAttempts && !gave_up; ++attempt) {
+    const auto t0 = Clock::now();
+    const auto waiter = dir.acquire_write_lock();  // Capped
+    const auto waited = Clock::now() - t0;
+    CAPTURE(attempt, std::chrono::duration_cast<Ms>(waited).count(),
+            relay.holds());
+    REQUIRE_FALSE(waiter.escalated_takeover);
+    REQUIRE_FALSE(waiter.forced_release);
+    REQUIRE(waited < MmapDirectory::kLockWaitCap + kCapMargin);
+    if (waiter.acquired) {
+      dir.release_write_lock(waiter);  // Caught a gap: acquired fairly
+      continue;
     }
-    dir.release_write_lock(token);
-  });
-  while (!first_parked.load()) {
-    std::this_thread::yield();
+    REQUIRE(waiter.gave_up);
+    REQUIRE(waited >= MmapDirectory::kLockWaitCap);
+    gave_up = true;
   }
-  const auto waiter = dir.acquire_write_lock();
-  relay.join();
-
-  REQUIRE(waiter.acquired);
-  REQUIRE_FALSE(waiter.escalated_takeover);
-  REQUIRE_FALSE(waiter.forced_release);
-  REQUIRE(lost.load() == 0);
-  dir.release_write_lock(waiter);
+  REQUIRE((gave_up || !kExpectGiveUp));
+  relay.stop();
+  REQUIRE(relay.lost() == 0);
   REQUIRE(dir.write_lock_value_for_test() == 0);
+
+  const auto next = dir.acquire_write_lock();
+  REQUIRE(next.acquired);
+  dir.release_write_lock(next);
+}
+
+TEST_CASE(
+    "Lock holder wait: a remove behind a live peer relaying the bucket gives "
+    "up within the cap, and never forces it",
+    "[mmap_directory][directory][concurrent][regression]") {
+  BudgetOverride budget(MmapDirectory::s_bucket_writer_budget_us_for_test,
+                        100ms);
+  MappedDir d;
+  const CacheKey key("bucket-relay-capped");
+  REQUIRE(d.dir.insert(key, 4096, 512));
+  const uint64_t recoveries =
+      MmapDirectory::s_bucket_recoveries_for_test.load();
+
+  Relay<uint32_t> relay(
+      [&] { return d.dir.begin_bucket_write_for_test(key); },
+      [&](uint32_t t) { return d.dir.bucket_version(key) == t + 1; },
+      [&](uint32_t t) { d.dir.end_bucket_write_for_test(key, t); });
+
+  bool gave_up = false;
+  for (int attempt = 0; attempt < kRelayAttempts && !gave_up; ++attempt) {
+    // A decoy tag at another offset: removing it changes nothing, so an
+    // attempt that catches a gap leaves the real entry in place.
+    bool busy = false;
+    const auto t0 = Clock::now();
+    const bool removed = d.dir.remove_at(key, 8192, &busy);
+    const auto waited = Clock::now() - t0;
+    CAPTURE(attempt, std::chrono::duration_cast<Ms>(waited).count(),
+            relay.holds());
+    REQUIRE_FALSE(removed);
+    REQUIRE(waited < MmapDirectory::kLockWaitCap + kCapMargin);
+    if (!busy) {
+      continue;  // Caught a gap: acquired fairly
+    }
+    REQUIRE(waited >= MmapDirectory::kLockWaitCap);
+    gave_up = true;
+  }
+  REQUIRE((gave_up || !kExpectGiveUp));
+  REQUIRE(MmapDirectory::s_bucket_recoveries_for_test.load() == recoveries);
+  relay.stop();
+  REQUIRE(relay.lost() == 0);
+  REQUIRE((d.dir.bucket_version(key) & 1) == 0);
+
+  bool busy = false;
+  REQUIRE(d.dir.remove_at(key, 4096, &busy));
+  REQUIRE_FALSE(busy);
+}
+
+TEST_CASE("Lock holder wait: a capped wait gives up only on changing holders",
+          "[directory][concurrent]") {
+  using Step = LockHolderWait::Step;
+  SECTION("holders that keep changing reach the cap") {
+    LockHolderWait wait(1s, 30ms);
+    const auto t0 = Clock::now();
+    uint64_t holder = 1;
+    auto switched = t0;
+    Step step = Step::kSpun;
+    while ((step = wait.wait(holder)) != Step::kGiveUp) {
+      REQUIRE(step != Step::kExpired);
+      REQUIRE(Clock::now() - t0 < 1s);
+      if (Clock::now() - switched >= 5ms) {
+        ++holder;
+        switched = Clock::now();
+      }
+    }
+    REQUIRE(Clock::now() - t0 >= 30ms);
+  }
+  SECTION("one holder that stays is governed by the budget alone") {
+    LockHolderWait wait(60ms, 10ms);
+    const auto t0 = Clock::now();
+    Step step = Step::kSpun;
+    while ((step = wait.wait(7)) != Step::kExpired) {
+      REQUIRE(step != Step::kGiveUp);
+    }
+    REQUIRE(Clock::now() - t0 >= 60ms);
+  }
 }
 
 TEST_CASE(

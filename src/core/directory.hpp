@@ -360,20 +360,35 @@ class SeqlockReadWait {
 // budget measures how long ONE holder has held the lock, not how long this
 // waiter has been queued, so a waiter that sat through several short
 // holders never presumes the latest one stuck.
+//
+// A capped wait (issue #27 review) also bounds how long the waiter queues
+// behind holders that keep CHANGING: once the holders it has seen come and
+// go add up to `cap`, wait() reports kGiveUp at the next change and the
+// caller abandons its operation as Busy -- it never takes the lock over on
+// the cap.  Time spent on the current holder does not count until that
+// holder goes, so a stuck holder is still governed by the per-holder budget
+// alone and a dead one is still recovered: the longest a capped wait lasts
+// is about cap + budget + kConfirmFor.  The locks are not fair (a peer that
+// re-acquires within nanoseconds wins against a sleeping waiter), and the
+// cap is what keeps such a peer from stalling a writer indefinitely.
 class LockHolderWait {
  public:
   enum class Step : uint8_t {
     kSpun,     // polled once more; attempt again
     kSlept,    // slept (and is now in a short spin window); attempt again
     kExpired,  // this holder has held the lock for the whole budget
+    kGiveUp,   // capped: changing holders kept the lock for the whole cap
   };
   static constexpr std::chrono::microseconds kSpinFor{20};
   static constexpr std::chrono::microseconds kWakeSpinFor{5};
   static constexpr std::chrono::microseconds kConfirmFor{2000};
   static constexpr uint32_t kPollsPerClockRead = 64;
 
-  explicit LockHolderWait(std::chrono::steady_clock::duration budget)
-      : _budget(budget) {}
+  // `cap` zero = uncapped (the caller cannot abandon its operation).
+  explicit LockHolderWait(std::chrono::steady_clock::duration budget,
+                          std::chrono::steady_clock::duration cap =
+                              std::chrono::steady_clock::duration::zero())
+      : _budget(budget), _cap(cap) {}
 
   // Call after an attempt found the lock held by `holder`.
   Step wait(uint64_t holder) {
@@ -389,7 +404,12 @@ class LockHolderWait {
 
   // The lock was seen free (the caller then lost the race for it): whoever
   // holds it next is a new holder.
-  void restart() { _started = false; }
+  void restart() {
+    if (_started) {
+      _changed += std::chrono::steady_clock::now() - _first_seen;
+    }
+    _started = false;
+  }
 
   // How long the current holder has been observed holding the lock.
   [[nodiscard]] std::chrono::steady_clock::duration held() const {
@@ -403,6 +423,14 @@ class LockHolderWait {
  private:
   CYCLONE_SEQLOCK_COLD Step new_holder(uint64_t holder) {
     const auto now = std::chrono::steady_clock::now();
+    if (_started) {
+      _changed += now - _first_seen;  // The previous holder went away
+    }
+    if (_cap != std::chrono::steady_clock::duration::zero() &&
+        _changed >= _cap) {
+      _started = false;
+      return Step::kGiveUp;
+    }
     _started = true;
     _confirming = false;
     _holder = holder;
@@ -438,6 +466,8 @@ class LockHolderWait {
   }
 
   std::chrono::steady_clock::duration _budget;
+  std::chrono::steady_clock::duration _cap;
+  std::chrono::steady_clock::duration _changed{};  // on holders that went
   bool _started = false;
   bool _confirming = false;
   uint64_t _holder = 0;

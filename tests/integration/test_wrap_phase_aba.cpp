@@ -2226,7 +2226,9 @@ void f6c_writer(MmapDirectory &dir, int fd, uint32_t writer_id,
                 uint64_t file_size, bool hold_across_pwrite,
                 std::span<std::byte> buf) {
   for (uint32_t seq = 0; seq < kF6cRecsPerWriter; ++seq) {
-    auto tok = dir.acquire_write_lock();
+    // Uncapped: this hammer uses the lock as a plain mutex and must not
+    // give up behind the other writer (issue #27's cap would report Busy).
+    auto tok = dir.acquire_write_lock(/*capped=*/false);
     uint64_t base = dir.get_shared_write_pos();
     if (base + kF6cRecSize > file_size) {
       dir.release_write_lock(tok);
