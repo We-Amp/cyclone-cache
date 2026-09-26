@@ -2062,7 +2062,17 @@ document written just before it, five runs
 [`write_then_read.cpp`](kv-cache-benchmark/small-reads/write_then_read.cpp)):
 3.61 µs per read with the guard against 3.55–3.58 with both hints off, and
 4.2 µs when a hint went out per read. Hints per 4000 reads: 265 with the
-guard (3734 skipped), 3719 without. Linux confirmation is pending.
+guard (3734 skipped), 3719 without.
+
+Linux, same tool on merged main, 15 interleaved runs: the same hint counts
+(265 hints, 3734 skipped). 7.83 µs per read with the hints on against 7.21
+with them off; the machine moves between about 7.1 and 8.1 µs from run to
+run, and the median paired difference is +0.21 µs (about 3 %). When the
+first read comes 1000 documents later, outside the recent-write window, it
+costs +0.4–0.6 µs per read, the resident sequential-run cost stated above.
+Two extra cold repetitions on main read 64 KiB at 2.71 and 2.72 GB/s (LMDB
+1.23 and 1.26 the same day), supporting that the 2.15 median above came from
+one slow-device run.
 
 ### 4 KB objects
 
