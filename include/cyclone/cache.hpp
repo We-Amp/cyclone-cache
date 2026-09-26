@@ -265,6 +265,10 @@ struct CacheStats {
   // PROCESS-LOCAL, appended at the tail; NOT mirrored in CycloneCacheStats.
   uint64_t cold_readahead_hints = 0;
   uint64_t sequential_readahead_hints = 0;
+  // CRC-pending reads that skipped the per-document hint because the
+  // document was written recently (ends within 4 MiB behind its stripe's
+  // write cursor) and so is almost certainly resident.  PROCESS-LOCAL.
+  uint64_t recent_write_hint_skips = 0;
 };
 
 // Thread-safe counters for stats updated from background threads (hit tracker).

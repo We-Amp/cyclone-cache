@@ -318,7 +318,11 @@ struct CacheConfig {
   // benchmark machine about 2 us for a 64 KiB document read out of order
   // (one madvise()), and in a sequential run one short mincore() per
   // window (4-7 % of a resident read); on macOS one F_RDADVISE, about
-  // 0.3 us.  With verification off the hint never fires.  Documents below this
+  // 0.3 us.  A document written recently (ending within 4 MiB behind its
+  // stripe's write cursor: the write-then-serve pattern of an optimized
+  // alternate) is taken as resident and skips the hint, with no syscall.
+  // With verification off the hint never fires, and small cold reads stay
+  // unhinted.  Documents below this
   // size are untouched: the 16 KiB default leaves one- to three-page HTTP
   // objects on the open-time MADV_RANDOM behaviour, with no hint and no
   // detector.

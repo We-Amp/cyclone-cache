@@ -328,9 +328,10 @@ hint per re-advise interval (2 s) however often it is read, and a document
 below `readahead_min_bytes` never contributes. On Linux a counted hint whose
 range is already fully resident stops at a `mincore()` check. Process-local.
 
-`cold_readahead_hints` and `sequential_readahead_hints` (appended at the tail
-of `CacheStats`, C++ only) count the hints issued on reads that ran the CRC
-pass (see ["Cold and Sequential Readahead"](#cold-and-sequential-readahead)
+`cold_readahead_hints`, `sequential_readahead_hints` and
+`recent_write_hint_skips` (appended at the tail of `CacheStats`, C++ only)
+count the hints issued on reads that ran the CRC pass, and the reads that
+skipped one as recently written (see ["Cold and Sequential Readahead"](#cold-and-sequential-readahead)
 below): a hint over one document below `readahead_min_bytes`, and a hint
 that extended past the document because the read continued a sequential run
 of its stripe. Process-local.
@@ -701,6 +702,8 @@ struct CacheConfig {
     // 0 = off).  Fluent setters: set_cold_readahead_min_bytes(),
     // set_sequential_readahead_bytes().  See "Cold and Sequential
     // Readahead" below.
+    // Both run only on checksum-verifying reads: with
+    // verify_checksum_on_read = false, small cold reads stay unhinted.
     size_t cold_readahead_min_bytes = 16 * 1024;
     size_t sequential_readahead_bytes = 1024 * 1024;
 };
@@ -1078,7 +1081,17 @@ pays nothing.
   64 KiB document read out of order (one `madvise()`), and in a sequential
   run one short `mincore()` per window (4–7 % of a resident read); on macOS
   one `F_RDADVISE`, about 0.3 µs.
-- With `verify_checksum_on_read = false` neither hint fires.
+- **Only checksum-verifying reads are hinted:** with
+  `verify_checksum_on_read = false` neither hint fires, and small cold reads
+  stay unhinted (one fault per page, as before).
+- **Recently written documents are skipped:** a first read of a document
+  that ends within 4 MiB behind its stripe's write cursor gets no hint
+  (it was just written and is resident; this is the write-then-serve
+  pattern of an optimized alternate), and a sequential run that catches up
+  with a writer still appending stops re-issuing its window. No syscall:
+  the cursor comes from the read's stripe snapshot. A cold read-back of
+  data the writer has finished with is unaffected.
+  `CacheStats::recent_write_hint_skips` counts these reads.
 - `CacheStats::cold_readahead_hints` and `sequential_readahead_hints` count
   the hints issued. Like the large-document hint, both are best-effort:
   no lock, no shared state besides the counters, errors ignored.

@@ -2040,6 +2040,30 @@ before every hint and without the cursor clamp or the resident-run probe,
 cost the sequential case 12–21 %. On macOS the same reads cost 0–3 %
 (below).
 
+### The first read after a write (added after review)
+
+The commonest resident CRC-pending read is the first read after a write:
+PageSpeed writes an optimized alternate and serves it on the next request.
+The change therefore skips the hint, with no syscall, when a
+non-sequential read's document ends within `kRecentWriteBytes` (4 MiB)
+behind its stripe's write cursor, and stops a sequential run's window when
+the run catches up with a writer that is still appending (the cursor moved
+since the run's last read, and what is left lies within 4 MiB behind it).
+4 MiB per stripe is 64 MiB across a 16-stripe volume of just-written pages,
+which only real memory pressure evicts; a wrong guess costs one document
+faulting in page by page, as before this change. A cold read-back of data
+nobody is appending to (every cold row above, where the cursor stands
+still) is unaffected: `kv_bench`'s hint counts are identical with and
+without the guard.
+
+macOS, 4000 puts of 64 KiB, each followed by the first read of the
+document written just before it, five runs
+([`small-reads-macos-write-then-read.txt`](kv-cache-benchmark/small-reads/small-reads-macos-write-then-read.txt),
+[`write_then_read.cpp`](kv-cache-benchmark/small-reads/write_then_read.cpp)):
+3.61 µs per read with the guard against 3.55–3.58 with both hints off, and
+4.2 µs when a hint went out per read. Hints per 4000 reads: 265 with the
+guard (3734 skipped), 3719 without. Linux confirmation is pending.
+
 ### 4 KB objects
 
 `performance_baseline --cache-size 512 --entries 5000 --content-size 4096`,

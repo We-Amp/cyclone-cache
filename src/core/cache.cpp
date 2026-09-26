@@ -1024,6 +1024,7 @@ CacheStats Cache::stats() const {
     result.readahead_hints_issued += vs.readahead_hints_issued;
     result.cold_readahead_hints += vs.cold_readahead_hints;
     result.sequential_readahead_hints += vs.sequential_readahead_hints;
+    result.recent_write_hint_skips += vs.recent_write_hint_skips;
 
     // Wrap-cadence telemetry: sum wrap counts; take the minimum interval
     // across volumes; last_* comes from the most recently wrapped volume.

@@ -1072,6 +1072,10 @@ struct VolumeStats {
   // is still counted.  PROCESS-LOCAL.
   uint64_t cold_readahead_hints = 0;
   uint64_t sequential_readahead_hints = 0;
+  // CRC-pending reads that skipped the per-document hint because the
+  // document ends within 4 MiB behind its stripe's write cursor (written
+  // recently, so almost certainly resident).  PROCESS-LOCAL.
+  uint64_t recent_write_hint_skips = 0;
 };
 
 class Volume;
@@ -2271,6 +2275,7 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // hint; declared last for the same reason as the counter above.
   std::atomic<uint64_t> _cold_readahead_hints{0};
   std::atomic<uint64_t> _sequential_readahead_hints{0};
+  std::atomic<uint64_t> _recent_write_hint_skips{0};
 };
 
 // Volume is always heap-allocated (make_shared).  Keep it small enough that a

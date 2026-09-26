@@ -1041,7 +1041,8 @@ int main(int argc, char *argv[]) {
       std::cerr << "        readahead hints issued so far: "
                 << st.readahead_hints_issued << " large, "
                 << st.cold_readahead_hints << " cold, "
-                << st.sequential_readahead_hints << " sequential (" << phase
+                << st.sequential_readahead_hints << " sequential, "
+                << st.recent_write_hint_skips << " skipped as recent (" << phase
                 << ")\n";
     };
     auto record = [&](Record r) {

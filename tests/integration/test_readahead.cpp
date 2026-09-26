@@ -444,6 +444,19 @@ std::vector<CacheKey> write_run(Cache& cache, const std::string& prefix,
   return keys;
 }
 
+// A document that ends within 4 MiB behind its stripe's write cursor counts
+// as recently written (resident) and gets no per-document hint on a
+// non-sequential read.  Writing this much filler afterwards into the SAME
+// stripe (a one-stripe cache) moves earlier documents out of that window,
+// so they are read the way a cold document is.
+void push_behind_cursor(Cache& cache) {
+  (void)write_run(cache, "readahead-filler-", 5, 1 * kMB + 4 * kKB);
+}
+
+uint64_t recent_skips(Cache& cache) {
+  return cache.stats().recent_write_hint_skips;
+}
+
 }  // namespace
 
 TEST_CASE("cold and sequential readahead config plumbing",
@@ -469,12 +482,16 @@ TEST_CASE("A small document is advised on its CRC-pending read only",
   CacheConfig cfg = readahead_config(std::nullopt);
   cfg.sequential_readahead_bytes = 0;
   TempCacheDir tmp("readahead_cold_small");
-  auto cache = make_cache(tmp, cfg);
+  auto cache = make_one_stripe_cache(tmp, cfg, kVolumeBytes);
 
   // 64 KiB: below the 256 KiB large-document threshold, above the 16 KiB
-  // cold threshold.
+  // cold threshold.  8 KiB: below the cold threshold.  Both written before
+  // the filler, so they are not "recently written" when read.
   const CacheKey key("readahead-cold-64k");
   write_doc(*cache, key, 64 * kKB, 12);
+  const CacheKey tiny("readahead-cold-8k");
+  write_doc(*cache, tiny, 8 * kKB, 13);
+  push_behind_cursor(*cache);
 
   // The first read runs the CRC pass: exactly one cold hint, and no
   // large-document hint.
@@ -491,8 +508,6 @@ TEST_CASE("A small document is advised on its CRC-pending read only",
   CHECK(seq_hints(*cache) == 0);
 
   // Below the cold threshold: no hint.
-  const CacheKey tiny("readahead-cold-8k");
-  write_doc(*cache, tiny, 8 * kKB, 13);
   REQUIRE(read_and_verify(*cache, tiny, 8 * kKB, 13));
   CHECK(cold_hints(*cache) == 1);
 
@@ -619,6 +634,65 @@ TEST_CASE("Each stripe keeps its own run when reads hop across stripes",
   CHECK(seq_hints(*cache) >= kDocs / 4);
 }
 
+TEST_CASE("A first read right after the write skips the per-document hint",
+          "[readahead][integration]") {
+  // PageSpeed's pattern: write an optimized alternate, serve it on the next
+  // request.  The document still sits within 4 MiB behind its stripe's
+  // write cursor, so it is taken as resident and the CRC-pending read pays
+  // no hint.  Once enough other data has been written after it, the same
+  // kind of read gets the hint again.
+  CacheConfig cfg = readahead_config(std::nullopt);
+  TempCacheDir tmp("readahead_recent");
+  auto cache = make_one_stripe_cache(tmp, cfg, kVolumeBytes);
+
+  // Scattered keys read in reverse, so none continues a sequential run.
+  const auto fresh = write_run(*cache, "readahead-fresh-", 8, 64 * kKB);
+  for (size_t i = fresh.size(); i-- > 0;) {
+    REQUIRE(
+        read_and_verify(*cache, fresh[i], 64 * kKB, static_cast<uint8_t>(i)));
+  }
+  CHECK(cold_hints(*cache) == 0);
+  CHECK(seq_hints(*cache) == 0);
+  CHECK(recent_skips(*cache) == fresh.size());
+
+  // Written, then pushed more than 4 MiB behind the cursor: hinted.
+  const auto old = write_run(*cache, "readahead-old-", 8, 64 * kKB);
+  push_behind_cursor(*cache);
+  const uint64_t skips = recent_skips(*cache);
+  for (size_t i = old.size(); i-- > 0;) {
+    REQUIRE(read_and_verify(*cache, old[i], 64 * kKB, static_cast<uint8_t>(i)));
+  }
+  CHECK(cold_hints(*cache) == old.size());
+  CHECK(recent_skips(*cache) == skips);
+}
+
+TEST_CASE("A run that chases a writer stops re-issuing its window",
+          "[readahead][integration]") {
+  // Write a document, read back the one written just before it, and so on:
+  // a sequential run whose write cursor moves on every read.  Everything
+  // between the reader and the cursor was just written, so the run must not
+  // re-issue a tiny hint up to the moving cursor on every read.
+  constexpr size_t kDocs = 64;
+  constexpr size_t kSize = 64 * kKB;
+  TempCacheDir tmp("readahead_chase");
+  auto cache =
+      make_one_stripe_cache(tmp, readahead_config(std::nullopt), kVolumeBytes);
+  std::vector<CacheKey> keys;
+  for (size_t i = 0; i < kDocs; ++i) {
+    keys.emplace_back("readahead-chase-" + std::to_string(i));
+    write_doc(*cache, keys.back(), kSize, static_cast<uint8_t>(i));
+    if (i > 0) {
+      REQUIRE(read_and_verify(*cache, keys[i - 1], kSize,
+                              static_cast<uint8_t>(i - 1)));
+    }
+  }
+  INFO("cold " << cold_hints(*cache) << ", sequential " << seq_hints(*cache)
+               << ", skipped " << recent_skips(*cache));
+  CHECK(cold_hints(*cache) == 0);
+  CHECK(seq_hints(*cache) <= 2);
+  CHECK(recent_skips(*cache) >= kDocs - 3);
+}
+
 TEST_CASE("A reverse-order read-back gets per-document hints only",
           "[readahead][integration]") {
   constexpr size_t kDocs = 32;
@@ -627,6 +701,7 @@ TEST_CASE("A reverse-order read-back gets per-document hints only",
   auto cache =
       make_one_stripe_cache(tmp, readahead_config(std::nullopt), kVolumeBytes);
   const auto keys = write_run(*cache, "readahead-rev-", kDocs, kSize);
+  push_behind_cursor(*cache);
   for (size_t i = kDocs; i-- > 0;) {
     REQUIRE(read_and_verify(*cache, keys[i], kSize, static_cast<uint8_t>(i)));
   }
@@ -643,6 +718,7 @@ TEST_CASE("sequential_readahead_bytes = 0 turns the window off",
   TempCacheDir tmp("readahead_seq_off");
   auto cache = make_one_stripe_cache(tmp, cfg, kVolumeBytes);
   const auto keys = write_run(*cache, "readahead-seqoff-", kDocs, kSize);
+  push_behind_cursor(*cache);
   for (size_t i = 0; i < kDocs; ++i) {
     REQUIRE(read_and_verify(*cache, keys[i], kSize, static_cast<uint8_t>(i)));
   }

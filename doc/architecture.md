@@ -561,8 +561,16 @@ which pays for a hint it did not need: on the Linux benchmark machine about
 issued without a `mincore()` check, which on pages the process has not yet
 mapped costs more than the `madvise()` itself), and in a sequential run one
 64 KiB `mincore()` per window once the run is known to be resident; on macOS
-one `F_RDADVISE`, about 0.3 µs. Documents below 16 KiB and reads with
-`verify_checksum_on_read` off are untouched.
+one `F_RDADVISE`, about 0.3 µs. The commonest such read is the first read
+after a write, e.g. PageSpeed serving an optimized alternate on the request
+after it wrote it, so that case skips the hint with no syscall: a
+non-sequential read of a document that ends within `kRecentWriteBytes`
+(4 MiB) behind its stripe's write cursor, taken from the read's snapshot, is
+treated as resident, and a sequential run that catches up with a writer
+still appending (the cursor moved since the run's last read, and what is
+left lies within 4 MiB behind it) stops re-issuing its window. A cold
+read-back of data nobody is appending to is unaffected. Documents below
+16 KiB and reads with `verify_checksum_on_read` off are untouched.
 
 The same switch covers one more cold path. After a restart with a cold page
 cache, the mmap directory itself is cold, and under `MADV_RANDOM` every first

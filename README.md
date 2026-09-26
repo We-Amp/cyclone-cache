@@ -527,6 +527,7 @@ struct CacheConfig {
   size_t       readahead_min_bytes = 256_KB;      // readahead hint for docs >= this; 0 = off
   size_t       cold_readahead_min_bytes = 16_KB;  // cold-read hint for docs >= this, first CRC pass only; 0 = off
   size_t       sequential_readahead_bytes = 1_MB;  // window past a doc on an in-order read-back; 0 = off
+  // Both hints run only on checksum-verifying reads: with verify_checksum_on_read = false, small cold reads stay unhinted.
   std::chrono::milliseconds directory_sync_interval{30000};  // multi-process durability cadence
   std::chrono::milliseconds read_lease_duration{5000};       // 0 disables leases
   std::chrono::milliseconds lease_wrap_ceiling{60000};

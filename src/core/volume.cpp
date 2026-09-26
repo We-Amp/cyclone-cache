@@ -2474,6 +2474,7 @@ struct SeqReadSlot {
   uint64_t next = 0;           // 8-aligned end of the last cold read
   uint64_t ahead = 0;          // end of what this run has already advised
   bool resident = false;       // the run's last window was all resident
+  uint64_t cursor = 0;         // the stripe's write cursor at the last read
 };
 constexpr size_t kSeqReadSlots = 64;
 // A read continues a run when it starts at most this far past the previous
@@ -2483,6 +2484,18 @@ constexpr uint64_t kSeqReadMaxGap = uint64_t{64} * 1024;
 // Once a run's window was found fully resident, later windows of the run
 // check only their first this-many bytes (see advise_cold_read).
 constexpr size_t kResidentProbeBytes = size_t{64} * 1024;
+// A document ending at most this far behind its stripe's write cursor was
+// written by the stripe's last few MiB of puts and is treated as resident:
+// a non-sequential CRC-pending read of it gets no per-document hint.  Why
+// 4 MiB per stripe: pwrite() leaves the pages in the page cache, and across
+// a volume the window is stripes x 4 MiB (64 MiB for 16 stripes), a sliver
+// of any machine's page cache, so those pages are evicted only under real
+// memory pressure; and it covers a write-then-read on the next request
+// unless the stripe took more than 4 MiB of other puts in between (a few
+// hundred small HTTP objects).  Wider would start to include pages that
+// may have been reclaimed; the cost of being wrong is a document faulting
+// in page by page, as before this change.
+constexpr uint64_t kRecentWriteBytes = uint64_t{4} * 1024 * 1024;
 thread_local std::array<SeqReadSlot, kSeqReadSlots> t_seq_read{};
 
 }  // namespace
@@ -2511,7 +2524,10 @@ void Volume::advise_cold_read(const Stripe* stripe, uint64_t cursor_rel,
   uint64_t lo = doc_advised ? doc_end : doc_offset;
   uint64_t hi = doc_wanted ? doc_end : lo;
   bool extended = false;
+  bool sequential = false;
+  bool recent_skip = false;  // a hint skipped as recently written
   SeqReadSlot* run = nullptr;
+  const uint64_t cursor = stripe->offset + cursor_rel;
 
   if (window != 0) {
     const size_t ordinal = stripe->index;
@@ -2519,9 +2535,9 @@ void Volume::advise_cold_read(const Stripe* stripe, uint64_t cursor_rel,
     const auto salt =
         static_cast<size_t>(reinterpret_cast<uintptr_t>(this) >> 6);
     SeqReadSlot& slot = t_seq_read[(ordinal + salt) % kSeqReadSlots];
-    const bool sequential =
-        slot.volume == this && slot.stripe_offset == stripe->offset &&
-        doc_offset >= slot.next && doc_offset - slot.next <= kSeqReadMaxGap;
+    sequential = slot.volume == this && slot.stripe_offset == stripe->offset &&
+                 doc_offset >= slot.next &&
+                 doc_offset - slot.next <= kSeqReadMaxGap;
     uint64_t ahead = sequential ? slot.ahead : 0;
     if (sequential && ahead < doc_end + window / 2) {
       // Re-issue once less than half a window is left ahead of this read,
@@ -2534,13 +2550,26 @@ void Volume::advise_cold_read(const Stripe* stripe, uint64_t cursor_rel,
       // measured before this clamp, the ends of the 16 runs cost resident
       // CRC-pending 64 KiB reads about 20 %.
       uint64_t run_end = stripe->offset + stripe->size;
-      const uint64_t cursor = stripe->offset + cursor_rel;
       if (doc_offset < cursor) {
         run_end = std::min(run_end, cursor);
       }
       const uint64_t want = std::min<uint64_t>(doc_end + window, run_end);
       lo = std::max(lo, ahead);
-      if (want > lo) {
+      // Caught up with a writer: the cursor moved since this run's last
+      // read and what is left to advise lies within kRecentWriteBytes behind
+      // it, i.e. the run is reading documents as fast as they are appended
+      // (a write-then-read loop).  Those were written by the stripe's last
+      // few MiB of puts and are resident, so the window stops there instead
+      // of re-issuing a tiny hint up to the moving cursor on every read.  A
+      // run over data that is no longer being appended to -- every cold
+      // read-back, where the cursor stands still -- is not affected.
+      const bool chasing_writer = doc_offset < cursor &&
+                                  cursor != slot.cursor &&
+                                  cursor - lo <= kRecentWriteBytes;
+      if (chasing_writer) {
+        lo = hi;
+        recent_skip = true;
+      } else if (want > lo) {
         hi = std::max(hi, want);
         extended = hi > doc_end;
       }
@@ -2551,12 +2580,34 @@ void Volume::advise_cold_read(const Stripe* stripe, uint64_t cursor_rel,
     }
     slot.volume = this;
     slot.stripe_offset = stripe->offset;
+    slot.cursor = cursor;
     slot.next = (doc_end + 7U) & ~uint64_t{7};
     slot.ahead = std::max({ahead, hi, doc_end});
     if (!sequential) {
       slot.resident = false;
     }
     run = &slot;
+  }
+
+  // Recently written, so almost certainly resident: a read that does not
+  // continue a sequential run skips its per-document hint when the document
+  // ends at most kRecentWriteBytes behind the stripe's write cursor.  That
+  // is the common first read after a write -- PageSpeed writes an optimized
+  // alternate and serves it on the next request -- which otherwise pays
+  // for a hint it cannot use (one madvise(), ~2 us on the Linux benchmark
+  // machine, for a resident 64 KiB document).  No syscall: the cursor comes
+  // from the read's stripe snapshot.  A sequential run is handled above (it
+  // stops only when it is chasing a writer, so a cold read-back of recent
+  // data keeps its window), and a document of the previous pass, ahead of
+  // the cursor, is never "recent".
+  if (!sequential && doc_offset < cursor &&
+      cursor - doc_end <= kRecentWriteBytes) {
+    recent_skip = true;
+    lo = hi;
+  }
+  if (recent_skip) {
+    _recent_write_hint_skips.fetch_add(1, std::memory_order_relaxed);
+    return;
   }
 
   hi = std::min<uint64_t>(hi, _mapped_file->file_size());
@@ -4224,6 +4275,8 @@ VolumeStats Volume::stats() const {
       _cold_readahead_hints.load(std::memory_order_relaxed);
   result.sequential_readahead_hints =
       _sequential_readahead_hints.load(std::memory_order_relaxed);
+  result.recent_write_hint_skips =
+      _recent_write_hint_skips.load(std::memory_order_relaxed);
 
   // Wrap-cadence telemetry. Count: process-local counter (non-mmap
   // stripes) plus the shared per-stripe counters (mmap stripes), so in
