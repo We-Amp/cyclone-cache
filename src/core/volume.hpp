@@ -436,6 +436,11 @@ struct Stripe {
   // Whether using mmap directory
   bool use_mmap_directory = false;
 
+  // Position of this stripe in its volume (0-based), fixed at creation.
+  // Keys the per-thread sequential-read detector (Volume::advise_cold_read);
+  // placed in the padding after the two bools above, so no hot member moves.
+  uint32_t index = 0;
+
   // Lease state for non-mmap (single-process) stripes: same
   // protocol as the shared header slot at offset 56, on a process-local
   // atomic.  Unused when use_mmap_directory (the shared slot is
@@ -1056,6 +1061,17 @@ struct VolumeStats {
   // process) a bucket whose holder died mid-update, until the owning
   // process's next write to that bucket recovers it.
   uint64_t directory_read_timeouts = 0;
+
+  // Readahead hints issued by advise_cold_read() (VolumeConfig::
+  // cold_readahead_min_bytes and sequential_readahead_bytes), on reads that
+  // ran the CRC pass.  cold_readahead_hints: a hint over one document below
+  // readahead_min_bytes.  sequential_readahead_hints: a hint that extended
+  // past the document because the read continued a sequential run of its
+  // stripe.  Like readahead_hints_issued these count hints issued: on Linux
+  // a range that is already fully resident stops at a mincore() check and
+  // is still counted.  PROCESS-LOCAL.
+  uint64_t cold_readahead_hints = 0;
+  uint64_t sequential_readahead_hints = 0;
 };
 
 class Volume;
@@ -1962,6 +1978,29 @@ class Volume : public std::enable_shared_from_this<Volume> {
   void maybe_advise_readahead(uint64_t doc_offset,
                               std::span<std::byte> region) noexcept;
 
+  // Cold-read readahead below readahead_min_bytes, and the sequential
+  // window past the document (VolumeConfig::cold_readahead_min_bytes,
+  // sequential_readahead_bytes).  Called ONLY on a read that is about to run
+  // the CRC pass -- the read that makes Cyclone's first touch of this
+  // incarnation's content -- after maybe_advise_readahead().  That gate is
+  // what keeps it off the warm path: a re-read whose checksum is already
+  // validated never calls it, so it needs no re-advise filter.
+  //
+  // CONCURRENCY: a pure hint, like maybe_advise_readahead.  Its only state is
+  // a thread_local detector (no shared cache line) and two relaxed counters
+  // at the tail of Volume, bumped when a hint is issued; the CRC-pending path
+  // it sits on already stores to the shared checksum-validation cache.
+  // `cursor_rel` is the write cursor of the read's stripe snapshot.
+  void advise_cold_read(const Stripe *stripe, uint64_t cursor_rel,
+                        uint64_t doc_offset, std::span<std::byte> doc) noexcept;
+
+  // One readahead hint over `region`, the mapping of the file range that
+  // starts at `file_offset`, with the platform split of
+  // maybe_advise_readahead (Darwin: the file range; Linux, Windows: the
+  // mapping).  No filter, errors ignored.  Used at open for an existing
+  // mmap directory region.
+  void advise_range(uint64_t file_offset, std::span<std::byte> region) noexcept;
+
   // Re-advise filter for the readahead hint.  The hint only pays for itself
   // when the range is NOT already resident: once it is, the madvise() still
   // walks every page, and on a warm 2 MiB view-mode read that walk cost
@@ -2226,6 +2265,12 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // see VolumeStats).  Touched only on that already-slow path.  Declared
   // LAST so adding it shifts no hot member's offset or cache-line layout.
   std::atomic<uint64_t> _directory_read_timeouts{0};
+
+  // Cold-read and sequential readahead hints issued (see VolumeStats and
+  // advise_cold_read).  Bumped only on a CRC-pending read that issued a
+  // hint; declared last for the same reason as the counter above.
+  std::atomic<uint64_t> _cold_readahead_hints{0};
+  std::atomic<uint64_t> _sequential_readahead_hints{0};
 };
 
 // Volume is always heap-allocated (make_shared).  Keep it small enough that a

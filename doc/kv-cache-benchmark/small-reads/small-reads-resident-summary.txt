@@ -1,0 +1,30 @@
+# Resident CRC-pending reads: the cold command WITHOUT dropping caches,
+# 64 KiB..1 MiB, so first touch and restart CRC-verify documents that are
+# in the page cache.  afterw0 = the change with the window off (every read
+# takes the per-document hint, as a non-sequential first read does).
+
+    64K put               -    T=1  after 1.31 [1.34 1.30 1.31]  afterw0 1.32 [1.31 1.33 1.32]  base 1.31 [1.31 1.42 1.30]  after/base 0.99
+    64K get_first_touch   view T=1  after 7.52 [7.48 7.52 7.58]  afterw0 6.54 [6.54 6.62 6.52]  base 8.06 [8.06 7.97 8.06]  after/base 0.93
+    64K get_warm          copy T=1  after 19.17 [19.25 18.69 19.17]  afterw0 19.31 [19.33 19.01 19.31]  base 19.03 [19.03 18.94 19.15]  after/base 1.01
+    64K get_warm          view T=1  after 2,088,468 [2,088,839 2,083,940 2,088,468]  afterw0 2,083,270 [2,083,270 2,080,477 2,090,580]  base 2,030,850 [2,019,852 2,030,850 2,031,479]  after/base 1.03
+    64K restart           view T=1  after 7.62 [7.62 7.64 7.60]  afterw0 6.64 [6.67 6.60 6.64]  base 8.10 [8.10 8.04 8.10]  after/base 0.94
+   128K put               -    T=1  after 1.51 [1.52 1.51 1.51]  afterw0 1.54 [1.52 1.56 1.54]  base 1.53 [1.53 1.50 1.55]  after/base 0.99
+   128K get_first_touch   view T=1  after 8.15 [8.15 8.10 8.17]  afterw0 7.27 [7.31 7.27 7.25]  base 8.68 [8.68 8.64 8.69]  after/base 0.94
+   128K get_warm          copy T=1  after 18.85 [19.09 18.52 18.85]  afterw0 18.80 [19.04 18.80 18.76]  base 18.61 [18.61 18.47 19.04]  after/base 1.01
+   128K get_warm          view T=1  after 1,758,907 [1,769,424 1,745,337 1,758,907]  afterw0 1,767,752 [1,767,752 1,767,589 1,768,612]  base 1,725,905 [1,725,905 1,720,848 1,745,710]  after/base 1.02
+   128K restart           view T=1  after 8.10 [8.10 8.00 8.19]  afterw0 7.20 [7.09 7.20 7.24]  base 8.63 [8.66 8.51 8.63]  after/base 0.94
+   256K put               -    T=1  after 1.59 [1.59 1.59 1.57]  afterw0 1.57 [1.57 1.58 1.56]  base 1.57 [1.57 1.57 1.59]  after/base 1.01
+   256K get_first_touch   view T=1  after 7.61 [7.63 7.61 7.61]  afterw0 7.91 [7.92 7.89 7.91]  base 7.93 [7.93 7.91 7.98]  after/base 0.96
+   256K get_warm          copy T=1  after 18.11 [18.12 18.11 17.70]  afterw0 17.98 [17.98 18.13 17.90]  base 18.02 [18.02 17.49 18.15]  after/base 1.00
+   256K get_warm          view T=1  after 1,165,165 [1,174,718 1,148,677 1,165,165]  afterw0 1,168,743 [1,175,966 1,165,614 1,168,743]  base 1,134,960 [1,134,960 1,128,340 1,147,435]  after/base 1.03
+   256K restart           view T=1  after 7.47 [7.45 7.49 7.47]  afterw0 7.77 [7.77 7.83 7.64]  base 7.80 [7.80 7.76 7.83]  after/base 0.96
+   512K put               -    T=1  after 1.62 [1.62 1.62 1.63]  afterw0 1.63 [1.62 1.63 1.63]  base 1.62 [1.61 1.63 1.62]  after/base 1.00
+   512K get_first_touch   view T=1  after 8.23 [8.23 8.28 8.18]  afterw0 8.62 [8.62 8.62 8.65]  base 8.60 [8.59 8.64 8.60]  after/base 0.96
+   512K get_warm          copy T=1  after 17.49 [17.62 17.41 17.49]  afterw0 17.37 [17.37 17.17 17.53]  base 17.16 [17.16 16.96 17.69]  after/base 1.02
+   512K get_warm          view T=1  after 792,557 [792,557 788,206 793,600]  afterw0 794,044 [793,582 794,044 797,989]  base 780,184 [774,001 780,184 783,170]  after/base 1.02
+   512K restart           view T=1  after 8.12 [8.10 8.12 8.15]  afterw0 8.48 [8.48 8.46 8.49]  base 8.49 [8.49 8.50 8.34]  after/base 0.96
+  1024K put               -    T=1  after 1.62 [1.62 1.61 1.62]  afterw0 1.62 [1.62 1.64 1.62]  base 1.62 [1.56 1.62 1.63]  after/base 1.00
+  1024K get_first_touch   view T=1  after 6.29 [6.29 8.64 6.05]  afterw0 6.86 [8.47 4.95 6.86]  base 6.62 [8.47 5.33 6.62]  after/base 0.95
+  1024K get_warm          copy T=1  after 13.57 [13.60 13.57 13.53]  afterw0 13.56 [13.52 13.61 13.56]  base 13.63 [13.67 13.54 13.63]  after/base 1.00
+  1024K get_warm          view T=1  after 476,131 [478,996 474,161 476,131]  afterw0 476,357 [471,598 476,357 477,645]  base 470,849 [470,206 472,459 470,849]  after/base 1.01
+  1024K restart           view T=1  after 8.75 [8.75 8.62 8.76]  afterw0 8.97 [8.97 8.97 8.98]  base 8.94 [8.94 8.99 8.91]  after/base 0.98

@@ -1,0 +1,15 @@
+Concurrent read scaling benchmark
+  entries=4000 content=65536B (working set ~250 MB, RAM-resident), seconds/point=2
+
+  volume=1024 MB (stripe floor 128MB => ~8 stripes)
+
+  wrap retention ON
+  RAM cache DISABLED (volume-only path, matches mps)
+ threads        reads/sec        vs 1T   scaling%
+       1          5830075        1.00x       100%
+       2          9670717        1.66x        83%
+       4         16448678        2.82x        71%
+       8         17950173        3.08x        38%
+      16         23047136        3.95x        25%
+
+(scaling% ~100 = linear scaling; collapsing scaling% = lock contention)

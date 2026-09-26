@@ -302,6 +302,53 @@ struct CacheConfig {
   // See doc/architecture.md ("Readahead policy") for the measurements.
   size_t readahead_min_bytes = 256_KB;
 
+  // Cold-read readahead (0 = off, and with it the sequential window below).
+  //
+  // A document at least this large and below readahead_min_bytes gets the
+  // same readahead hint over its own byte range, but only on a read that is
+  // about to run the CRC pass: verify_checksum_on_read is on, the document
+  // carries a checksum, and this incarnation has not been verified in this
+  // process yet (first read after a write, a restart, or an eviction from
+  // the checksum-validation cache).  That is the read that makes Cyclone's
+  // first content touch, and the one a cold document takes.  A warm
+  // re-read whose checksum is already validated never reaches the hint, so
+  // the warm path pays nothing for it: no clock read, no filter, no
+  // syscall.  A read that does run the CRC pass over a document that is
+  // already resident pays for a hint it did not need: on the Linux
+  // benchmark machine about 2 us for a 64 KiB document read out of order
+  // (one madvise()), and in a sequential run one short mincore() per
+  // window (4-7 % of a resident read); on macOS one F_RDADVISE, about
+  // 0.3 us.  With verification off the hint never fires.  Documents below this
+  // size are untouched: the 16 KiB default leaves one- to three-page HTTP
+  // objects on the open-time MADV_RANDOM behaviour, with no hint and no
+  // detector.
+  //
+  // Why this gate and not a lower readahead_min_bytes: the large-document
+  // hint runs on every read and relies on a per-document re-advise filter,
+  // whose collisions cost a syscall on warm reads that take under a
+  // microsecond at 64 KiB (measured 8-18 % slower warm view reads with the
+  // threshold at 64 KiB).  See doc/kv-cache-benchmark.md, "Small cold
+  // reads (issue #29)".
+  size_t cold_readahead_min_bytes = 16_KB;
+
+  // Sequential readahead window, in bytes (0 = off).
+  //
+  // On the same CRC-pending reads of documents of at least
+  // cold_readahead_min_bytes (any size above it, including those that take
+  // the large-document hint), a thread-local detector notes where each
+  // stripe's last read ended.  When a read starts at (or just past) that
+  // point -- one thread reading documents back in the order they were
+  // appended to that stripe, as a KV tier does when a prompt prefix is
+  // reused -- the hint is extended past the document by up to this many
+  // bytes of the same stripe, so the next documents are in flight before
+  // they are asked for.  The window is re-issued when less than half of it
+  // is left ahead of the reader.  Keys hash across stripes, so an
+  // insertion-order read-back alternates between them; the detector keeps
+  // one entry per stripe and each stripe gets its own window.  The state is
+  // per thread (no shared cache line) and is only a hint: a stale or
+  // colliding entry costs one extra or one missing hint.
+  size_t sequential_readahead_bytes = 1_MB;
+
   // Hit tracking
   std::chrono::milliseconds hit_flush_interval{
       1000};  // How often to flush hit counts to disk
@@ -511,6 +558,14 @@ struct CacheConfig {
     readahead_min_bytes = bytes;
     return *this;
   }
+  CacheConfig &set_cold_readahead_min_bytes(size_t bytes) {
+    cold_readahead_min_bytes = bytes;
+    return *this;
+  }
+  CacheConfig &set_sequential_readahead_bytes(size_t bytes) {
+    sequential_readahead_bytes = bytes;
+    return *this;
+  }
   CacheConfig &set_directory_sync_interval(std::chrono::milliseconds val) {
     directory_sync_interval = val;
     return *this;
@@ -584,6 +639,12 @@ struct VolumeConfig {
   // set from CacheConfig::readahead_min_bytes; see its documentation there
   // for the mechanism and why the open-time MADV_RANDOM stays.
   size_t readahead_min_bytes = 256_KB;
+
+  // Cold-read readahead below readahead_min_bytes, and the sequential
+  // readahead window (0 = off, each).  Normally set from the CacheConfig
+  // fields of the same names; see their documentation there.
+  size_t cold_readahead_min_bytes = 16_KB;
+  size_t sequential_readahead_bytes = 1_MB;
 
   // Version compatibility behavior
   // If true (default): automatically reset/purge cache on version mismatch

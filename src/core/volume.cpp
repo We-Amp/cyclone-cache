@@ -2282,6 +2282,7 @@ std::expected<void, CacheError> Volume::init_stripes(bool exclusive) {
     auto stripe = std::make_unique<Stripe>();
     stripe->offset = offset;
     stripe->size = stripe_size;
+    stripe->index = static_cast<uint32_t>(i);
     stripe->use_mmap_directory = use_mmap_dir;
 
     if (use_mmap_dir) {
@@ -2318,6 +2319,18 @@ std::expected<void, CacheError> Volume::init_stripes(bool exclusive) {
         stripe->mmap_directory = std::move(*new_dir);
       } else {
         stripe->mmap_directory = std::move(*mmap_dir);
+        // An existing directory may be entirely cold (a restart after the
+        // page cache was dropped or reclaimed).  Under the mapping's
+        // MADV_RANDOM every first lookup in a bucket then takes a serial
+        // 4 KiB major fault before the document read can even start --
+        // measured, that made a cold 64 KiB read after a restart 5x slower
+        // than the same read before it.  One readahead hint over the
+        // directory region (~0.7 MiB per stripe) at open turns those into a
+        // few large asynchronous reads.  A pure hint, errors ignored; off
+        // together with the cold-read hint (cold_readahead_min_bytes = 0).
+        if (_config.cold_readahead_min_bytes != 0) {
+          advise_range(offset, *dir_region);
+        }
       }
 
       // Data starts after directory, aligned to page size
@@ -2442,6 +2455,177 @@ void Volume::maybe_advise_readahead(uint64_t doc_offset,
     (void)_mapped_file->advise_willneed(region);
   }
   _readahead_hints.fetch_add(1, std::memory_order_relaxed);
+}
+
+namespace {
+
+// Per-thread sequential-read detector for Volume::advise_cold_read().  One
+// entry per (volume, stripe), direct-mapped: a stripe's index within its
+// volume plus a per-volume salt picks the slot, so the stripes of one volume
+// never collide with each other while there are at most kSeqReadSlots of
+// them.  Only ever compared, never dereferenced: a stale entry (a destroyed
+// volume whose address was reused, a collision between two volumes) reads as
+// "not sequential" or at worst costs one extra hint.  thread_local, so the
+// detector adds no shared cache line to the read path (invariant 6), and it
+// is only touched on a CRC-pending read.
+struct SeqReadSlot {
+  const void* volume = nullptr;
+  uint64_t stripe_offset = 0;  // which stripe of `volume`
+  uint64_t next = 0;           // 8-aligned end of the last cold read
+  uint64_t ahead = 0;          // end of what this run has already advised
+  bool resident = false;       // the run's last window was all resident
+};
+constexpr size_t kSeqReadSlots = 64;
+// A read continues a run when it starts at most this far past the previous
+// read's end: documents this reader never asks for (another sequence's
+// blocks appended in between) do not break the run.
+constexpr uint64_t kSeqReadMaxGap = uint64_t{64} * 1024;
+// Once a run's window was found fully resident, later windows of the run
+// check only their first this-many bytes (see advise_cold_read).
+constexpr size_t kResidentProbeBytes = size_t{64} * 1024;
+thread_local std::array<SeqReadSlot, kSeqReadSlots> t_seq_read{};
+
+}  // namespace
+
+void Volume::advise_cold_read(const Stripe* stripe, uint64_t cursor_rel,
+                              uint64_t doc_offset,
+                              std::span<std::byte> doc) noexcept {
+  // Below cold_readahead_min_bytes (and with it 0) nothing changes: one- to
+  // three-page HTTP objects keep the open-time MADV_RANDOM behaviour, with
+  // no hint and no detector, exactly as before.
+  const size_t small_min = _config.cold_readahead_min_bytes;
+  const size_t len = doc.size();
+  if (small_min == 0 || len < small_min || stripe == nullptr || !_mapped_file) {
+    return;
+  }
+  const size_t window = _config.sequential_readahead_bytes;
+  const uint64_t doc_end = doc_offset + len;
+  // The large-document hint (maybe_advise_readahead) already covered the
+  // document itself; this one then only adds the window past it.
+  const size_t large_min = _config.readahead_min_bytes;
+  const bool doc_advised = large_min != 0 && len >= large_min;
+  const bool doc_wanted = !doc_advised;
+
+  // [lo, hi): the file range to advise.  Empty unless the document wants
+  // its own hint, or the detector extends it.
+  uint64_t lo = doc_advised ? doc_end : doc_offset;
+  uint64_t hi = doc_wanted ? doc_end : lo;
+  bool extended = false;
+  SeqReadSlot* run = nullptr;
+
+  if (window != 0) {
+    const size_t ordinal = stripe->index;
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    const auto salt =
+        static_cast<size_t>(reinterpret_cast<uintptr_t>(this) >> 6);
+    SeqReadSlot& slot = t_seq_read[(ordinal + salt) % kSeqReadSlots];
+    const bool sequential =
+        slot.volume == this && slot.stripe_offset == stripe->offset &&
+        doc_offset >= slot.next && doc_offset - slot.next <= kSeqReadMaxGap;
+    uint64_t ahead = sequential ? slot.ahead : 0;
+    if (sequential && ahead < doc_end + window / 2) {
+      // Re-issue once less than half a window is left ahead of this read,
+      // so the next documents are in flight before they are asked for.
+      // Never past the stripe (the next stripe is another log), and, for a
+      // document behind the write cursor, never past the cursor: the run
+      // continues in the current pass, and beyond the cursor is either
+      // space not yet written or the previous pass in another order.  A
+      // hint there still pays page setup for pages no read wants --
+      // measured before this clamp, the ends of the 16 runs cost resident
+      // CRC-pending 64 KiB reads about 20 %.
+      uint64_t run_end = stripe->offset + stripe->size;
+      const uint64_t cursor = stripe->offset + cursor_rel;
+      if (doc_offset < cursor) {
+        run_end = std::min(run_end, cursor);
+      }
+      const uint64_t want = std::min<uint64_t>(doc_end + window, run_end);
+      lo = std::max(lo, ahead);
+      if (want > lo) {
+        hi = std::max(hi, want);
+        extended = hi > doc_end;
+      }
+    } else if (sequential) {
+      // Still well inside the window: an earlier hint of the run covered
+      // this document.
+      lo = hi;
+    }
+    slot.volume = this;
+    slot.stripe_offset = stripe->offset;
+    slot.next = (doc_end + 7U) & ~uint64_t{7};
+    slot.ahead = std::max({ahead, hi, doc_end});
+    if (!sequential) {
+      slot.resident = false;
+    }
+    run = &slot;
+  }
+
+  hi = std::min<uint64_t>(hi, _mapped_file->file_size());
+  if (hi <= lo) {
+    return;
+  }
+  // Same platform split as maybe_advise_readahead: Darwin advises the FILE
+  // range (F_RDADVISE, ~0.3 us on a resident range on an M5), Linux and
+  // Windows the mapping.
+  const auto length = static_cast<size_t>(hi - lo);
+  if (_mapped_file->supports_advise_readahead()) {
+    (void)_mapped_file->advise_readahead(lo, length);
+  } else if (const std::byte* base = _mapped_file->persistent_base()) {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
+    const std::span<std::byte> range(const_cast<std::byte*>(base) + lo, length);
+    // No residency check before a hint: on pages this process has not
+    // mapped yet -- which is what a CRC-pending read touches -- mincore() is
+    // dearer than the madvise() it would save (16 pages: 1.6 against
+    // 1.0 us, measured), and a cold range needs the hint anyway.  The
+    // exception is a window of a resident run (documents read back soon
+    // after they were written, or after a restart with a warm page cache),
+    // where every window would be advised for nothing: once a full check
+    // found one window of the run all resident, the next windows check
+    // their first 64 KiB only and are skipped while that stays resident.  A
+    // window resident at its head but not beyond then goes unadvised, and
+    // its missing pages fault in one at a time until the run's next window;
+    // the run drops back to full checks as soon as a head check misses.
+    if (extended && run != nullptr) {
+      if (run->resident) {
+        if (_mapped_file->range_resident(
+                range.first(std::min(length, kResidentProbeBytes)))) {
+          _sequential_readahead_hints.fetch_add(1, std::memory_order_relaxed);
+          return;
+        }
+        run->resident = false;
+      } else if (_mapped_file->range_resident(range)) {
+        run->resident = true;
+        _sequential_readahead_hints.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+    }
+    (void)_mapped_file->advise_willneed_unchecked(range);
+  } else {
+    // No whole-file mapping: only the document's own range is addressable.
+    const uint64_t doc_hi = std::min(hi, doc_end);
+    if (lo < doc_offset || doc_hi <= lo) {
+      return;
+    }
+    (void)_mapped_file->advise_willneed_unchecked(
+        doc.subspan(static_cast<size_t>(lo - doc_offset),
+                    static_cast<size_t>(doc_hi - lo)));
+  }
+  if (extended) {
+    _sequential_readahead_hints.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    _cold_readahead_hints.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void Volume::advise_range(uint64_t file_offset,
+                          std::span<std::byte> region) noexcept {
+  if (!_mapped_file || region.empty()) {
+    return;
+  }
+  if (_mapped_file->supports_advise_readahead()) {
+    (void)_mapped_file->advise_readahead(file_offset, region.size());
+  } else {
+    (void)_mapped_file->advise_willneed(region);
+  }
 }
 
 uint32_t Volume::readahead_tick() noexcept {
@@ -2662,30 +2846,36 @@ std::expected<ReadHandle, CacheError> Volume::read_sync(const CacheKey& key) {
           // does not participate in the reader protocols (see
           // maybe_advise_readahead).  Advise exactly the document, never the
           // slack a coarse approx_size mapping may carry past its end.
-          maybe_advise_readahead(doc_offset,
-                                 mapped->first(std::min<size_t>(
-                                     mapped->size(), reader.document().len)));
+          const std::span<std::byte> doc_span = mapped->first(
+              std::min<size_t>(mapped->size(), reader.document().len));
+          maybe_advise_readahead(doc_offset, doc_span);
 
           // Verify checksum to detect corruption or torn reads.  Skip it only
           // if this exact incarnation -- the token of the header just read
           // and key-verified above -- already passed in this process (see
           // _checksum_cache).  NOT the overwrite guard: the wrap-epoch
           // revalidation below is.
+          uint64_t token = 0;
+          bool crc_pending = false;
           if (_config.verify_checksum_on_read &&
               reader.document().checksum != 0) {
-            const uint64_t token =
-                checksum_token(doc_offset, reader.document());
-            if (!is_checksum_validated(doc_offset, token)) {
+            token = checksum_token(doc_offset, reader.document());
+            crc_pending = !is_checksum_validated(doc_offset, token);
+          }
+          if (crc_pending) {
+            // Cold-read and sequential readahead: only on the read that
+            // makes the first content touch (see advise_cold_read).  A
+            // validated warm re-read never gets here.
+            advise_cold_read(stripe, snap.cursor_rel, doc_offset, doc_span);
 #ifdef CYCLONE_TEST_SEAMS
-              reader_seam(ReaderSeam::kCrcVerify);
+            reader_seam(ReaderSeam::kCrcVerify);
 #endif
-              if (!reader.document().verify_checksum(reader.payload())) {
-                _mapped_file->unmap_region(*mapped);
-                checksum_failed = true;
-                return true;  // Continue to next candidate
-              }
-              mark_checksum_validated(doc_offset, token);
+            if (!reader.document().verify_checksum(reader.payload())) {
+              _mapped_file->unmap_region(*mapped);
+              checksum_failed = true;
+              return true;  // Continue to next candidate
             }
+            mark_checksum_validated(doc_offset, token);
           }
 
           // Lease protocol + register the borrow (count+1) and stamp the
@@ -4030,6 +4220,10 @@ VolumeStats Volume::stats() const {
   result.directory_syncs = _directory_syncs.load();
   result.fsyncs = _fsyncs.load();
   result.readahead_hints_issued = _readahead_hints.load();
+  result.cold_readahead_hints =
+      _cold_readahead_hints.load(std::memory_order_relaxed);
+  result.sequential_readahead_hints =
+      _sequential_readahead_hints.load(std::memory_order_relaxed);
 
   // Wrap-cadence telemetry. Count: process-local counter (non-mmap
   // stripes) plus the shared per-stripe counters (mmap stripes), so in
@@ -6202,31 +6396,36 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
           // placement rule as read_sync(): the key has been re-verified, the
           // byte range is known, and the CRC pass below is the first content
           // touch.  See maybe_advise_readahead().
-          maybe_advise_readahead(
-              selected_offset,
+          const std::span<std::byte> selected_span =
               selected_mapped->first(std::min<size_t>(
-                  selected_mapped->size(), selected_reader.document().len)));
+                  selected_mapped->size(), selected_reader.document().len));
+          maybe_advise_readahead(selected_offset, selected_span);
 
           // Verify checksum of selected alternate.  Skip it only if this
           // exact incarnation -- the token of the header just read and
           // key-verified above -- already passed in this process.
+          uint64_t token = 0;
+          bool crc_pending = false;
           if (_config.verify_checksum_on_read &&
               selected_reader.document().checksum != 0) {
-            const uint64_t token =
-                checksum_token(selected_offset, selected_reader.document());
-            if (!is_checksum_validated(selected_offset, token)) {
+            token = checksum_token(selected_offset, selected_reader.document());
+            crc_pending = !is_checksum_validated(selected_offset, token);
+          }
+          if (crc_pending) {
+            // Same cold-read placement as read_sync().
+            advise_cold_read(stripe, snap.cursor_rel, selected_offset,
+                             selected_span);
 #ifdef CYCLONE_TEST_SEAMS
-              reader_seam(ReaderSeam::kCrcVerify);
+            reader_seam(ReaderSeam::kCrcVerify);
 #endif
-              if (!selected_reader.document().verify_checksum(
-                      selected_reader.payload())) {
-                _mapped_file->unmap_region(*selected_mapped);
-                _mapped_file->unmap_region(*mapped);
-                checksum_failed = true;
-                return false;
-              }
-              mark_checksum_validated(selected_offset, token);
+            if (!selected_reader.document().verify_checksum(
+                    selected_reader.payload())) {
+              _mapped_file->unmap_region(*selected_mapped);
+              _mapped_file->unmap_region(*mapped);
+              checksum_failed = true;
+              return false;
             }
+            mark_checksum_validated(selected_offset, token);
           }
 
           // Lease protocol + register the borrow (count+1) and stamp the

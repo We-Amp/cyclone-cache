@@ -286,9 +286,11 @@ struct Options {
   bool skip_multiprocess = false;
   std::string output;
   std::string path;
-  int64_t readahead_min_bytes = -1;  // -1 = library default
-  double pause_before_warm = 0.0;    // seconds to sleep before phase 3
-  std::string drop_caches_cmd;       // run before phases 2 and 4 (e.g. Linux
+  int64_t readahead_min_bytes = -1;         // -1 = library default
+  int64_t cold_readahead_min_bytes = -1;    // -1 = library default
+  int64_t sequential_readahead_bytes = -1;  // -1 = library default
+  double pause_before_warm = 0.0;           // seconds to sleep before phase 3
+  std::string drop_caches_cmd;  // run before phases 2 and 4 (e.g. Linux
                                 // "sync; echo 3 > /proc/sys/vm/drop_caches")
 };
 
@@ -360,6 +362,14 @@ CacheConfig make_config(const Options &opts) {
   config.max_object_size = 0;
   if (opts.readahead_min_bytes >= 0) {
     config.readahead_min_bytes = static_cast<size_t>(opts.readahead_min_bytes);
+  }
+  if (opts.cold_readahead_min_bytes >= 0) {
+    config.cold_readahead_min_bytes =
+        static_cast<size_t>(opts.cold_readahead_min_bytes);
+  }
+  if (opts.sequential_readahead_bytes >= 0) {
+    config.sequential_readahead_bytes =
+        static_cast<size_t>(opts.sequential_readahead_bytes);
   }
   config.enable_checksum = true;
   config.verify_checksum_on_read = !opts.no_verify;
@@ -804,6 +814,13 @@ void print_usage(const char *argv0) {
       << "  --readahead-min-bytes N  Override "
          "CacheConfig::readahead_min_bytes\n"
       << "                        (0 = no readahead hints)\n"
+      << "  --cold-readahead-min-bytes N  Override "
+         "CacheConfig::cold_readahead_min_bytes\n"
+      << "                        (0 = no cold-read hint below the "
+         "threshold)\n"
+      << "  --sequential-readahead-bytes N  Override "
+         "CacheConfig::sequential_readahead_bytes\n"
+      << "                        (0 = no sequential window)\n"
       << "  --pause-before-warm S Sleep S seconds before phase 3\n"
       << "  --drop-caches-cmd CMD Shell command run before phases 2 and 4\n"
       << "                        (e.g. \"sync; echo 3 > /proc/sys/vm/"
@@ -889,6 +906,10 @@ int main(int argc, char *argv[]) {
       opts.path = argv[++i];
     } else if (arg == "--readahead-min-bytes" && i + 1 < argc) {
       opts.readahead_min_bytes = std::stoll(argv[++i]);
+    } else if (arg == "--cold-readahead-min-bytes" && i + 1 < argc) {
+      opts.cold_readahead_min_bytes = std::stoll(argv[++i]);
+    } else if (arg == "--sequential-readahead-bytes" && i + 1 < argc) {
+      opts.sequential_readahead_bytes = std::stoll(argv[++i]);
     } else if (arg == "--pause-before-warm" && i + 1 < argc) {
       opts.pause_before_warm = std::stod(argv[++i]);
     } else if (arg == "--drop-caches-cmd" && i + 1 < argc) {
@@ -1016,8 +1037,11 @@ int main(int argc, char *argv[]) {
     // CacheStats::readahead_hints_issued), so a phase whose hints silently
     // stop firing is visible without a profiler.
     auto hints_note = [&](const char *phase) {
+      const auto st = cache->stats();
       std::cerr << "        readahead hints issued so far: "
-                << cache->stats().readahead_hints_issued << " (" << phase
+                << st.readahead_hints_issued << " large, "
+                << st.cold_readahead_hints << " cold, "
+                << st.sequential_readahead_hints << " sequential (" << phase
                 << ")\n";
     };
     auto record = [&](Record r) {

@@ -48,7 +48,12 @@ Where Cyclone stands now (round 6, Linux, same-day peers):
   2.73), 1.32× at 512 KiB (1.70 against 2.25), 1.5× at 1 MiB and 1.9× at
   256 KiB. Below the 256 KiB readahead threshold it is far behind (64 KiB:
   0.04 against 1.61 GB/s, issue #29). The checksum is verified in every
-  case.
+  case. **Since round 6** ([small cold reads](#small-cold-reads-issue-29)):
+  cold-read and sequential readahead put Cyclone ahead of a same-day LMDB at
+  every size from 64 KiB to 32 MiB (64 KiB 2.15–2.63 against 1.42 GB/s,
+  512 KiB 2.93 against 1.70), with warm reads unchanged; LMDB read 12–27 %
+  below its round-6 rates that day, and Cyclone is ahead of those too except
+  at 2 MiB, where they tie.
 - **Writes:** faster than round 5 at every size (×1.25–2.1). Against a
   same-day file-per-block, Cyclone is ahead at 512 KiB (1.62 against 1.38
   GB/s) and level at 2 MiB (1.47 against 1.52). It is behind at 8 MiB
@@ -86,6 +91,7 @@ Where Cyclone stands now (round 6, Linux, same-day peers):
 | Cold restart GET, Linux | 2.08 GB/s | LMDB 2.71, filedir 1.77, RocksDB 0.83 | [6](#round-6-re-benchmark-at-main-b5c31e8) |
 | Cold first-touch, 512 KiB / 8 MiB / 32 MiB, Linux | 1.70 / 3.00 / 3.39 GB/s | LMDB 2.25 / 2.76 / 2.76 | [6](#round-6-re-benchmark-at-main-b5c31e8) |
 | Cold first-touch, 64 KiB / 256 KiB, Linux | 0.04 / 1.12 GB/s | LMDB 1.61 / 2.11 | [6](#cold-reads-from-64-kib-to-32-mib-issue-29-baseline) |
+| Cold first-touch, 64 KiB / 256 KiB / 512 KiB, Linux, after #29 | 2.15 / 2.69 / 2.93 GB/s | LMDB 1.42 / 1.60 / 1.70 (same day) | [#29](#small-cold-reads-issue-29) |
 | PUT, 1 thread, Linux, 512 KiB / 2 MiB / 32 MiB | 1.62 / 1.47 / 0.88 GB/s | filedir 1.38 / 1.52 / 1.41, RocksDB 0.52 / 0.44 / 0.41 | [6](#round-6-re-benchmark-at-main-b5c31e8) |
 | 4 reader processes, `view`, Linux | 743 k gets/s | LMDB 613 k | [6](#round-6-re-benchmark-at-main-b5c31e8) |
 | Churn, `zipf`, 4 threads, retention on: hit ratio / served / hit p99 | 0.814 / 2.40 GB/s / 29.9 ms | LMDB 0.850 / 1.94 / 67.0 ms; filedir 0.849 / 2.16 / 38.4 ms | [6](#churn-linux-2-mib-c--16-gib-4-gib-cgroup) |
@@ -1801,6 +1807,282 @@ that is still readable.
   reads 1.3–1.9× behind LMDB from 256 KiB to 1 MiB, and 40× behind at
   64 KiB.
 
+## Small cold reads (issue #29)
+
+> 2026-09-26, Linux machine, plus a warm-path check on macOS. main 775af03
+> against the change. The cold, resident and 4 KB rows are its final code
+> (built at b76d481). The warm rows and a second cold set are an earlier
+> build (171a48f: before the write-cursor clamp, the resident-run probe and
+> the unchecked hint, which only change what a CRC-pending read of a
+> resident document costs), and the window sweep an earlier one still
+> (6c060e9). Same-day LMDB. Raw data, per-run samples, logs and every script
+> are in [`kv-cache-benchmark/small-reads/`](kv-cache-benchmark/small-reads/).
+
+The readahead section and round 6 left two gaps. Below the 256 KiB
+large-document threshold there was no readahead hint at all, and a cold
+64 KiB read ran at 0.04 GB/s against LMDB's 1.61 (round 6). Above it,
+`kv_bench` reads blocks back in insertion order, which is sequential on disk
+for LMDB but hops across 16 stripes for Cyclone (512 KiB: 1.69 against 2.19).
+
+### Why 64 KiB was 40× behind
+
+A cold 64 KiB get took 1.71 ms at the median on main, against LMDB's 32 µs
+([`small-reads-cold-summary.txt`](kv-cache-benchmark/small-reads/small-reads-cold-summary.txt)
+and the per-run JSONL). That is 16 page faults of about 107 µs each, one
+after the other. The volume mapping is advised `MADV_RANDOM` at open, and on
+Linux that turns off fault readaround: each fault reads one 4 KiB page,
+synchronously. LMDB maps its file with the default policy, so a fault reads
+128 KiB around the faulting page (`read_ahead_kb`) and arms asynchronous
+readahead further on; its reads stream ahead of the gets.
+
+Two measurements confirm it. main with the open-time `MADV_RANDOM` removed
+and nothing else changed reads cold 64 KiB at 2.40 GB/s and 128 KiB at 2.04
+([`small-reads-normal-summary.txt`](kv-cache-benchmark/small-reads/small-reads-normal-summary.txt)).
+And a per-document hint alone, the change below with its sequential window
+off, reads 64 KiB at only 0.23 GB/s (p50 263 µs): one 64 KiB read per
+document goes out when that document is asked for, and nothing is in flight
+ahead of it. The #28 experiment of lowering `readahead_min_bytes` to 64 KiB
+got the same 0.24. A per-document hint cannot close this gap; reading ahead
+across documents can.
+
+The #28 experiment also cost warm `view` reads 8–18 %. That came from
+running the large-document hint on every read: each get read the clock and
+probed the re-advise filter, and the filter's collisions (4096 documents in
+8192 direct-mapped slots, under a Zipf load) sent a share of warm gets into
+a `mincore()` call, on a read that otherwise takes 0.4–0.5 µs. A cheaper
+residency check does not fix that shape: any per-read call is a large share
+of a sub-microsecond read.
+
+### Stripe interleaving is a real pattern
+
+`kv_bench` reads blocks back in the order it wrote them. That is the order a
+KV tier sees when a prompt prefix is reused: the prefix's blocks were written
+in order when the sequence was first computed, and are read back in the same
+order. Their keys are hashes, so consecutive blocks land on different
+stripes, but each stripe's share of them sits back to back in that stripe's
+log. So the pattern is real, and it is sequential per stripe. Changing
+placement (keeping a sequence's blocks in one stripe) would need the caller
+to name the sequence, and would give up the hash spread that keeps stripes
+evenly loaded. Predicting *which* stripe comes next would need the next key,
+which only the caller has. A per-stripe window needs neither: it reads ahead
+in each stripe on its own, and with 16 stripes that keeps up to 16 windows
+in flight at once.
+
+### The change
+
+`Volume::advise_cold_read` runs on one kind of read only: a read that is
+about to run the CRC pass, because this incarnation of the document has not
+been verified in this process yet (the first read after a write, after a
+restart, or after the offset fell out of the checksum-validation cache).
+That is the read that makes Cyclone's first touch of the content, and the
+one a cold document takes. A validated warm re-read never reaches it, so it
+needs no filter, reads no clock and costs the warm path nothing. On that
+read, for documents of at least `CacheConfig::cold_readahead_min_bytes`
+(16 KiB):
+
+1. **Cold hint.** A document below `readahead_min_bytes` gets the
+   per-platform readahead hint over its own range.
+2. **Sequential window.** A thread-local detector keeps, per stripe, where
+   the last read ended. A read that starts there, or up to 64 KiB past it,
+   continues the run, and the hint is extended by
+   `CacheConfig::sequential_readahead_bytes` (1 MiB) past the document,
+   within the stripe and never past its write cursor. It is re-issued once
+   less than half of the window is left ahead of the reader, so a run of
+   64 KiB documents issues one hint per 8 of them. The detector is indexed
+   by the stripe's position in its volume, so the stripes of one volume
+   never share a slot.
+3. **Directory hint at open.** After a restart with a cold page cache, the
+   mmap directory is cold too, and each first lookup in a bucket took a
+   serial 4 KiB fault before the document read could start. With the first
+   two parts in place, cold 64 KiB reads after a restart still ran at 0.49
+   GB/s against 2.46 before it. `Volume::open` now issues one readahead hint
+   over each existing stripe directory (about 0.7 MiB per stripe).
+
+On Linux the hints go out without a residency check. On pages the process
+has not mapped yet, which is what a CRC-pending read touches, `mincore()`
+costs more than the `madvise()` it would save: 1.6 against 1.0 µs for 16
+pages, 12.6 against 7.7 µs for 256, measured on this machine. The exception
+is a window of a run that is already resident (documents read back soon
+after they were written, or after a restart with a warm page cache): once a
+full check finds one window of the run all resident, the next windows check
+only their first 64 KiB and are skipped while that holds.
+
+Documents below 16 KiB, and every read with `verify_checksum_on_read` off,
+behave exactly as before. `cold_readahead_min_bytes = 0` turns all three
+parts off; `sequential_readahead_bytes = 0` turns off the window only.
+`CacheStats::cold_readahead_hints` and `sequential_readahead_hints` count the
+hints issued.
+
+The options in the issue, and what became of them:
+
+- **A cheaper residency check for small documents.** Replaced by the CRC
+  gate, which needs no call on a warm read at all.
+- **A per-stripe sequential detector.** Taken (part 2), per thread, so it
+  adds no shared cache line to the read path.
+- **The mapping-wide policy.** Measured, not taken. `MADV_NORMAL` on main
+  reads 64 KiB and 128 KiB cold at 2.40 and 2.04 GB/s with no code, but
+  does nothing for larger documents (256 KiB 1.04, 512 KiB 1.57, 1 MiB
+  1.67, about main's rates), and it turns every cold miss of a small HTTP
+  object into a 128 KiB read until the kernel's per-file miss heuristic
+  switches readaround off. The change gets more at every size, keeps
+  `MADV_RANDOM` for everything else, and works the same way on macOS and
+  Windows.
+- **A `pread` fallback for cold small reads.** Not done. `read_sync` returns
+  a view into the mapping; a read into a private buffer would need a copy
+  and a different handle, and a synchronous read of one document is the
+  0.23 GB/s case again.
+
+### Choosing the window
+
+Cold first touch (restart in parentheses), GB/s, median of three runs per
+window, one binary (6c060e9)
+([`small-reads-ablate-summary.txt`](kv-cache-benchmark/small-reads/small-reads-ablate-summary.txt)):
+
+| window | 64 KiB | 128 KiB | 256 KiB | 512 KiB | 1 MiB |
+|---|---:|---:|---:|---:|---:|
+| 0 (cold hint only) | 0.23 (0.23) | 0.50 (0.48) | 1.09 (1.09) | 1.61 (1.59) | 1.52 (1.56) |
+| 256 KiB | 2.44 (2.40) | 2.51 (2.48) | 2.24 (2.23) | 2.05 (1.97) | 1.72 (1.76) |
+| 512 KiB | 2.63 (2.58) | 2.49 (2.73) | 2.70 (2.55) | 2.69 (2.73) | 1.87 (1.86) |
+| **1 MiB** | **2.63 (2.58)** | **2.80 (2.86)** | **2.76 (2.77)** | **2.96 (2.93)** | **3.03 (3.00)** |
+| 2 MiB | 2.58 (2.53) | 2.84 (2.84) | 2.91 (2.77) | 2.97 (2.94) | 3.01 (3.13) |
+
+A window smaller than the document helps little: at 1 MiB documents only
+windows of 1 MiB and up lift the rate. 2 MiB reads the same as 1 MiB, so the
+default is 1 MiB. On a run that stops, the most a thread can have read ahead
+for nothing is one window per stripe.
+
+### Before and after, cold (Linux, page cache dropped)
+
+`kv_bench --seconds 1 --threads 1 --skip-multiprocess` over eight block
+sizes, main, the change and LMDB interleaved, three runs each. Median GB/s,
+first touch (restart in parentheses)
+([`small-reads-cold-summary.txt`](kv-cache-benchmark/small-reads/small-reads-cold-summary.txt);
+the earlier build's set, run first, is in
+[`small-reads-cold-earlier-summary.txt`](kv-cache-benchmark/small-reads/small-reads-cold-earlier-summary.txt)):
+
+| block | main | change | change / main | LMDB, same day | change / LMDB | earlier build | LMDB, round 6 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **64 KiB** | 0.04 (0.04) | **2.15 (2.60)** | 54× (67×) | 1.42 (1.15) | **1.5×** (2.3×) | 2.63 (2.62) | 1.61 (1.48) |
+| 128 KiB | 0.04 (0.04) | 2.70 (2.85) | 69× (73×) | 1.43 (1.45) | 1.9× (2.0×) | 2.83 (2.64) | — |
+| **256 KiB** | 1.10 (0.84) | **2.69 (2.78)** | 2.4× (3.3×) | 1.60 (1.52) | **1.7×** (1.8×) | 2.76 (2.82) | 2.11 (1.97) |
+| **512 KiB** | 1.63 (1.33) | **2.93 (2.99)** | 1.8× (2.2×) | 1.70 (1.72) | **1.7×** (1.7×) | 2.94 (2.90) | 2.19 (2.18) |
+| 1 MiB | 1.43 (1.53) | 2.99 (2.99) | 2.1× (2.0×) | 1.96 (1.94) | 1.5× (1.5×) | 3.03 (3.00) | 2.65 (2.64) |
+| 2 MiB | 2.25 (2.02) | 2.64 (2.62) | 1.17× (1.30×) | 2.08 (2.02) | 1.27× (1.30×) | 2.63 (2.64) | 2.65 (2.57) |
+| 8 MiB | 2.84 (2.60) | 3.01 (2.94) | 1.06× (1.13×) | 2.03 (2.05) | 1.48× (1.44×) | 3.00 (2.96) | 2.62 (2.59) |
+| 32 MiB | 3.15 (3.01) | 3.17 (3.12) | 1.01× (1.04×) | 2.00 (2.00) | 1.58× (1.56×) | 3.17 (3.13) | 2.75 (2.63) |
+
+- **64 KiB: 0.04 → 2.15–2.63 GB/s.** The three final-build runs read 2.15,
+  1.03 and 2.58 at first touch. The second hit a slow-device window (p99
+  1.1 ms against 0.16–0.28 ms in the others); the earlier build's three runs
+  read 2.61–2.65. Either way it is ahead of LMDB on the same day and of
+  round 6's LMDB. A median get takes 8–9 µs, served from pages a window
+  already brought in; the p99 is the get that waits for a window.
+- **Every size up to 1 MiB is 1.8–2.4× faster than main**, and restart
+  matches first touch (the directory hint): 256 KiB restart 0.84 → 2.78.
+- **LMDB read 12–27 % slower today than in round 6** at every size, with
+  the same harness binary on the same machine, and main 2–19 % slower: the
+  device was slower on the day. Compare within the day. The change is
+  ahead of round 6's LMDB too, at every size except 2 MiB, where they tie
+  (2.64 against 2.65).
+- **8 MiB**, flagged in #28 as 2–5 % slower after the chunking change, reads
+  6 % faster than main here: the window reaches the next document.
+- A runner job ran during two of the three main runs (the samples record
+  it). main's 64 KiB and 128 KiB rates are fault-bound and did not move.
+
+### Warm reads, the 4-process phase and puts
+
+64 KiB, 256 KiB and 512 KiB, all phases, `--seconds 5 --threads 1,4`, main
+and the change (build 171a48f) interleaved, three runs each. Median, change
+/ main
+([`small-reads-warm-summary.txt`](kv-cache-benchmark/small-reads/small-reads-warm-summary.txt)):
+
+| | 64 KiB | 256 KiB | 512 KiB |
+|---|---:|---:|---:|
+| Warm `view`, T = 1 / 4 | 1.01 / 1.01 | 1.01 / 0.99 | 1.01 / 1.00 |
+| Warm `copy`, T = 1 / 4 | 1.00 / 1.00 | 1.00 / 1.01 | 1.01 / 1.00 |
+| 4 reader processes, `view` / `copy` | 0.99 / 1.00 | 0.98 / 1.01 | 0.98 / 1.01 |
+| PUT | 1.00 | 0.99 | 0.98 |
+| Cold first touch (restart) | 71× (73×) | 2.77× (3.58×) | 1.96× (2.29×) |
+
+Warm reads do not move: a validated re-read never reaches the new code, and
+that path is the same in the final build. The 4-process `view` medians are
+1–2 % lower, inside the per-run spread (each side has one run 3–10 % below
+its others); each reader process runs the CRC pass once per document and
+pays one hint there. The final build's own warm set is in the raw data but
+not used: a containerised build job started during its first run (load 14
+at its end) that the runner-job check did not see, and it halved warm
+`copy` in two of the three runs. `small-reads/idle.sh` now also waits for
+container jobs.
+
+### What the hints cost when the document is already resident
+
+The one place the change costs something is a CRC-pending read of a document
+that is already in the page cache: the first read after a write while the
+pages are still cached, or after a restart with a warm page cache. The cold
+command without dropping caches, three interleaved runs, median GB/s, first
+touch (restart). "Window off" runs the change with
+`--sequential-readahead-bytes 0`, so every read takes the per-document hint,
+as a first read out of order does
+([`small-reads-resident-summary.txt`](kv-cache-benchmark/small-reads/small-reads-resident-summary.txt)):
+
+| block | main | change | change / main | window off | window off / main |
+|---|---:|---:|---:|---:|---:|
+| 64 KiB | 8.06 (8.10) | 7.52 (7.62) | 0.93 (0.94) | 6.54 (6.64) | 0.81 (0.82) |
+| 128 KiB | 8.68 (8.63) | 8.15 (8.10) | 0.94 (0.94) | 7.27 (7.20) | 0.84 (0.83) |
+| 256 KiB | 7.93 (7.80) | 7.61 (7.47) | 0.96 (0.96) | 7.91 (7.77) | 1.00 (1.00) |
+| 512 KiB | 8.60 (8.49) | 8.23 (8.12) | 0.96 (0.96) | 8.62 (8.48) | 1.00 (1.00) |
+
+In a sequential run the cost is the residency check per window, 4–7 %. Out
+of order, a 64 KiB document pays one `madvise()` it did not need, about 2 µs
+on this machine (19 %). From 256 KiB up the per-document hint is the
+large-document one, as before. The first build, with a residency check
+before every hint and without the cursor clamp or the resident-run probe,
+cost the sequential case 12–21 %. On macOS the same reads cost 0–3 %
+(below).
+
+### 4 KB objects
+
+`performance_baseline --cache-size 512 --entries 5000 --content-size 4096`,
+three interleaved runs: every operation's median is within 4 % of main's,
+the change's higher on all but key generation
+([`small-reads-baseline-summary.txt`](kv-cache-benchmark/small-reads/small-reads-baseline-summary.txt)).
+Documents below 16 KiB never reach the new code. main's first run followed
+the resident runs and was slow on every operation, as in the readahead
+section.
+
+### macOS (Apple M5, warm page cache)
+
+macOS cannot drop the page cache on the shared machine, so this checks the
+warm path and the resident cost only. main and the final build interleaved,
+five runs each, with other jobs running (1-minute load 1–5;
+[`small-reads-macos-summary.txt`](kv-cache-benchmark/small-reads/small-reads-macos-summary.txt)):
+
+- `performance_baseline` (4 KB): every read, lookup and miss within 2 %.
+  Its write and mixed rows are bimodal on that machine (about 49 k or 305 k
+  writes/s, run to run, in both builds) and say nothing either way.
+- `concurrent_read_bench`, 512 B objects: 0.98 / 1.00 / 0.99 at 1 / 4 / 16
+  threads; 64 KiB objects: 0.98 / 0.98 / 1.00 (0.95 at 8 threads, inside
+  its run spread).
+- `kv_bench` 64 KiB and 128 KiB warm `view` and `copy`: within 1 %;
+  4-process `view` 0.97 and 0.99.
+- First touch and restart, which there CRC-verify resident documents: 0.97
+  to 1.01. That is one `F_RDADVISE` per window, about 0.3 µs.
+
+### Caveats
+
+- One Linux machine and SSD (Samsung 970 PRO, `read_ahead_kb` 128, kernel
+  5.15), shared with CI jobs. Every point waited for the runner to be idle
+  and the 1-minute load to drop below 1.0; a job that starts mid-run is not
+  prevented, and the samples record runner jobs (and, from `small-reads/`'s
+  own sampler on, container jobs).
+- The window helps one thread reading one stripe's documents in the order
+  they were appended. More than 64 KiB of other writers' documents appended
+  in between breaks the run, and several threads splitting one prefix each
+  see a partial run; both fall back to the per-document hint.
+- The hints need the CRC pass. With `verify_checksum_on_read = false`, or
+  on a document whose CRC verdict is still cached but whose pages were
+  evicted, a small document faults in page by page as before.
+
 ## Device transfer: does zero-copy pay off? (Metal, Apple silicon)
 
 The open question from rounds 1 and 2 is whether the zero-copy read pays
@@ -2241,7 +2523,7 @@ through nvcc in `kv_gpu_cuda.cu`, behind the plain-C seam in
 |---|---|---|
 | Readahead for large cold reads: a per-document hint, with a per-platform call | **Done** | [Round 3](#readahead-alone); mechanism in [architecture.md](architecture.md#memory-mapped-io) |
 | Readahead for medium cold reads: the Linux hint in 64 KiB chunks over a document's first 4 MiB, and no hint on a resident document | **Done** (#18) | [Readahead chunking](#readahead-chunking-issue-18): cold 512 KiB 0.81 → 1.70 GB/s, 1.39× behind a same-day LMDB; warm 512 KiB `view` +7 % |
-| Readahead below the 256 KiB threshold: a warm path cheap enough to lower it | Open (#29); 64 KiB reads cold at 0.04 GB/s against LMDB's 1.61 (round 6), and 256 KiB at 1.12 against 2.11. A 64 KiB threshold lifts 64 KiB to 0.24 but costs warm `view` 8–18 % | [Readahead chunking](#what-is-left-of-the-gap), [round 6](#cold-reads-from-64-kib-to-32-mib-issue-29-baseline) |
+| Readahead below the 256 KiB threshold, and across stripe-interleaved documents | **Done** (#29): a hint on the CRC-pending read only (no warm-path cost), a per-stripe sequential window, and a directory hint at open. Cold 64 KiB 0.04 → 2.15–2.63 GB/s, 512 KiB 1.63 → 2.93, ahead of a same-day LMDB at every size; warm reads unchanged; a CRC-pending read of a resident 64 KiB document costs 6–19 % | [Small cold reads](#small-cold-reads-issue-29) |
 | Fast document checksum: slice-by-16 / ARMv8 CRC32, then CRC-32C at format v8 | **Done** | [Round 3](#fast-crc32-alone), [Round 3b](#round-3b-crc-32c-on-disk-format-v8); [architecture.md](architecture.md#document-format) |
 | Verified state that outlives the process: keep the CRC-validation cache beside the mmap directory, so a restart and every peer process skip re-verification | Designed, then shelved ([design](design/verified-state.md)); the 512 KiB gap was tracked as a readahead item (#18, since [fixed](#readahead-chunking-issue-18)). Measured there: about half of a warm-page-cache first read (view) is the CRC pass, but only 2–9 % of a cold NVMe read. The 512 KiB cold gap to LMDB is the I/O pattern, not the CRC | [Design, section 2](design/verified-state.md#2-what-is-avoidable-measurement) |
 | `WriteHandle::reserve(n)` that returns the destination span, so the caller writes or DMAs straight into the record (three copies become one) | **Done** (#16), with the destination being the handle's buffer: a slot exists only at commit, under the write lock held across the fill. The larger win was dropping the contiguous-document build; puts went from 0.62 to 1.52 GB/s at 2 MiB, 4 % ahead of a same-day file-per-block, and `reserve()` takes a 2 MiB insert from 490 to 410 µs p50 | [Insert path](#insert-path-profile-issue-16) |

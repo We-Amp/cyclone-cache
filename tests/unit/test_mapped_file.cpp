@@ -275,3 +275,45 @@ TEST_CASE("MappedFile advise_willneed accepts a mid-page region over 4 MiB",
   remove_temp_file(path);
 }
 #endif
+
+TEST_CASE("MappedFile range_resident is true only where it can tell",
+          "[mapped_file]") {
+  // The sequential readahead window skips a hint when range_resident() says
+  // the range is cached, so the one thing it must never do is report a range
+  // resident that is not: false is always a safe answer.  On Linux a range
+  // this process has just read is resident (mincore()); elsewhere the answer
+  // is always false.
+  constexpr size_t kFileBytes = size_t{256} * 1024;
+  auto path = create_temp_file(kFileBytes);
+  auto mf = MappedFile::create();
+  REQUIRE(mf->open(path.string(), MappedFile::OpenMode::ReadOnly).has_value());
+  auto mapped = mf->map_region(0, kFileBytes, MappedFile::MapMode::ReadOnly);
+  REQUIRE(mapped.has_value());
+
+  // Touch every byte: the whole range is now in the page cache.
+  unsigned sum = 0;
+  for (std::byte b : *mapped) {
+    sum += static_cast<unsigned>(b);
+  }
+  REQUIRE(sum != 0);
+
+  // Mid-page start and end, as a document range has.
+  const auto region = mapped->subspan(100, kFileBytes - 200);
+#if defined(__linux__)
+  CHECK(mf->range_resident(region));
+  CHECK(mf->range_resident(region.first(1)));
+#else
+  CHECK_FALSE(mf->range_resident(region));
+#endif
+
+  // The unchecked hint advises a resident, mid-page range without error and
+  // leaves the contents alone.
+  const auto ec = mf->advise_willneed_unchecked(mapped->subspan(100, 70000));
+  INFO("advise_willneed_unchecked error: " << ec.message());
+  CHECK_FALSE(ec);
+  CHECK((*mapped)[100] == std::byte{'X'});
+
+  mf->unmap_region(*mapped);
+  mf->close();
+  remove_temp_file(path);
+}

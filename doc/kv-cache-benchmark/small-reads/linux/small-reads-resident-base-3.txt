@@ -1,0 +1,111 @@
+Cyclone KV-cache storage-tier benchmark (workload spec v1)
+  cpu          : Intel(R) Core(TM) i7-8750H CPU @ 2.20GHz
+  cores        : 12 (hw_concurrency 12)
+  os           : Linux 5.15.0-191-generic
+  filesystem   : ext4
+  store        : cyclone 0.1.0 @ unknown
+  volume       : <data dir>/cyclone_kv_bench.dat (8192 MiB)
+
+Cyclone tuning (spec allows store-specific tuning if printed):
+  max_object_size         = 0 (unbounded; blocks reach 32 MiB)
+  ram_cache_size          = 0 (the CLFUS RAM tier is irrelevant for
+                            multi-MB blobs; disk hits are zero-copy
+                            mmap spans served from the OS page cache)
+  enable_checksum         = true (mandatory in multi-process mode)
+  verify_checksum_on_read = true
+  mmap directory          = on (multi-process 0 of 1)
+  hit tracking            = off
+  optimization engine     = off
+  directory_sync_interval = 0 (no periodic fsync; the restart
+                            phase is a process restart, not a power-loss test)
+  sync_on_write           = false (no per-put fsync)
+  metadata                = 64-byte set_header() slot (a dedicated
+                            header, not a value prefix)
+  seconds/point           = 1 (after a 2s warm-up)
+
+=== block_size 65536 (64 KiB), n = 4096, dataset 0.25 GiB, stripe_size = auto ===
+  [1/5] put
+  content verify: ok
+  [2/5] get_first_touch
+        readahead hints issued so far: 0 (after get_first_touch)
+  [3/5] get_warm (Zipf theta=0.99)
+        mode=view threads=1
+        mode=copy threads=1
+  [4/5] restart
+        readahead hints issued so far: 0 (after restart)
+  [5/5] multiprocess_read: skipped (--skip-multiprocess)
+=== block_size 131072 (128 KiB), n = 4096, dataset 0.5 GiB, stripe_size = auto ===
+  [1/5] put
+  content verify: ok
+  [2/5] get_first_touch
+        readahead hints issued so far: 0 (after get_first_touch)
+  [3/5] get_warm (Zipf theta=0.99)
+        mode=view threads=1
+        mode=copy threads=1
+  [4/5] restart
+        readahead hints issued so far: 0 (after restart)
+  [5/5] multiprocess_read: skipped (--skip-multiprocess)
+=== block_size 262144 (256 KiB), n = 4096, dataset 1 GiB, stripe_size = auto ===
+  [1/5] put
+  content verify: ok
+  [2/5] get_first_touch
+        readahead hints issued so far: 4096 (after get_first_touch)
+  [3/5] get_warm (Zipf theta=0.99)
+        mode=view threads=1
+        mode=copy threads=1
+  [4/5] restart
+        readahead hints issued so far: 4096 (after restart)
+  [5/5] multiprocess_read: skipped (--skip-multiprocess)
+=== block_size 524288 (512 KiB), n = 4096, dataset 2 GiB, stripe_size = auto ===
+  [1/5] put
+  content verify: ok
+  [2/5] get_first_touch
+        readahead hints issued so far: 4096 (after get_first_touch)
+  [3/5] get_warm (Zipf theta=0.99)
+        mode=view threads=1
+        mode=copy threads=1
+  [4/5] restart
+        readahead hints issued so far: 4096 (after restart)
+  [5/5] multiprocess_read: skipped (--skip-multiprocess)
+=== block_size 1048576 (1024 KiB), n = 4096, dataset 4 GiB, stripe_size = auto ===
+  [1/5] put
+  content verify: ok
+  [2/5] get_first_touch
+        readahead hints issued so far: 4096 (after get_first_touch)
+  [3/5] get_warm (Zipf theta=0.99)
+        mode=view threads=1
+        mode=copy threads=1
+  [4/5] restart
+        readahead hints issued so far: 4096 (after restart)
+  [5/5] multiprocess_read: skipped (--skip-multiprocess)
+
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+|---|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|
+| cyclone | 65536 | 4096 | put | - | 1 | 19891.1 | 1.304 | 32.0 | 80.6 | 92.4 | - |
+| cyclone | 65536 | 4096 | get_first_touch | view | 1 | 123048.9 | 8.064 | 8.0 | 10.1 | 24.0 | 1.000 |
+| cyclone | 65536 | 4096 | get_warm | view | 1 | 2031478.9 | 133.135 | 0.4 | 0.8 | 1.0 | - |
+| cyclone | 65536 | 4096 | get_warm | copy | 1 | 292221.9 | 19.151 | 3.2 | 5.8 | 18.2 | - |
+| cyclone | 65536 | 4096 | restart | view | 1 | 123549.4 | 8.097 | 7.9 | 12.0 | 31.9 | 1.000 |
+| cyclone | 131072 | 4096 | put | - | 1 | 11826.9 | 1.550 | 57.3 | 87.9 | 115.9 | - |
+| cyclone | 131072 | 4096 | get_first_touch | view | 1 | 66269.6 | 8.686 | 15.0 | 18.2 | 30.8 | 1.000 |
+| cyclone | 131072 | 4096 | get_warm | view | 1 | 1745710.0 | 228.814 | 0.5 | 1.0 | 1.2 | - |
+| cyclone | 131072 | 4096 | get_warm | copy | 1 | 145271.8 | 19.041 | 7.5 | 11.0 | 28.2 | - |
+| cyclone | 131072 | 4096 | restart | view | 1 | 65814.1 | 8.626 | 14.9 | 21.2 | 42.8 | 1.000 |
+| cyclone | 262144 | 4096 | put | - | 1 | 6083.2 | 1.595 | 110.1 | 152.3 | 168.7 | - |
+| cyclone | 262144 | 4096 | get_first_touch | view | 1 | 30432.8 | 7.978 | 32.5 | 38.0 | 47.4 | 1.000 |
+| cyclone | 262144 | 4096 | get_warm | view | 1 | 1147435.1 | 300.793 | 0.7 | 2.6 | 3.8 | - |
+| cyclone | 262144 | 4096 | get_warm | copy | 1 | 69227.3 | 18.148 | 15.8 | 22.1 | 39.5 | - |
+| cyclone | 262144 | 4096 | restart | view | 1 | 29870.2 | 7.830 | 32.6 | 52.2 | 76.3 | 1.000 |
+| cyclone | 524288 | 4096 | put | - | 1 | 3099.1 | 1.625 | 212.6 | 289.8 | 343.0 | - |
+| cyclone | 524288 | 4096 | get_first_touch | view | 1 | 16409.7 | 8.603 | 59.6 | 85.2 | 106.7 | 1.000 |
+| cyclone | 524288 | 4096 | get_warm | view | 1 | 783170.4 | 410.607 | 1.0 | 4.0 | 4.9 | - |
+| cyclone | 524288 | 4096 | get_warm | copy | 1 | 33738.8 | 17.689 | 31.8 | 43.8 | 73.8 | - |
+| cyclone | 524288 | 4096 | restart | view | 1 | 15902.3 | 8.337 | 60.9 | 103.4 | 126.9 | 1.000 |
+| cyclone | 1048576 | 4096 | put | - | 1 | 1552.0 | 1.627 | 423.4 | 540.5 | 593.4 | - |
+| cyclone | 1048576 | 4096 | get_first_touch | view | 1 | 6314.3 | 6.621 | 117.0 | 418.6 | 433.3 | 1.000 |
+| cyclone | 1048576 | 4096 | get_warm | view | 1 | 470849.1 | 493.721 | 1.9 | 5.5 | 8.1 | - |
+| cyclone | 1048576 | 4096 | get_warm | copy | 1 | 13001.8 | 13.633 | 82.8 | 97.6 | 148.2 | - |
+| cyclone | 1048576 | 4096 | restart | view | 1 | 8496.1 | 8.909 | 114.5 | 161.8 | 195.6 | 1.000 |
+
+(sink 97628941183)
+JSON lines written to $HOME/cy29/out/resident-base-3.jsonl

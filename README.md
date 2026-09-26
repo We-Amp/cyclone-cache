@@ -257,8 +257,9 @@ four. At four threads its hit-latency tail is 0.38–0.45× LMDB's, and with
 wrap retention on (the default) a bounded tier meets the benchmark's
 pre-registered bar against LMDB on that latency clause, with a thin margin
 on plain Zipf. It is not a general LMDB replacement: warm reads are in the
-same class, blocks up to 2 MiB read cold behind LMDB (512 KiB at 0.76× its
-rate; below 256 KiB, where no readahead hint is issued, far behind),
+same class, cold reads were behind LMDB up to 2 MiB in round 6 and are
+ahead of it at every size from 64 KiB since the small-cold-read readahead
+(issue #29; a same-day LMDB read slower than in round 6),
 writes match file-per-block at 2 MiB (about 1.5 GB/s per thread) but trail
 it at 8–32 MiB, and a one-thread insert has a 24 ms p99 against 6–16 ms
 for the peers.
@@ -524,6 +525,8 @@ struct CacheConfig {
   uint32_t     small_tier_percent = 0;            // 1..50 enables the small-object tier
   bool         cross_process_ram_coherence = false;
   size_t       readahead_min_bytes = 256_KB;      // readahead hint for docs >= this; 0 = off
+  size_t       cold_readahead_min_bytes = 16_KB;  // cold-read hint for docs >= this, first CRC pass only; 0 = off
+  size_t       sequential_readahead_bytes = 1_MB;  // window past a doc on an in-order read-back; 0 = off
   std::chrono::milliseconds directory_sync_interval{30000};  // multi-process durability cadence
   std::chrono::milliseconds read_lease_duration{5000};       // 0 disables leases
   std::chrono::milliseconds lease_wrap_ceiling{60000};

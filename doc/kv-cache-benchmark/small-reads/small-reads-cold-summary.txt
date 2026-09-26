@@ -1,0 +1,88 @@
+# Cold sweep: kv_bench --seconds 1 --threads 1 --skip-multiprocess, eight
+# block sizes, page cache dropped before first touch and restart; main
+# (base), the change (after) and LMDB interleaved.  Median [per run], GB/s
+# (put, first touch, restart, copy) or gets/s (view).
+
+## after / lmdb
+    64K put               -    T=1  after 1.32 [1.43 1.32 1.31]  base 1.34 [1.34 1.35 1.34]  lmdb 0.01 [0.01 0.01 0.01]  after/lmdb 129.88
+    64K get_first_touch   view T=1  after 2.15 [2.15 1.03 2.58]  base 0.04 [0.04 0.04 0.04]  lmdb 1.42 [1.42 1.48 1.22]  after/lmdb 1.52
+    64K get_warm          copy T=1  after 19.21 [19.21 18.90 19.32]  base 19.12 [19.12 19.19 19.12]  lmdb 17.96 [17.92 17.96 17.99]  after/lmdb 1.07
+    64K get_warm          view T=1  after 2,069,284 [2,080,624 2,069,284 2,050,161]  base 2,040,503 [2,040,503 2,050,140 2,025,778]  lmdb 1,333,677 [1,333,677 1,324,217 1,338,463]  after/lmdb 1.55
+    64K restart           view T=1  after 2.60 [2.66 0.99 2.60]  base 0.04 [0.04 0.04 0.04]  lmdb 1.15 [1.15 1.21 1.08]  after/lmdb 2.26
+   128K put               -    T=1  after 1.53 [1.53 1.53 1.53]  base 1.54 [1.56 1.54 1.53]  lmdb 0.02 [0.02 0.02 0.02]  after/lmdb 81.90
+   128K get_first_touch   view T=1  after 2.70 [2.89 2.59 2.70]  base 0.04 [0.04 0.04 0.04]  lmdb 1.43 [1.43 1.72 1.36]  after/lmdb 1.89
+   128K get_warm          copy T=1  after 18.90 [18.91 18.89 18.90]  base 18.41 [18.58 18.41 16.72]  lmdb 18.05 [18.32 18.05 17.92]  after/lmdb 1.05
+   128K get_warm          view T=1  after 1,750,684 [1,750,684 1,767,458 1,747,562]  base 1,716,797 [1,722,664 1,716,797 1,230,533]  lmdb 1,131,966 [1,132,598 1,131,421 1,131,966]  after/lmdb 1.55
+   128K restart           view T=1  after 2.85 [2.89 2.85 2.81]  base 0.04 [0.04 0.04 0.05]  lmdb 1.45 [1.49 1.45 1.20]  after/lmdb 1.97
+   256K put               -    T=1  after 1.58 [1.57 1.58 1.59]  base 1.57 [1.57 1.59 1.55]  lmdb 0.03 [0.03 0.03 0.03]  after/lmdb 46.79
+   256K get_first_touch   view T=1  after 2.69 [2.65 2.69 2.85]  base 1.10 [1.12 1.10 1.02]  lmdb 1.60 [1.60 1.63 1.43]  after/lmdb 1.68
+   256K get_warm          copy T=1  after 17.85 [17.85 17.99 17.75]  base 17.36 [17.36 17.55 16.04]  lmdb 17.78 [17.82 17.78 17.57]  after/lmdb 1.00
+   256K get_warm          view T=1  after 1,162,731 [1,156,074 1,162,731 1,163,360]  base 1,130,462 [1,130,462 1,137,536 890,559]  lmdb 927,582 [925,498 929,230 927,582]  after/lmdb 1.25
+   256K restart           view T=1  after 2.78 [2.66 2.78 2.79]  base 0.84 [0.90 0.80 0.84]  lmdb 1.52 [1.58 1.49 1.52]  after/lmdb 1.83
+   512K put               -    T=1  after 1.61 [1.61 1.62 1.61]  base 1.61 [1.61 1.63 1.32]  lmdb 0.06 [0.06 0.06 0.06]  after/lmdb 27.57
+   512K get_first_touch   view T=1  after 2.93 [2.93 2.96 2.88]  base 1.63 [1.63 1.65 1.58]  lmdb 1.70 [1.70 1.93 1.47]  after/lmdb 1.73
+   512K get_warm          copy T=1  after 17.61 [17.61 17.79 17.27]  base 17.35 [17.51 17.35 10.17]  lmdb 17.07 [17.08 17.07 16.75]  after/lmdb 1.03
+   512K get_warm          view T=1  after 788,889 [791,523 786,308 788,889]  base 774,262 [778,474 774,262 626,273]  lmdb 663,531 [668,562 662,116 663,531]  after/lmdb 1.19
+   512K restart           view T=1  after 2.99 [2.91 2.99 2.99]  base 1.33 [1.33 1.38 1.32]  lmdb 1.72 [1.72 1.86 1.53]  after/lmdb 1.74
+  1024K put               -    T=1  after 1.45 [1.29 1.45 1.55]  base 1.35 [1.58 1.35 1.32]  lmdb 0.09 [0.09 0.10 0.09]  after/lmdb 15.48
+  1024K get_first_touch   view T=1  after 2.99 [2.98 2.99 3.04]  base 1.43 [1.67 0.99 1.43]  lmdb 1.96 [1.96 2.01 1.81]  after/lmdb 1.53
+  1024K get_warm          copy T=1  after 13.57 [13.62 13.52 13.57]  base 13.55 [13.55 13.63 12.90]  lmdb 13.96 [13.96 14.02 13.86]  after/lmdb 0.97
+  1024K get_warm          view T=1  after 477,638 [477,638 477,398 479,762]  base 471,477 [471,477 474,445 452,734]  lmdb 417,069 [417,069 414,670 419,885]  after/lmdb 1.15
+  1024K restart           view T=1  after 2.99 [2.95 2.99 3.00]  base 1.53 [1.53 1.32 1.59]  lmdb 1.94 [1.95 1.94 1.77]  after/lmdb 1.54
+  2048K put               -    T=1  after 1.46 [1.46 1.45 1.55]  base 1.47 [1.47 1.52 1.40]  lmdb 0.14 [0.14 0.14 0.14]  after/lmdb 10.28
+  2048K get_first_touch   view T=1  after 2.64 [2.64 2.64 2.63]  base 2.25 [2.28 2.25 2.23]  lmdb 2.08 [2.08 2.09 1.89]  after/lmdb 1.27
+  2048K get_warm          copy T=1  after 13.34 [13.39 13.23 13.34]  base 11.65 [11.10 13.35 11.65]  lmdb 13.70 [13.67 13.75 13.70]  after/lmdb 0.97
+  2048K get_warm          view T=1  after 268,516 [268,516 269,366 268,240]  base 251,939 [251,939 266,009 192,510]  lmdb 242,118 [241,969 243,996 242,118]  after/lmdb 1.11
+  2048K restart           view T=1  after 2.62 [2.62 2.61 2.62]  base 2.02 [2.02 2.00 2.12]  lmdb 2.02 [2.02 2.05 1.79]  after/lmdb 1.30
+  8192K put               -    T=1  after 1.30 [1.29 1.30 1.32]  base 1.14 [1.00 1.31 1.14]  lmdb 0.36 [0.36 0.36 0.30]  after/lmdb 3.65
+  8192K get_first_touch   view T=1  after 3.01 [3.01 3.00 3.01]  base 2.84 [2.61 2.85 2.84]  lmdb 2.03 [2.03 2.43 1.87]  after/lmdb 1.48
+  8192K get_warm          copy T=1  after 12.82 [12.72 12.82 12.84]  base 11.49 [6.76 12.77 11.49]  lmdb 13.14 [13.14 9.38 13.18]  after/lmdb 0.98
+  8192K get_warm          view T=1  after 68,289 [67,770 68,578 68,289]  base 63,642 [47,321 68,276 63,642]  lmdb 66,028 [66,028 63,075 66,389]  after/lmdb 1.03
+  8192K restart           view T=1  after 2.94 [2.94 2.95 2.94]  base 2.60 [2.51 2.60 2.77]  lmdb 2.05 [2.05 2.17 1.76]  after/lmdb 1.44
+ 32768K put               -    T=1  after 0.89 [0.89 0.89 0.86]  base 0.87 [0.77 0.90 0.87]  lmdb 0.45 [0.46 0.45 0.37]  after/lmdb 1.98
+ 32768K get_first_touch   view T=1  after 3.17 [3.10 3.22 3.17]  base 3.15 [3.15 3.26 2.63]  lmdb 2.00 [2.00 2.17 2.00]  after/lmdb 1.58
+ 32768K get_warm          copy T=1  after 12.22 [12.23 12.09 12.22]  base 11.57 [11.57 12.20 11.22]  lmdb 12.39 [12.32 12.47 12.39]  after/lmdb 0.99
+ 32768K get_warm          view T=1  after 17,303 [17,303 17,275 17,341]  base 17,135 [17,135 17,211 16,415]  lmdb 17,112 [17,112 17,054 17,178]  after/lmdb 1.01
+ 32768K restart           view T=1  after 3.12 [3.06 3.13 3.12]  base 3.01 [3.01 3.09 2.84]  lmdb 2.00 [2.00 2.04 1.82]  after/lmdb 1.56
+
+## after / base
+    64K put               -    T=1  after 1.32 [1.43 1.32 1.31]  base 1.34 [1.34 1.35 1.34]  lmdb 0.01 [0.01 0.01 0.01]  after/base 0.99
+    64K get_first_touch   view T=1  after 2.15 [2.15 1.03 2.58]  base 0.04 [0.04 0.04 0.04]  lmdb 1.42 [1.42 1.48 1.22]  after/base 53.92
+    64K get_warm          copy T=1  after 19.21 [19.21 18.90 19.32]  base 19.12 [19.12 19.19 19.12]  lmdb 17.96 [17.92 17.96 17.99]  after/base 1.00
+    64K get_warm          view T=1  after 2,069,284 [2,080,624 2,069,284 2,050,161]  base 2,040,503 [2,040,503 2,050,140 2,025,778]  lmdb 1,333,677 [1,333,677 1,324,217 1,338,463]  after/base 1.01
+    64K restart           view T=1  after 2.60 [2.66 0.99 2.60]  base 0.04 [0.04 0.04 0.04]  lmdb 1.15 [1.15 1.21 1.08]  after/base 67.12
+   128K put               -    T=1  after 1.53 [1.53 1.53 1.53]  base 1.54 [1.56 1.54 1.53]  lmdb 0.02 [0.02 0.02 0.02]  after/base 0.99
+   128K get_first_touch   view T=1  after 2.70 [2.89 2.59 2.70]  base 0.04 [0.04 0.04 0.04]  lmdb 1.43 [1.43 1.72 1.36]  after/base 68.80
+   128K get_warm          copy T=1  after 18.90 [18.91 18.89 18.90]  base 18.41 [18.58 18.41 16.72]  lmdb 18.05 [18.32 18.05 17.92]  after/base 1.03
+   128K get_warm          view T=1  after 1,750,684 [1,750,684 1,767,458 1,747,562]  base 1,716,797 [1,722,664 1,716,797 1,230,533]  lmdb 1,131,966 [1,132,598 1,131,421 1,131,966]  after/base 1.02
+   128K restart           view T=1  after 2.85 [2.89 2.85 2.81]  base 0.04 [0.04 0.04 0.05]  lmdb 1.45 [1.49 1.45 1.20]  after/base 73.11
+   256K put               -    T=1  after 1.58 [1.57 1.58 1.59]  base 1.57 [1.57 1.59 1.55]  lmdb 0.03 [0.03 0.03 0.03]  after/base 1.01
+   256K get_first_touch   view T=1  after 2.69 [2.65 2.69 2.85]  base 1.10 [1.12 1.10 1.02]  lmdb 1.60 [1.60 1.63 1.43]  after/base 2.45
+   256K get_warm          copy T=1  after 17.85 [17.85 17.99 17.75]  base 17.36 [17.36 17.55 16.04]  lmdb 17.78 [17.82 17.78 17.57]  after/base 1.03
+   256K get_warm          view T=1  after 1,162,731 [1,156,074 1,162,731 1,163,360]  base 1,130,462 [1,130,462 1,137,536 890,559]  lmdb 927,582 [925,498 929,230 927,582]  after/base 1.03
+   256K restart           view T=1  after 2.78 [2.66 2.78 2.79]  base 0.84 [0.90 0.80 0.84]  lmdb 1.52 [1.58 1.49 1.52]  after/base 3.32
+   512K put               -    T=1  after 1.61 [1.61 1.62 1.61]  base 1.61 [1.61 1.63 1.32]  lmdb 0.06 [0.06 0.06 0.06]  after/base 1.00
+   512K get_first_touch   view T=1  after 2.93 [2.93 2.96 2.88]  base 1.63 [1.63 1.65 1.58]  lmdb 1.70 [1.70 1.93 1.47]  after/base 1.79
+   512K get_warm          copy T=1  after 17.61 [17.61 17.79 17.27]  base 17.35 [17.51 17.35 10.17]  lmdb 17.07 [17.08 17.07 16.75]  after/base 1.02
+   512K get_warm          view T=1  after 788,889 [791,523 786,308 788,889]  base 774,262 [778,474 774,262 626,273]  lmdb 663,531 [668,562 662,116 663,531]  after/base 1.02
+   512K restart           view T=1  after 2.99 [2.91 2.99 2.99]  base 1.33 [1.33 1.38 1.32]  lmdb 1.72 [1.72 1.86 1.53]  after/base 2.24
+  1024K put               -    T=1  after 1.45 [1.29 1.45 1.55]  base 1.35 [1.58 1.35 1.32]  lmdb 0.09 [0.09 0.10 0.09]  after/base 1.07
+  1024K get_first_touch   view T=1  after 2.99 [2.98 2.99 3.04]  base 1.43 [1.67 0.99 1.43]  lmdb 1.96 [1.96 2.01 1.81]  after/base 2.08
+  1024K get_warm          copy T=1  after 13.57 [13.62 13.52 13.57]  base 13.55 [13.55 13.63 12.90]  lmdb 13.96 [13.96 14.02 13.86]  after/base 1.00
+  1024K get_warm          view T=1  after 477,638 [477,638 477,398 479,762]  base 471,477 [471,477 474,445 452,734]  lmdb 417,069 [417,069 414,670 419,885]  after/base 1.01
+  1024K restart           view T=1  after 2.99 [2.95 2.99 3.00]  base 1.53 [1.53 1.32 1.59]  lmdb 1.94 [1.95 1.94 1.77]  after/base 1.95
+  2048K put               -    T=1  after 1.46 [1.46 1.45 1.55]  base 1.47 [1.47 1.52 1.40]  lmdb 0.14 [0.14 0.14 0.14]  after/base 1.00
+  2048K get_first_touch   view T=1  after 2.64 [2.64 2.64 2.63]  base 2.25 [2.28 2.25 2.23]  lmdb 2.08 [2.08 2.09 1.89]  after/base 1.17
+  2048K get_warm          copy T=1  after 13.34 [13.39 13.23 13.34]  base 11.65 [11.10 13.35 11.65]  lmdb 13.70 [13.67 13.75 13.70]  after/base 1.15
+  2048K get_warm          view T=1  after 268,516 [268,516 269,366 268,240]  base 251,939 [251,939 266,009 192,510]  lmdb 242,118 [241,969 243,996 242,118]  after/base 1.07
+  2048K restart           view T=1  after 2.62 [2.62 2.61 2.62]  base 2.02 [2.02 2.00 2.12]  lmdb 2.02 [2.02 2.05 1.79]  after/base 1.30
+  8192K put               -    T=1  after 1.30 [1.29 1.30 1.32]  base 1.14 [1.00 1.31 1.14]  lmdb 0.36 [0.36 0.36 0.30]  after/base 1.14
+  8192K get_first_touch   view T=1  after 3.01 [3.01 3.00 3.01]  base 2.84 [2.61 2.85 2.84]  lmdb 2.03 [2.03 2.43 1.87]  after/base 1.06
+  8192K get_warm          copy T=1  after 12.82 [12.72 12.82 12.84]  base 11.49 [6.76 12.77 11.49]  lmdb 13.14 [13.14 9.38 13.18]  after/base 1.12
+  8192K get_warm          view T=1  after 68,289 [67,770 68,578 68,289]  base 63,642 [47,321 68,276 63,642]  lmdb 66,028 [66,028 63,075 66,389]  after/base 1.07
+  8192K restart           view T=1  after 2.94 [2.94 2.95 2.94]  base 2.60 [2.51 2.60 2.77]  lmdb 2.05 [2.05 2.17 1.76]  after/base 1.13
+ 32768K put               -    T=1  after 0.89 [0.89 0.89 0.86]  base 0.87 [0.77 0.90 0.87]  lmdb 0.45 [0.46 0.45 0.37]  after/base 1.02
+ 32768K get_first_touch   view T=1  after 3.17 [3.10 3.22 3.17]  base 3.15 [3.15 3.26 2.63]  lmdb 2.00 [2.00 2.17 2.00]  after/base 1.01
+ 32768K get_warm          copy T=1  after 12.22 [12.23 12.09 12.22]  base 11.57 [11.57 12.20 11.22]  lmdb 12.39 [12.32 12.47 12.39]  after/base 1.06
+ 32768K get_warm          view T=1  after 17,303 [17,303 17,275 17,341]  base 17,135 [17,135 17,211 16,415]  lmdb 17,112 [17,112 17,054 17,178]  after/base 1.01
+ 32768K restart           view T=1  after 3.12 [3.06 3.13 3.12]  base 3.01 [3.01 3.09 2.84]  lmdb 2.00 [2.00 2.04 1.82]  after/base 1.04

@@ -44,3 +44,8 @@ insert-path-.*\.patch
 # and its per-run 1 Hz sampler files (round6-samples/<run tag>.txt).
 round6-.*\.txt
 round6-samples
+# Small cold reads (issue #29) raw output, logs and summaries
+# (doc/kv-cache-benchmark/small-reads/), and its per-run 1 Hz sampler files
+# (small-reads-samples/<run tag>.txt).
+small-reads-.*\.txt
+small-reads-samples

@@ -1,0 +1,175 @@
+Cyclone KV-cache storage-tier benchmark (workload spec v1)
+  cpu          : Intel(R) Core(TM) i7-8750H CPU @ 2.20GHz
+  cores        : 12 (hw_concurrency 12)
+  os           : Linux 5.15.0-191-generic
+  filesystem   : ext4
+  store        : cyclone 0.1.0 @ unknown
+  volume       : <data dir>/cyclone_kv_bench.dat (8192 MiB)
+
+Cyclone tuning (spec allows store-specific tuning if printed):
+  max_object_size         = 0 (unbounded; blocks reach 32 MiB)
+  ram_cache_size          = 0 (the CLFUS RAM tier is irrelevant for
+                            multi-MB blobs; disk hits are zero-copy
+                            mmap spans served from the OS page cache)
+  enable_checksum         = true (mandatory in multi-process mode)
+  verify_checksum_on_read = true
+  mmap directory          = on (multi-process 0 of 1)
+  hit tracking            = off
+  optimization engine     = off
+  directory_sync_interval = 0 (no periodic fsync; the restart
+                            phase is a process restart, not a power-loss test)
+  sync_on_write           = false (no per-put fsync)
+  metadata                = 64-byte set_header() slot (a dedicated
+                            header, not a value prefix)
+  seconds/point           = 1 (after a 2s warm-up)
+
+=== block_size 65536 (64 KiB), n = 4096, dataset 0.25 GiB, stripe_size = auto ===
+  [1/5] put
+  content verify: ok
+  [2/5] get_first_touch
+        dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+        readahead hints issued so far: 0 (after get_first_touch)
+  [3/5] get_warm (Zipf theta=0.99)
+        mode=view threads=1
+        mode=copy threads=1
+  [4/5] restart
+        dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+        readahead hints issued so far: 0 (after restart)
+  [5/5] multiprocess_read: skipped (--skip-multiprocess)
+=== block_size 131072 (128 KiB), n = 4096, dataset 0.5 GiB, stripe_size = auto ===
+  [1/5] put
+  content verify: ok
+  [2/5] get_first_touch
+        dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+        readahead hints issued so far: 0 (after get_first_touch)
+  [3/5] get_warm (Zipf theta=0.99)
+        mode=view threads=1
+        mode=copy threads=1
+  [4/5] restart
+        dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+        readahead hints issued so far: 0 (after restart)
+  [5/5] multiprocess_read: skipped (--skip-multiprocess)
+=== block_size 262144 (256 KiB), n = 4096, dataset 1 GiB, stripe_size = auto ===
+  [1/5] put
+  content verify: ok
+  [2/5] get_first_touch
+        dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+        readahead hints issued so far: 4096 (after get_first_touch)
+  [3/5] get_warm (Zipf theta=0.99)
+        mode=view threads=1
+        mode=copy threads=1
+  [4/5] restart
+        dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+        readahead hints issued so far: 4096 (after restart)
+  [5/5] multiprocess_read: skipped (--skip-multiprocess)
+=== block_size 524288 (512 KiB), n = 4096, dataset 2 GiB, stripe_size = auto ===
+  [1/5] put
+  content verify: ok
+  [2/5] get_first_touch
+        dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+        readahead hints issued so far: 4098 (after get_first_touch)
+  [3/5] get_warm (Zipf theta=0.99)
+        mode=view threads=1
+        mode=copy threads=1
+  [4/5] restart
+        dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+        readahead hints issued so far: 4096 (after restart)
+  [5/5] multiprocess_read: skipped (--skip-multiprocess)
+=== block_size 1048576 (1024 KiB), n = 4096, dataset 4 GiB, stripe_size = auto ===
+  [1/5] put
+  content verify: ok
+  [2/5] get_first_touch
+        dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+        readahead hints issued so far: 4096 (after get_first_touch)
+  [3/5] get_warm (Zipf theta=0.99)
+        mode=view threads=1
+        mode=copy threads=1
+  [4/5] restart
+        dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+        readahead hints issued so far: 4096 (after restart)
+  [5/5] multiprocess_read: skipped (--skip-multiprocess)
+=== block_size 2097152 (2048 KiB), n = 2048, dataset 4 GiB, stripe_size = auto ===
+  [1/5] put
+  content verify: ok
+  [2/5] get_first_touch
+        dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+        readahead hints issued so far: 2050 (after get_first_touch)
+  [3/5] get_warm (Zipf theta=0.99)
+        mode=view threads=1
+        mode=copy threads=1
+  [4/5] restart
+        dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+        readahead hints issued so far: 2048 (after restart)
+  [5/5] multiprocess_read: skipped (--skip-multiprocess)
+=== block_size 8388608 (8192 KiB), n = 512, dataset 4 GiB, stripe_size = auto ===
+  [1/5] put
+  content verify: ok
+  [2/5] get_first_touch
+        dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+        readahead hints issued so far: 514 (after get_first_touch)
+  [3/5] get_warm (Zipf theta=0.99)
+        mode=view threads=1
+        mode=copy threads=1
+  [4/5] restart
+        dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+        readahead hints issued so far: 512 (after restart)
+  [5/5] multiprocess_read: skipped (--skip-multiprocess)
+=== block_size 33554432 (32768 KiB), n = 128, dataset 4 GiB, stripe_size = 2048 MiB ===
+  [1/5] put
+  content verify: ok
+  [2/5] get_first_touch
+        dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+        readahead hints issued so far: 130 (after get_first_touch)
+  [3/5] get_warm (Zipf theta=0.99)
+        mode=view threads=1
+        mode=copy threads=1
+  [4/5] restart
+        dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+        readahead hints issued so far: 128 (after restart)
+  [5/5] multiprocess_read: skipped (--skip-multiprocess)
+
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+|---|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|
+| cyclone | 65536 | 4096 | put | - | 1 | 20314.8 | 1.331 | 32.1 | 79.2 | 108.0 | - |
+| cyclone | 65536 | 4096 | get_first_touch | view | 1 | 608.7 | 0.040 | 1653.1 | 2386.4 | 2960.0 | 1.000 |
+| cyclone | 65536 | 4096 | get_warm | view | 1 | 2021251.0 | 132.465 | 0.4 | 0.8 | 1.0 | - |
+| cyclone | 65536 | 4096 | get_warm | copy | 1 | 294351.7 | 19.291 | 3.2 | 5.8 | 19.5 | - |
+| cyclone | 65536 | 4096 | restart | view | 1 | 583.8 | 0.038 | 1700.2 | 2510.6 | 2897.7 | 1.000 |
+| cyclone | 131072 | 4096 | put | - | 1 | 11841.3 | 1.552 | 57.5 | 73.5 | 104.3 | - |
+| cyclone | 131072 | 4096 | get_first_touch | view | 1 | 300.4 | 0.039 | 3312.5 | 4116.0 | 4697.0 | 1.000 |
+| cyclone | 131072 | 4096 | get_warm | view | 1 | 1739750.7 | 228.033 | 0.5 | 1.0 | 1.2 | - |
+| cyclone | 131072 | 4096 | get_warm | copy | 1 | 144228.0 | 18.904 | 7.5 | 11.3 | 25.8 | - |
+| cyclone | 131072 | 4096 | restart | view | 1 | 296.5 | 0.039 | 3362.3 | 4199.8 | 5496.3 | 1.000 |
+| cyclone | 262144 | 4096 | put | - | 1 | 6065.7 | 1.590 | 109.9 | 151.8 | 178.0 | - |
+| cyclone | 262144 | 4096 | get_first_touch | view | 1 | 4208.4 | 1.103 | 225.3 | 392.1 | 539.2 | 1.000 |
+| cyclone | 262144 | 4096 | get_warm | view | 1 | 1146065.5 | 300.434 | 0.7 | 2.4 | 3.8 | - |
+| cyclone | 262144 | 4096 | get_warm | copy | 1 | 69587.0 | 18.242 | 15.7 | 22.0 | 44.0 | - |
+| cyclone | 262144 | 4096 | restart | view | 1 | 3147.4 | 0.825 | 289.5 | 730.4 | 915.7 | 1.000 |
+| cyclone | 524288 | 4096 | put | - | 1 | 3078.7 | 1.614 | 213.6 | 293.2 | 467.2 | - |
+| cyclone | 524288 | 4096 | get_first_touch | view | 1 | 3030.6 | 1.589 | 304.4 | 587.5 | 932.6 | 1.000 |
+| cyclone | 524288 | 4096 | get_warm | view | 1 | 783825.8 | 410.950 | 1.0 | 4.0 | 4.7 | - |
+| cyclone | 524288 | 4096 | get_warm | copy | 1 | 33834.8 | 17.739 | 31.6 | 48.8 | 69.5 | - |
+| cyclone | 524288 | 4096 | restart | view | 1 | 2653.0 | 1.391 | 355.6 | 885.9 | 1100.9 | 1.000 |
+| cyclone | 1048576 | 4096 | put | - | 1 | 972.4 | 1.020 | 426.9 | 6650.0 | 11795.4 | - |
+| cyclone | 1048576 | 4096 | get_first_touch | view | 1 | 1602.7 | 1.681 | 583.5 | 1006.8 | 1540.2 | 1.000 |
+| cyclone | 1048576 | 4096 | get_warm | view | 1 | 475340.5 | 498.431 | 1.9 | 5.4 | 7.1 | - |
+| cyclone | 1048576 | 4096 | get_warm | copy | 1 | 12930.2 | 13.558 | 83.1 | 117.0 | 148.9 | - |
+| cyclone | 1048576 | 4096 | restart | view | 1 | 1446.2 | 1.516 | 641.7 | 1741.8 | 2185.9 | 1.000 |
+| cyclone | 2097152 | 2048 | put | - | 1 | 651.8 | 1.367 | 875.3 | 5966.9 | 14550.7 | - |
+| cyclone | 2097152 | 2048 | get_first_touch | view | 1 | 1076.7 | 2.258 | 914.8 | 1240.7 | 1661.2 | 1.000 |
+| cyclone | 2097152 | 2048 | get_warm | view | 1 | 270658.9 | 567.613 | 4.0 | 4.9 | 20.1 | - |
+| cyclone | 2097152 | 2048 | get_warm | copy | 1 | 6333.2 | 13.282 | 166.4 | 218.1 | 247.7 | - |
+| cyclone | 2097152 | 2048 | restart | view | 1 | 934.7 | 1.960 | 1017.2 | 2227.8 | 2463.9 | 1.000 |
+| cyclone | 8388608 | 512 | put | - | 1 | 147.9 | 1.241 | 4364.5 | 18288.8 | 23590.9 | - |
+| cyclone | 8388608 | 512 | get_first_touch | view | 1 | 316.2 | 2.652 | 3120.9 | 4042.7 | 4807.9 | 1.000 |
+| cyclone | 8388608 | 512 | get_warm | view | 1 | 69263.4 | 581.023 | 14.8 | 19.5 | 35.7 | - |
+| cyclone | 8388608 | 512 | get_warm | copy | 1 | 1521.3 | 12.761 | 667.1 | 743.6 | 841.6 | - |
+| cyclone | 8388608 | 512 | restart | view | 1 | 308.5 | 2.588 | 3108.3 | 4930.2 | 5742.0 | 1.000 |
+| cyclone | 33554432 | 128 | put | - | 1 | 25.9 | 0.868 | 27384.3 | 56845.3 | 60352.6 | - |
+| cyclone | 33554432 | 128 | get_first_touch | view | 1 | 93.2 | 3.129 | 10827.9 | 11821.6 | 12106.7 | 1.000 |
+| cyclone | 33554432 | 128 | get_warm | view | 1 | 17335.6 | 581.687 | 57.1 | 88.9 | 115.6 | - |
+| cyclone | 33554432 | 128 | get_warm | copy | 1 | 372.8 | 12.509 | 2676.4 | 3030.2 | 3075.3 | - |
+| cyclone | 33554432 | 128 | restart | view | 1 | 91.2 | 3.059 | 10808.6 | 12320.4 | 13126.2 | 1.000 |
+
+(sink 206097801438)
+JSON lines written to $HOME/cy29/out/cold-base-3.jsonl

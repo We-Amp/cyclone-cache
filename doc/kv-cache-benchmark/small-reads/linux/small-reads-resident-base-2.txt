@@ -1,0 +1,111 @@
+Cyclone KV-cache storage-tier benchmark (workload spec v1)
+  cpu          : Intel(R) Core(TM) i7-8750H CPU @ 2.20GHz
+  cores        : 12 (hw_concurrency 12)
+  os           : Linux 5.15.0-191-generic
+  filesystem   : ext4
+  store        : cyclone 0.1.0 @ unknown
+  volume       : <data dir>/cyclone_kv_bench.dat (8192 MiB)
+
+Cyclone tuning (spec allows store-specific tuning if printed):
+  max_object_size         = 0 (unbounded; blocks reach 32 MiB)
+  ram_cache_size          = 0 (the CLFUS RAM tier is irrelevant for
+                            multi-MB blobs; disk hits are zero-copy
+                            mmap spans served from the OS page cache)
+  enable_checksum         = true (mandatory in multi-process mode)
+  verify_checksum_on_read = true
+  mmap directory          = on (multi-process 0 of 1)
+  hit tracking            = off
+  optimization engine     = off
+  directory_sync_interval = 0 (no periodic fsync; the restart
+                            phase is a process restart, not a power-loss test)
+  sync_on_write           = false (no per-put fsync)
+  metadata                = 64-byte set_header() slot (a dedicated
+                            header, not a value prefix)
+  seconds/point           = 1 (after a 2s warm-up)
+
+=== block_size 65536 (64 KiB), n = 4096, dataset 0.25 GiB, stripe_size = auto ===
+  [1/5] put
+  content verify: ok
+  [2/5] get_first_touch
+        readahead hints issued so far: 0 (after get_first_touch)
+  [3/5] get_warm (Zipf theta=0.99)
+        mode=view threads=1
+        mode=copy threads=1
+  [4/5] restart
+        readahead hints issued so far: 0 (after restart)
+  [5/5] multiprocess_read: skipped (--skip-multiprocess)
+=== block_size 131072 (128 KiB), n = 4096, dataset 0.5 GiB, stripe_size = auto ===
+  [1/5] put
+  content verify: ok
+  [2/5] get_first_touch
+        readahead hints issued so far: 0 (after get_first_touch)
+  [3/5] get_warm (Zipf theta=0.99)
+        mode=view threads=1
+        mode=copy threads=1
+  [4/5] restart
+        readahead hints issued so far: 0 (after restart)
+  [5/5] multiprocess_read: skipped (--skip-multiprocess)
+=== block_size 262144 (256 KiB), n = 4096, dataset 1 GiB, stripe_size = auto ===
+  [1/5] put
+  content verify: ok
+  [2/5] get_first_touch
+        readahead hints issued so far: 4096 (after get_first_touch)
+  [3/5] get_warm (Zipf theta=0.99)
+        mode=view threads=1
+        mode=copy threads=1
+  [4/5] restart
+        readahead hints issued so far: 4096 (after restart)
+  [5/5] multiprocess_read: skipped (--skip-multiprocess)
+=== block_size 524288 (512 KiB), n = 4096, dataset 2 GiB, stripe_size = auto ===
+  [1/5] put
+  content verify: ok
+  [2/5] get_first_touch
+        readahead hints issued so far: 4096 (after get_first_touch)
+  [3/5] get_warm (Zipf theta=0.99)
+        mode=view threads=1
+        mode=copy threads=1
+  [4/5] restart
+        readahead hints issued so far: 4096 (after restart)
+  [5/5] multiprocess_read: skipped (--skip-multiprocess)
+=== block_size 1048576 (1024 KiB), n = 4096, dataset 4 GiB, stripe_size = auto ===
+  [1/5] put
+  content verify: ok
+  [2/5] get_first_touch
+        readahead hints issued so far: 4096 (after get_first_touch)
+  [3/5] get_warm (Zipf theta=0.99)
+        mode=view threads=1
+        mode=copy threads=1
+  [4/5] restart
+        readahead hints issued so far: 4096 (after restart)
+  [5/5] multiprocess_read: skipped (--skip-multiprocess)
+
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+|---|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|
+| cyclone | 65536 | 4096 | put | - | 1 | 21700.1 | 1.422 | 31.7 | 44.4 | 70.9 | - |
+| cyclone | 65536 | 4096 | get_first_touch | view | 1 | 121597.2 | 7.969 | 8.1 | 11.2 | 28.1 | 1.000 |
+| cyclone | 65536 | 4096 | get_warm | view | 1 | 2030850.3 | 133.094 | 0.4 | 0.8 | 1.0 | - |
+| cyclone | 65536 | 4096 | get_warm | copy | 1 | 289049.9 | 18.943 | 3.3 | 5.9 | 20.1 | - |
+| cyclone | 65536 | 4096 | restart | view | 1 | 122736.9 | 8.044 | 8.0 | 11.4 | 23.6 | 1.000 |
+| cyclone | 131072 | 4096 | put | - | 1 | 11481.6 | 1.505 | 57.8 | 107.5 | 117.4 | - |
+| cyclone | 131072 | 4096 | get_first_touch | view | 1 | 65950.9 | 8.644 | 15.0 | 18.3 | 42.0 | 1.000 |
+| cyclone | 131072 | 4096 | get_warm | view | 1 | 1720848.4 | 225.555 | 0.5 | 1.0 | 1.2 | - |
+| cyclone | 131072 | 4096 | get_warm | copy | 1 | 140879.8 | 18.465 | 7.7 | 11.1 | 27.8 | - |
+| cyclone | 131072 | 4096 | restart | view | 1 | 64922.4 | 8.510 | 15.1 | 21.5 | 41.3 | 1.000 |
+| cyclone | 262144 | 4096 | put | - | 1 | 5999.9 | 1.573 | 109.1 | 190.9 | 349.8 | - |
+| cyclone | 262144 | 4096 | get_first_touch | view | 1 | 30168.9 | 7.909 | 32.5 | 49.3 | 76.3 | 1.000 |
+| cyclone | 262144 | 4096 | get_warm | view | 1 | 1128339.7 | 295.787 | 0.7 | 3.0 | 3.9 | - |
+| cyclone | 262144 | 4096 | get_warm | copy | 1 | 66710.2 | 17.488 | 16.2 | 23.0 | 46.8 | - |
+| cyclone | 262144 | 4096 | restart | view | 1 | 29621.0 | 7.765 | 32.7 | 61.3 | 78.0 | 1.000 |
+| cyclone | 524288 | 4096 | put | - | 1 | 3100.4 | 1.625 | 212.2 | 292.7 | 342.0 | - |
+| cyclone | 524288 | 4096 | get_first_touch | view | 1 | 16471.6 | 8.636 | 59.6 | 72.1 | 102.2 | 1.000 |
+| cyclone | 524288 | 4096 | get_warm | view | 1 | 780183.6 | 409.041 | 1.0 | 4.1 | 4.7 | - |
+| cyclone | 524288 | 4096 | get_warm | copy | 1 | 32345.6 | 16.958 | 32.7 | 45.1 | 81.2 | - |
+| cyclone | 524288 | 4096 | restart | view | 1 | 16217.1 | 8.502 | 59.8 | 100.2 | 122.0 | 1.000 |
+| cyclone | 1048576 | 4096 | put | - | 1 | 1544.8 | 1.620 | 422.4 | 572.5 | 964.8 | - |
+| cyclone | 1048576 | 4096 | get_first_touch | view | 1 | 5081.1 | 5.328 | 117.6 | 408.3 | 448.8 | 1.000 |
+| cyclone | 1048576 | 4096 | get_warm | view | 1 | 472458.7 | 495.409 | 1.9 | 5.5 | 8.6 | - |
+| cyclone | 1048576 | 4096 | get_warm | copy | 1 | 12909.6 | 13.537 | 83.0 | 118.2 | 159.3 | - |
+| cyclone | 1048576 | 4096 | restart | view | 1 | 8574.1 | 8.991 | 113.7 | 155.4 | 193.2 | 1.000 |
+
+(sink 97421221425)
+JSON lines written to $HOME/cy29/out/resident-base-2.jsonl
