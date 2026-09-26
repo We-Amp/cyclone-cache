@@ -256,6 +256,12 @@ enum class ResetProvenance : std::uint8_t {
 // actually gating anything.
 constexpr std::uint64_t kInitLockByte = 0x7FFFFFFFFFFFFFFEULL;
 constexpr std::uint64_t kLifetimeLockByte = 0x7FFFFFFFFFFFFFFDULL;
+#ifndef _WIN32
+static_assert(sizeof(off_t) == 8,
+              "the lock bytes are cast to off_t at the fcntl call; a 32-bit "
+              "off_t would truncate them (_FILE_OFFSET_BITS=64 on 32-bit "
+              "targets)");
+#endif
 static_assert(kInitLockByte != kLifetimeLockByte,
               "the init and lifetime locks must sit on DISTINCT bytes or the "
               "reset-gate probe self-succeeds against our own init lock");
@@ -1995,6 +2001,10 @@ void Volume::close() {
   _teardown.store(true, std::memory_order_seq_cst);
   _stripes.clear();
   _mapped_file.reset();
+  // After the stripes (nothing can take the write lock any more), before the
+  // fd (Windows registers on it).
+  _writer_liveness.detach();
+  _writer_liveness_attached.store(false, std::memory_order_relaxed);
 
   // Closing _fd releases the SHARED lifetime lock -- but only when this is the
   // LAST close of the OFD.  That is deliberate and load-bearing: an
@@ -2274,6 +2284,15 @@ std::expected<void, CacheError> Volume::init_stripes(bool exclusive) {
   // Determine if we should use mmap'd directories
   bool use_mmap_dir = _mp_config.enabled;
 
+  // Claim this process's write-lock liveness slot on the volume file (issue
+  // #32) before any stripe can take the write lock, so a peer can tell our
+  // death from a stall in any PID namespace.  Idempotent across reset().
+  if (use_mmap_dir &&
+      !_writer_liveness_attached.load(std::memory_order_relaxed)) {
+    _writer_liveness.attach(_fd, _config.path);
+    _writer_liveness_attached.store(true, std::memory_order_relaxed);
+  }
+
   // Stripes start after the volume header
   uint64_t offset = VolumeHeader::kSize;
   for (size_t i = 0; i < num_stripes; ++i) {
@@ -2332,6 +2351,7 @@ std::expected<void, CacheError> Volume::init_stripes(bool exclusive) {
           advise_range(offset, *dir_region);
         }
       }
+      stripe->mmap_directory->set_liveness(&_writer_liveness);
 
       // Data starts after directory, aligned to page size
       size_t page_size = 4096;
@@ -3930,8 +3950,8 @@ std::expected<Volume::WriteSlot, CacheError> Volume::allocate_write_slot(
   // lock here -- "holding it through pwrite() could exceed the spin timeout and
   // get force-released, causing overlapping writes" -- is obsolete since the
   // write-lock lifetime fix: a force-release now PROVES the holder dead
-  // (kill(pid,0)) before recovering it, so a live process mid-pwrite is never
-  // usurped by routine recovery. (The multi-second last-resort escalation
+  // (WriterLiveness) before recovering it, so a live process mid-pwrite is
+  // never usurped by routine recovery. (The multi-second last-resort escalation
   // remains the bounded W2-class residual -- see the honesty note on WriteSlot
   // in volume.hpp and the commit_write_slot usurp comment below.)  Releasing
   // the lock BEFORE the pwrite instead opened the reservation-to-pwrite tear
@@ -4261,6 +4281,11 @@ VolumeStats Volume::stats() const {
   result.stripe_count = _stripes.size();
   result.reset_gate_degraded =
       _reset_gate_degraded.load(std::memory_order_relaxed) ? 1 : 0;
+  result.write_lock_liveness_unregistered =
+      _writer_liveness_attached.load(std::memory_order_relaxed) &&
+              _writer_liveness.slot_of() < 0
+          ? 1
+          : 0;
   result.resets_under_degraded_gate =
       _resets_under_degraded_gate.load(std::memory_order_relaxed);
   result.resets_gate_verified =

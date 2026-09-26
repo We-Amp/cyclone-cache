@@ -66,11 +66,15 @@ config.set_multi_process_config(mp_config);
 - **Checksums must be enabled** (`enable_checksum = true`, the default)
 - **Valid process index**: `process_index < total_processes`
 - **All processes must use the same** `total_processes` value
-- **All processes must share one host and one PID namespace.** A writer
-  recovers the write lock from a holder whose PID the OS reports gone
-  (`kill(pid, 0)` / `OpenProcess`). A live holder in another PID namespace,
-  such as another container sharing the volume, looks gone, and taking the
-  lock from it can overlap two writes.
+- **All processes must share one host**, and the volume file must support
+  byte-range locks (local filesystems do; see
+  [Writer liveness](#writer-liveness)).
+- **Sharing one PID namespace is recommended, no longer required.** Processes
+  in different PID namespaces, such as two containers sharing the volume, are
+  safe with each other: a writer's liveness is a lock on the volume file, not
+  its PID. Keep one namespace while any process sharing the volume runs a
+  build from before issue #32, which still decides liveness with
+  `kill(pid, 0)` / `OpenProcess` (see [Writer liveness](#writer-liveness)).
 
 ## Architecture
 
@@ -176,7 +180,7 @@ holder.
 |------|--------|------------------|
 | Bucket seqlock | 250 ms | The waiter forces the bucket to even. |
 | Phase lock | 1 s | The waiter recovers the lock. |
-| Write lock | 5 s | Once one holder has kept the lock for 50 ms, the waiter checks after every sleep whether `kill(pid, 0)` / `OpenProcess` proves it dead, and recovers the lock if so. It takes over a holder it cannot prove dead only after the budget. |
+| Write lock | 5 s | Once one holder has kept the lock for 50 ms, the waiter checks after every sleep whether the holder's liveness lock is gone (see [Writer liveness](#writer-liveness)), and recovers the lock if so. It takes over a holder it cannot prove dead only after the budget. |
 
 The budgets are far above the longest live hold measured with 5.2 runnable
 threads per core (56 ms for a bucket, 112 ms for the phase lock). A holder
@@ -243,6 +247,96 @@ over with a blind store of 0. Builds of the same format still exclude each
 other in normal locking, because both treat any nonzero lock value as held.
 During an upgrade overlap, the pair therefore behaves like the older build,
 and no worse than before.
+
+### Writer liveness
+
+A write-lock holder that dies must be recovered quickly, and a live one must
+never be taken over: its overlapping write is the one failure readers cannot
+detect. The waiter therefore needs a proof of death that holds in any PID
+namespace. A PID is not one: to a process in another namespace, a live
+holder's PID reads as gone, or names an unrelated live process.
+
+**Slots.** Each process that opens a multi-process volume claims one of
+**251 liveness slots**: bytes `0x7FFFFFFE00000000 + slot` of the volume
+file, far past any data and below the two reset-gate lock bytes. It holds a
+byte-range lock on its slot for as long as it lives. The kernel drops the
+lock when the process dies, whatever namespace or container it ran in,
+because the lock belongs to the file, not to a process ID.
+
+**The token names the slot.** A holder stores a lock token that encodes its
+slot. For each generation of the lock, the 252 values 2 to 253 form a ring:
+the plain token (what a holder without a slot, and every older build, stores)
+takes one position, and the 251 slot tokens take the others. So a slot token
+never equals the plain token of the same generation, and never 0 (free), 1
+(the only value builds before #27 store) or a recovery claim (254, 255). No
+header bytes are added. The owner PID stays where it was, for older builds.
+
+**The probe.** A waiter that has watched one holder for 50 ms decodes the
+slot from the token and generation it read, and asks whether any process
+holds a lock on that slot's byte:
+
+| Platform | Claim | Probe |
+|----------|-------|-------|
+| Linux, macOS | on a descriptor of its own, reopened read-only by path and checked to be the volume's inode: `F_OFD_GETLK` that the slot is free, `F_OFD_SETLK` `F_RDLCK`, then `F_OFD_GETLK` again to back off from a racing claimer | `F_OFD_GETLK` on the volume descriptor, which holds no slot lock |
+| Windows | exclusive `LockFileEx` on the volume handle | an exclusive `LockFileEx` try, undone at once when it succeeds |
+
+The holder is dead iff no process holds its slot. A live holder can never
+look dead. The one way a dead holder looks alive is that a new process
+claimed its slot in the moments since it died; the waiter then falls back
+to the 5 s escalation, the safe direction. Claims start at a pseudo-random
+slot to make that rare. Nothing depends on PID numbers, so two containers
+whose processes share PID numbers (every container's first process is
+pid 1) do not confuse each other.
+
+A forked child (an nginx or Apache worker of a master that opened the
+volume) claims a slot of its own at its first write-lock acquisition, on a
+descriptor of its own, so its lock dies with it and not with the family.
+The claim reopens the file read-only, so a worker that dropped privileges
+can still claim.
+
+**Keep the slot's descriptor open.** On Linux and macOS the slot lock lives
+on a descriptor the cache opened. An application that closes every
+descriptor after opening the cache (a `closefrom()`-style daemonize step, or
+a child that closes inherited descriptors) drops its slot lock while it
+still stores slot tokens, and a waiter could then take over one of its live
+write-lock holders. Open the cache after daemonizing, and never close
+descriptors behind its back. `fork()` itself is safe: the claim, probe and
+release run under one process-wide mutex that a `pthread_atfork` handler
+takes around `fork()`, so a child never inherits it locked; everything done
+under it is non-blocking (`F_OFD_GETLK`, `F_OFD_SETLK`, never `SETLKW`), so
+a fork waits for at most a few syscalls.
+
+**Network filesystems.** Byte-range lock behaviour on NFS and SMB shares is
+unverified. The one-host requirement above already rules out sharing a
+volume between hosts; on a network mount used by one host, a claim that
+fails leaves the process without a slot (5 s escalation), but a server that
+accepts locks without keeping them across a client or server restart is
+not detected.
+
+**Without a slot.** A process that holds no slot (all 251 taken,
+byte-range locks unsupported on the filesystem, the file replaced by name)
+stores the plain token. A waiter never probes such a holder: it is never
+proven dead, and if it dies holding the lock the waiter recovers it only by
+the 5 s escalation. `VolumeStats::write_lock_liveness_unregistered` reports
+that state.
+
+**Cost.** A claim costs one `open` and a few `fcntl` calls per process and
+volume (Windows: one `LockFileEx` or a few). The uncontended acquisition
+makes the same `getpid()` call as before plus one atomic load; the probe
+runs only on the contended path, after 50 ms behind one holder.
+
+**Mixed builds.** Builds from before issue #32 keep deciding liveness with
+`kill(pid, 0)` / `OpenProcess`, on the PID the new build still publishes. So
+during an upgrade overlap:
+
+- an older waiter behind a new holder behaves exactly as before: safe in
+  one PID namespace, and able to take over a live holder in another one;
+- a new waiter behind an older holder (plain token) never probes it: it
+  never takes over a live one, and recovers a dead one only after the 5 s
+  escalation instead of within about 50 ms.
+
+Keep all processes in one PID namespace until every build sharing the
+volume includes this change.
 
 ### Read Operations
 
