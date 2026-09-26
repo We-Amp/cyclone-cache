@@ -1,0 +1,143 @@
+=== machine ===
+cpu          : Intel(R) Core(TM) i7-8750H CPU @ 2.20GHz (6 physical / 12 logical)
+memory       : 23 GiB
+os           : Ubuntu 22.04.5 LTS (5.15.0-191-generic)
+filesystem   : ext4 on / (path <data dir>)
+store        : lmdb LMDB 0.9.24: (July 24, 2019)
+tuning       : map size 16 GiB; env flags = 0 (MDB_NOSYNC off, MDB_NOMETASYNC off, MDB_WRITEMAP off, MDB_NORDAHEAD off -> durable default, fsync per commit); single unnamed DB; key = raw 32-byte digest; value = 64 B header followed by the block; put = one write txn per put using mdb_put(MDB_RESERVE) (writes straight into the map); get = one MDB_RDONLY txn per get, zero-copy MDB_val into the map
+workload     : kv-workload-spec v1; zipf theta 0.99, seed 42+tid; 1 s per phase-3 point after a 1 s warm-up
+capacity     : spec asks for 8 GiB; none of the peer stores has a capacity knob (no eviction configured, dataset <= 4 GiB)
+
+--- block_size 65536 (64 KiB), n = 4096, dataset 256 MiB ---
+  put              : 153.1 puts/s, 0.010 GB/s, p50 6273.797 us, p99 10440.182 us
+  content verify   : ok
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  get_first_touch  : 18680.0 gets/s, 1.224 GB/s, p50 31.965 us, p99 648.069 us
+  get_warm T=1 view  : 1338463.0 gets/s, 87.718 GB/s, p50 0.733 us, p99 1.089 us
+  get_warm T=1 copy  : 274552.7 gets/s, 17.993 GB/s, p50 3.569 us, p99 6.339 us
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  restart          : hit_fraction 1.0000, 16406.9 gets/s, 1.075 GB/s
+  multiprocess     : skipped (--skip-multiprocess)
+
+--- block_size 131072 (128 KiB), n = 4096, dataset 512 MiB ---
+  put              : 138.9 puts/s, 0.018 GB/s, p50 6760.421 us, p99 11074.478 us
+  content verify   : ok
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  get_first_touch  : 10382.8 gets/s, 1.361 GB/s, p50 50.361 us, p99 654.113 us
+  get_warm T=1 view  : 1131966.2 gets/s, 148.369 GB/s, p50 0.902 us, p99 1.257 us
+  get_warm T=1 copy  : 136752.7 gets/s, 17.924 GB/s, p50 7.956 us, p99 12.172 us
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  restart          : hit_fraction 1.0000, 9174.4 gets/s, 1.203 GB/s
+  multiprocess     : skipped (--skip-multiprocess)
+
+--- block_size 262144 (256 KiB), n = 4096, dataset 1024 MiB ---
+  put              : 128.8 puts/s, 0.034 GB/s, p50 7381.197 us, p99 11561.314 us
+  content verify   : ok
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  get_first_touch  : 5453.8 gets/s, 1.430 GB/s, p50 100.914 us, p99 845.025 us
+  get_warm T=1 view  : 927581.7 gets/s, 243.160 GB/s, p50 1.140 us, p99 1.519 us
+  get_warm T=1 copy  : 67022.4 gets/s, 17.570 GB/s, p50 16.143 us, p99 23.586 us
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  restart          : hit_fraction 1.0000, 5797.6 gets/s, 1.520 GB/s
+  multiprocess     : skipped (--skip-multiprocess)
+
+--- block_size 524288 (512 KiB), n = 4096, dataset 2048 MiB ---
+  put              : 110.2 puts/s, 0.058 GB/s, p50 8488.019 us, p99 13014.752 us
+  content verify   : ok
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  get_first_touch  : 2802.6 gets/s, 1.469 GB/s, p50 212.277 us, p99 1451.118 us
+  get_warm T=1 view  : 663531.1 gets/s, 347.881 GB/s, p50 1.603 us, p99 2.049 us
+  get_warm T=1 copy  : 31956.1 gets/s, 16.754 GB/s, p50 32.978 us, p99 48.893 us
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  restart          : hit_fraction 1.0000, 2917.6 gets/s, 1.530 GB/s
+  multiprocess     : skipped (--skip-multiprocess)
+
+--- block_size 1048576 (1024 KiB), n = 4096, dataset 4096 MiB ---
+  put              : 88.7 puts/s, 0.093 GB/s, p50 10304.967 us, p99 15430.927 us
+  content verify   : ok
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  get_first_touch  : 1722.4 gets/s, 1.806 GB/s, p50 318.500 us, p99 2705.591 us
+  get_warm T=1 view  : 419884.8 gets/s, 440.281 GB/s, p50 2.488 us, p99 3.059 us
+  get_warm T=1 copy  : 13217.0 gets/s, 13.859 GB/s, p50 80.285 us, p99 126.232 us
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  restart          : hit_fraction 1.0000, 1683.9 gets/s, 1.766 GB/s
+  multiprocess     : skipped (--skip-multiprocess)
+
+--- block_size 2097152 (2048 KiB), n = 2048, dataset 4096 MiB ---
+  put              : 67.9 puts/s, 0.142 GB/s, p50 13269.632 us, p99 18610.783 us
+  content verify   : ok
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  get_first_touch  : 900.7 gets/s, 1.889 GB/s, p50 729.373 us, p99 3797.627 us
+  get_warm T=1 view  : 242117.9 gets/s, 507.758 GB/s, p50 4.243 us, p99 4.930 us
+  get_warm T=1 copy  : 6532.5 gets/s, 13.700 GB/s, p50 160.951 us, p99 211.141 us
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  restart          : hit_fraction 1.0000, 855.5 gets/s, 1.794 GB/s
+  multiprocess     : skipped (--skip-multiprocess)
+
+--- block_size 8388608 (8192 KiB), n = 512, dataset 4096 MiB ---
+  put              : 35.9 puts/s, 0.301 GB/s, p50 23239.727 us, p99 43272.532 us
+  content verify   : ok
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  get_first_touch  : 222.6 gets/s, 1.867 GB/s, p50 4607.144 us, p99 7473.553 us
+  get_warm T=1 view  : 66388.9 gets/s, 556.910 GB/s, p50 15.194 us, p99 17.669 us
+  get_warm T=1 copy  : 1570.8 gets/s, 13.177 GB/s, p50 643.952 us, p99 722.514 us
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  restart          : hit_fraction 1.0000, 209.3 gets/s, 1.756 GB/s
+  multiprocess     : skipped (--skip-multiprocess)
+
+--- block_size 33554432 (32768 KiB), n = 128, dataset 4096 MiB ---
+  put              : 10.9 puts/s, 0.366 GB/s, p50 72049.732 us, p99 123977.108 us
+  content verify   : ok
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  get_first_touch  : 59.7 gets/s, 2.002 GB/s, p50 16343.823 us, p99 23884.310 us
+  get_warm T=1 view  : 17178.0 gets/s, 576.397 GB/s, p50 58.350 us, p99 62.984 us
+  get_warm T=1 copy  : 369.2 gets/s, 12.388 GB/s, p50 2655.296 us, p99 2998.784 us
+  dropping caches  : sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+  restart          : hit_fraction 1.0000, 54.4 gets/s, 1.824 GB/s
+  multiprocess     : skipped (--skip-multiprocess)
+
+## Results (lmdb)
+
+| phase | mode | block | threads | ops/s | GB/s | p50 us | p99 us | p99.9 us | hit |
+|---|---|---|---|---|---|---|---|---|---|
+| put | - | 64 KiB | 1 | 153.1 | 0.010 | 6273.8 | 10440.2 | 17104.4 | - |
+| get_first_touch | view | 64 KiB | 1 | 18680.0 | 1.224 | 32.0 | 648.1 | 688.6 | 1.000 |
+| get_warm | view | 64 KiB | 1 | 1338463.0 | 87.718 | 0.7 | 1.1 | 1.2 | 1.000 |
+| get_warm | copy | 64 KiB | 1 | 274552.7 | 17.993 | 3.6 | 6.3 | 20.4 | 1.000 |
+| restart | view | 64 KiB | 1 | 16406.9 | 1.075 | 31.9 | 590.8 | 661.7 | 1.000 |
+| put | - | 128 KiB | 1 | 138.9 | 0.018 | 6760.4 | 11074.5 | 69259.7 | - |
+| get_first_touch | view | 128 KiB | 1 | 10382.8 | 1.361 | 50.4 | 654.1 | 809.4 | 1.000 |
+| get_warm | view | 128 KiB | 1 | 1131966.2 | 148.369 | 0.9 | 1.3 | 1.4 | 1.000 |
+| get_warm | copy | 128 KiB | 1 | 136752.7 | 17.924 | 8.0 | 12.2 | 29.9 | 1.000 |
+| restart | view | 128 KiB | 1 | 9174.4 | 1.203 | 49.3 | 630.6 | 1041.6 | 1.000 |
+| put | - | 256 KiB | 1 | 128.8 | 0.034 | 7381.2 | 11561.3 | 15215.4 | - |
+| get_first_touch | view | 256 KiB | 1 | 5453.8 | 1.430 | 100.9 | 845.0 | 1855.0 | 1.000 |
+| get_warm | view | 256 KiB | 1 | 927581.7 | 243.160 | 1.1 | 1.5 | 1.7 | 1.000 |
+| get_warm | copy | 256 KiB | 1 | 67022.4 | 17.570 | 16.1 | 23.6 | 45.1 | 1.000 |
+| restart | view | 256 KiB | 1 | 5797.6 | 1.520 | 126.2 | 818.1 | 1165.2 | 1.000 |
+| put | - | 512 KiB | 1 | 110.2 | 0.058 | 8488.0 | 13014.8 | 16624.3 | - |
+| get_first_touch | view | 512 KiB | 1 | 2802.6 | 1.469 | 212.3 | 1451.1 | 2266.8 | 1.000 |
+| get_warm | view | 512 KiB | 1 | 663531.1 | 347.881 | 1.6 | 2.0 | 4.3 | 1.000 |
+| get_warm | copy | 512 KiB | 1 | 31956.1 | 16.754 | 33.0 | 48.9 | 80.2 | 1.000 |
+| restart | view | 512 KiB | 1 | 2917.6 | 1.530 | 229.9 | 1335.3 | 1554.8 | 1.000 |
+| put | - | 1024 KiB | 1 | 88.7 | 0.093 | 10305.0 | 15430.9 | 19590.6 | - |
+| get_first_touch | view | 1024 KiB | 1 | 1722.4 | 1.806 | 318.5 | 2705.6 | 3320.5 | 1.000 |
+| get_warm | view | 1024 KiB | 1 | 419884.8 | 440.281 | 2.5 | 3.1 | 5.9 | 1.000 |
+| get_warm | copy | 1024 KiB | 1 | 13217.0 | 13.859 | 80.3 | 126.2 | 142.1 | 1.000 |
+| restart | view | 1024 KiB | 1 | 1683.9 | 1.766 | 352.5 | 2674.9 | 2810.9 | 1.000 |
+| put | - | 2048 KiB | 1 | 67.9 | 0.142 | 13269.6 | 18610.8 | 21946.7 | - |
+| get_first_touch | view | 2048 KiB | 1 | 900.7 | 1.889 | 729.4 | 3797.6 | 4444.2 | 1.000 |
+| get_warm | view | 2048 KiB | 1 | 242117.9 | 507.758 | 4.2 | 4.9 | 20.7 | 1.000 |
+| get_warm | copy | 2048 KiB | 1 | 6532.5 | 13.700 | 161.0 | 211.1 | 253.0 | 1.000 |
+| restart | view | 2048 KiB | 1 | 855.5 | 1.794 | 740.1 | 3957.3 | 4420.6 | 1.000 |
+| put | - | 8192 KiB | 1 | 35.9 | 0.301 | 23239.7 | 43272.5 | 45227.2 | - |
+| get_first_touch | view | 8192 KiB | 1 | 222.6 | 1.867 | 4607.1 | 7473.6 | 8179.4 | 1.000 |
+| get_warm | view | 8192 KiB | 1 | 66388.9 | 556.910 | 15.2 | 17.7 | 37.0 | 1.000 |
+| get_warm | copy | 8192 KiB | 1 | 1570.8 | 13.177 | 644.0 | 722.5 | 783.9 | 1.000 |
+| restart | view | 8192 KiB | 1 | 209.3 | 1.756 | 4823.5 | 8242.1 | 9069.3 | 1.000 |
+| put | - | 32768 KiB | 1 | 10.9 | 0.366 | 72049.7 | 123977.1 | 127144.6 | - |
+| get_first_touch | view | 32768 KiB | 1 | 59.7 | 2.002 | 16343.8 | 23884.3 | 23962.6 | 1.000 |
+| get_warm | view | 32768 KiB | 1 | 17178.0 | 576.397 | 58.4 | 63.0 | 104.1 | 1.000 |
+| get_warm | copy | 32768 KiB | 1 | 369.2 | 12.388 | 2655.3 | 2998.8 | 3086.2 | 1.000 |
+| restart | view | 32768 KiB | 1 | 54.4 | 1.824 | 18034.1 | 24952.5 | 25004.2 | 1.000 |
+

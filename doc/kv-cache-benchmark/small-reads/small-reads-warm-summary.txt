@@ -1,0 +1,34 @@
+# Warm check: kv_bench --block-size 65536 --block-size 262144
+# --block-size 524288 --seconds 5 --threads 1,4 (all phases, including the
+# 4-process phase), main (base) and the change (after) interleaved.
+# Build 171a48f of the change (linux/earlier-build/): its validated warm
+# path is the final one.  The final build's warm set
+# (linux/disturbed-warm/) ran into a container job and is not used.
+
+    64K put               -    T=1  after 1.33 [1.40 1.33 1.32]  base 1.34 [1.36 1.34 1.32]  after/base 1.00
+    64K get_first_touch   view T=1  after 2.59 [2.53 2.64 2.59]  base 0.04 [0.04 0.04 0.04]  after/base 71.22
+    64K get_warm          copy T=1  after 18.98 [19.03 18.87 18.98]  base 18.99 [18.99 19.21 18.96]  after/base 1.00
+    64K get_warm          copy T=4  after 50.97 [50.97 51.12 50.71]  base 50.81 [50.81 50.94 50.31]  after/base 1.00
+    64K get_warm          view T=1  after 2,036,579 [2,036,579 2,055,187 2,029,933]  base 2,016,079 [2,016,079 2,027,151 1,989,086]  after/base 1.01
+    64K get_warm          view T=4  after 7,275,931 [7,275,931 7,338,374 7,072,261]  base 7,173,873 [7,226,156 7,129,044 7,173,873]  after/base 1.01
+    64K restart           view T=1  after 2.54 [2.67 2.54 2.22]  base 0.03 [0.04 0.03 0.03]  after/base 73.22
+    64K multiprocess_read copy T=4  after 50.11 [50.23 50.11 49.53]  base 50.32 [50.32 50.38 49.22]  after/base 1.00
+    64K multiprocess_read view T=4  after 7,085,158 [7,142,343 7,085,158 6,810,199]  base 7,146,200 [7,146,200 7,197,855 6,925,715]  after/base 0.99
+   256K put               -    T=1  after 1.55 [1.57 1.52 1.55]  base 1.56 [1.60 1.56 1.54]  after/base 0.99
+   256K get_first_touch   view T=1  after 2.75 [2.85 2.70 2.75]  base 0.99 [0.99 0.99 0.99]  after/base 2.77
+   256K get_warm          copy T=1  after 17.67 [18.09 17.67 17.65]  base 17.68 [17.66 18.14 17.68]  after/base 1.00
+   256K get_warm          copy T=4  after 41.01 [41.05 41.01 40.47]  base 40.81 [40.81 41.08 40.32]  after/base 1.01
+   256K get_warm          view T=1  after 1,143,351 [1,144,331 1,141,490 1,143,351]  base 1,128,021 [1,128,021 1,134,382 1,123,073]  after/base 1.01
+   256K get_warm          view T=4  after 4,136,046 [4,136,046 4,245,933 4,057,034]  base 4,170,657 [4,170,657 4,201,866 4,069,000]  after/base 0.99
+   256K restart           view T=1  after 2.78 [2.78 2.78 2.61]  base 0.78 [0.81 0.77 0.78]  after/base 3.58
+   256K multiprocess_read copy T=4  after 40.66 [40.75 40.66 36.81]  base 40.06 [40.58 40.06 39.70]  after/base 1.01
+   256K multiprocess_read view T=4  after 3,936,672 [3,974,540 3,936,672 3,603,507]  base 3,999,233 [3,999,233 4,093,675 3,852,022]  after/base 0.98
+   512K put               -    T=1  after 1.56 [1.61 1.56 1.45]  base 1.59 [1.59 1.61 1.54]  after/base 0.98
+   512K get_first_touch   view T=1  after 2.84 [2.97 2.84 2.74]  base 1.45 [1.56 1.45 1.44]  after/base 1.96
+   512K get_warm          copy T=1  after 17.44 [17.99 17.44 17.23]  base 17.33 [17.33 17.29 17.44]  after/base 1.01
+   512K get_warm          copy T=4  after 35.92 [35.92 36.24 35.24]  base 35.98 [36.02 35.98 35.51]  after/base 1.00
+   512K get_warm          view T=1  after 780,444 [790,384 780,444 769,246]  base 771,950 [771,818 778,503 771,950]  after/base 1.01
+   512K get_warm          view T=4  after 2,816,994 [2,854,800 2,809,128 2,816,994]  base 2,820,320 [2,820,320 2,836,677 2,785,289]  after/base 1.00
+   512K restart           view T=1  after 2.77 [2.77 2.74 2.92]  base 1.21 [1.16 1.21 1.25]  after/base 2.29
+   512K multiprocess_read copy T=4  after 34.90 [34.90 35.20 34.32]  base 34.49 [35.43 33.67 34.49]  after/base 1.01
+   512K multiprocess_read view T=4  after 2,672,384 [2,710,678 2,672,384 2,623,575]  base 2,732,000 [2,732,000 2,750,244 2,663,795]  after/base 0.98

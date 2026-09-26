@@ -328,6 +328,14 @@ hint per re-advise interval (2 s) however often it is read, and a document
 below `readahead_min_bytes` never contributes. On Linux a counted hint whose
 range is already fully resident stops at a `mincore()` check. Process-local.
 
+`cold_readahead_hints`, `sequential_readahead_hints` and
+`recent_write_hint_skips` (appended at the tail of `CacheStats`, C++ only)
+count the hints issued on reads that ran the CRC pass, and the reads that
+skipped one as recently written (see ["Cold and Sequential Readahead"](#cold-and-sequential-readahead)
+below): a hint over one document below `readahead_min_bytes`, and a hint
+that extended past the document because the read continued a sequential run
+of its stripe. Process-local.
+
 The wrap-retention counters observe the eviction mode (see ["Wrap
 Retention"](#wrap-retention) below). `retained_hits` is the direct measure of
 what retention buys. `advances_deferred_by_lease` is the retention
@@ -687,6 +695,17 @@ struct CacheConfig {
     // 256 KiB; 0 = off).  Fluent setter: set_readahead_min_bytes().
     // See "Large-Document Readahead" below.
     size_t readahead_min_bytes = 256 * 1024;
+
+    // Cold-read readahead for documents of at least this size, on reads
+    // that run the CRC pass (default: 16 KiB; 0 = off, window included),
+    // and the sequential window past the document (default: 1 MiB;
+    // 0 = off).  Fluent setters: set_cold_readahead_min_bytes(),
+    // set_sequential_readahead_bytes().  See "Cold and Sequential
+    // Readahead" below.
+    // Both run only on checksum-verifying reads: with
+    // verify_checksum_on_read = false, small cold reads stay unhinted.
+    size_t cold_readahead_min_bytes = 16 * 1024;
+    size_t sequential_readahead_bytes = 1024 * 1024;
 };
 
 enum class RamCacheType {
@@ -1022,6 +1041,63 @@ fault-per-page behaviour; the open-time `MADV_RANDOM` is left in place.
   default (256 KiB).
 
 See `doc/architecture.md` ("Readahead policy") for the measurements.
+
+### Cold and Sequential Readahead
+
+```cpp
+size_t cold_readahead_min_bytes = 16 * 1024;     // CacheConfig field (0 = off)
+size_t sequential_readahead_bytes = 1024 * 1024; // CacheConfig field (0 = off)
+CacheConfig& set_cold_readahead_min_bytes(size_t bytes);
+CacheConfig& set_sequential_readahead_bytes(size_t bytes);
+```
+
+Below `readahead_min_bytes` the large-document hint does not fire, and a cold
+64 KiB read used to fault its 16 pages in one at a time. These two fields add
+readahead there, and past the document, **only on a read that is about to
+run the CRC pass**: `verify_checksum_on_read` is on, the document carries a
+checksum, and this incarnation has not been verified in this process yet (the
+first read after a write, after a restart, or after the offset fell out of
+the checksum-validation cache). That is the read that makes Cyclone's first
+touch of the content. A warm re-read whose checksum is already validated
+never reaches either hint, so it needs no re-advise filter and the warm path
+pays nothing.
+
+- **Cold hint.** A document of at least `cold_readahead_min_bytes` and below
+  `readahead_min_bytes` gets a readahead hint over its own byte range, with
+  the same per-platform call as the large-document hint. Documents below
+  `cold_readahead_min_bytes` are untouched (no hint, no detector); the 16 KiB
+  default leaves one- to three-page HTTP objects alone.
+- **Sequential window.** On the same reads, for documents of at least
+  `cold_readahead_min_bytes` of any size, a thread-local detector remembers
+  where each stripe's last read ended. A read that starts there (or up to
+  64 KiB past it) continues a run, and the hint is extended by up to
+  `sequential_readahead_bytes` past the document, within the stripe. It is
+  re-issued once less than half of the window is left ahead of the reader.
+  One thread reading documents back in the order they were written -- a KV
+  tier reusing a prompt prefix -- hops across stripes by key hash, but within
+  each stripe the documents are adjacent, so each stripe gets its own window.
+- **Cost on a CRC-pending read of a document that is already resident:** a
+  hint it did not need. On the Linux benchmark machine about 2 µs for a
+  64 KiB document read out of order (one `madvise()`), and in a sequential
+  run one short `mincore()` per window (4–7 % of a resident read); on macOS
+  one `F_RDADVISE`, about 0.3 µs.
+- **Only checksum-verifying reads are hinted:** with
+  `verify_checksum_on_read = false` neither hint fires, and small cold reads
+  stay unhinted (one fault per page, as before).
+- **Recently written documents are skipped:** a first read of a document
+  that ends within 4 MiB behind its stripe's write cursor gets no hint
+  (it was just written and is resident; this is the write-then-serve
+  pattern of an optimized alternate), and a sequential run that catches up
+  with a writer still appending stops re-issuing its window. No syscall:
+  the cursor comes from the read's stripe snapshot. A cold read-back of
+  data the writer has finished with is unaffected.
+  `CacheStats::recent_write_hint_skips` counts these reads.
+- `CacheStats::cold_readahead_hints` and `sequential_readahead_hints` count
+  the hints issued. Like the large-document hint, both are best-effort:
+  no lock, no shared state besides the counters, errors ignored.
+- **Not exposed in the C API**; a C-created cache runs with the defaults.
+
+Measurements: `doc/kv-cache-benchmark.md`, "Small cold reads (issue #29)".
 
 ### Small-Object Tier
 

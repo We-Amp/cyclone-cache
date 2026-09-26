@@ -1,0 +1,22 @@
+Randomness seeded to: 785540941
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+cyclone-tests is a Catch2 v3.4.0 host application.
+Run with -? for options
+
+-------------------------------------------------------------------------------
+Retention review R3 (flush): a stale wrap-deferral episode does not force-tear
+a fresh borrow
+-------------------------------------------------------------------------------
+$HOME/cy29-after/tests/integration/test_wrap_retention.cpp:2684
+...............................................................................
+
+$HOME/cy29-after/tests/integration/test_wrap_retention.cpp:2686: SKIPPED:
+explicitly with message:
+  flush mode only
+
+================================================================================
+test cases:     741 |     740 passed | 1 skipped
+assertions: 3023939 | 3023939 passed
+
+rc=0

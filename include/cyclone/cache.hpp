@@ -256,6 +256,19 @@ struct CacheStats {
   // tail to match CycloneCacheStats).  Expected near 0; full semantics on
   // VolumeStats in src/core/volume.hpp.
   uint64_t directory_read_timeouts = 0;
+
+  // Readahead hints on reads that ran the CRC pass (see
+  // CacheConfig::cold_readahead_min_bytes and sequential_readahead_bytes),
+  // summed across volumes.  cold_readahead_hints: over one document below
+  // readahead_min_bytes.  sequential_readahead_hints: extended past the
+  // document because the read continued a sequential run of its stripe.
+  // PROCESS-LOCAL, appended at the tail; NOT mirrored in CycloneCacheStats.
+  uint64_t cold_readahead_hints = 0;
+  uint64_t sequential_readahead_hints = 0;
+  // CRC-pending reads that skipped the per-document hint because the
+  // document was written recently (ends within 4 MiB behind its stripe's
+  // write cursor) and so is almost certainly resident.  PROCESS-LOCAL.
+  uint64_t recent_write_hint_skips = 0;
 };
 
 // Thread-safe counters for stats updated from background threads (hit tracker).

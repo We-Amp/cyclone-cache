@@ -1,0 +1,15 @@
+2026-09-26T13:58:07+02:00
+5.15.0-191-generic
+Samsung SSD 970 PRO 512GB               
+1B2QEXP7
+read_ahead_kb: 128
+max_sectors_kb: 1280
+scheduler: [none] mq-deadline 
+vm.dirty_ratio = 20
+vm.dirty_background_ratio = 10
+vm.dirty_bytes = 0
+vm.dirty_background_bytes = 0
+Ubuntu clang version 20.1.8 (++20250708082409+6fb913d3e2ec-1~exp1~20250708202428.132)
+cy29-base: 775af03
+cy29-after: b76d481
+cy29-normal: 775af03

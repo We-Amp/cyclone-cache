@@ -45,6 +45,29 @@ class MappedFile {
   virtual std::error_code advise_willneed(std::span<std::byte> region) = 0;
   virtual std::error_code advise_dontneed(std::span<std::byte> region) = 0;
 
+  // advise_willneed() without its residency check: the hint is issued even
+  // when every page is already cached.  On Linux, for pages this process has
+  // not mapped yet, the check is the dearer half: one page-cache lookup per
+  // page plus a syscall, measured 1.6 us for 16 pages against 1.0 us for the
+  // madvise() itself (12.6 against 7.7 us for 256).  For callers that
+  // advise a range the process is about to touch for the first time
+  // (Volume::advise_cold_read).  Elsewhere the same as advise_willneed().
+  virtual std::error_code advise_willneed_unchecked(
+      std::span<std::byte> region) {
+    return advise_willneed(region);
+  }
+
+  // Whether every page of an ADDRESS range of the mapping is in the page
+  // cache: the check advise_willneed() makes on Linux before it advises.
+  // Best-effort and one-sided: true only when the platform can tell
+  // (mincore() on Linux); false on error and wherever it cannot, so a
+  // caller that skips a hint on true never skips one it needed.
+  [[nodiscard]] virtual bool range_resident(
+      std::span<const std::byte> region) const {
+    (void)region;
+    return false;
+  }
+
   // Best-effort readahead over a FILE byte range, addressed through the
   // descriptor rather than through the mapping.  This exists because the
   // only asynchronous readahead Darwin offers is fcntl(F_RDADVISE), which

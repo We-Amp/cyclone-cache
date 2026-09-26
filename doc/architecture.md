@@ -523,6 +523,65 @@ error is discarded, because a failed hint only costs the previous behaviour.
 is *not* discarded — it is how the platform says "use the address-range
 call instead".
 
+**Cold and sequential readahead below the threshold.** A document below
+`readahead_min_bytes` gets no large-document hint, and cold it faults in one
+page at a time: 16 serial 4 KiB reads for a 64 KiB document, because the
+mapping's `MADV_RANDOM` also turns off the kernel's fault readaround. Simply
+lowering the threshold was measured and rejected: the large-document hint
+runs on *every* read and leans on the re-advise filter, and at 64 KiB, where
+a warm `view` read takes under a microsecond, the filter's collisions cost a
+`mincore()` often enough to slow warm reads 8–18 %.
+`Volume::advise_cold_read` uses a different gate instead: it runs only on a
+read that is about to run the CRC pass, i.e. the first read of this
+incarnation in this process (after a write, a restart, or an eviction from
+the checksum-validation cache). That is the read that makes Cyclone's first
+content touch, and the one a cold document takes. A validated warm re-read
+never reaches it, so it needs no filter, reads no clock and adds nothing to
+the warm path. On that read, for documents of at least
+`CacheConfig::cold_readahead_min_bytes` (16 KiB):
+
+- a document below `readahead_min_bytes` gets the same per-platform hint
+  over its own range;
+- a thread-local detector (one slot per stripe, no shared cache line)
+  remembers where the stripe's last read ended, and a read that starts there,
+  or up to 64 KiB past it, extends the hint by up to
+  `CacheConfig::sequential_readahead_bytes` (1 MiB) of the same stripe,
+  re-issued when less than half of it is left ahead.
+
+The second part is for the read order a KV tier actually produces. A prompt
+prefix's blocks are written in order and read back in the same order, and
+their keys hash across stripes, so consecutive gets alternate between stripes
+while each stripe's share of them sits back to back in its log. A
+per-document hint cannot cover the next document; a per-stripe window does,
+and it keeps several stripes' reads in flight at once. Predicting *which*
+stripe comes next would need the next key, which only the caller knows. The
+cost falls on a CRC-pending read of a document that is already resident,
+which pays for a hint it did not need: on the Linux benchmark machine about
+2 µs for a 64 KiB document read out of order (one `madvise()`; the hint is
+issued without a `mincore()` check, which on pages the process has not yet
+mapped costs more than the `madvise()` itself), and in a sequential run one
+64 KiB `mincore()` per window once the run is known to be resident; on macOS
+one `F_RDADVISE`, about 0.3 µs. The commonest such read is the first read
+after a write, e.g. PageSpeed serving an optimized alternate on the request
+after it wrote it, so that case skips the hint with no syscall: a
+non-sequential read of a document that ends within `kRecentWriteBytes`
+(4 MiB) behind its stripe's write cursor, taken from the read's snapshot, is
+treated as resident, and a sequential run that catches up with a writer
+still appending (the cursor moved since the run's last read, and what is
+left lies within 4 MiB behind it) stops re-issuing its window. A cold
+read-back of data nobody is appending to is unaffected. Documents below
+16 KiB and reads with `verify_checksum_on_read` off are untouched.
+
+The same switch covers one more cold path. After a restart with a cold page
+cache, the mmap directory itself is cold, and under `MADV_RANDOM` every first
+lookup in a bucket took a serial 4 KiB fault before the document read could
+start: a cold 64 KiB restart read ran at a fifth of the first-touch rate.
+`Volume::open` therefore issues one readahead hint (`Volume::advise_range`)
+over each existing stripe directory (about 0.7 MiB per stripe) when it opens
+it.
+Measurements are in
+[kv-cache-benchmark.md, Small cold reads](kv-cache-benchmark.md#small-cold-reads-issue-29).
+
 Measured effect on a cold 2 MiB read (Linux, NVMe, median of three runs):
 0.120 → 0.446 GB/s with CRC verification on, 0.179 → 2.327 GB/s with it
 off. The verified path was then bounded by the checksum (the byte-wise CRC32

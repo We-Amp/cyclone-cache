@@ -1,0 +1,79 @@
+Cyclone KV-cache storage-tier benchmark (workload spec v1)
+  cpu          : Apple M5
+  cores        : 10 physical / 10 logical (hw_concurrency 10)
+  os           : Darwin 27.0.0 / macOS 27.0
+  filesystem   : /dev/disk3s5 on /System/Volumes/Data (apfs, local, journaled, nobrowse, protect, root data)
+  store        : cyclone 0.1.0 @ unknown
+  volume       : <volume dir>/cyclone_kv_bench.dat (8192 MiB)
+
+Cyclone tuning (spec allows store-specific tuning if printed):
+  max_object_size         = 0 (unbounded; blocks reach 32 MiB)
+  ram_cache_size          = 0 (the CLFUS RAM tier is irrelevant for
+                            multi-MB blobs; disk hits are zero-copy
+                            mmap spans served from the OS page cache)
+  enable_checksum         = true (mandatory in multi-process mode)
+  verify_checksum_on_read = true
+  mmap directory          = on (multi-process 0 of 1)
+  hit tracking            = off
+  optimization engine     = off
+  directory_sync_interval = 0 (no periodic fsync; the restart
+                            phase is a process restart, not a power-loss test)
+  sync_on_write           = false (no per-put fsync)
+  metadata                = 64-byte set_header() slot (a dedicated
+                            header, not a value prefix)
+  seconds/point           = 3 (after a 2s warm-up)
+
+=== block_size 65536 (64 KiB), n = 4096, dataset 0.25 GiB, stripe_size = auto ===
+  [1/5] put
+  content verify: ok
+  [2/5] get_first_touch
+        readahead hints issued so far: 0 (after get_first_touch)
+  [3/5] get_warm (Zipf theta=0.99)
+        mode=view threads=1
+        mode=view threads=4
+        mode=copy threads=1
+        mode=copy threads=4
+  [4/5] restart
+        readahead hints issued so far: 0 (after restart)
+  [5/5] multiprocess_read (4 processes)
+        mode=view
+        mode=copy
+=== block_size 131072 (128 KiB), n = 4096, dataset 0.5 GiB, stripe_size = auto ===
+  [1/5] put
+  content verify: ok
+  [2/5] get_first_touch
+        readahead hints issued so far: 0 (after get_first_touch)
+  [3/5] get_warm (Zipf theta=0.99)
+        mode=view threads=1
+        mode=view threads=4
+        mode=copy threads=1
+        mode=copy threads=4
+  [4/5] restart
+        readahead hints issued so far: 0 (after restart)
+  [5/5] multiprocess_read (4 processes)
+        mode=view
+        mode=copy
+
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+|---|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|
+| cyclone | 65536 | 4096 | put | - | 1 | 47152.3 | 3.090 | 9.3 | 15.8 | 20.8 | - |
+| cyclone | 65536 | 4096 | get_first_touch | view | 1 | 195843.4 | 12.835 | 5.0 | 7.0 | 10.1 | 1.000 |
+| cyclone | 65536 | 4096 | get_warm | view | 1 | 5212783.0 | 341.625 | 0.2 | 0.3 | 0.5 | - |
+| cyclone | 65536 | 4096 | get_warm | view | 4 | 14731954.8 | 965.473 | 0.2 | 0.4 | 0.6 | - |
+| cyclone | 65536 | 4096 | get_warm | copy | 1 | 818204.2 | 53.622 | 1.1 | 2.0 | 2.4 | - |
+| cyclone | 65536 | 4096 | get_warm | copy | 4 | 1137936.2 | 74.576 | 3.3 | 5.1 | 5.8 | - |
+| cyclone | 65536 | 4096 | restart | view | 1 | 193080.8 | 12.654 | 5.0 | 6.6 | 7.1 | 1.000 |
+| cyclone | 65536 | 4096 | multiprocess_read | view | 4x4p | 16584401.9 | 1086.875 | - | - | - | 1.000 |
+| cyclone | 65536 | 4096 | multiprocess_read | copy | 4x4p | 1132718.4 | 74.234 | - | - | - | 1.000 |
+| cyclone | 131072 | 4096 | put | - | 1 | 22379.6 | 2.933 | 15.5 | 120.0 | 526.6 | - |
+| cyclone | 131072 | 4096 | get_first_touch | view | 1 | 96844.6 | 12.694 | 10.0 | 15.0 | 16.3 | 1.000 |
+| cyclone | 131072 | 4096 | get_warm | view | 1 | 4647000.9 | 609.092 | 0.2 | 0.3 | 0.5 | - |
+| cyclone | 131072 | 4096 | get_warm | view | 4 | 14418893.5 | 1889.913 | 0.2 | 0.4 | 0.7 | - |
+| cyclone | 131072 | 4096 | get_warm | copy | 1 | 465462.2 | 61.009 | 2.0 | 3.0 | 3.5 | - |
+| cyclone | 131072 | 4096 | get_warm | copy | 4 | 578517.0 | 75.827 | 6.8 | 9.8 | 18.0 | - |
+| cyclone | 131072 | 4096 | restart | view | 1 | 97333.4 | 12.758 | 10.1 | 13.7 | 18.2 | 1.000 |
+| cyclone | 131072 | 4096 | multiprocess_read | view | 4x4p | 14373476.6 | 1883.960 | - | - | - | 1.000 |
+| cyclone | 131072 | 4096 | multiprocess_read | copy | 4x4p | 573205.3 | 75.131 | - | - | - | 1.000 |
+
+(sink 594172375956)
+JSON lines written to <out dir>/kv-base-4.jsonl

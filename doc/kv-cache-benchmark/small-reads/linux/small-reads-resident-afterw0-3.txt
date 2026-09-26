@@ -1,0 +1,111 @@
+Cyclone KV-cache storage-tier benchmark (workload spec v1)
+  cpu          : Intel(R) Core(TM) i7-8750H CPU @ 2.20GHz
+  cores        : 12 (hw_concurrency 12)
+  os           : Linux 5.15.0-191-generic
+  filesystem   : ext4
+  store        : cyclone 0.1.0 @ unknown
+  volume       : <data dir>/cyclone_kv_bench.dat (8192 MiB)
+
+Cyclone tuning (spec allows store-specific tuning if printed):
+  max_object_size         = 0 (unbounded; blocks reach 32 MiB)
+  ram_cache_size          = 0 (the CLFUS RAM tier is irrelevant for
+                            multi-MB blobs; disk hits are zero-copy
+                            mmap spans served from the OS page cache)
+  enable_checksum         = true (mandatory in multi-process mode)
+  verify_checksum_on_read = true
+  mmap directory          = on (multi-process 0 of 1)
+  hit tracking            = off
+  optimization engine     = off
+  directory_sync_interval = 0 (no periodic fsync; the restart
+                            phase is a process restart, not a power-loss test)
+  sync_on_write           = false (no per-put fsync)
+  metadata                = 64-byte set_header() slot (a dedicated
+                            header, not a value prefix)
+  seconds/point           = 1 (after a 2s warm-up)
+
+=== block_size 65536 (64 KiB), n = 4096, dataset 0.25 GiB, stripe_size = auto ===
+  [1/5] put
+  content verify: ok
+  [2/5] get_first_touch
+        readahead hints issued so far: 0 large, 4096 cold, 0 sequential (after get_first_touch)
+  [3/5] get_warm (Zipf theta=0.99)
+        mode=view threads=1
+        mode=copy threads=1
+  [4/5] restart
+        readahead hints issued so far: 0 large, 4096 cold, 0 sequential (after restart)
+  [5/5] multiprocess_read: skipped (--skip-multiprocess)
+=== block_size 131072 (128 KiB), n = 4096, dataset 0.5 GiB, stripe_size = auto ===
+  [1/5] put
+  content verify: ok
+  [2/5] get_first_touch
+        readahead hints issued so far: 0 large, 4096 cold, 0 sequential (after get_first_touch)
+  [3/5] get_warm (Zipf theta=0.99)
+        mode=view threads=1
+        mode=copy threads=1
+  [4/5] restart
+        readahead hints issued so far: 0 large, 4096 cold, 0 sequential (after restart)
+  [5/5] multiprocess_read: skipped (--skip-multiprocess)
+=== block_size 262144 (256 KiB), n = 4096, dataset 1 GiB, stripe_size = auto ===
+  [1/5] put
+  content verify: ok
+  [2/5] get_first_touch
+        readahead hints issued so far: 4096 large, 0 cold, 0 sequential (after get_first_touch)
+  [3/5] get_warm (Zipf theta=0.99)
+        mode=view threads=1
+        mode=copy threads=1
+  [4/5] restart
+        readahead hints issued so far: 4096 large, 0 cold, 0 sequential (after restart)
+  [5/5] multiprocess_read: skipped (--skip-multiprocess)
+=== block_size 524288 (512 KiB), n = 4096, dataset 2 GiB, stripe_size = auto ===
+  [1/5] put
+  content verify: ok
+  [2/5] get_first_touch
+        readahead hints issued so far: 4096 large, 0 cold, 0 sequential (after get_first_touch)
+  [3/5] get_warm (Zipf theta=0.99)
+        mode=view threads=1
+        mode=copy threads=1
+  [4/5] restart
+        readahead hints issued so far: 4096 large, 0 cold, 0 sequential (after restart)
+  [5/5] multiprocess_read: skipped (--skip-multiprocess)
+=== block_size 1048576 (1024 KiB), n = 4096, dataset 4 GiB, stripe_size = auto ===
+  [1/5] put
+  content verify: ok
+  [2/5] get_first_touch
+        readahead hints issued so far: 4096 large, 0 cold, 0 sequential (after get_first_touch)
+  [3/5] get_warm (Zipf theta=0.99)
+        mode=view threads=1
+        mode=copy threads=1
+  [4/5] restart
+        readahead hints issued so far: 4096 large, 0 cold, 0 sequential (after restart)
+  [5/5] multiprocess_read: skipped (--skip-multiprocess)
+
+| store | block_size | n | phase | mode | threads | ops_per_s | gb_per_s | p50_us | p99_us | p999_us | hit_fraction |
+|---|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|
+| cyclone | 65536 | 4096 | put | - | 1 | 20132.6 | 1.319 | 31.8 | 87.2 | 129.4 | - |
+| cyclone | 65536 | 4096 | get_first_touch | view | 1 | 99450.0 | 6.518 | 10.0 | 13.2 | 30.7 | 1.000 |
+| cyclone | 65536 | 4096 | get_warm | view | 1 | 2090580.3 | 137.008 | 0.4 | 0.8 | 1.0 | - |
+| cyclone | 65536 | 4096 | get_warm | copy | 1 | 294720.0 | 19.315 | 3.2 | 5.8 | 19.7 | - |
+| cyclone | 65536 | 4096 | restart | view | 1 | 101319.3 | 6.640 | 9.7 | 13.6 | 27.7 | 1.000 |
+| cyclone | 131072 | 4096 | put | - | 1 | 11749.5 | 1.540 | 57.8 | 89.3 | 118.6 | - |
+| cyclone | 131072 | 4096 | get_first_touch | view | 1 | 55340.5 | 7.254 | 17.9 | 21.2 | 39.8 | 1.000 |
+| cyclone | 131072 | 4096 | get_warm | view | 1 | 1768612.4 | 231.816 | 0.5 | 1.0 | 1.2 | - |
+| cyclone | 131072 | 4096 | get_warm | copy | 1 | 143155.7 | 18.764 | 7.7 | 11.2 | 26.8 | - |
+| cyclone | 131072 | 4096 | restart | view | 1 | 55251.9 | 7.242 | 17.8 | 24.2 | 45.1 | 1.000 |
+| cyclone | 262144 | 4096 | put | - | 1 | 5932.2 | 1.555 | 109.3 | 235.8 | 304.2 | - |
+| cyclone | 262144 | 4096 | get_first_touch | view | 1 | 30180.9 | 7.912 | 32.5 | 49.8 | 74.2 | 1.000 |
+| cyclone | 262144 | 4096 | get_warm | view | 1 | 1168742.7 | 306.379 | 0.7 | 2.9 | 3.8 | - |
+| cyclone | 262144 | 4096 | get_warm | copy | 1 | 68281.0 | 17.899 | 15.8 | 22.6 | 44.9 | - |
+| cyclone | 262144 | 4096 | restart | view | 1 | 29143.0 | 7.640 | 33.3 | 64.1 | 89.9 | 1.000 |
+| cyclone | 524288 | 4096 | put | - | 1 | 3109.3 | 1.630 | 213.5 | 261.9 | 296.2 | - |
+| cyclone | 524288 | 4096 | get_first_touch | view | 1 | 16492.7 | 8.647 | 59.6 | 70.8 | 100.7 | 1.000 |
+| cyclone | 524288 | 4096 | get_warm | view | 1 | 797988.6 | 418.376 | 1.0 | 4.0 | 4.6 | - |
+| cyclone | 524288 | 4096 | get_warm | copy | 1 | 33434.5 | 17.529 | 31.8 | 42.8 | 73.3 | - |
+| cyclone | 524288 | 4096 | restart | view | 1 | 16187.1 | 8.487 | 59.8 | 103.7 | 122.8 | 1.000 |
+| cyclone | 1048576 | 4096 | put | - | 1 | 1548.0 | 1.623 | 424.0 | 550.6 | 624.8 | - |
+| cyclone | 1048576 | 4096 | get_first_touch | view | 1 | 6539.5 | 6.857 | 114.9 | 406.1 | 447.9 | 1.000 |
+| cyclone | 1048576 | 4096 | get_warm | view | 1 | 477644.7 | 500.847 | 1.9 | 5.5 | 7.3 | - |
+| cyclone | 1048576 | 4096 | get_warm | copy | 1 | 12930.9 | 13.559 | 82.9 | 122.9 | 158.6 | - |
+| cyclone | 1048576 | 4096 | restart | view | 1 | 8559.8 | 8.976 | 113.7 | 161.3 | 204.7 | 1.000 |
+
+(sink 99826647143)
+JSON lines written to $HOME/cy29/out/resident-afterw0-3.jsonl

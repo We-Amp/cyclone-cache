@@ -34,6 +34,12 @@
 //   * BOUNDARY -- a document whose length (header included) is exactly the
 //     threshold issues one hint, and one a byte under it issues none; both
 //     read back intact.
+//   * COLD / SEQUENTIAL (issue #29) -- below the threshold a document is
+//     advised only on the read that runs its CRC pass, never on a validated
+//     warm re-read; an insertion-order read-back of one stripe extends the
+//     hint past the document about every other document, a reverse-order
+//     one never does; both knobs turn off at 0, and the window never
+//     changes what a read returns up to the end of the stripe.
 
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
@@ -42,7 +48,9 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "core/document.hpp"
@@ -391,4 +399,364 @@ TEST_CASE("Documents below the threshold never issue a readahead hint",
   write_doc(*off, large, 1 * kMB, 8);
   REQUIRE(read_and_verify(*off, large, 1 * kMB, 8));
   REQUIRE(off->stats().readahead_hints_issued == 0);
+}
+
+// ---------------------------------------------------------------------------
+// Cold-read readahead below readahead_min_bytes, and the sequential window
+// (CacheConfig::cold_readahead_min_bytes / sequential_readahead_bytes;
+// issue #29).  Both fire only on a read that runs the CRC pass, which is what
+// keeps them off the warm path; the counters are their only observable.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// One stripe, so documents written in order sit back to back in one log and
+// a read-back in insertion order is sequential on disk.
+std::unique_ptr<Cache> make_one_stripe_cache(const TempCacheDir& dir,
+                                             const CacheConfig& cfg,
+                                             size_t volume_bytes) {
+  auto created = Cache::create(cfg);
+  REQUIRE(created.has_value());
+  auto cache = std::move(*created);
+  VolumeConfig vc;
+  vc.path = dir.path();
+  vc.size = volume_bytes;
+  vc.stripe_size = volume_bytes;
+  REQUIRE(cache->add_volume(vc).has_value());
+  REQUIRE(cache->start().has_value());
+  return cache;
+}
+
+uint64_t cold_hints(Cache& cache) { return cache.stats().cold_readahead_hints; }
+uint64_t seq_hints(Cache& cache) {
+  return cache.stats().sequential_readahead_hints;
+}
+
+// Writes `count` documents of `size` bytes, seeded by index.
+std::vector<CacheKey> write_run(Cache& cache, const std::string& prefix,
+                                size_t count, size_t size) {
+  std::vector<CacheKey> keys;
+  keys.reserve(count);
+  for (size_t i = 0; i < count; ++i) {
+    keys.emplace_back(prefix + std::to_string(i));
+    write_doc(cache, keys.back(), size, static_cast<uint8_t>(i));
+  }
+  return keys;
+}
+
+// A document that ends within 4 MiB behind its stripe's write cursor counts
+// as recently written (resident) and gets no per-document hint on a
+// non-sequential read.  Writing this much filler afterwards into the SAME
+// stripe (a one-stripe cache) moves earlier documents out of that window,
+// so they are read the way a cold document is.
+void push_behind_cursor(Cache& cache) {
+  (void)write_run(cache, "readahead-filler-", 5, 1 * kMB + 4 * kKB);
+}
+
+uint64_t recent_skips(Cache& cache) {
+  return cache.stats().recent_write_hint_skips;
+}
+
+}  // namespace
+
+TEST_CASE("cold and sequential readahead config plumbing",
+          "[readahead][config]") {
+  CacheConfig cc;
+  REQUIRE(cc.cold_readahead_min_bytes == 16 * kKB);
+  REQUIRE(cc.sequential_readahead_bytes == 1 * kMB);
+  VolumeConfig vc;
+  REQUIRE(vc.cold_readahead_min_bytes == 16 * kKB);
+  REQUIRE(vc.sequential_readahead_bytes == 1 * kMB);
+
+  CacheConfig& a = cc.set_cold_readahead_min_bytes(64 * kKB);
+  CacheConfig& b = cc.set_sequential_readahead_bytes(0);
+  REQUIRE(&a == &cc);
+  REQUIRE(&b == &cc);
+  REQUIRE(cc.cold_readahead_min_bytes == 64 * kKB);
+  REQUIRE(cc.sequential_readahead_bytes == 0);
+}
+
+TEST_CASE("A small document is advised on its CRC-pending read only",
+          "[readahead][integration]") {
+  // Sequential window off: this case is about the per-document hint.
+  CacheConfig cfg = readahead_config(std::nullopt);
+  cfg.sequential_readahead_bytes = 0;
+  TempCacheDir tmp("readahead_cold_small");
+  auto cache = make_one_stripe_cache(tmp, cfg, kVolumeBytes);
+
+  // 64 KiB: below the 256 KiB large-document threshold, above the 16 KiB
+  // cold threshold.  8 KiB: below the cold threshold.  Both written before
+  // the filler, so they are not "recently written" when read.
+  const CacheKey key("readahead-cold-64k");
+  write_doc(*cache, key, 64 * kKB, 12);
+  const CacheKey tiny("readahead-cold-8k");
+  write_doc(*cache, tiny, 8 * kKB, 13);
+  push_behind_cursor(*cache);
+
+  // The first read runs the CRC pass: exactly one cold hint, and no
+  // large-document hint.
+  REQUIRE(read_and_verify(*cache, key, 64 * kKB, 12));
+  CHECK(cold_hints(*cache) == 1);
+  CHECK(cache->stats().readahead_hints_issued == 0);
+
+  // Warm re-reads take the checksum-validation cache and never reach the
+  // hint: the warm path pays nothing, however often it runs.
+  for (int i = 0; i < 50; ++i) {
+    REQUIRE(read_and_verify(*cache, key, 64 * kKB, 12));
+  }
+  CHECK(cold_hints(*cache) == 1);
+  CHECK(seq_hints(*cache) == 0);
+
+  // Below the cold threshold: no hint.
+  REQUIRE(read_and_verify(*cache, tiny, 8 * kKB, 13));
+  CHECK(cold_hints(*cache) == 1);
+
+  // A large document takes the large-document hint, not the cold one.
+  const CacheKey large("readahead-cold-1m");
+  write_doc(*cache, large, 1 * kMB, 14);
+  REQUIRE(read_and_verify(*cache, large, 1 * kMB, 14));
+  CHECK(cold_hints(*cache) == 1);
+  CHECK(cache->stats().readahead_hints_issued == 1);
+}
+
+TEST_CASE("The cold hint is off at 0 and without read verification",
+          "[readahead][integration]") {
+  SECTION("cold_readahead_min_bytes = 0 turns off the window too") {
+    // An insertion-order run of one stripe, the window left at its
+    // default: with the cold threshold at 0 nothing is advised at all.
+    CacheConfig cfg = readahead_config(std::nullopt);
+    cfg.cold_readahead_min_bytes = 0;
+    TempCacheDir tmp("readahead_cold_zero");
+    auto cache = make_one_stripe_cache(tmp, cfg, kVolumeBytes);
+    const auto keys = write_run(*cache, "readahead-cold-zero-", 16, 64 * kKB);
+    for (size_t i = 0; i < keys.size(); ++i) {
+      REQUIRE(
+          read_and_verify(*cache, keys[i], 64 * kKB, static_cast<uint8_t>(i)));
+    }
+    CHECK(cold_hints(*cache) == 0);
+    CHECK(seq_hints(*cache) == 0);
+  }
+
+  SECTION("documents below the cold threshold are untouched") {
+    // 4 KB objects read back in insertion order: no hint and no window,
+    // the open-time MADV_RANDOM behaviour exactly as before.
+    TempCacheDir tmp("readahead_cold_tiny_run");
+    auto cache = make_one_stripe_cache(tmp, readahead_config(std::nullopt),
+                                       kVolumeBytes);
+    const auto keys = write_run(*cache, "readahead-tiny-", 256, 4 * kKB);
+    for (size_t i = 0; i < keys.size(); ++i) {
+      REQUIRE(
+          read_and_verify(*cache, keys[i], 4 * kKB, static_cast<uint8_t>(i)));
+    }
+    CHECK(cold_hints(*cache) == 0);
+    CHECK(seq_hints(*cache) == 0);
+  }
+
+  SECTION("verify_checksum_on_read = false") {
+    // No CRC pass, so no CRC-pending read: the hint never fires and small
+    // documents keep the fault-per-page behaviour.
+    CacheConfig cfg = readahead_config(std::nullopt);
+    cfg.verify_checksum_on_read = false;
+    TempCacheDir tmp("readahead_cold_noverify");
+    auto cache = make_cache(tmp, cfg);
+    const CacheKey key("readahead-cold-noverify");
+    write_doc(*cache, key, 64 * kKB, 22);
+    REQUIRE(read_and_verify(*cache, key, 64 * kKB, 22));
+    CHECK(cold_hints(*cache) == 0);
+    CHECK(seq_hints(*cache) == 0);
+  }
+}
+
+TEST_CASE("An insertion-order read-back extends the hint past the document",
+          "[readahead][integration]") {
+  constexpr size_t kDocs = 64;
+  constexpr size_t kSize = 64 * kKB;
+  // A 256 KiB window (the default is 1 MiB) so the run re-issues often
+  // enough within 64 documents to pin the cadence.
+  CacheConfig cfg = readahead_config(std::nullopt);
+  cfg.sequential_readahead_bytes = 256 * kKB;
+  TempCacheDir tmp("readahead_sequential");
+  auto cache = make_one_stripe_cache(tmp, cfg, kVolumeBytes);
+  const auto keys = write_run(*cache, "readahead-seq-", kDocs, kSize);
+
+  // In insertion order: the first read starts the run (one cold hint), the
+  // second extends it, and from then on a new window goes out only when
+  // less than half of the window is left ahead -- about every other
+  // 64 KiB document, never once per document.
+  for (size_t i = 0; i < kDocs; ++i) {
+    INFO("document " << i);
+    REQUIRE(read_and_verify(*cache, keys[i], kSize, static_cast<uint8_t>(i)));
+  }
+  const uint64_t seq = seq_hints(*cache);
+  const uint64_t cold = cold_hints(*cache);
+  INFO("sequential " << seq << ", cold " << cold);
+  CHECK(seq >= kDocs / 4);
+  CHECK(seq + cold < kDocs);
+  CHECK(cold <= 2);
+
+  // Warm re-read in the same order: validated, so nothing at all.
+  for (size_t i = 0; i < kDocs; ++i) {
+    REQUIRE(read_and_verify(*cache, keys[i], kSize, static_cast<uint8_t>(i)));
+  }
+  CHECK(seq_hints(*cache) == seq);
+  CHECK(cold_hints(*cache) == cold);
+}
+
+TEST_CASE("Each stripe keeps its own run when reads hop across stripes",
+          "[readahead][integration]") {
+  // Keys hash across stripes, so an insertion-order read-back alternates
+  // between them.  Four stripes, the last one larger (the volume is not a
+  // multiple of the stripe size): every stripe must keep its own detector
+  // slot, so each starts one run and never breaks it.
+  constexpr size_t kDocs = 128;
+  constexpr size_t kSize = 64 * kKB;
+  constexpr size_t kStripe = 128 * kMB;  // the stripe-size floor
+  CacheConfig cfg = readahead_config(std::nullopt);
+  cfg.sequential_readahead_bytes = 256 * kKB;
+  auto created = Cache::create(cfg);
+  REQUIRE(created.has_value());
+  auto cache = std::move(*created);
+  TempCacheDir tmp("readahead_hop");
+  VolumeConfig vc;
+  vc.path = tmp.path();
+  vc.size = 4 * kStripe + 5 * kMB;
+  vc.stripe_size = kStripe;
+  REQUIRE(cache->add_volume(vc).has_value());
+  REQUIRE(cache->start().has_value());
+  REQUIRE(cache->stats().stripe_count == 4);
+
+  const auto keys = write_run(*cache, "readahead-hop-", kDocs, kSize);
+  for (size_t i = 0; i < kDocs; ++i) {
+    REQUIRE(read_and_verify(*cache, keys[i], kSize, static_cast<uint8_t>(i)));
+  }
+  INFO("cold " << cold_hints(*cache) << ", sequential " << seq_hints(*cache));
+  CHECK(cold_hints(*cache) <= 4);
+  CHECK(seq_hints(*cache) >= kDocs / 4);
+}
+
+TEST_CASE("A first read right after the write skips the per-document hint",
+          "[readahead][integration]") {
+  // PageSpeed's pattern: write an optimized alternate, serve it on the next
+  // request.  The document still sits within 4 MiB behind its stripe's
+  // write cursor, so it is taken as resident and the CRC-pending read pays
+  // no hint.  Once enough other data has been written after it, the same
+  // kind of read gets the hint again.
+  CacheConfig cfg = readahead_config(std::nullopt);
+  TempCacheDir tmp("readahead_recent");
+  auto cache = make_one_stripe_cache(tmp, cfg, kVolumeBytes);
+
+  // Scattered keys read in reverse, so none continues a sequential run.
+  const auto fresh = write_run(*cache, "readahead-fresh-", 8, 64 * kKB);
+  for (size_t i = fresh.size(); i-- > 0;) {
+    REQUIRE(
+        read_and_verify(*cache, fresh[i], 64 * kKB, static_cast<uint8_t>(i)));
+  }
+  CHECK(cold_hints(*cache) == 0);
+  CHECK(seq_hints(*cache) == 0);
+  CHECK(recent_skips(*cache) == fresh.size());
+
+  // Written, then pushed more than 4 MiB behind the cursor: hinted.
+  const auto old = write_run(*cache, "readahead-old-", 8, 64 * kKB);
+  push_behind_cursor(*cache);
+  const uint64_t skips = recent_skips(*cache);
+  for (size_t i = old.size(); i-- > 0;) {
+    REQUIRE(read_and_verify(*cache, old[i], 64 * kKB, static_cast<uint8_t>(i)));
+  }
+  CHECK(cold_hints(*cache) == old.size());
+  CHECK(recent_skips(*cache) == skips);
+}
+
+TEST_CASE("A run that chases a writer stops re-issuing its window",
+          "[readahead][integration]") {
+  // Write a document, read back the one written just before it, and so on:
+  // a sequential run whose write cursor moves on every read.  Everything
+  // between the reader and the cursor was just written, so the run must not
+  // re-issue a tiny hint up to the moving cursor on every read.
+  constexpr size_t kDocs = 64;
+  constexpr size_t kSize = 64 * kKB;
+  TempCacheDir tmp("readahead_chase");
+  auto cache =
+      make_one_stripe_cache(tmp, readahead_config(std::nullopt), kVolumeBytes);
+  std::vector<CacheKey> keys;
+  for (size_t i = 0; i < kDocs; ++i) {
+    keys.emplace_back("readahead-chase-" + std::to_string(i));
+    write_doc(*cache, keys.back(), kSize, static_cast<uint8_t>(i));
+    if (i > 0) {
+      REQUIRE(read_and_verify(*cache, keys[i - 1], kSize,
+                              static_cast<uint8_t>(i - 1)));
+    }
+  }
+  INFO("cold " << cold_hints(*cache) << ", sequential " << seq_hints(*cache)
+               << ", skipped " << recent_skips(*cache));
+  CHECK(cold_hints(*cache) == 0);
+  CHECK(seq_hints(*cache) <= 2);
+  CHECK(recent_skips(*cache) >= kDocs - 3);
+}
+
+TEST_CASE("A reverse-order read-back gets per-document hints only",
+          "[readahead][integration]") {
+  constexpr size_t kDocs = 32;
+  constexpr size_t kSize = 64 * kKB;
+  TempCacheDir tmp("readahead_reverse");
+  auto cache =
+      make_one_stripe_cache(tmp, readahead_config(std::nullopt), kVolumeBytes);
+  const auto keys = write_run(*cache, "readahead-rev-", kDocs, kSize);
+  push_behind_cursor(*cache);
+  for (size_t i = kDocs; i-- > 0;) {
+    REQUIRE(read_and_verify(*cache, keys[i], kSize, static_cast<uint8_t>(i)));
+  }
+  CHECK(seq_hints(*cache) == 0);
+  CHECK(cold_hints(*cache) == kDocs);
+}
+
+TEST_CASE("sequential_readahead_bytes = 0 turns the window off",
+          "[readahead][integration]") {
+  constexpr size_t kDocs = 16;
+  constexpr size_t kSize = 64 * kKB;
+  CacheConfig cfg = readahead_config(std::nullopt);
+  cfg.sequential_readahead_bytes = 0;
+  TempCacheDir tmp("readahead_seq_off");
+  auto cache = make_one_stripe_cache(tmp, cfg, kVolumeBytes);
+  const auto keys = write_run(*cache, "readahead-seqoff-", kDocs, kSize);
+  push_behind_cursor(*cache);
+  for (size_t i = 0; i < kDocs; ++i) {
+    REQUIRE(read_and_verify(*cache, keys[i], kSize, static_cast<uint8_t>(i)));
+  }
+  CHECK(seq_hints(*cache) == 0);
+  CHECK(cold_hints(*cache) == kDocs);
+}
+
+TEST_CASE(
+    "Sequential reads of mixed sizes read back intact up to the stripe"
+    " end",
+    "[readahead][edge]") {
+  // Sizes below, at and above both thresholds, read in insertion order
+  // through a small single-stripe volume filled to about three quarters:
+  // the window is clamped to the stripe, and whatever it advises, every read
+  // returns its own bytes.
+  constexpr size_t kSmallVolume = 16 * kMB;
+  TempCacheDir tmp("readahead_seq_edge");
+  auto cache =
+      make_one_stripe_cache(tmp, readahead_config(std::nullopt), kSmallVolume);
+
+  const size_t sizes[] = {20 * kKB,  64 * kKB,  100 * kKB,
+                          256 * kKB, 300 * kKB, 1 * kMB};
+  std::vector<std::pair<CacheKey, size_t>> docs;
+  size_t total = 0;
+  for (size_t round = 0; total + 2 * kMB < kSmallVolume * 3 / 4; ++round) {
+    for (size_t size : sizes) {
+      docs.emplace_back(CacheKey("readahead-edge-" + std::to_string(round) +
+                                 "-" + std::to_string(size)),
+                        size);
+      write_doc(*cache, docs.back().first, size,
+                static_cast<uint8_t>(docs.size()));
+      total += size;
+    }
+  }
+  for (size_t i = 0; i < docs.size(); ++i) {
+    INFO("document " << i);
+    REQUIRE(read_and_verify(*cache, docs[i].first, docs[i].second,
+                            static_cast<uint8_t>(i + 1)));
+  }
+  CHECK(seq_hints(*cache) > 0);
 }

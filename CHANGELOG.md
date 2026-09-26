@@ -7,6 +7,27 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Cold-read readahead below the large-document threshold, and a
+  sequential window (issue #29). `CacheConfig::cold_readahead_min_bytes`
+  (default 16 KiB, `0` = off) and `CacheConfig::sequential_readahead_bytes`
+  (default 1 MiB, `0` = off), mirrored on `VolumeConfig`, with fluent
+  setters. On a read that is about to run the CRC pass (the first read of
+  a document incarnation in this process), a document of at least 16 KiB
+  and below `readahead_min_bytes` gets a readahead hint over its own range,
+  and a per-thread, per-stripe detector extends the hint by up to 1 MiB past
+  the document when the read continues where that stripe's previous read
+  ended (a KV prefix read back in insertion order). Validated warm re-reads
+  never reach either hint. An existing mmap directory also gets one
+  readahead hint per stripe at open, so a restart with a cold page cache no
+  longer faults it in page by page. A first read of a document written
+  within the stripe's last 4 MiB of puts (write, then serve on the next
+  request) skips the hint with no syscall, as does a sequential run that
+  catches up with a writer still appending. Cold 64 KiB reads on the Linux benchmark
+  machine: 0.04 → 2.6 GB/s (2.0× a same-day LMDB); 512 KiB 1.6 → 2.9 GB/s.
+  `CacheStats::cold_readahead_hints`, `sequential_readahead_hints` and
+  `recent_write_hint_skips` count the hints and the skips (C++ only, appended at the tail). Internal:
+  `MappedFile::range_resident()` and `advise_willneed_unchecked()`, and
+  `Stripe::index`. Not in the C API.
 - `WriteHandle::reserve(length)`: appends `length` bytes to the object and
   returns them as a writable span, so a producer generates the content in
   the handle's buffer instead of in its own buffer that `write_sync()` then

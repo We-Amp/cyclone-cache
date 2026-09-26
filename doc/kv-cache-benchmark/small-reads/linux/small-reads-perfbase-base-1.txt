@@ -1,0 +1,40 @@
+Cyclone Cache Performance Baseline
+===================================
+Cache size: 512 MB
+Entries: 5000
+Content size: 4096 bytes
+
+Wrap retention: on
+
+Running benchmarks...
+  [1/7] Key generation...
+  [2/7] Sequential write...
+  [3/7] Sequential read...
+  [4/7] Random read...
+  [5/7] Exists check...
+  [6/7] Cache miss...
+  [7/7] Mixed workload...
+
+Benchmark                               Ops/sec   Avg(us)   P50(us)   P99(us)   P99.9(us)
+-----------------------------------------------------------------------------------------
+key_generation                          2481074      0.38      0.37      0.39        0.40
+sequential_write_4096B                     1362    733.23    175.02   4108.71     4340.38
+sequential_read                          166995      5.79      4.83     17.96       27.69
+random_read                              577837      1.63      1.51      2.71        3.20
+exists_check                            1568518      0.61      0.60      0.68        0.97
+cache_miss                              1493901      0.64      0.62      0.88        1.01
+mixed_workload_70r_20e_10w               121434      8.17      2.08    106.64      409.75
+-----------------------------------------------------------------------------------------
+
+Cache Statistics:
+  Entries: 5000
+  Bytes used: 34448320
+  RAM cache hits: 0
+  Disk cache hits: 32673
+  Evictions: 0
+  Wraps: 0
+  Frontier advances: 35
+  Advances deferred by lease: 0
+  Early advances skipped: 0
+  Retained hits: 0
+  Writes dropped by lease: 0

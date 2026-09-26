@@ -34,7 +34,7 @@ namespace {
 // tables (a file it cannot write), a page cached only by another process
 // reads as not resident, which again only costs the hint.  mincore() never
 // reports a missing page as resident.
-bool range_resident(uintptr_t addr, size_t length, size_t page_size) {
+bool pages_resident(uintptr_t addr, size_t length, size_t page_size) {
   constexpr size_t kFirstWindowPages = 16;
   constexpr size_t kWindowPages = 256;
   unsigned char vec[kWindowPages];
@@ -262,6 +262,15 @@ class PosixMappedFile : public MappedFile {
   }
 
   std::error_code advise_willneed(std::span<std::byte> region) override {
+    return willneed(region, /*check_resident=*/true);
+  }
+
+  std::error_code advise_willneed_unchecked(
+      std::span<std::byte> region) override {
+    return willneed(region, /*check_resident=*/false);
+  }
+
+  std::error_code willneed(std::span<std::byte> region, bool check_resident) {
 #ifdef MADV_WILLNEED
     // madvise() requires a page-aligned start address.  Regions handed out
     // by map_region() may start mid-page (a document begins at an arbitrary
@@ -284,10 +293,12 @@ class PosixMappedFile : public MappedFile {
     // survive reclaim, and drop_caches, one by one), and skipping its hint
     // costs one serial 4 KiB fault per missing page -- ~10 ms for a 512 KiB
     // document, measured when a one-page probe was tried.
-    if (range_resident(page_addr, advise_length,
-                       static_cast<size_t>(page_size))) {
+    if (check_resident && pages_resident(page_addr, advise_length,
+                                         static_cast<size_t>(page_size))) {
       return {};
     }
+#else
+    (void)check_resident;
 #endif
 
     // Issue the advice in bounded chunks, for two reasons.
@@ -335,8 +346,26 @@ class PosixMappedFile : public MappedFile {
     }
 #else
     (void)region;
+    (void)check_resident;
 #endif
     return {};
+  }
+
+  [[nodiscard]] bool range_resident(
+      std::span<const std::byte> region) const override {
+#if defined(__linux__)
+    if (region.empty()) {
+      return true;
+    }
+    const auto page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    auto addr = reinterpret_cast<uintptr_t>(region.data());
+    const uintptr_t page_addr = addr & ~(page_size - 1);
+    return pages_resident(page_addr, region.size() + (addr - page_addr),
+                          page_size);
+#else
+    (void)region;
+    return false;
+#endif
   }
 
   std::error_code advise_dontneed(std::span<std::byte> region) override {

@@ -1,0 +1,10 @@
+# performance_baseline --cache-size 512 --entries 5000 --content-size 4096
+# (4 KB objects, below cold_readahead_min_bytes), base / after interleaved.
+
+pb      key_generation               base    2,441,435 [2481074, 2441435, 2431484]  after    2,431,961 [2411701, 2442439, 2431961]  after/base 0.996
+pb      sequential_write_4096B       base      323,645 [1362, 330400, 323645]  after      329,795 [327841, 329795, 331497]  after/base 1.019
+pb      sequential_read              base      595,326 [166995, 605839, 595326]  after      607,458 [599930, 609595, 607458]  after/base 1.020
+pb      random_read                  base    1,091,556 [577837, 1111931, 1091556]  after    1,123,478 [1109228, 1123478, 1136302]  after/base 1.029
+pb      exists_check                 base    2,115,383 [1568518, 2115383, 2157725]  after    2,143,447 [2143447, 2091994, 2146123]  after/base 1.013
+pb      cache_miss                   base    1,814,737 [1493901, 1818503, 1814737]  after    1,840,779 [1810854, 1864566, 1840779]  after/base 1.014
+pb      mixed_workload_70r_20e_10w   base    1,017,847 [121434, 1038838, 1017847]  after    1,051,841 [1040569, 1051841, 1053126]  after/base 1.033
