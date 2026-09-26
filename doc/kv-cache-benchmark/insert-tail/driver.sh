@@ -6,7 +6,7 @@
 # Issue #35 (tail fill) before/after driver, Linux benchmark machine.  One
 # benchmark at a time; every point waits for round6/idle.sh (no runner job,
 # 1-minute load < 1.0) and runs with round6/sampler.sh beside it, exactly as
-# the round-6 driver does.  Usage: driver.sh churn|put|diag [REPS]
+# the round-6 driver does.  Usage: driver.sh churn|put|extra|diag [REPS]
 #
 #   churn : kv_churn, 2 MiB, zipf, C = 16 GiB, 4 GiB cgroup, 120 s, wrap
 #           retention on (the default), T=1 and T=4, before and after
@@ -16,10 +16,13 @@
 #           ones compared), before and after interleaved, REPS repetitions;
 #           kvpeer LMDB and file-per-block full sweeps in the first
 #           PEER_REPS repetitions.
+#   extra : driver.sh extra REP NAME:PATTERN:T ... runs single churn points
+#           as repetition REP (NAME: before, after, lmdb, filedir).
 #   diag  : round6/diag.sh (60 s off-CPU trace of the T=1 zipf point) for
 #           the before and the after tree, retention on and flush mode.
 #
-# Environment: BEFORE / AFTER (Cyclone trees, each built in ./build),
+# Environment: BEFORE / AFTER (Cyclone trees, each built in ./build, with
+# its commit id in ./COMMIT),
 # PEER_BUILD (peer harness build dir: kvpeer, kvchurn), OUTROOT (output
 # root), DATA (store root), PEER_REPS (default 2).
 set -u
@@ -47,8 +50,8 @@ if [ ! -e "$OUT/machine.txt" ]; then
       vm.dirty_writeback_centisecs
     echo "filesystem: $(findmnt -no FSTYPE -T "$DATA")"
     clang++-20 --version | head -1
-    echo "before: $(git -C "$BEFORE" rev-parse --short HEAD)"
-    echo "after: $(git -C "$AFTER" rev-parse --short HEAD)"
+    echo "before: $(cat "$BEFORE/COMMIT" 2>/dev/null)"
+    echo "after: $(cat "$AFTER/COMMIT" 2>/dev/null)"
     "$AFTER/build/kv_bench" --print-vectors
     echo "--- kv_churn"; "$AFTER/build/kv_churn" --print-vectors
     echo "--- kvchurn"; "$PEER_BUILD/kvchurn" --print-vectors
@@ -108,6 +111,22 @@ case $mode in
         bench "filedir-full-$r" "$PEER_BUILD/kvpeer" --store filedir \
           --seconds 10
       fi
+    done ;;
+  extra)
+    # driver.sh extra REP NAME:PATTERN:T ...  -- single churn points as
+    # repetition REP; NAME is before, after, lmdb or filedir.
+    shift 2
+    for spec in "$@"; do
+      IFS=: read -r name p t <<< "$spec"
+      case $name in
+        before|after)
+          tree=$BEFORE
+          [ "$name" = after ] && tree=$AFTER
+          churn "$name-$p-t$t-$reps" cyclone "$p" "$t" "$tree/build" \
+            --wrap-retention on ;;
+        lmdb|filedir)
+          churn "$name-$p-t$t-$reps" "$name" "$p" "$t" "$AFTER/build" ;;
+      esac
     done ;;
   diag)
     # round6/diag.sh from each tree, against that tree's build; the output
