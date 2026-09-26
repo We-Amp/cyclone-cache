@@ -1164,7 +1164,36 @@ class Volume : public std::enable_shared_from_this<Volume> {
     // The pass the reservation belongs to: the caller stamps it into the
     // document's write_serial (patch_pass_stamp) before the pwrite.
     uint64_t pass = 0;
+    // Tail fill (issue #35; see kTailFillPage): when non-zero, the caller
+    // writes zeros from the document's last byte up to this absolute offset
+    // in the SAME write as the document.  At most one page past
+    // new_write_pos, never past the data area or, with wrap retention, the
+    // clean frontier; the cursor still advances only to new_write_pos.
+    uint64_t fill_end = 0;
   };
+
+  // Tail fill (issue #35).  A document larger than kTailFillAboveBytes is
+  // written together with zeros up to the next kTailFillPage boundary of the
+  // FILE, so its fill never ends partway through a page.  Without it the
+  // last page is shared with bytes of the previous pass; on a filesystem
+  // that reads a partially overwritten, uncached block before the write can
+  // proceed (ext4, XFS), that is a synchronous device read inside the
+  // pwrite, the source of the one-thread insert p99.  The next document
+  // then starts inside a page the kernel has just had written whole, which
+  // is in the page cache.
+  //
+  // Only the fill grows.  Documents stay packed at 8-byte boundaries, the
+  // cursor advances by the 8-byte-rounded document size as before, so the
+  // on-disk format, the space used and the frontier arithmetic are
+  // unchanged.  The zeros land ahead of the cursor, on bytes that are
+  // already dead: behind the clean frontier with wrap retention (the fill is
+  // clamped to it), anywhere ahead of the cursor in flush mode.  Up to
+  // 64 KiB, the size up to which commit_write also folds the content into a
+  // single buffer, an object is written exactly as before: up to a page of
+  // zeros is a real share of its write, and small-object behaviour stays
+  // what the PageSpeed workloads were measured on.
+  static constexpr uint64_t kTailFillPage = 4096;
+  static constexpr uint64_t kTailFillAboveBytes = uint64_t{64} * 1024;
 
   // Stamp `pass` (mod 2^32) into a built document's write_serial field --
   // outside the checksum, which covers only header data + content.  The

@@ -574,8 +574,8 @@ slots for the exposed chunks. That is the same 64 lines it sums today.
 ### 4.11 Document sizes
 
 Cyclone has no aggregation buffer. Each commit writes one document (a
-plain write above 64 KiB as two pwrites, the header and then the content
-from the caller's buffer, into one reservation), so advances happen per document, and a document larger than the
+plain write above 64 KiB as one `pwritev` of the header, the content from
+the caller's buffer and the tail fill, into one reservation), so advances happen per document, and a document larger than the
 runway advances by as many chunks as it needs in one gated step. Otherwise
 behaviour is unchanged:
 
@@ -768,8 +768,12 @@ today.
 
 **Proof.**
 
-1. Pwrites land only in `[W, W + doc)`, which lies inside the runway as it
-   was at allocation.
+1. Pwrites land only in `[W, W + doc)`, plus, for a document above 64 KiB,
+   the tail fill: zeros from `W + doc` to the next 4 KiB boundary of the
+   file, clamped to the frontier `F` as it stands after this allocation's
+   advances (issue #35). Both lie inside the runway as it was at
+   allocation. The fill never moves `W`: the cursor still advances by the
+   8-byte-rounded document.
 2. The runway only ever covers chunks already exposed by an advance, that is,
    chunks for which `G` has passed their threshold.
 3. The document's first byte, in chunk `c`, is overwritten only after some
