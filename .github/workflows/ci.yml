@@ -43,14 +43,72 @@ jobs:
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCYCLONE_USE_BUNDLED_SHA256=ON
       - name: Build
         run: cmake --build build --config Release -j
+      # Self-diagnosis (issue #38): the Test step prints the binary's exit
+      # code, turns each Catch2 failure into a job annotation (so the failing
+      # assertion shows on the run summary, not only deep in the log), and on
+      # Windows arms WER local dumps so a crash at exit leaves a minidump and
+      # an event-log record behind.  When reading a rerun's log from the CLI,
+      # pass the attempt: `gh run view --job <id> --log` shows the LATEST
+      # attempt's log whatever job id is given; the per-attempt log is
+      # `gh api repos/<owner>/<repo>/actions/jobs/<id>/logs`.
+      - name: Arm crash dumps (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dumps = Join-Path $env:GITHUB_WORKSPACE 'crashdumps'
+          New-Item -ItemType Directory -Force $dumps | Out-Null
+          foreach ($exe in 'cyclone-tests.exe', 'cyclone-test-peer.exe') {
+            $key = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\$exe"
+            New-Item -Path $key -Force | Out-Null
+            New-ItemProperty -Path $key -Name DumpFolder -PropertyType ExpandString -Value $dumps -Force | Out-Null
+            New-ItemProperty -Path $key -Name DumpType -PropertyType DWord -Value 1 -Force | Out-Null
+            New-ItemProperty -Path $key -Name DumpCount -PropertyType DWord -Value 2 -Force | Out-Null
+          }
       - name: Test
         shell: bash
         run: |
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            ./build/Release/cyclone-tests.exe
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            bin=./build/Release/cyclone-tests.exe
           else
-            ./build/cyclone-tests
+            bin=./build/cyclone-tests
           fi
+          set +e
+          "$bin" 2>&1 | tee test-output.txt
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "cyclone-tests exit code: $rc"
+          if [ "$rc" -ne 0 ]; then
+            # One annotation per failed assertion: its location and the
+            # assertion that follows the FAILED: line (CRs stripped: Windows
+            # text-mode output).
+            tr -d '\r' < test-output.txt > test-output.lf
+            grep -A1 -E ': FAILED:$' test-output.lf | grep -v '^--$' |
+              paste - - | head -n 20 |
+              while IFS= read -r line; do
+                printf '::error title=cyclone-tests failure::%s\n' "$line"
+              done || true
+            if ! grep -q ': FAILED:$' test-output.lf; then
+              echo "::error title=cyclone-tests exit code $rc::no Catch2 assertion failed; the process failed outside the test cases (crash, exit-time teardown, or a reporter error)"
+            fi
+          fi
+          exit "$rc"
+      - name: Crash evidence (Windows, on failure)
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Get-ChildItem -ErrorAction SilentlyContinue (Join-Path $env:GITHUB_WORKSPACE 'crashdumps')
+          Get-WinEvent -ErrorAction SilentlyContinue -MaxEvents 5 -FilterHashtable @{
+            LogName = 'Application'; ProviderName = 'Application Error', 'Windows Error Reporting'
+            StartTime = (Get-Date).AddHours(-1) } | Format-List TimeCreated, ProviderName, Message
+      - name: Upload crash dumps (Windows, on failure)
+        if: failure() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: crashdumps-attempt-${{ github.run_attempt }}
+          path: crashdumps/
+          if-no-files-found: ignore
+          retention-days: 1
 
   license-audit:
     name: License audit (Apache RAT)
