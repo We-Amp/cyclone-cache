@@ -384,6 +384,16 @@ constexpr auto kCapMargin = 750ms;
 // must then have ended without a takeover, inside the bound.  Up to this
 // many attempts are made to observe the give-up itself (a slow runner may
 // catch several gaps in a row).
+//
+// After a caught gap, the next attempt starts only once the relay holds the
+// lock again (Relay::await_hold_after; issue #38).  The relay that lost the
+// gap is itself a waiter then, asleep in its backoff, and an attempt started
+// at once found the lock free: it acquired uncontended, and so did every
+// attempt after it, all within microseconds, before the relay woke -- one
+// caught gap (about 1 run in 13 on windows-latest, on the relay's very
+// first release) failed the whole case.  Waiting for the re-take makes
+// every attempt queue behind a relay holder, so the attempts are
+// independent.
 constexpr int kRelayAttempts = 20;
 // Under ThreadSanitizer every release-to-re-acquire gap is wide enough that
 // the waiter nearly always catches one before the cap; there only the bound
@@ -401,6 +411,17 @@ constexpr bool kExpectGiveUp = false;
 #else
 constexpr bool kExpectGiveUp = true;
 #endif
+
+// One line per relay attempt, reported if a relay case fails.
+void note_attempt(std::string &trace, int attempt, Clock::duration waited,
+                  bool caught_gap, int holds) {
+  trace += "attempt " + std::to_string(attempt) + ": " +
+           std::to_string(
+               std::chrono::duration_cast<std::chrono::microseconds>(waited)
+                   .count()) +
+           " us, " + (caught_gap ? "caught a gap" : "gave up") +
+           ", relay holds " + std::to_string(holds) + "\n";
+}
 
 template <typename Token>
 class Relay {
@@ -451,6 +472,20 @@ class Relay {
   Relay &operator=(const Relay &) = delete;
   [[nodiscard]] int lost() const { return _lost.load(); }
   [[nodiscard]] int holds() const { return _holds.load(); }
+  // Waits until the relay has re-taken the lock after hold number `seen`
+  // (bounded: false if it did not within 5 s).  Call after a caught gap,
+  // with holds() read at the catch, so the next attempt queues behind a
+  // relay holder instead of finding the lock free (see kRelayAttempts).
+  [[nodiscard]] bool await_hold_after(int seen) const {
+    const auto end = Clock::now() + 5s;
+    while (_holds.load() <= seen) {
+      if (Clock::now() >= end) {
+        return false;
+      }
+      std::this_thread::yield();
+    }
+    return true;
+  }
 
  private:
   std::atomic<bool> _parked{false};
@@ -500,6 +535,7 @@ TEST_CASE(
       });
 
   bool gave_up = false;
+  std::string trace;
   for (int attempt = 0; attempt < kRelayAttempts && !gave_up; ++attempt) {
     const CacheKey attempt_key("phase-lock-relay-" + std::to_string(attempt));
     auto wh = local->write_sync(attempt_key, content.size());
@@ -511,8 +547,11 @@ TEST_CASE(
     CAPTURE(attempt, std::chrono::duration_cast<Ms>(waited).count(),
             relay.holds());
     REQUIRE(waited < MmapDirectory::kLockWaitCap + kCapMargin);
+    const int holds = relay.holds();
+    note_attempt(trace, attempt, waited, closed.has_value(), holds);
     if (closed.has_value()) {
       REQUIRE(read_content(*local, attempt_key) == content);
+      REQUIRE(relay.await_hold_after(holds));
       continue;  // Caught a gap: acquired fairly
     }
     REQUIRE(closed.error() == CacheError::Busy);
@@ -521,6 +560,7 @@ TEST_CASE(
     REQUIRE_FALSE(local->read_sync(attempt_key).has_value());
     gave_up = true;
   }
+  INFO(trace);
   REQUIRE((gave_up || !kExpectGiveUp));
   REQUIRE(MmapDirectory::s_lock_give_ups_for_test.load() ==
           give_ups + (gave_up ? 1 : 0));
@@ -555,6 +595,7 @@ TEST_CASE(
       });
 
   bool gave_up = false;
+  std::string trace;
   for (int attempt = 0; attempt < kRelayAttempts && !gave_up; ++attempt) {
     const auto t0 = Clock::now();
     const auto waiter = dir.acquire_write_lock();  // Capped
@@ -564,14 +605,18 @@ TEST_CASE(
     REQUIRE_FALSE(waiter.escalated_takeover);
     REQUIRE_FALSE(waiter.forced_release);
     REQUIRE(waited < MmapDirectory::kLockWaitCap + kCapMargin);
+    const int holds = relay.holds();  // Stable: the relay waits on us
+    note_attempt(trace, attempt, waited, waiter.acquired, holds);
     if (waiter.acquired) {
       dir.release_write_lock(waiter);  // Caught a gap: acquired fairly
+      REQUIRE(relay.await_hold_after(holds));
       continue;
     }
     REQUIRE(waiter.gave_up);
     REQUIRE(waited >= MmapDirectory::kLockWaitCap);
     gave_up = true;
   }
+  INFO(trace);
   REQUIRE((gave_up || !kExpectGiveUp));
   relay.stop();
   REQUIRE(relay.lost() == 0);
@@ -600,6 +645,7 @@ TEST_CASE(
       [&](uint32_t t) { d.dir.end_bucket_write_for_test(key, t); });
 
   bool gave_up = false;
+  std::string trace;
   for (int attempt = 0; attempt < kRelayAttempts && !gave_up; ++attempt) {
     // A decoy tag at another offset: removing it changes nothing, so an
     // attempt that catches a gap leaves the real entry in place.
@@ -611,12 +657,16 @@ TEST_CASE(
             relay.holds());
     REQUIRE_FALSE(removed);
     REQUIRE(waited < MmapDirectory::kLockWaitCap + kCapMargin);
+    const int holds = relay.holds();
+    note_attempt(trace, attempt, waited, !busy, holds);
     if (!busy) {
+      REQUIRE(relay.await_hold_after(holds));
       continue;  // Caught a gap: acquired fairly
     }
     REQUIRE(waited >= MmapDirectory::kLockWaitCap);
     gave_up = true;
   }
+  INFO(trace);
   REQUIRE((gave_up || !kExpectGiveUp));
   REQUIRE(MmapDirectory::s_bucket_recoveries_for_test.load() == recoveries);
   relay.stop();
