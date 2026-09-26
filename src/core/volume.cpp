@@ -72,6 +72,7 @@ using ssize_t = SSIZE_T;
 // POSIX systems
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/uio.h>  // pwritev
 #include <unistd.h>
 #define CYCLONE_OPEN ::open
 #define CYCLONE_CLOSE ::close
@@ -105,27 +106,62 @@ namespace {
 
 #ifndef _WIN32
 // Write `parts` back to back at `offset`: the fill of one document written as
-// its head and its content from the caller's buffer, never joined into one
-// contiguous copy first.  Retries short writes and EINTR; false on any other
-// error.
+// its head, its content from the caller's buffer and its tail fill (see
+// Volume::kTailFillPage), never joined into one contiguous copy first.
+//
+// ONE pwritev, not one pwrite per part (issue #35): the kernel's buffered
+// write walks the page cache page by page across all the iovecs, so a page
+// the parts cover between them is written whole.  Split into separate
+// pwrites, a head that starts on a page boundary would cover only the start
+// of its first page, and a filesystem that must read a partially written,
+// uncached block first (ext4, XFS) would read it synchronously inside the
+// write.  Retries short writes and EINTR; false on any other error.
 bool pwrite_parts(int fd, std::span<const std::span<const std::byte>> parts,
                   uint64_t offset) {
+  constexpr size_t kMaxParts = 4;
+  std::array<iovec, kMaxParts> iov{};
+  size_t count = 0;
   for (auto part : parts) {
-    while (!part.empty()) {
-      const ssize_t n =
-          pwrite(fd, part.data(), part.size(), static_cast<off_t>(offset));
-      if (n < 0 && errno == EINTR) {
-        continue;
-      }
-      if (n <= 0) {
-        return false;
-      }
-      part = part.subspan(static_cast<size_t>(n));
-      offset += static_cast<uint64_t>(n);
+    if (part.empty()) {
+      continue;
+    }
+    if (count == kMaxParts) {
+      return false;  // a caller bug: every fill has at most three parts
+    }
+    // iovec takes a non-const pointer; pwritev only reads through it.
+    iov[count].iov_base =
+        const_cast<void*>(static_cast<const void*>(part.data()));
+    iov[count].iov_len = part.size();
+    ++count;
+  }
+  size_t first = 0;
+  while (first < count) {
+    const ssize_t n = pwritev(fd, &iov[first], static_cast<int>(count - first),
+                              static_cast<off_t>(offset));
+    if (n < 0 && errno == EINTR) {
+      continue;
+    }
+    if (n <= 0) {
+      return false;
+    }
+    // Short write: skip the iovecs it completed and trim the one it ended in.
+    auto done = static_cast<size_t>(n);
+    offset += done;
+    while (first < count && done >= iov[first].iov_len) {
+      done -= iov[first].iov_len;
+      ++first;
+    }
+    if (first < count) {
+      iov[first].iov_base = static_cast<std::byte*>(iov[first].iov_base) + done;
+      iov[first].iov_len -= done;
     }
   }
   return true;
 }
+
+// Zeros for the tail fill (Volume::kTailFillPage): it runs from a document's
+// last byte to the next page boundary, so at most one page minus a byte.
+constexpr std::array<std::byte, Volume::kTailFillPage> kZeroPage{};
 #endif
 
 // --- Cross-process lock substrate (init lock + reset gate) --------
@@ -3938,6 +3974,40 @@ std::expected<Volume::WriteSlot, CacheError> Volume::allocate_write_slot(
   // lock G cannot move, so a fresh load equals what the prologue saw.
   slot.pass =
       retained_pass ? *retained_pass : stripe->pass_of(stripe->exposure_gen());
+  // Tail fill (issue #35, kTailFillPage): let a large document's fill run to
+  // the next page boundary of the file so it never covers only part of its
+  // last page.  The cursor still advances only to new_write_pos, so packing,
+  // capacity and every cursor and frontier computation above are untouched.
+  // The extra bytes lie ahead of the cursor, where nothing is admitted
+  // (invariant 9): with wrap retention they are clamped to the clean
+  // frontier, which this reservation already moved to or past new_write_pos, so
+  // they never reach a retained document or a chunk a borrow still counts
+  // in; in flush mode the whole previous pass ahead of the cursor was
+  // exposed at the wrap.  Page boundaries are 8-aligned, so the rounded end
+  // sits on the same boundary as the document's true end would.  (A usurped
+  // holder's late pwrite, the bounded residual noted on WriteSlot, now
+  // carries these zeros too: less than a page more of the same detectable
+  // tear.)
+  if (doc_size > kTailFillAboveBytes) {
+    uint64_t fill_end =
+        (slot.new_write_pos + kTailFillPage - 1) & ~(kTailFillPage - 1);
+    fill_end = std::min(fill_end, data_area_end);
+    if (stripe->retain) {
+      // G is stable here: only a writer moves it, under this stripe's
+      // mutex and, across processes, the write lock we hold.
+      const uint64_t n = stripe->chunks;
+      const uint64_t f =
+          std::min<uint64_t>(stripe->exposure_gen() % (n + 1), n);
+      fill_end =
+          std::min(fill_end, stripe->offset + stripe->frontier_rel_of(f));
+    }
+    // Never below new_write_pos: the data area and the frontier both cover
+    // the reservation.  Equal still counts: the caller then zeroes the 0-7
+    // rounding bytes, which may be all that is left of the last page.
+    if (fill_end >= slot.new_write_pos) {
+      slot.fill_end = fill_end;
+    }
+  }
 
   // Pre-F6 demonstrator seam (TEST ONLY): revert to advancing the guard cursor
   // + releasing the lock AT RESERVATION, before the caller's pwrite --
@@ -4256,8 +4326,14 @@ std::expected<void, CacheError> Volume::commit_write(
   // commit_write_slot below, after the fill is durable) -- no peer can
   // allocate an overlapping range, and the guard-visible cursor is advanced
   // only once the bytes exist.
+  // The tail fill's zeros go behind the document in the same write (see
+  // Volume::kTailFillPage); none for a small document.
+  const size_t tail_fill =
+      slot.fill_end != 0
+          ? static_cast<size_t>(slot.fill_end - (write_offset + doc_size))
+          : 0;
 #ifdef _WIN32
-  auto map_result = _mapped_file->map_region(write_offset, doc_size,
+  auto map_result = _mapped_file->map_region(write_offset, doc_size + tail_fill,
                                              MappedFile::MapMode::ReadWrite);
   bool fill_ok = map_result.has_value();
   if (fill_ok) {
@@ -4266,14 +4342,16 @@ std::expected<void, CacheError> Volume::commit_write(
       std::memcpy(map_result->data() + doc_head.size(), tail.data(),
                   tail.size());
     }
+    std::memset(map_result->data() + doc_size, 0, tail_fill);
     if (_config.sync_on_write) {
       _mapped_file->sync(*map_result, MappedFile::SyncMode::Sync);
     }
     _mapped_file->unmap_region(*map_result);
   }
 #else
-  const std::array<std::span<const std::byte>, 2> fill_parts{
-      std::span<const std::byte>(doc_head), tail};
+  const std::array<std::span<const std::byte>, 3> fill_parts{
+      std::span<const std::byte>(doc_head), tail,
+      std::span<const std::byte>(kZeroPage.data(), tail_fill)};
   bool fill_ok = pwrite_parts(_fd, fill_parts, write_offset);
 #endif
 
@@ -5476,20 +5554,28 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
   // pwrite (released by commit_write_slot below, after the fill is durable).
   // If the fill fails, the reserved region becomes a harmless "gap" (the cursor
   // is NOT advanced past it), reclaimed at the next wrap-around.
+  // Tail fill, as in commit_write (see Volume::kTailFillPage).
+  const size_t tail_fill =
+      slot.fill_end != 0
+          ? static_cast<size_t>(slot.fill_end - (write_offset + fill.size()))
+          : 0;
 #ifdef _WIN32
-  auto map_result = _mapped_file->map_region(write_offset, fill.size(),
-                                             MappedFile::MapMode::ReadWrite);
+  auto map_result = _mapped_file->map_region(
+      write_offset, fill.size() + tail_fill, MappedFile::MapMode::ReadWrite);
   bool fill_ok = map_result.has_value();
   if (fill_ok) {
     std::memcpy(map_result->data(), fill.data(), fill.size());
+    std::memset(map_result->data() + fill.size(), 0, tail_fill);
     if (_config.sync_on_write) {
       _mapped_file->sync(*map_result, MappedFile::SyncMode::Sync);
     }
     _mapped_file->unmap_region(*map_result);
   }
 #else
-  ssize_t written = pwrite(_fd, fill.data(), fill.size(), write_offset);
-  bool fill_ok = !(written < 0 || static_cast<size_t>(written) != fill.size());
+  const std::array<std::span<const std::byte>, 2> fill_parts{
+      std::span<const std::byte>(fill),
+      std::span<const std::byte>(kZeroPage.data(), tail_fill)};
+  bool fill_ok = pwrite_parts(_fd, fill_parts, write_offset);
 #endif
 
   // Sync if configured.

@@ -44,3 +44,8 @@ insert-path-.*\.patch
 # and its per-run 1 Hz sampler files (round6-samples/<run tag>.txt).
 round6-.*\.txt
 round6-samples
+# Issue #35 tail-fill benchmark raw output, logs and off-CPU trace summaries
+# (doc/kv-cache-benchmark/insert-tail/), and its per-run 1 Hz sampler files
+# (insert-tail-samples/<run tag>.txt).
+insert-tail-.*\.txt
+insert-tail-samples

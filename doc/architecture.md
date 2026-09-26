@@ -767,8 +767,8 @@ sequenceDiagram
     WH->>St: acquire stripe->mutex EXCLUSIVE  (the only stripe lock)
     WH->>St: allocate_write_slot
     Note over St: flush: if wrap needed: set_wrap_intent → lease gate →<br/>DEFER (NoSpace) or publish_wrap_phase (O(1)) + store G<br/>retention: ungated wrap, then gated frontier advance(s)
-    WH->>St: pwrite head, then content from the handle's buffer
-    Note over St: objects ≤ 64 KiB: head + content in one pwrite
+    WH->>St: one pwritev: head, content from the handle's buffer, tail fill
+    Note over St: objects ≤ 64 KiB: head + content in one buffer, no tail fill<br/>larger: zeros to the next 4 KiB file boundary (clamped to the frontier),<br/>so no page is left partly written; the cursor ignores them
     Note over St: INVARIANT: data durable BEFORE directory insert
     WH->>St: in-place-update election (full-key verify each candidate)
     WH->>St: directory insert (bumps bucket seqlock version)

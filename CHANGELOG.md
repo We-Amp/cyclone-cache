@@ -122,6 +122,20 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **A document above 64 KiB is written through to the next 4 KiB boundary
+  of the file** (issue #35). Its fill now ends with zeros up to that
+  boundary, clamped to the data area and, with wrap retention, to the clean
+  frontier, so its write never covers only part of its last page. On ext4
+  such a partial page, when not cached, was read from the device inside the
+  `pwrite`; that synchronous read was the one-thread churn insert p99. The
+  head, the content and the zeros go out in one `pwritev` (so the next
+  document's head, which now starts in a page the kernel has just had
+  written whole, is not split from its content either); the alternate write
+  path fills its tail the same way. Documents stay packed at 8-byte
+  boundaries and the cursor advances by the 8-byte-rounded document, so the
+  on-disk format, capacity and frontier arithmetic are unchanged; the zeros
+  land ahead of the cursor on bytes that are already dead. Objects up to
+  64 KiB are written as before.
 - **Plain writes no longer assemble the document in a second and third
   buffer** (issue #16). `commit_write` used to copy the content into the
   document builder and again into one contiguous document, two fresh heap
