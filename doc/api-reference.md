@@ -706,6 +706,15 @@ struct CacheConfig {
     // verify_checksum_on_read = false, small cold reads stay unhinted.
     size_t cold_readahead_min_bytes = 16 * 1024;
     size_t sequential_readahead_bytes = 1024 * 1024;
+
+    // Opt-in (default off): write documents above 64 KiB together with
+    // zeros up to the next 4 KiB file boundary, so ext4/XFS never read a
+    // partly overwritten page inside the write.  Roughly halves the insert
+    // p99 on a saturated device, at the cost of a longer read tail (the
+    // removed read also throttled writers).  C++ only.  Fluent setter:
+    // set_fill_large_document_tail().  See doc/kv-cache-benchmark.md,
+    // "Insert tail".
+    bool fill_large_document_tail = false;
 };
 
 enum class RamCacheType {
