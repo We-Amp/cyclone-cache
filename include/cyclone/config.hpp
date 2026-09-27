@@ -357,6 +357,31 @@ struct CacheConfig {
   // colliding entry costs one extra or one missing hint.
   size_t sequential_readahead_bytes = 1_MB;
 
+  // Fill a large document's last page on write (opt-in, default off).
+  //
+  // When true, a document above 64 KiB is written together with zeros up to
+  // the next 4 KiB boundary of the volume file, head, content and zeros in
+  // one pwritev(), so the write never covers only part of its last page.
+  // Documents stay packed and the cursor, capacity and on-disk format are
+  // unchanged; the zeros land on dead bytes ahead of the cursor (clamped to
+  // the clean frontier with wrap retention).  Objects up to 64 KiB are
+  // written as before.  Not persisted: processes sharing a volume may
+  // differ.  C++ only (not in the C API).
+  //
+  // Why: on ext4 (and XFS) a partly overwritten page that is not cached is
+  // read from the device synchronously inside the write.  The last page of
+  // a document written over the previous pass usually is such a page, and
+  // under a busy device that read was the insert tail (issue #35).
+  //
+  // Trade-off, measured on a saturated NVMe (doc/kv-cache-benchmark.md,
+  // "Insert tail"): with it on, the churn insert p99 roughly halves, but the
+  // hit p99 at four threads rises 25-68 %.  The read it removes also acted
+  // as admission control for writers, slowing inserts exactly when the
+  // device was congested; without it reads queue longer.  Turn it on for
+  // write-latency-sensitive, insert-heavy workloads that can afford the
+  // read tail.  The default leaves writes byte-for-byte as before.
+  bool fill_large_document_tail = false;
+
   // Hit tracking
   std::chrono::milliseconds hit_flush_interval{
       1000};  // How often to flush hit counts to disk
@@ -574,6 +599,10 @@ struct CacheConfig {
     sequential_readahead_bytes = bytes;
     return *this;
   }
+  CacheConfig &set_fill_large_document_tail(bool enable) {
+    fill_large_document_tail = enable;
+    return *this;
+  }
   CacheConfig &set_directory_sync_interval(std::chrono::milliseconds val) {
     directory_sync_interval = val;
     return *this;
@@ -653,6 +682,10 @@ struct VolumeConfig {
   // fields of the same names; see their documentation there.
   size_t cold_readahead_min_bytes = 16_KB;
   size_t sequential_readahead_bytes = 1_MB;
+
+  // Fill a large document's last page on write (opt-in).  Normally set from
+  // CacheConfig::fill_large_document_tail; see its documentation there.
+  bool fill_large_document_tail = false;
 
   // Version compatibility behavior
   // If true (default): automatically reset/purge cache on version mismatch

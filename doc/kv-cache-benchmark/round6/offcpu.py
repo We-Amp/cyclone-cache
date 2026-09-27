@@ -35,7 +35,7 @@ WAIT = [  # (category, frame regex), first listed match wins
     ("jbd2 / journal", r"jbd2|start_this_handle|__ext4_journal_start"),
 ]
 ORIGIN = [
-    ("pwrite", r"__x64_sys_pwrite64|ksys_pwrite64"),
+    ("pwrite", r"__x64_sys_pwrite64|ksys_pwrite64|__x64_sys_pwritev|do_pwritev"),
     ("writev/write", r"__x64_sys_writev|__x64_sys_write\b|ksys_write|do_writev"),
     ("pread/preadv", r"__x64_sys_pread64|__x64_sys_preadv"),
     ("page fault", r"asm_exc_page_fault|exc_page_fault|handle_mm_fault"),

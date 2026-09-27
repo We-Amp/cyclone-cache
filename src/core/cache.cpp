@@ -434,6 +434,9 @@ std::expected<void, CacheError> Cache::add_volume_locked(
   vol_config.cold_readahead_min_bytes = _impl->config.cold_readahead_min_bytes;
   vol_config.sequential_readahead_bytes =
       _impl->config.sequential_readahead_bytes;
+  // Tail fill on write (opt-in): configured on CacheConfig, applied by the
+  // volume's write path (see VolumeConfig::fill_large_document_tail).
+  vol_config.fill_large_document_tail = _impl->config.fill_large_document_tail;
   // Lease-pinning knobs are configured on CacheConfig.
   vol_config.read_lease_duration = _impl->config.read_lease_duration;
   vol_config.lease_wrap_ceiling = _impl->config.lease_wrap_ceiling;

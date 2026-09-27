@@ -1,0 +1,25 @@
+=== 2026-09-26T22:06:44+02:00 cyclone zipf T=1 C=17179869184 s=120 --block-size 2097152 --max-warmup-seconds 1800 --wrap-retention on
+load: 0.91 1.27 1.85 3/721 91465
+universe U = 24576 keys
+stream zipf t0: 7700/c2a3658d 13615/2358d785 15692/f5863216 4926/54e0669b 10997/c6add4fa 23573/677bbff9 23573/677bbff9 22519/01a05535 10549/d01ed625 16656/03258f4e 6506/1525ef69 3338/f3d62629
+stream zipf t1: 12554/1ecaeb65 13478/ec6073a9 22844/19799a46 7190/072f0877 16279/258fda28 8277/acdf06e1 5305/7df2fd1f 23573/677bbff9 14761/ef5e0531 12242/8c3cbd7d 9396/4f79cd21 7700/c2a3658d
+stream zipf+scan t0: 7700/c2a3658d 13615/2358d785 15692/f5863216 4926/54e0669b 10997/c6add4fa 23573/677bbff9 23573/677bbff9 1099511627776/6fdf167b 22519/01a05535 10549/d01ed625 16656/03258f4e 1099511627777/f11f5dc2
+stream zipf+scan t1: 12554/1ecaeb65 13478/ec6073a9 22844/19799a46 7190/072f0877 16279/258fda28 8277/acdf06e1 5305/7df2fd1f 23573/677bbff9 14761/ef5e0531 1103806595072/5cb8bfa5 1103806595073/dafeb106 1103806595074/bf4b5300
+Cyclone KV churn (kv-churn-spec v1)
+  cpu        :  Intel(R) Core(TM) i7-8750H CPU @ 2.20GHz
+  os         : Linux 5.15.0-191-generic
+  commit     : unknown
+  device     : nvme0n1p1
+  cgroup     : /sys/fs/cgroup/system.slice/run-r23c93c8a97604f9d8465d14788a7e7d3.scope memory.max=4294967296
+  load       :  22:06:44 up  2:04,  0 users,  load average: 0,91, 1,27, 1,85
+  pattern    : zipf, threads 1, block 2097152, capacity 17179869184, seconds 120
+  dropping caches: sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+Cyclone tuning:
+  volume size             = 17191473152 B, 16 stripes, 724992 B mmap directory each (65536 entries/stripe)
+  usable data area        = 17179873216 B (1.0000 x C), ~511 blocks/stripe
+  mmap directory ON, checksum ON + verify on read, readahead default, max_object_size 0, ram_cache_size 0, sync_on_write false, hit tracking/optimization/dir sync off
+  eviction                = FIFO by stripe wrap (no app index), wrap retention ON
+  insert                  = write_sync() of a generated block
+  warm-up: 93.3 s, inserted 34359738368 B
+{"store":"cyclone","bench":"churn","pattern":"zipf","block_size":2097152,"capacity":17179869184,"universe":24576,"threads":1,"seconds":120.00,"ops_per_s":1009.84,"hit_ratio":0.8147,"served_gb_per_s":1.7254,"inserted_gb_per_s":0.3923,"hit_p50_us":197.3,"hit_p99_us":9030.6,"hit_p999_us":48591.2,"miss_p50_us":1491.8,"miss_p99_us":24879.6,"miss_p999_us":59366.4,"hits":89509,"misses":20353,"inserts":20353,"put_failures":0,"read_errors":0,"verified":1399,"write_amp":1.006,"device_write_bytes":42936197120,"device_read_bytes":30703050752,"footprint_bytes":17159585792,"apparent_bytes":17191473152,"peak_rss_kib":3569092,"cgroup_mem_peak":4294967296,"cgroup_file_end":4167139328,"cgroup_anon_end":9158656,"warmup_s":93.314,"warmup_inserted_bytes":34359738368,"warmup_capped":false,"reopen_hit_ratio":0.816,"reopen_open_s":0.003,"data_area_bytes":17179873216,"cy_evictions":41,"cy_wraps":41,"cy_writes_dropped_by_lease":0,"cy_wraps_deferred_by_lease":0,"cy_wrap_retention":true,"cy_insert_reserve":false,"ops_per_second_target":0.000,"cy_frontier_advances":2551,"cy_advances_deferred_by_lease":0,"cy_retained_hits":15305,"cy_stamp_rejections":0,"cy_tag_collision_evictions_total":0,"cy_entries_total":35860,"cy_readahead_hints":58837,"failed":false}
+rc=0 load-after: 1.53 1.44 1.80 2/724 101727

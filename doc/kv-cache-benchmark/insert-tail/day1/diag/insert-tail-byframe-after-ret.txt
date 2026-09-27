@@ -1,0 +1,9 @@
+user-space frame                                 waiting for                                        n  total ms  >10ms  >20ms  max ms
+sleep (idle helper threads)                      other sleep                                      299     59832    299    299   200.4
+read path (read_sync / borrow / CRC / copy)      read I/O in a page fault (mmap)                17124     19807    437    199   146.7
+read path (read_sync / borrow / CRC / copy)      other sleep                                       13       262      4      3   121.8
+write path (commit_write / write handle close)   jbd2 / journal                                     1        23      1      1    23.3
+unattributed                                     other sleep                                        5        11      0      0     5.3
+write path (commit_write / write handle close)   read of a partial page before the write (write_begin)      12         7      0      0     4.9
+read path (read_sync / borrow / CRC / copy)      jbd2 / journal                                     1         1      0      0     0.9
+unattributed                                     jbd2 / journal                                     2         0      0      0     0.2
