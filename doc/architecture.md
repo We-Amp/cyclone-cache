@@ -196,7 +196,7 @@ The directory maps `tag → disk offset` within one stripe. Two interchangeable
 implementations, same seqlock read protocol:
 
 - **`Directory`** — in-memory, single-process (`directory.hpp` (`class Directory`)).
-- **`MmapDirectory`** — lives in the mmap'd file so multiple processes share it (`mmap_directory.hpp` (`class MmapDirectory`)). Its 64-byte `Header` carries cross-process shared state (phase, `shared_write_pos`, `write_lock`/`phase_lock` CAS spinlocks, and the lease/wrap-intent fields) via `std::atomic_ref`.
+- **`MmapDirectory`** — lives in the mmap'd file so multiple processes share it (`mmap_directory.hpp` (`class MmapDirectory`)). Its 64-byte `Header` carries cross-process shared state (phase, `shared_write_pos`, `write_lock`/`phase_lock` CAS spinlocks, and the lease/wrap-intent fields) via `std::atomic_ref`. A write-lock waiter proves a holder dead through **`WriterLiveness`** (same header): every process holds a byte-range lock on one of 251 slot bytes of the volume file, which the kernel drops when it dies in any PID namespace, and a holder encodes its slot in the lock token; see [multi-process.md](multi-process.md#writer-liveness).
 
 #### Entry structure (10 bytes)
 
