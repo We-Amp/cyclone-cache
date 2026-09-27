@@ -924,11 +924,13 @@ struct VolumeStats {
   // multi-process mode the write lock (write-pos allocation) can be
   // recovered from a peer that died holding it.
   //
-  // Write locks recovered from a peer PROVEN dead (kill(pid,0)/OpenProcess)
-  // — routine crash recovery; expected after a peer SIGKILL/OOM.
+  // Write locks recovered from a peer PROVEN dead (its WriterLiveness slot
+  // lock is gone) — routine crash recovery; expected after a peer SIGKILL/OOM.
   uint64_t write_lock_force_releases = 0;
   // Write locks taken over via the LAST-RESORT escalation from a holder we
-  // could NOT prove dead (PID reuse, or a live holder wedged for seconds).
+  // could NOT prove dead (a holder without a liveness slot, such as an older
+  // build or a process that found no free slot; a dead holder whose slot a
+  // new process re-claimed at once; or a live holder wedged for seconds).
   // THE alertable counter: nonzero means a live-holder takeover happened —
   // corruption stays gated (the usurped holder aborts at its next
   // revalidate), but sustained nonzero growth here indicates a pathologically
@@ -1016,6 +1018,14 @@ struct VolumeStats {
   // The gate is implemented on Windows too, so a set gauge is NOT expected
   // there and is NOT normal (it was, when the gate was POSIX-only).
   uint64_t reset_gate_degraded = 0;
+
+  // 1 iff this process holds no write-lock liveness slot on this
+  // multi-process volume (WriterLiveness: all 251 slots taken, byte-range
+  // locking unsupported here, or the volume file was replaced by name).  Its
+  // write-lock holds then carry no slot: if it dies holding the lock, peers
+  // recover it only by the last-resort escalation (5 s) instead of within
+  // about 50 ms.  A GAUGE.
+  uint64_t write_lock_liveness_unregistered = 0;
 
   // Monotonic COUNTERS of resets that actually wiped data, split by the gate
   // state they ran under.  NOT cleared by close/reopen (unlike the gauge
@@ -1155,7 +1165,7 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // shared_write_pos) and releases the lock -- so a lock-free reader never sees
   // the cursor cover reserved-but-torn bytes.  Holding the lock across the
   // pwrite is safe since the write-lock lifetime fix: a force-release proves
-  // the holder dead (kill(pid,0)) before recovering, so a live process
+  // the holder dead (WriterLiveness) before recovering, so a live process
   // mid-pwrite is never usurped by routine recovery.  RESIDUAL, stated honestly
   // (W2-class, bounded, NOT closed): the multi-second last-resort escalation
   // CAN usurp a live holder stalled longer than the escalation deadline inside
@@ -1514,6 +1524,12 @@ class Volume : public std::enable_shared_from_this<Volume> {
   VolumeConfig _config;
   MultiProcessConfig _mp_config;
   int _fd = -1;
+  // This process's write-lock liveness slot on the volume file (issue #32);
+  // attached by init_stripes in mmap-directory mode, detached by
+  // close() after the stripes are gone.  Every stripe's MmapDirectory points
+  // here.
+  WriterLiveness _writer_liveness;
+  std::atomic<bool> _writer_liveness_attached{false};
   // Set when the reset gate could not use advisory locking (unsupported fs) and
   // fell back to the historical ungated behaviour.  Surfaced via stats(); see
   // VolumeStats::reset_gate_degraded.  A GAUGE: cleared on every open().

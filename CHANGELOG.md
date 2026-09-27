@@ -236,6 +236,36 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- A multi-process writer no longer decides that a write-lock holder is dead
+  from its PID (issue #32). Across PID namespaces (two containers sharing a
+  volume) `kill(pid, 0)` reported a live holder in the other namespace as
+  gone, or a dead one as alive when its PID named an unrelated process, and
+  taking the lock from a live holder overlaps two writes that readers cannot
+  detect.
+  - Each process now claims one of 251 liveness slots on the volume file
+    (bytes `0x7FFFFFFE00000000 + slot`) and holds a byte-range lock on it
+    (fcntl OFD locks on Linux and macOS, `LockFileEx` on Windows). The
+    kernel drops it when the process dies, in any namespace.
+  - A write-lock holder encodes its slot in the lock token. A waiter
+    recovers the lock only when no process holds that slot; a live holder
+    can never look dead.
+  - A forked child claims its own slot at its first write-lock acquisition,
+    so its death is visible while the parent lives.
+  - A holder without a slot (all slots taken, byte-range locks unsupported,
+    the volume file replaced by name, or a build from before this change)
+    stores the plain token and is never proven dead; only the 5 s
+    escalation recovers it. New gauge
+    `VolumeStats::write_lock_liveness_unregistered`.
+  - No format change: the slot lives in the token value, and the owner PID
+    stays at directory header offset 20 for older builds.
+  - The uncontended acquisition makes no extra syscall; the probe runs only
+    after 50 ms behind one holder.
+  - Mixed builds: an older build still uses `kill(pid, 0)` on the PID a new
+    holder publishes, so keep one PID namespace until every process sharing
+    the volume runs this build. A new waiter never probes an older holder:
+    it recovers a dead one after 5 s instead of about 50 ms.
+  - The one-PID-namespace requirement in `doc/multi-process.md` is now a
+    recommendation for mixed-build overlaps only.
 - Multi-process writers no longer take a cross-process lock from a peer that
   is alive but descheduled (issue #27). The phase lock used to presume its
   holder dead after about 33 µs of spinning (Apple M), and a directory

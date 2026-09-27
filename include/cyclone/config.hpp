@@ -74,10 +74,14 @@ enum class Tier : std::uint8_t {
 // those stripes. All processes can read from all stripes via mmap, with torn
 // read detection via CRC-32C.
 //
-// All processes sharing a volume must run on one host and in one PID
-// namespace: a writer recovers the cross-process write lock from a holder
-// whose PID the OS reports gone (kill(pid, 0) / OpenProcess), and a live
-// holder in another PID namespace (e.g. another container) looks gone.
+// All processes sharing a volume must run on one host (one kernel: the
+// shared directory is a memory map, and a writer's liveness is a byte-range
+// lock on the volume file).  They need not share a PID namespace: a writer
+// recovers the cross-process write lock from a holder only when the holder's
+// liveness lock is gone, which the kernel guarantees whichever namespace or
+// container the holder ran in.  Sharing one PID namespace is still
+// recommended while builds from before that change (which used
+// kill(pid, 0) / OpenProcess) share the volume.
 struct MultiProcessConfig {
   bool enabled = false;        // Disabled by default for backward compatibility
   uint32_t process_index = 0;  // This process's index (0 to total_processes-1)
