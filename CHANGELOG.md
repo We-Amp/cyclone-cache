@@ -257,6 +257,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Every descriptor Cyclone opens on its cache files is now close-on-exec
+  (`O_CLOEXEC`; `_O_NOINHERIT` on Windows CRT opens). A child the
+  application exec's (for example a fetcher helper) no longer inherits the
+  volume, which pinned the file and kept its byte-range locks alive: a dead
+  writer's liveness slot read as held until the helper exited, delaying
+  write-lock recovery to the 5 s escalation. `fork()` still shares the
+  descriptors, so a cache opened before forking workers is unaffected.
+
 - A multi-process writer no longer decides that a write-lock holder is dead
   from its PID (issue #32). Across PID namespaces (two containers sharing a
   volume) `kill(pid, 0)` reported a live holder in the other namespace as

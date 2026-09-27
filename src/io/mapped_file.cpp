@@ -88,7 +88,8 @@ class PosixMappedFile : public MappedFile {
         break;
     }
 
-    _fd = ::open(path.c_str(), flags, perms);
+    // Close-on-exec: an exec'd child must not inherit the mapping's fd.
+    _fd = ::open(path.c_str(), flags | O_CLOEXEC, perms);
     if (_fd < 0) {
       return make_unexpected(
           std::make_error_code(static_cast<std::errc>(errno)));
