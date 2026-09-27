@@ -76,8 +76,14 @@ Where Cyclone stands now (round 6, Linux, same-day peers):
   whose other bytes are old data. When that page is not cached, ext4
   reads it synchronously inside the `pwrite`. About 1 % of inserts wait
   over 10–20 ms for that 4 KiB read behind the device's other I/O. The
-  peers never do this read. Nothing was changed
-  ([round 6](#the-one-thread-insert-tail-24-ms-p99)).
+  peers never do this read
+  ([round 6](#the-one-thread-insert-tail-24-ms-p99)). Filling the last
+  page removes the read and cuts the insert p99 by 40–50 %, but the hit
+  p99 at four threads rises by 25–68 %, because the read was also a brake
+  on inserting into a saturated device. It is therefore an opt-in
+  (`fill_large_document_tail`, default off), and writer admission driven
+  by read latency is issue #43
+  ([insert tail](#insert-tail-fill-the-last-page-issue-35)).
 - **GPU transfer:** registering the whole volume mapping once reaches the
   PCIe ceiling (12.79 of 12.82 GB/s, 2.3× over staging). Pinning each
   returned span is slower than staging. LMDB also keeps every value in one
@@ -2117,6 +2123,288 @@ five runs each, with other jobs running (1-minute load 1–5;
   on a document whose CRC verdict is still cached but whose pages were
   evicted, a small document faults in page by page as before.
 
+## Insert tail: fill the last page (issue #35)
+
+> 2026-09-26 and 27, Linux machine, with a check on the M5. Two sets. **Day 1**
+> compared main at 775af03 (the round-6 code) with this change. **Day 2**
+> compared current main, ae5b0ad (which adds cold and sequential readahead,
+> #41), with this change rebased onto it. Day 2 also ran three diagnostic
+> variants of the change. Before/after runs are interleaved. Every point
+> waited for no runner job, no container job and a 1-minute load below 1.0,
+> with 1 Hz memory, device and (day 2) writeback-throttling samplers
+> beside it. Runs that a runner job started into are marked `*` and left
+> out of the medians. Raw data, samplers, traces and the driver are in
+> [`kv-cache-benchmark/insert-tail/`](kv-cache-benchmark/insert-tail/)
+> (`day1/`, `day2/`). Every run's JSON result and log is kept, and so is
+> every run's sampler summary (`insert-tail-day2-samples-summary.txt`,
+> `insert-tail-day2-per-run.txt`). The raw per-second sampler files
+> (`insert-tail-samples/`) are kept only for a representative subset: day 2's
+> first closed-loop pair of each pattern and thread count, one paced
+> main/change/no-fill and one main/change/sync-read triple, and one
+> async-read run; day 1's first T=1 and T=4 pair. The other runs'
+> per-second files, about 8 MB, were dropped.
+
+**Outcome: an opt-in, off by default.** `CacheConfig::fill_large_document_tail`
+(C++ only; the C API has no field for it). With it off, writes are
+byte-for-byte and syscall-for-syscall what they were. Turn it on for
+write-latency-sensitive, insert-heavy workloads that can afford a longer
+read tail:
+
+| T=4 unless stated, 2 MiB, closed loop | default (off) | `fill_large_document_tail = true` |
+|---|---:|---:|
+| `zipf` T=1: miss+insert p99 | 26.1 ms | **15.2 ms** (−42 %) |
+| `zipf`: miss+insert p99 | 57.3 ms | **30.1 ms** (−47 %) |
+| `zipf+scan`: miss+insert p99 | 64.2 ms | **30.4 ms** (−53 %) |
+| `zipf`: hit p99 | 30.6 ms | 38.0 ms (**+25 %**) |
+| `zipf+scan`: hit p99 | 23.0 ms | 38.7 ms (**+68 %**) |
+| `zipf` T=1: hit p99 | 9.4 ms | 11.9 ms (+26 %) |
+| served GB/s (`zipf` T=1 / `zipf` / `zipf+scan`) | 1.72 / 2.23 / 1.43 | 1.72 / 2.32 / 1.69 |
+| churn latency clause, `zipf+scan` | met (0.38× LMDB) | **not met** (0.64×) |
+
+The mechanism: the ext4 read-before-write was acting as accidental writer
+admission control under device saturation. Writer admission driven by the
+device's read latency, which could keep the insert win without the read
+cost, is issue #43.
+
+In the rest of this section "the change" means the fill switched on,
+which is what was measured before it became an option: the day-2 builds
+filled unconditionally. The opt-in adds only the switch; with it on, the
+write path is the one measured here.
+
+**Result, in one paragraph.** The fix does what it was meant to do. The
+synchronous reads inside `pwrite` go from 6 016 to 12 per traced minute,
+and the miss+insert p99 falls by 40–50 % at both thread counts. But the
+hit p99 rises by 25 % on `zipf` and 68 % on `zipf+scan` at four threads,
+and this is not noise, throughput or extra I/O. The read-before-write was
+a brake: every insert waited behind the device queue for one small read,
+so inserting slowed down whenever the device was congested. Take the wait
+away and the reads queue longer. Putting back just a synchronous 4 KiB read
+per insert, outside the write, restores the hit tail. An asynchronous read
+does not. On `zipf+scan` at four threads, the change fails the
+pre-registered churn criterion that main passes (hit p99 0.64× LMDB's
+against the 0.5× bar). It is a trade-off, not a free fix.
+
+### The design
+
+Documents are packed at 8-byte boundaries. A 2 MiB KV block is a
+2 097 348-byte document (a 132-byte header, 64 bytes of caller metadata,
+then the content), so its first and last pages are both shared. The first
+page's other bytes are the previous document of the same stripe, written
+moments earlier and cached. The last page's are data from the previous
+pass, and that page usually is not cached.
+
+The issue listed three options:
+
+1. **Align large documents' starts to 4 KiB and pad their tails.** This is
+   not a format change. A `DirEntry` offset is a 40-bit byte offset into
+   the stripe, readers follow offsets, nothing scans the data area, and
+   the recovered cursor only has to be 8-aligned, which a page boundary
+   is. But it costs space: 3 900 bytes per KV block (0.74 % of capacity at
+   512 KiB, 0.19 % at 2 MiB, 0.05 % at 8 MiB), and about 2 KiB per object
+   for variable sizes above the threshold.
+2. **Pre-read the boundary page asynchronously.** This is still one device
+   read per insert. The slot is only known under the write lock, right
+   before the write, so there is no lead time to hide the read in.
+3. **Write N's tail together with N + 1's head.** This either publishes N
+   before its bytes exist (invariant 2) or holds N back.
+
+**What the change does instead: it fills the last page and leaves the
+cursor where it was.** A document above 64 KiB is written together with
+zeros up to the next 4 KiB boundary of the file. Its write then never
+covers part of a page, so ext4 has nothing to read. The cursor still
+advances by the 8-byte-rounded document, so the next document starts
+inside the page just written whole, which is in the page cache. Packing,
+capacity, the directory, readers and recovery are untouched: no format
+change and no space cost. The zeros land ahead of the cursor, where no
+reader may admit anything (invariant 9). With wrap retention the fill is
+clamped to the clean frontier, so it never reaches a retained document or
+a chunk a borrow still counts in; a test pins the clamp with a borrowed
+retained document one page past the fill. The frontier arithmetic is
+unchanged. Head, content and zeros go out in one `pwritev`, because as
+separate `pwrite` calls a head starting on a page boundary would trigger
+the same read. Objects up to 64 KiB are written as before.
+
+### Insert tail and throughput (day 2, closed loop)
+
+`run-churn.sh` at the round-6 settings (2 MiB, C = 16 GiB, 4 GiB cgroup,
+120 s measured, wrap retention on), with LMDB twice at T=4 the same
+night. Medians; ms unless stated; runs in brackets are the count of clean
+runs.
+
+| | served GB/s | hit p50 µs | hit p99 | hit p99.9 | miss+insert p50 | p99 | p99.9 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `zipf`, T=1, main (4) | 1.72 | 197 | 9.4 | 49.6 | 1.49 | 26.1 | 57.9 |
+| `zipf`, T=1, change (4) | 1.72 | 198 | **11.9** | 55.9 | 1.44 | **15.2** | 42.7 |
+| `zipf`, T=4, main (8) | 2.23 | 399 | 30.6 | 69.7 | 4.95 | 57.3 | 91.8 |
+| `zipf`, T=4, change (8) | 2.32 | 384 | **38.0** | 71.2 | 4.02 | **30.1** | 50.1 |
+| `zipf`, T=4, LMDB (2) | 1.67 | 386 | 80.6 | 167 | 5.64 | 48.3 | 101 |
+| `zipf+scan`, T=4, main (7) | 1.43 | 337 | 23.0 | 59.0 | 5.44 | 64.2 | 102 |
+| `zipf+scan`, T=4, change (8) | 1.69 | 308 | **38.7** | 73.6 | 3.81 | **30.4** | 54.2 |
+| `zipf+scan`, T=4, LMDB (2) | 1.32 | 293 | 60.7 | 142 | 6.85 | 55.2 | 104 |
+
+Per run at T=4 `zipf`, main then change, hit p99 in ms: 32.9 / 39.1,
+30.9 / 40.7, 30.2 / 37.3, 29.2 / 35.9, 28.4 / 34.4, 30.4 / 38.7,
+32.9 / 38.9, 31.2 / 33.7. The change is higher in all eight pairs. On
+`zipf+scan` the ranges are 21.0–24.3 against 37.5–42.9. Day 1, on the
+round-6 read path, showed the same shape: miss+insert p99 25.5 → 15.8 ms at
+T=1 and 54.4 → 28.2 at T=4, hit p99 +16 % and +22 %
+([`insert-tail-day1-churn-summary.txt`](kv-cache-benchmark/insert-tail/day1/insert-tail-day1-churn-summary.txt)).
+No run failed the content check or reported a read error. Hit ratios did
+not change (0.814–0.815 on `zipf`).
+
+### Where the hit tail comes from
+
+The hypotheses from the review, tested in turn:
+
+- **Noise: no.** Eight interleaved pairs at T=4 `zipf`, every one higher.
+- **More throughput: no.** Closed loop, the change serves 4–18 % more, and
+  a busier device alone would lengthen the reads. So `kv_churn` gained
+  `--ops-per-second`: Poisson arrivals per thread, seeded the same for
+  every tree. At the same offered load (250 ops/s per thread, T=4 `zipf`,
+  8 clean pairs), both trees served 1.75–1.77 GB/s at 1 030–1 038 ops/s.
+  The change still had hit p99 **35.7 against 31.0 ms (+15 %)**, and
+  miss+insert p99 29.1 against 57.2.
+- **(a) The zeros add write-back or dirty pages: no.** Device bytes written
+  per insert are 2.109 MB in both trees (median). At equal load, write MB/s
+  (390 against 388), cgroup dirty and writeback are the same.
+- **(b) The fill churns the page cache: no.** At equal load, cgroup
+  reclaim is 574 against 570 MiB/s and refaults 268 against 266 MiB/s.
+  The fill only completes a page the old path had already read in, so the
+  pages it touches are the same.
+- **(c) Reads wait behind larger writes: no.** The mean write request is
+  298 against 294 KiB, and writes complete faster with the change (11.5
+  against 13.4 ms).
+- **What does differ is that reads wait longer at the device for the same
+  work:** read `await` 3.54 against 2.62 ms at 4 658 against 4 739
+  reads/s, with a deeper queue (31.0 against 29.3) and a less busy device
+  (89 % against 95 %). Second by second (checked on two pairs), read
+  `await` is higher throughout, not only in bursts.
+
+Three variants of the change, each against main and the change in the
+same interleave (paced unless stated):
+
+| T=4 | hit p99 | miss+insert p99 | read await |
+|---|---:|---:|---:|
+| main (8) | 31.0 | 57.2 | 2.62 |
+| change (8) | 35.7 | 29.1 | 3.54 |
+| **no fill, `pwritev` kept** (3) | 27.4 | 49.7 | 2.34 |
+| **change + synchronous 4 KiB `pread`** past each fill, after the write (3) | 33.1 | 45.3 | 2.99 |
+| same, closed loop `zipf` (3) | 31.4 (main 30.6) | 42.2 (main 57.3) | 2.90 |
+| same, closed loop `zipf+scan` (3) | 28.4 (main 23.0) | 38.5 (main 64.2) | 3.13 |
+| same, closed loop `zipf`, **T=1** (2) | 10.0 (main 9.4) | 27.3 (main 26.1) | 0.78 |
+| **change + asynchronous** 4 KiB readahead there, closed loop `zipf+scan` (1 clean) | 45.1 | 39.2 | 7.23 |
+
+- The `pwritev` is not the cause. Without the fill the tree behaves like
+  main.
+- Adding back a synchronous small read per insert, outside the inode lock,
+  brings the hit tail back to main's at T=4 `zipf`. The insert keeps part
+  of its gain, because one writer's wait no longer holds the other
+  writers' `pwrite` behind the inode lock. At T=1 the insert gain is gone
+  completely, and served drops 9 %.
+- The same read issued asynchronously makes things worse (45 ms). The
+  read itself does not help; the wait does.
+
+That identifies the mechanism. The old read-before-write was accidental
+back-pressure. An insert whose last page was not cached waited for one
+4 KiB read behind whatever the device was doing, so inserts, and the
+write-back they produce, slowed exactly when the device was congested. At
+four threads it was stronger still: the wait happened inside `pwrite`
+under the file's inode lock, so every other writer waited too. With the
+wait gone, inserts keep arriving into a saturated device (99.5 % busy
+closed loop, in both trees), and the reads, which are what a hit waits
+for, sit in a longer queue. Block-layer writeback throttling (wbt, 2 ms
+read-latency target) is active the whole time, and more often at its
+tightest writeback limit with the change (18 % of samples against 13 %
+closed loop). It shows the reads missing their target more often; it
+does not undo it.
+
+This is not specific to this patch. Anything else that removed the
+insert's wait on this saturated device would probably trade the same way.
+That is inferred from the mechanism, not measured.
+
+### Against the pre-registered criteria (T=4, same-night LMDB)
+
+Clause A: served ≥ 1.5× LMDB. Clause B: hit p99 ≤ 0.5× LMDB's at ≥ 0.9×
+the served GB/s. The range in brackets pairs each run with each LMDB run.
+
+| pattern | tree | served | hit p99 | clause A | clause B |
+|---|---|---:|---:|---|---|
+| `zipf` | main | 1.34× | 0.38× [0.33–0.44] | no | **yes** |
+| `zipf` | change | 1.39× | 0.47× [0.39–0.54] | no | **yes**, median only |
+| `zipf` | + sync read | 1.37× | 0.39× | no | yes |
+| `zipf+scan` | main | 1.08× | 0.38× [0.34–0.41] | no | **yes** |
+| `zipf+scan` | change | 1.28× | **0.64×** [0.61–0.72] | no | **no** |
+| `zipf+scan` | + sync read | 1.21× | 0.47× | no | yes, thin |
+
+The change fails the criterion on `zipf+scan`, which main meets. The
+retention-default verdict of round 6 (a win through clause B on both
+patterns) would become partial.
+
+### PUT (day 2, `kv_bench`, three interleaved runs; LMDB and file-per-block twice)
+
+| GB/s (p99 ms) | main | change | filedir | LMDB |
+|---|---:|---:|---:|---:|
+| 512 KiB | 1.60 (0.33) | 1.60 (0.31) | 1.44 | 0.06 |
+| 2 MiB | 1.38 (2.2) | 1.32 (4.6) | 1.40 | 0.15 |
+| 8 MiB | 1.22 (10.8) | 1.27 (11.1) | 1.40 | 0.29 |
+| 32 MiB | 0.84 (89.3) | 0.88 (36.9) | 1.33 | 0.38 |
+
+Throughput is within the run-to-run spread at every size (2 MiB:
+1.28–1.48 against 1.28–1.40). The 2 MiB p99 is higher with the change
+(4.5–5.5 ms against 2.2, 5.6 and 2.2 on main); 32 MiB's is lower. A fresh store's first lap has no old data under the pages, so
+PUT never paid the read. One LMDB sweep had a runner job start into it.
+
+### The trace (day 1)
+
+The round-6 off-CPU trace ([`round6/diag.sh`](kv-cache-benchmark/round6/diag.sh),
+60 s of the measured phase of a T=1 `zipf` run). Summaries are in
+`day1/diag/`; `insert-tail-byframe-*.txt` splits the intervals by the
+user-space frame on the blocking stack
+([`byframe.py`](kv-cache-benchmark/insert-tail/byframe.py)).
+
+| 60 s traced, T=1 `zipf` | main, retention | change, retention | main, flush | change, flush |
+|---|---:|---:|---:|---:|
+| synchronous reads inside the write (`ext4_block_write_begin`) | 6 016 | **12** | 9 438 | **12** |
+| … total wait, ms | 4 912 | **7** | 9 148 | **8** |
+| … waits over 10 ms / longest | 134 / 119.7 ms | **0 / 4.9 ms** | 248 / 64.9 ms | **0 / 6.8 ms** |
+| read faults on the hit path: n / total ms / over 10 ms | 15 884 / 15 331 / 328 | 17 124 / 19 807 / 437 | 11 382 / 11 794 / 252 | 13 194 / 19 588 / 441 |
+
+With the change the write path is `pwritev → ext4_da_write_begin` with no
+read under it. The dozen reads left are pages the fill could not cover.
+The same number of hit-path faults wait longer each, which is the
+queueing described above.
+
+### macOS (M5, APFS)
+
+APFS does not read partial pages before a write, so the M5 run only checks
+that the change costs nothing. Main and the change were interleaved:
+
+| | main | change |
+|---|---:|---:|
+| `performance_baseline` 4 KiB writes, ops/s (p50) | 369 k (2.29 µs) | 410 k (2.29 µs) |
+| `performance_baseline` 256 KiB writes, ops/s (p50) | 34.0 k (28.8 µs) | 36.8 k (26.6 µs) |
+| `insert_bench` 2 MiB / 512 KiB, steady laps, GB/s | 1.04 / 0.72 | 1.20 / 0.78 |
+
+### Status
+
+Landed as an opt-in, `CacheConfig::fill_large_document_tail`, default off.
+The default keeps the brake, and with it the round-6 churn verdict (a win
+through the latency clause on both patterns). The options that were
+weighed:
+
+- **The fill on by default:** miss+insert p99 −42 % (T=1) and −47 to −53 %
+  (T=4), served level to +18 %. Hit p99 rises 25–68 % at T=4, and the
+  default mode then fails the churn criterion on `zipf+scan`.
+- **The fill plus a synchronous read after each large write:** the hit
+  tail stays close to main's (+2 % `zipf`, +24 % `zipf+scan`, both
+  criteria met). Miss+insert p99 is −26 to −40 % at T=4 but unchanged at
+  T=1, which is what issue #35 was about, and T=1 serves 9 % less. It is
+  an explicit throttle that spends one device read per insert.
+
+A throttle that is aware of the device's read latency, rather than one
+that spends a read per insert, is the direction that could keep both:
+issue #43.
+
 ## Device transfer: does zero-copy pay off? (Metal, Apple silicon)
 
 The open question from rounds 1 and 2 is whether the zero-copy read pays
@@ -2565,7 +2853,7 @@ through nvcc in `kv_gpu_cuda.cu`, behind the plain-C seam in
 | A zero-copy C read entry point and a Python binding, which is what a vLLM/SGLang connector would call | Open | — |
 | Keep the previous lap resolvable until it is actually overwritten ([design](design/wrap-retention.md)) | **Done**: implemented and on by default (`wrap_retention = false` is the flush opt-out); see [CHANGELOG](../CHANGELOG.md). Measured: at 16 GiB it meets the churn decision criteria (latency clause, both patterns, T=4), in rounds 5 and 6; flush mode stays partial | [Round 5](#round-5-re-benchmark-at-main-2aed24c): hit ratio 0.758 → 0.814 (`zipf`) and 0.640 → 0.686 (`zipf+scan`), matching the replay within 0.002; served +16 % at T=1, within noise at T=4; hit p99 0.27–0.37× LMDB's. [Round 6](#round-6-re-benchmark-at-main-b5c31e8), with it on by default: hit p99 0.45× (`zipf`, worst run pairing 0.52×) and 0.38× LMDB's at 1.24× and 1.14× its served GB/s |
 | Profile insert latency (miss+insert p50 4.0 ms vs 1.4–1.6 ms for the peers) | **Done** (#16): two fresh 2 MiB heap buffers per put and their ~1,000 page faults were most of it. Removed; T=1 miss+insert p50 4.41 → 1.49 ms (file-per-block 1.43, same day) | [Insert path](#insert-path-profile-issue-16) |
-| The one-thread insert tail (miss+insert p99 24 ms against 6 for file-per-block and 16 for LMDB) | Explained, open. A document ends partway through a page that holds older data; when that page is not cached, ext4 reads 4 KiB synchronously inside the `pwrite`, and about 1 % of inserts wait 10–56 ms for it behind the device's other I/O. Candidates: 4 KiB-aligned document starts (a format change), or reading the boundary page ahead of the write | [Round 6](#the-one-thread-insert-tail-24-ms-p99) |
+| The one-thread insert tail (miss+insert p99 24 ms against 6 for file-per-block and 16 for LMDB) | **Opt-in** (`CacheConfig::fill_large_document_tail`, default off). Filling each large document's last page (no format or space change) removes the read: insert p99 26.1 → 15.2 ms at T=1, 57.3 → 30.1 at T=4. But the read was also back-pressure on a saturated device: hit p99 at T=4 rises 25 % (`zipf`) and 68 % (`zipf+scan`), and `zipf+scan` then fails the latency clause (0.64× LMDB). A synchronous read per insert restores the hit tail but gives back the T=1 gain. Follow-up: writer admission driven by read latency, #43 | [Round 6](#the-one-thread-insert-tail-24-ms-p99), [insert tail](#insert-tail-fill-the-last-page-issue-35) |
 | Large-block puts: 8 MiB and 32 MiB behind file-per-block (1.27 against 1.43, 0.88 against 1.41 GB/s) | Open; not profiled. Faster than round 5 at both sizes (1.01, 0.48) | [Round 6](#regressions-and-losses-since-round-5) |
 | Scan resistance or admission control on the disk tier | Open | [Round 4](#why-the-hit-ratio-and-where-it-comes-from): a scan costs every store about 12 points |
 

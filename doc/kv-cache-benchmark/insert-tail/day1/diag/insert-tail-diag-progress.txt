@@ -1,0 +1,8 @@
+16:02:22 diag before-ret load: 0.94 6.73 8.74 1/967 278595
+16:06:22 diag before-ret done load: 2.18 4.39 7.31 1/751 282807
+16:07:37 diag before-flush load: 0.85 3.51 6.78 1/754 283806
+16:11:29 diag before-flush done load: 3.25 3.19 5.89 1/753 287111
+16:12:44 diag after-ret load: 0.93 2.48 5.43 1/745 287161
+16:16:54 diag after-ret done load: 2.90 2.76 4.85 1/753 292639
+16:18:39 diag after-flush load: 0.80 2.09 4.38 1/749 293557
+16:22:28 diag after-flush done load: 1.45 1.82 3.77 1/744 295752

@@ -7,6 +7,27 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `CacheConfig::fill_large_document_tail` (and
+  `VolumeConfig::fill_large_document_tail`, fluent
+  `set_fill_large_document_tail()`), opt-in, default off (issue #35). When
+  on, a document above 64 KiB is written together with zeros up to the next
+  4 KiB boundary of the file, clamped to the data area and, with wrap
+  retention, to the clean frontier, all in one `pwritev`. Its write then
+  never covers part of a page, so ext4 and XFS no longer read that page
+  from the device inside the write. Documents stay packed and the cursor,
+  capacity and on-disk format are unchanged; the alternate write path fills
+  its tail the same way. Not persisted and not in the C API. With it off,
+  writes are byte-for-byte and syscall-for-syscall as before. Measured on
+  the Linux benchmark machine (2 MiB churn, saturated NVMe): the insert
+  p99 roughly halves (26 → 15 ms at one thread, 57 → 30 ms at four), but
+  the hit p99 at four threads rises 25 % (`zipf`) and 68 % (`zipf+scan`).
+  The removed read was acting as writer admission control under device
+  saturation. For write-latency-sensitive, insert-heavy workloads; see
+  doc/kv-cache-benchmark.md, "Insert tail". Follow-up: #43.
+- `kv_churn --ops-per-second R`: paces each thread's measured phase as a
+  Poisson process of R operations per second, so two trees can be compared
+  at the same offered load.
+
 - Cold-read readahead below the large-document threshold, and a
   sequential window (issue #29). `CacheConfig::cold_readahead_min_bytes`
   (default 16 KiB, `0` = off) and `CacheConfig::sequential_readahead_bytes`
