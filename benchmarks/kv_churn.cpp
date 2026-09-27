@@ -120,6 +120,11 @@ struct Options {
   // into the handle's buffer instead of a harness buffer that write_sync()
   // copies.  Generation stays untimed either way.
   bool reserve = false;
+  // Paced measured phase: each thread starts operations as a Poisson
+  // process of ops_per_second (see Worker::run).  0 = closed loop, as fast
+  // as the store allows.  Lets two trees be compared at the same
+  // offered load, so a latency difference is not just a throughput one.
+  double ops_per_second = 0.0;
 };
 
 // ---------------------------------------------------------------------------
@@ -435,6 +440,7 @@ class Worker {
          uint32_t tid, bool scan, Shared& shared)
       : _cache(cache),
         _opts(opts),
+        _tid(tid),
         _stream(perm, tid, scan),
         _shared(shared),
         _copy(opts.block_size),
@@ -551,7 +557,30 @@ class Worker {
     const auto start = Clock::now();
     const auto end = start + std::chrono::duration_cast<Clock::duration>(
                                  std::chrono::duration<double>(_opts.seconds));
+    // Paced: Poisson arrivals (exponential gaps, a fixed seed per thread,
+    // so every tree sees the same schedule).  An operation that falls
+    // behind its arrival starts at once and the schedule is kept (open
+    // loop); only a backlog over one second is dropped, so an overloaded
+    // store sheds load instead of running flat out.  Independent gaps keep
+    // the threads from waking in lockstep.
+    uint64_t rng = 0x9E3779B97F4A7C15ULL * (uint64_t{_tid} + 1);
+    auto next = start;
     while (Clock::now() < end && !_shared.failed.load()) {
+      if (_opts.ops_per_second > 0) {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        const double u =
+            (static_cast<double>(rng >> 11) + 0.5) / 9007199254740992.0;
+        next += std::chrono::duration_cast<Clock::duration>(
+            std::chrono::duration<double>(-std::log(u) / _opts.ops_per_second));
+        const auto now = Clock::now();
+        if (next > now) {
+          std::this_thread::sleep_until(next);
+        } else if (now - next > std::chrono::seconds(1)) {
+          next = now;
+        }
+      }
       if (!step(true)) _shared.failed.store(true);
     }
     _stats.elapsed_s = seconds_since(start);
@@ -562,6 +591,7 @@ class Worker {
  private:
   Cache& _cache;
   const Options& _opts;
+  uint32_t _tid;
   ChurnStream _stream;
   Shared& _shared;
   std::vector<std::byte> _copy;
@@ -602,6 +632,8 @@ void usage(const char* argv0) {
                "library default)\n"
             << "  --reserve               insert via WriteHandle::reserve() "
                "(generate in place)\n"
+            << "  --ops-per-second R      pace each thread's measured phase at "
+               "R ops/s (default: closed loop)\n"
             << "  --print-vectors         print the stream heads and exit\n";
 }
 
@@ -670,6 +702,9 @@ int main(int argc, char* argv[]) {
       opts.wrap_retention = std::string(argv[++i]) == "on";
     } else if (a == "--reserve") {
       opts.reserve = true;
+    } else if (a == "--ops-per-second" && has) {
+      args_ok = parse_double(argv[++i], opts.ops_per_second) &&
+                opts.ops_per_second >= 0;
     } else if (a == "--print-vectors") {
       vectors_only = true;
     } else {
@@ -906,6 +941,7 @@ int main(int argc, char* argv[]) {
             ? "true"
             : "false")
     << ",\"cy_insert_reserve\":" << (opts.reserve ? "true" : "false")
+    << ",\"ops_per_second_target\":" << opts.ops_per_second
     << ",\"cy_frontier_advances\":"
     << (st1.frontier_advances - st0.frontier_advances)
     << ",\"cy_advances_deferred_by_lease\":"
