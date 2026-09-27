@@ -215,6 +215,7 @@ if(CYCLONE_BUILD_TESTS)
     tests/integration/test_seqlock_read_wait.cpp
     tests/integration/test_write_reserve.cpp
     tests/integration/test_tail_fill.cpp
+    tests/integration/test_cloexec.cpp
     tests/integration/test_lock_holder_wait.cpp
     tests/integration/test_write_lock_liveness.cpp
   )

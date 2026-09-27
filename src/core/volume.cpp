@@ -48,7 +48,8 @@ using ssize_t = SSIZE_T;
 #define CYCLONE_READ _read
 #define CYCLONE_WRITE _write
 #define CYCLONE_FSYNC _commit
-#define CYCLONE_OPEN_FLAGS (O_RDWR | O_CREAT | O_BINARY)
+#define CYCLONE_NOINHERIT _O_NOINHERIT
+#define CYCLONE_OPEN_FLAGS (O_RDWR | O_CREAT | O_BINARY | CYCLONE_NOINHERIT)
 #define CYCLONE_OPEN_MODE (_S_IREAD | _S_IWRITE)
 #else
 // MinGW uses POSIX-style functions but _commit for sync
@@ -65,7 +66,8 @@ using ssize_t = SSIZE_T;
 #define CYCLONE_READ ::read
 #define CYCLONE_WRITE ::write
 #define CYCLONE_FSYNC ::_commit
-#define CYCLONE_OPEN_FLAGS (O_RDWR | O_CREAT | O_BINARY)
+#define CYCLONE_NOINHERIT _O_NOINHERIT
+#define CYCLONE_OPEN_FLAGS (O_RDWR | O_CREAT | O_BINARY | CYCLONE_NOINHERIT)
 #define CYCLONE_OPEN_MODE 0666
 #endif
 #else
@@ -83,7 +85,12 @@ using ssize_t = SSIZE_T;
 #define CYCLONE_READ ::read
 #define CYCLONE_WRITE ::write
 #define CYCLONE_FSYNC ::fsync
-#define CYCLONE_OPEN_FLAGS (O_RDWR | O_CREAT)
+// Every descriptor Cyclone opens is close-on-exec (not inherited by a
+// spawned child).  fork() still shares them, so a pre-fork cache (nginx
+// master -> workers) is unaffected; an exec'd helper no longer keeps the
+// volume open, which would pin the file and hold its byte-range locks.
+#define CYCLONE_NOINHERIT O_CLOEXEC
+#define CYCLONE_OPEN_FLAGS (O_RDWR | O_CREAT | CYCLONE_NOINHERIT)
 #define CYCLONE_OPEN_MODE 0666
 #endif
 
@@ -1565,7 +1572,7 @@ void gc_superseded_volumes(const std::vector<Volume*>& live_volumes,
       // O_RDWR (NOT O_RDONLY): an O_RDONLY fd rejects the F_WRLCK exclusive
       // probe with EBADF, which we would misread as "no lock support".  Any
       // open failure (any errno) -> skip.
-      const int fd = CYCLONE_OPEN(f.c_str(), O_RDWR);
+      const int fd = CYCLONE_OPEN(f.c_str(), O_RDWR | CYCLONE_NOINHERIT);
       if (fd < 0) {
         continue;
       }
@@ -1678,7 +1685,8 @@ std::expected<void, CacheError> Volume::open() {
   _fd = CYCLONE_OPEN(_config.path.c_str(), CYCLONE_OPEN_FLAGS | O_EXCL,
                      CYCLONE_OPEN_MODE);
 #else
-  _fd = CYCLONE_OPEN(_config.path.c_str(), O_RDWR | O_CREAT | O_EXCL,
+  _fd = CYCLONE_OPEN(_config.path.c_str(),
+                     O_RDWR | O_CREAT | O_EXCL | CYCLONE_NOINHERIT,
                      CYCLONE_OPEN_MODE);
 #endif
   if (_fd >= 0) {
