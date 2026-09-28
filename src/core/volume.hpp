@@ -1086,6 +1086,12 @@ struct VolumeStats {
   // document ends within 4 MiB behind its stripe's write cursor (written
   // recently, so almost certainly resident).  PROCESS-LOCAL.
   uint64_t recent_write_hint_skips = 0;
+  // Write-behind (VolumeConfig::write_behind): large documents whose
+  // write-back was started, and the total time writers spent in those
+  // calls (how much the device held them back).  Both 0 when it is off or
+  // the platform has no sync_file_range.  PROCESS-LOCAL.
+  uint64_t write_behind_ranges = 0;
+  uint64_t write_behind_us = 0;
 };
 
 class Volume;
@@ -1272,6 +1278,14 @@ class Volume : public std::enable_shared_from_this<Volume> {
   };
   using WriterSeamHook = std::function<void(WriterSeam seam)>;
   static inline WriterSeamHook s_writer_seam_for_test{};
+
+  // TEST SEAM ONLY -- never installed in production.  Fires once per
+  // write-behind range (VolumeConfig::write_behind), on every platform, just
+  // before the kernel call (which only Linux makes), with the absolute file
+  // range.  Runs after the commit, with no stripe mutex and no write lock
+  // held.  Same shape and cost as the seams above.
+  using WriteBehindHook = std::function<void(uint64_t offset, uint64_t len)>;
+  static inline WriteBehindHook s_write_behind_for_test{};
 
   // TEST SEAM ONLY -- never installed in production.  The two steps of an
   // alternate write's carry-forward (see carry_retained_chain) that neither
@@ -2244,10 +2258,25 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // to a live current chain gives its (unfilled) slot back and sets
   // `*restart` instead of refusing the link: after the wrap that chain is
   // retained, and the second attempt carries it forward.
+  //
+  // Both commit sites report the file range their pwrite filled through
+  // `written` (left empty for a document of kTailFillAboveBytes or less, or
+  // when nothing was written), for the write-behind the public wrappers
+  // start once the stripe mutex is released.
+  struct WrittenRange {
+    uint64_t offset = 0;
+    uint64_t length = 0;
+  };
   std::expected<void, CacheError> commit_alternate_write_once(
       Stripe *stripe, const CacheKey &key, AlternateId alternate_id,
       std::span<const std::byte> header, std::span<const std::byte> content,
-      bool allow_restart, bool *restart);
+      bool allow_restart, bool *restart, WrittenRange *written);
+  std::expected<void, CacheError> commit_write_impl(
+      Stripe *stripe, const CacheKey &key, std::span<const std::byte> header,
+      std::span<const std::byte> content, WrittenRange *written);
+  // Write-behind (VolumeConfig::write_behind, issue #43): start the kernel's
+  // write-back of `range` without waiting for it.  Called with no lock held.
+  void start_write_behind(const WrittenRange &range);
   // Fire the carry seam (test only; a no-op in production).
   static void carry_seam(CarrySeam seam) {
     if (s_carry_seam_for_test) {
@@ -2324,6 +2353,11 @@ class Volume : public std::enable_shared_from_this<Volume> {
   std::atomic<uint64_t> _cold_readahead_hints{0};
   std::atomic<uint64_t> _sequential_readahead_hints{0};
   std::atomic<uint64_t> _recent_write_hint_skips{0};
+
+  // Write-behind telemetry (see VolumeStats); bumped by writers only, after
+  // their commit.
+  std::atomic<uint64_t> _write_behind_ranges{0};
+  std::atomic<uint64_t> _write_behind_ns{0};
 };
 
 // Volume is always heap-allocated (make_shared).  Keep it small enough that a

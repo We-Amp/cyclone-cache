@@ -382,6 +382,33 @@ struct CacheConfig {
   // read tail.  The default leaves writes byte-for-byte as before.
   bool fill_large_document_tail = false;
 
+  // Start write-back of each large document as soon as it is written
+  // (opt-in, default off; issue #43, doc/design/writer-admission-control.md).
+  //
+  // When true, after a document above 64 KiB has been written and
+  // published, the writing thread asks the kernel to start writing its
+  // bytes to the device (Linux: sync_file_range(SYNC_FILE_RANGE_WRITE),
+  // which does not wait for completion and is not a durability barrier).
+  // It runs after the commit, outside the stripe mutex and the
+  // cross-process write lock.  Elsewhere it does nothing.  Not persisted;
+  // C++ only (not in the C API).
+  //
+  // Why: without it, large inserts pile up hundreds of MiB of dirty page
+  // cache that the kernel's flusher writes back in deep bursts, and a read
+  // that misses the page cache queues behind them.  Submitting each
+  // document's write-back from the writer keeps dirty data at a few MiB and
+  // the write queue shallow, and makes the writer, not the flusher, the
+  // thread the block layer holds back when the device queue is full or
+  // blk-wbt throttles writes because reads miss their latency target: the
+  // writer is admitted at the rate the device can take.  Measured with
+  // fill_large_document_tail on a saturated NVMe (doc/kv-cache-benchmark.md,
+  // "Writer admission"), it cuts both the hit p99 and the insert p99.
+  //
+  // Cost: the call can block while the device queue is full.  That is the
+  // point on a worker thread, but an event-loop caller (nginx) should leave
+  // it off.
+  bool write_behind = false;
+
   // Hit tracking
   std::chrono::milliseconds hit_flush_interval{
       1000};  // How often to flush hit counts to disk
@@ -603,6 +630,10 @@ struct CacheConfig {
     fill_large_document_tail = enable;
     return *this;
   }
+  CacheConfig &set_write_behind(bool enable) {
+    write_behind = enable;
+    return *this;
+  }
   CacheConfig &set_directory_sync_interval(std::chrono::milliseconds val) {
     directory_sync_interval = val;
     return *this;
@@ -686,6 +717,11 @@ struct VolumeConfig {
   // Fill a large document's last page on write (opt-in).  Normally set from
   // CacheConfig::fill_large_document_tail; see its documentation there.
   bool fill_large_document_tail = false;
+
+  // Start write-back of each large document as soon as it is written
+  // (opt-in).  Normally set from CacheConfig::write_behind; see its
+  // documentation there.
+  bool write_behind = false;
 
   // Version compatibility behavior
   // If true (default): automatically reset/purge cache on version mismatch

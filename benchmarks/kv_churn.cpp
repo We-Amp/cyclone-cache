@@ -125,6 +125,10 @@ struct Options {
   // as the store allows.  Lets two trees be compared at the same
   // offered load, so a latency difference is not just a throughput one.
   double ops_per_second = 0.0;
+  // CacheConfig::fill_large_document_tail (unset = the library default).
+  std::optional<bool> fill_tail;
+  // CacheConfig::write_behind (unset = the library default).
+  std::optional<bool> write_behind;
 };
 
 // ---------------------------------------------------------------------------
@@ -371,6 +375,12 @@ std::unique_ptr<Cache> open_store(const Options& opts) {
   config.set_multi_process(0, 1);
   if (opts.wrap_retention) {
     config.wrap_retention = *opts.wrap_retention;
+  }
+  if (opts.fill_tail) {
+    config.fill_large_document_tail = *opts.fill_tail;
+  }
+  if (opts.write_behind) {
+    config.write_behind = *opts.write_behind;
   }
   auto created = Cache::create(config);
   if (!created) {
@@ -634,6 +644,10 @@ void usage(const char* argv0) {
                "(generate in place)\n"
             << "  --ops-per-second R      pace each thread's measured phase at "
                "R ops/s (default: closed loop)\n"
+            << "  --fill-tail on|off      fill_large_document_tail (default: "
+               "the library default)\n"
+            << "  --write-behind on|off   write_behind (default: the library "
+               "default)\n"
             << "  --print-vectors         print the stream heads and exit\n";
 }
 
@@ -705,6 +719,10 @@ int main(int argc, char* argv[]) {
     } else if (a == "--ops-per-second" && has) {
       args_ok = parse_double(argv[++i], opts.ops_per_second) &&
                 opts.ops_per_second >= 0;
+    } else if (a == "--fill-tail" && has) {
+      opts.fill_tail = std::string(argv[++i]) == "on";
+    } else if (a == "--write-behind" && has) {
+      opts.write_behind = std::string(argv[++i]) == "on";
     } else if (a == "--print-vectors") {
       vectors_only = true;
     } else {
@@ -952,6 +970,16 @@ int main(int argc, char* argv[]) {
     << ",\"cy_tag_collision_evictions_total\":" << st1.tag_collision_evictions
     << ",\"cy_entries_total\":" << st1.current_entries
     << ",\"cy_readahead_hints\":" << st1.readahead_hints_issued
+    << ",\"cy_fill_tail\":"
+    << (opts.fill_tail.value_or(CacheConfig{}.fill_large_document_tail)
+            ? "true"
+            : "false")
+    << ",\"cy_write_behind\":"
+    << (opts.write_behind.value_or(CacheConfig{}.write_behind) ? "true"
+                                                               : "false")
+    << ",\"cy_write_behind_ranges\":"
+    << (st1.write_behind_ranges - st0.write_behind_ranges)
+    << ",\"cy_write_behind_us\":" << (st1.write_behind_us - st0.write_behind_us)
     << ",\"failed\":" << (failed ? "true" : "false") << "}";
   std::cout << j.str() << "\n";
   if (!opts.output.empty()) {

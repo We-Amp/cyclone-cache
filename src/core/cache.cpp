@@ -437,6 +437,9 @@ std::expected<void, CacheError> Cache::add_volume_locked(
   // Tail fill on write (opt-in): configured on CacheConfig, applied by the
   // volume's write path (see VolumeConfig::fill_large_document_tail).
   vol_config.fill_large_document_tail = _impl->config.fill_large_document_tail;
+  // Write-behind (opt-in): applied by the volume's commit paths after the
+  // commit (see VolumeConfig::write_behind).
+  vol_config.write_behind = _impl->config.write_behind;
   // Lease-pinning knobs are configured on CacheConfig.
   vol_config.read_lease_duration = _impl->config.read_lease_duration;
   vol_config.lease_wrap_ceiling = _impl->config.lease_wrap_ceiling;
@@ -1028,6 +1031,8 @@ CacheStats Cache::stats() const {
     result.cold_readahead_hints += vs.cold_readahead_hints;
     result.sequential_readahead_hints += vs.sequential_readahead_hints;
     result.recent_write_hint_skips += vs.recent_write_hint_skips;
+    result.write_behind_ranges += vs.write_behind_ranges;
+    result.write_behind_us += vs.write_behind_us;
 
     // Wrap-cadence telemetry: sum wrap counts; take the minimum interval
     // across volumes; last_* comes from the most recently wrapped volume.

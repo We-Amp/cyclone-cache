@@ -529,6 +529,7 @@ struct CacheConfig {
   size_t       sequential_readahead_bytes = 1_MB;  // window past a doc on an in-order read-back; 0 = off
   // Both hints run only on checksum-verifying reads: with verify_checksum_on_read = false, small cold reads stay unhinted.
   bool         fill_large_document_tail = false;  // opt-in: zero-fill a >64 KiB doc's last page (insert p99 vs read tail)
+  bool         write_behind = false;              // opt-in: start write-back of each >64 KiB doc after its commit (Linux)
   std::chrono::milliseconds directory_sync_interval{30000};  // multi-process durability cadence
   std::chrono::milliseconds read_lease_duration{5000};       // 0 disables leases
   std::chrono::milliseconds lease_wrap_ceiling{60000};
