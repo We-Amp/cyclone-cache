@@ -55,3 +55,11 @@ small-reads-samples
 # (insert-tail-samples/<run tag>.txt).
 insert-tail-.*\.txt
 insert-tail-samples
+
+# Issue #43 writer admission benchmark raw output, logs and summaries
+# (doc/kv-cache-benchmark/admission-control/), its per-run sampler files
+# (admission-control-samples/<run tag>.*), and the pilot variant patches
+# (diffs applied with patch(1) to build the pilot trees; not shipped source).
+admission-control-.*\.txt
+admission-control-.*\.patch
+admission-control-samples

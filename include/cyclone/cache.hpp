@@ -269,6 +269,15 @@ struct CacheStats {
   // document was written recently (ends within 4 MiB behind its stripe's
   // write cursor) and so is almost certainly resident.  PROCESS-LOCAL.
   uint64_t recent_write_hint_skips = 0;
+
+  // Write-behind (CacheConfig::write_behind; PROCESS-LOCAL, summed across
+  // volumes, appended at the tail; NOT mirrored in CycloneCacheStats).  Both
+  // stay 0 when it is off or the platform has no sync_file_range.
+  //   write_behind_ranges: large documents whose write-back was started.
+  //   write_behind_us: total time writers spent in those calls: how much the
+  //     device held them back.
+  uint64_t write_behind_ranges = 0;
+  uint64_t write_behind_us = 0;
 };
 
 // Thread-safe counters for stats updated from background threads (hit tracker).

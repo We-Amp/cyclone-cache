@@ -81,9 +81,19 @@ Where Cyclone stands now (round 6, Linux, same-day peers):
   page removes the read and cuts the insert p99 by 40–50 %, but the hit
   p99 at four threads rises by 25–68 %, because the read was also a brake
   on inserting into a saturated device. It is therefore an opt-in
-  (`fill_large_document_tail`, default off), and writer admission driven
-  by read latency is issue #43
+  (`fill_large_document_tail`, default off)
   ([insert tail](#insert-tail-fill-the-last-page-issue-35)).
+- **Write-behind fixes both tails (#43):** with the fill on, starting each
+  large document's write-back from the writer as soon as it is committed
+  (`write_behind`, opt-in) keeps the page cache from piling up ~300 MiB of
+  dirty data for the flusher to write in deep batches. At four threads
+  the miss+insert p99 falls to 11.0 / 12.5 ms (`zipf` / `zipf+scan`;
+  main 44.5 / 43.9, fill alone 20.8 / 21.9), the hit p99 to 8.4 / 10.5 ms
+  (main 23.5 / 18.8) and both patterns pass the latency clause at 0.22×
+  and 0.25× LMDB, serving 1.38× and 1.48× as much. At one thread the
+  insert p99 is 4.2 / 3.75 ms. A delay driven by the device's read
+  latency, the first design, cut throughput by a third and did not help
+  ([writer admission](#writer-admission-issue-43)).
 - **GPU transfer:** registering the whole volume mapping once reaches the
   PCIe ceiling (12.79 of 12.82 GB/s, 2.3× over staging). Pinning each
   returned span is slower than staging. LMDB also keeps every value in one
@@ -2403,7 +2413,183 @@ weighed:
 
 A throttle that is aware of the device's read latency, rather than one
 that spends a read per insert, is the direction that could keep both:
-issue #43.
+issue #43. What worked in the end was not a throttle but starting each
+large document's write-back from the writer
+([writer admission](#writer-admission-issue-43)).
+
+## Writer admission (issue #43)
+
+> 2026-09-27 and 28, Linux machine (the same NVMe, kernel and dirty limits
+> as round 6 and the insert-tail section). Main at d453fc3 against this
+> change with `fill_large_document_tail` on, with the fill and
+> `write_behind` on, and with `write_behind` alone, all interleaved, with
+> a same-night LMDB. Every point waited for no runner job, no container
+> job and a 1-minute load below 1.0, with the insert-tail section's 1 Hz
+> memory, device and writeback-throttling samplers and a job watcher
+> beside it; runs a job was seen in during the measured phase are marked
+> `*`, left out of the medians and re-run. Raw data, the driver, the
+> summarisers and the pilot patches are in
+> [`kv-cache-benchmark/admission-control/`](kv-cache-benchmark/admission-control/)
+> (the per-second sampler files are kept for one T=4 `zipf+scan` set and
+> one T=1 `zipf` pair; the pilots are in `pilot1/` and `pilot2/`). Design:
+> [`doc/design/writer-admission-control.md`](design/writer-admission-control.md).
+
+**Outcome: `CacheConfig::write_behind`, opt-in.** After a document above
+64 KiB is committed, the writer asks the kernel to start writing it
+(`sync_file_range(SYNC_FILE_RANGE_WRITE)`: no wait, not a durability
+point), outside every lock. With the fill it meets the goal of #43 with
+room to spare: at four threads the miss+insert p99 is lower than with the
+fill alone, the hit p99 is a third of main's, and both patterns pass the
+churn latency clause at 0.22× and 0.25× LMDB's hit p99.
+
+| 2 MiB, C = 16 GiB, 4 GiB cgroup, closed loop | main | fill | **fill + write-behind** |
+|---|---:|---:|---:|
+| `zipf` T=4: miss+insert p99 / hit p99 | 44.5 / 23.5 ms | 20.8 / 24.8 ms | **11.0 / 8.4 ms** |
+| `zipf+scan` T=4: miss+insert p99 / hit p99 | 43.9 / 18.8 ms | 21.9 / 29.6 ms | **12.5 / 10.5 ms** |
+| `zipf` T=1: miss+insert p99 / hit p99 | 14.9 / 5.9 ms | 9.6 / 6.4 ms | **4.2 / 3.7 ms** |
+| `zipf+scan` T=1: miss+insert p99 / hit p99 | 20.5 / 9.1 ms | 11.1 / 11.3 ms | **3.75 / 4.1 ms** |
+| served GB/s, T=4 `zipf` / `zipf+scan` | 2.51 / 1.68 | 2.97 / 2.01 | **3.52 / 2.37** |
+| churn latency clause, `zipf` / `zipf+scan` (hit p99 vs LMDB) | no (0.62×) / yes (0.46×) | no / no (0.65×, 0.72×) | **yes / yes (0.22×, 0.25×)** |
+
+### The pilot: a delay driven by read latency did not work
+
+The design as first written (section 2–4 of the design doc) sampled the
+device's read `await` from `/sys/dev/block/…/stat` every 50 ms and slept
+before each large write for twice the excess over 2 ms, up to 10 ms. It
+was piloted at `zipf+scan`, T=4, one run each
+([`pilot1/`](kv-cache-benchmark/admission-control/pilot1/),
+recipe `admission-control-sleep-throttle.patch`):
+
+| `zipf+scan`, T=4 | served GB/s | hit p99 | miss+insert p99 | inserts delayed, mean | write MB/s | read `await` | cgroup dirty |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| main | 1.41 | 21.1 | 61.4 | — | 616 | 2.00 | 312 MiB |
+| fill | 1.49 | 44.4 | 33.0 | — | 653 | 6.41 | 335 MiB |
+| fill + delay | 1.00 | 49.7 | 46.4 | 91 %, 7.2 ms | 447 | 5.65 | 302 MiB |
+| fill + delay, gain 4 `*` | 1.18 | 40.4 | 39.1 | 81 %, 7.3 ms | — | — | — |
+
+The delay engaged on nine inserts in ten, cut throughput by a third and
+left the hit tail where it was. Writing 31 % less hardly moved the read
+`await`: read latency here is set not by how much is written but by how it
+reaches the device, as ~300 MiB of dirty page cache that the flusher
+writes back in deep batches (write `await` 13–16 ms), with every uncached
+read queued behind a batch. A sleep on a 50 ms average cannot line up with
+those batches; the old read-before-write did, because a writer waiting for
+a queued read waited exactly while a batch was in the queue.
+
+A second pilot ([`pilot2/`](kv-cache-benchmark/admission-control/pilot2/),
+recipe `admission-control-write-behind-pilot.patch` on top of the first)
+started each large document's write-back from the writer instead:
+
+| `zipf+scan`, T=4 | served GB/s | hit p99 | miss+insert p99 | write `await` | queue | cgroup dirty |
+|---|---:|---:|---:|---:|---:|---:|
+| main | 1.36 | 23.6 | 63.6 | 14.7 | 31.7 | 297 MiB |
+| fill + write-behind | 2.20 | 15.4 | 14.5 | 2.1 | 17.6 | 8 MiB |
+| fill + write-behind + wait for the previous document's write-back | 1.94 | 17.0 | 19.1 | 2.7 | 18.5 | 8 MiB |
+
+Everything improved at once; the extra wait added nothing. The delay was
+dropped and write-behind (without the wait) is what the change ships.
+
+### Churn, 2 MiB, C = 16 GiB, 4 GiB cgroup (three clean runs per point)
+
+`run-churn.sh` at the round-6 settings (120 s measured, wrap retention
+on). Medians; latencies in ms except hit p50 (µs); "held" is the time an
+insert spent in the write-behind call, per insert.
+
+| | served GB/s | hit p50 µs | hit p99 | hit p99.9 | miss+insert p50 | p99 | p99.9 | held |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `zipf` T=4, main | 2.51 | 590 | 23.5 | 53.6 | 5.33 | 44.5 | 69.4 | — |
+| `zipf` T=4, fill | 2.97 | 610 | 24.8 | 45.0 | 4.41 | 20.8 | 32.5 | — |
+| `zipf` T=4, **fill + write-behind** | **3.52** | 650 | **8.4** | **14.6** | 4.54 | **11.0** | **16.0** | 0.32 |
+| `zipf` T=4, write-behind alone | 3.33 | 630 | 7.4 | 11.9 | 5.28 | 13.5 | 20.6 | 0.34 |
+| `zipf` T=4, LMDB | 2.55 | 530 | 37.9 | 124 | 6.04 | 32.3 | 60.5 | — |
+| `zipf+scan` T=4, main | 1.68 | 490 | 18.8 | 44.1 | 5.66 | 43.9 | 74.0 | — |
+| `zipf+scan` T=4, fill | 2.01 | 510 | 29.6 | 50.7 | 4.41 | 21.9 | 35.2 | — |
+| `zipf+scan` T=4, **fill + write-behind** | **2.37** | 590 | **10.5** | **20.2** | 4.53 | **12.5** | **21.6** | 0.31 |
+| `zipf+scan` T=4, write-behind alone | 2.20 | 580 | 6.8 | 11.7 | 5.67 | 14.5 | 21.6 | 0.32 |
+| `zipf+scan` T=4, LMDB | 1.60 | 400 | 41.3 | 116 | 7.28 | 50.4 | 79.2 | — |
+| `zipf` T=1, main | 1.94 | 270 | 5.9 | 30.0 | 1.51 | 14.9 | 34.9 | — |
+| `zipf` T=1, fill | 1.99 | 270 | 6.4 | 32.4 | 1.44 | 9.6 | 22.4 | — |
+| `zipf` T=1, **fill + write-behind** | **2.05** | 310 | **3.7** | **7.3** | 1.69 | **4.2** | **7.8** | 0.21 |
+| `zipf` T=1, write-behind alone | 1.92 | 310 | 4.0 | 7.9 | 1.83 | 5.1 | 8.5 | 0.22 |
+| `zipf+scan` T=1, main | 1.21 | 280 | 9.1 | 48.4 | 1.42 | 20.5 | 44.7 | — |
+| `zipf+scan` T=1, fill | 1.39 | 280 | 11.3 | 44.3 | 1.32 | 11.1 | 29.4 | — |
+| `zipf+scan` T=1, **fill + write-behind** | **1.52** | 340 | **4.1** | **7.7** | 1.56 | **3.75** | **7.6** | 0.21 |
+| `zipf+scan` T=1, write-behind alone | 1.42 | 340 | 4.1 | 8.4 | 1.69 | 5.8 | 10.0 | 0.21 |
+
+Per-run values are in
+[`admission-control-churn-summary.txt`](kv-cache-benchmark/admission-control/admission-control-churn-summary.txt).
+Runs were spread: at T=4 `zipf` the three fill + write-behind hit p99s
+are 8.36, 8.39 and 8.47 ms against main's 23.1–27.7; at `zipf+scan`
+8.9–18.6 against 17.8–22.3 (the 18.6 is the first repetition, which ran
+slow for every configuration). Hit ratios did not change (0.8137–0.8153 on
+`zipf`, 0.6844–0.6865 on `zipf+scan`, every Cyclone configuration), no run failed
+the content check or reported a read error, and device bytes written per
+insert were 2.103–2.104 MB with write-behind against 2.106–2.108 without:
+no write amplification. Ten runs had a runner or container job start in
+their measured phase and were repeated
+([`admission-control-progress.txt`](kv-cache-benchmark/admission-control/admission-control-progress.txt)).
+
+LMDB was faster this night than in round 6 (2.55 against 1.94 GB/s on
+`zipf` at T=4, hit p99 37.9 against 67.0 ms), which is why main misses the
+latency clause on `zipf` here (0.62×) although it met it in round 6.
+
+What the device did (medians of the per-run samples,
+[`admission-control-device-medians.txt`](kv-cache-benchmark/admission-control/admission-control-device-medians.txt)):
+
+| T=4 | reads/s | read `await` | write MB/s | write `await` | queue | cgroup dirty | wbt at its tightest |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `zipf`, main | 6 733 | 1.81 | 545 | 12.7 | 34.0 | 292 MiB | 7.1 % |
+| `zipf`, fill | 7 764 | 1.86 | 643 | 9.7 | 35.2 | 296 MiB | 4.0 % |
+| `zipf`, fill + write-behind | 9 291 | 1.07 | 753 | 1.0 | 11.9 | 7 MiB | 0 % |
+| `zipf+scan`, main | 3 850 | 1.63 | 734 | 10.7 | 29.2 | 302 MiB | 5.5 % |
+| `zipf+scan`, fill | 4 281 | 3.27 | 866 | 9.9 | 39.1 | 348 MiB | 9.5 % |
+| `zipf+scan`, fill + write-behind | 5 073 | 1.80 | 1 013 | 1.3 | 11.9 | 8 MiB | 0.2 % |
+
+With write-behind the device moves more of both, at the same 99.9 %
+utilisation, with a third of the queue and a tenth of the write latency;
+the dirty page cache all but disappears. The writers were barely held back
+(0.2–0.3 ms per insert, mostly the submission work itself): the benefit
+comes from the shape of the write-back, not from throttling. See the
+design doc, section 6.
+
+### Against the pre-registered criteria (T=4, same-night LMDB)
+
+Clause A: served ≥ 1.5× LMDB. Clause B: hit p99 ≤ 0.5× LMDB's at ≥ 0.9×
+the served GB/s. Brackets pair each clean run with each clean LMDB run.
+
+| pattern | configuration | served | hit p99 | clause A | clause B |
+|---|---|---:|---:|---|---|
+| `zipf` | main | 0.98× | 0.62× [0.60–0.77] | no | no |
+| `zipf` | fill | 1.16× | 0.65× [0.64–0.74] | no | no |
+| `zipf` | **fill + write-behind** | 1.38× | **0.22×** [0.22–0.23] | no | **yes** |
+| `zipf` | write-behind alone | 1.30× | 0.20× [0.19–0.25] | no | yes |
+| `zipf+scan` | main | 1.05× | 0.46× [0.43–0.56] | no | yes, thin |
+| `zipf+scan` | fill | 1.25× | 0.72× [0.71–0.95] | no | no |
+| `zipf+scan` | **fill + write-behind** | 1.48× | **0.25×** [0.21–0.46] | no | **yes** |
+| `zipf+scan` | write-behind alone | 1.37× | 0.16× [0.16–0.17] | no | yes |
+
+Against #43's goal (fill on, insert p99 near the fill-on numbers, hit p99
+≤ 0.5× LMDB on both patterns at T=4): met. The insert p99 is not just near
+the fill's, it is about half of it (11.0 against 20.8 ms, 12.5 against
+21.9 at T=4; 4.2 against 9.6 and 3.75 against 11.1 at T=1). Clause A
+(1.5× served) is missed narrowly on `zipf+scan` (1.48×).
+
+### What it costs, and what is left
+
+- **The median.** Hit p50 rises 10–20 % (270 → 310 µs at T=1, 590 → 650
+  at T=4 `zipf`), and miss+insert p50 by 0.1–0.25 ms against the fill alone: the call itself.
+  Every tail percentile falls.
+- **Write-behind alone is almost as good.** With the fill off, a short
+  queue makes the ext4 read-before-write fast too: miss+insert p99 5.1 and
+  5.8 ms at T=1 (fill + write-behind 4.2 and 3.75), and the lowest hit p99
+  of all at T=4. The fill still helps the insert tail at both thread
+  counts, so the two are meant together.
+- **Opt-in.** One machine, one device, one workload. Making it (or both)
+  the default wants a second device and the PageSpeed workload; an event
+  loop must not use it (the call can block while the device queue is
+  full), and the C API does not expose it.
+- **macOS and Windows:** no `sync_file_range`; the option does nothing
+  there. It was not measured on the M5.
 
 ## Device transfer: does zero-copy pay off? (Metal, Apple silicon)
 
@@ -2853,7 +3039,7 @@ through nvcc in `kv_gpu_cuda.cu`, behind the plain-C seam in
 | A zero-copy C read entry point and a Python binding, which is what a vLLM/SGLang connector would call | Open | — |
 | Keep the previous lap resolvable until it is actually overwritten ([design](design/wrap-retention.md)) | **Done**: implemented and on by default (`wrap_retention = false` is the flush opt-out); see [CHANGELOG](../CHANGELOG.md). Measured: at 16 GiB it meets the churn decision criteria (latency clause, both patterns, T=4), in rounds 5 and 6; flush mode stays partial | [Round 5](#round-5-re-benchmark-at-main-2aed24c): hit ratio 0.758 → 0.814 (`zipf`) and 0.640 → 0.686 (`zipf+scan`), matching the replay within 0.002; served +16 % at T=1, within noise at T=4; hit p99 0.27–0.37× LMDB's. [Round 6](#round-6-re-benchmark-at-main-b5c31e8), with it on by default: hit p99 0.45× (`zipf`, worst run pairing 0.52×) and 0.38× LMDB's at 1.24× and 1.14× its served GB/s |
 | Profile insert latency (miss+insert p50 4.0 ms vs 1.4–1.6 ms for the peers) | **Done** (#16): two fresh 2 MiB heap buffers per put and their ~1,000 page faults were most of it. Removed; T=1 miss+insert p50 4.41 → 1.49 ms (file-per-block 1.43, same day) | [Insert path](#insert-path-profile-issue-16) |
-| The one-thread insert tail (miss+insert p99 24 ms against 6 for file-per-block and 16 for LMDB) | **Opt-in** (`CacheConfig::fill_large_document_tail`, default off). Filling each large document's last page (no format or space change) removes the read: insert p99 26.1 → 15.2 ms at T=1, 57.3 → 30.1 at T=4. But the read was also back-pressure on a saturated device: hit p99 at T=4 rises 25 % (`zipf`) and 68 % (`zipf+scan`), and `zipf+scan` then fails the latency clause (0.64× LMDB). A synchronous read per insert restores the hit tail but gives back the T=1 gain. Follow-up: writer admission driven by read latency, #43 | [Round 6](#the-one-thread-insert-tail-24-ms-p99), [insert tail](#insert-tail-fill-the-last-page-issue-35) |
+| The one-thread insert tail (miss+insert p99 24 ms against 6 for file-per-block and 16 for LMDB) | **Opt-in** (`CacheConfig::fill_large_document_tail`, default off). Filling each large document's last page (no format or space change) removes the read: insert p99 26.1 → 15.2 ms at T=1, 57.3 → 30.1 at T=4. But the read was also back-pressure on a saturated device: hit p99 at T=4 rises 25 % (`zipf`) and 68 % (`zipf+scan`), and `zipf+scan` then fails the latency clause (0.64× LMDB). A synchronous read per insert restores the hit tail but gives back the T=1 gain. **With `write_behind` (opt-in, #43)** as well: insert p99 4.2 ms at T=1 and 11.0 / 12.5 at T=4, hit p99 8.4 / 10.5 ms at T=4, latency clause met on both patterns (0.22×, 0.25× LMDB) | [Round 6](#the-one-thread-insert-tail-24-ms-p99), [insert tail](#insert-tail-fill-the-last-page-issue-35), [writer admission](#writer-admission-issue-43) |
 | Large-block puts: 8 MiB and 32 MiB behind file-per-block (1.27 against 1.43, 0.88 against 1.41 GB/s) | Open; not profiled. Faster than round 5 at both sizes (1.01, 0.48) | [Round 6](#regressions-and-losses-since-round-5) |
 | Scan resistance or admission control on the disk tier | Open | [Round 4](#why-the-hit-ratio-and-where-it-comes-from): a scan costs every store about 12 points |
 

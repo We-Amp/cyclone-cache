@@ -4402,6 +4402,10 @@ VolumeStats Volume::stats() const {
       _sequential_readahead_hints.load(std::memory_order_relaxed);
   result.recent_write_hint_skips =
       _recent_write_hint_skips.load(std::memory_order_relaxed);
+  result.write_behind_ranges =
+      _write_behind_ranges.load(std::memory_order_relaxed);
+  result.write_behind_us =
+      _write_behind_ns.load(std::memory_order_relaxed) / 1000;
 
   // Wrap-cadence telemetry. Count: process-local counter (non-mmap
   // stripes) plus the shared per-stripe counters (mmap stripes), so in
@@ -4553,9 +4557,70 @@ class HeldWriteSlotReleaser {
 };
 }  // namespace
 
+// Write-behind (issue #43; VolumeConfig::write_behind,
+// doc/design/writer-admission-control.md).  Called by both public commit
+// wrappers AFTER the commit has returned: the stripe mutex and, in
+// multi-process mode, the cross-process write lock are released, so the
+// call can hold up only the calling thread.  Readers never come here
+// (invariant 1 is untouched).  The document is already published; this
+// only asks the kernel to start writing its pages now instead of leaving
+// them for the flusher.  It is not a durability point (the data sync of
+// invariant 2 is sync_on_write's fsync, before the insert), and a range
+// the stripe has since wrapped over costs one redundant write-back at
+// worst.  SYNC_FILE_RANGE_WRITE does not wait for the write to complete,
+// but it submits the I/O from this thread, so the block layer holds the
+// thread back while the device queue is full or blk-wbt is throttling
+// writes for the sake of reads: that is the admission control.
+//
+// The range ends at the last page boundary at or before the document's end:
+// the page the document ends in is shared with the next document (with the
+// tail fill, the zeros from the cursor on; either way, the next document
+// starts inside it).  Starting that page's write-back now would write it
+// twice, and on devices with stable pages (T10-PI / integrity, some RAID)
+// the next writer's pwrite into it would wait for that write-back while
+// holding the stripe mutex and the cross-process write lock.  It is
+// written back with the next document's range instead (whose start page it
+// is), or by the flusher, so every page is started once.
+void Volume::start_write_behind(const WrittenRange& range) {
+  if (!_config.write_behind || range.length == 0) {
+    return;
+  }
+  const uint64_t end = (range.offset + range.length) & ~(kTailFillPage - 1);
+  if (end <= range.offset) {
+    return;
+  }
+  const uint64_t length = end - range.offset;
+  if (s_write_behind_for_test) {
+    s_write_behind_for_test(range.offset, length);
+  }
+#ifdef __linux__
+  const auto t0 = std::chrono::steady_clock::now();
+  const int rc =
+      ::sync_file_range(_fd, static_cast<off_t>(range.offset),
+                        static_cast<off_t>(length), SYNC_FILE_RANGE_WRITE);
+  const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now() - t0)
+                      .count();
+  if (rc == 0) {  // not on a file system that refuses it (EINVAL, ESPIPE)
+    _write_behind_ranges.fetch_add(1, std::memory_order_relaxed);
+    _write_behind_ns.fetch_add(static_cast<uint64_t>(ns),
+                               std::memory_order_relaxed);
+  }
+#endif
+}
+
 std::expected<void, CacheError> Volume::commit_write(
     Stripe* stripe, const CacheKey& key, std::span<const std::byte> header,
     std::span<const std::byte> content) {
+  WrittenRange written;
+  auto result = commit_write_impl(stripe, key, header, content, &written);
+  start_write_behind(written);  // stripe mutex released by now
+  return result;
+}
+
+std::expected<void, CacheError> Volume::commit_write_impl(
+    Stripe* stripe, const CacheKey& key, std::span<const std::byte> header,
+    std::span<const std::byte> content, WrittenRange* written) {
   if (stripe == nullptr) {
     return make_unexpected(CacheError::NotInitialized);
   }
@@ -4663,6 +4728,13 @@ std::expected<void, CacheError> Volume::commit_write(
     fill_ok = pwrite_parts(_fd, fill_parts, write_offset);
   }
 #endif
+  // The range for the write-behind (VolumeConfig::write_behind), started by
+  // commit_write once the stripe mutex is released.  Large documents only;
+  // the document's own bytes (start_write_behind drops its last, shared
+  // page).
+  if (fill_ok && doc_size > kTailFillAboveBytes) {
+    *written = WrittenRange{write_offset, doc_size};
+  }
 
   // Sync to ensure data is visible to mmap readers (if configured).
   // ORDERING INVARIANT (power loss): this data sync MUST happen before the
@@ -5130,15 +5202,18 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
   // retry carries the chain forward.  The retry cannot restart again: its
   // head is retained or gone, and a carry never refuses its own links.
   bool restart = false;
+  WrittenRange written;
   auto result =
       commit_alternate_write_once(stripe, key, alternate_id, header, content,
-                                  /*allow_restart=*/true, &restart);
+                                  /*allow_restart=*/true, &restart, &written);
   if (restart) {
     restart = false;
-    result =
-        commit_alternate_write_once(stripe, key, alternate_id, header, content,
-                                    /*allow_restart=*/false, &restart);
+    written = {};
+    result = commit_alternate_write_once(stripe, key, alternate_id, header,
+                                         content, /*allow_restart=*/false,
+                                         &restart, &written);
   }
+  start_write_behind(written);  // stripe mutex released by now
   return result;
 }
 
@@ -5323,7 +5398,7 @@ Volume::CarryPlan Volume::carry_retained_chain(
 std::expected<void, CacheError> Volume::commit_alternate_write_once(
     Stripe* stripe, const CacheKey& key, AlternateId alternate_id,
     std::span<const std::byte> header, std::span<const std::byte> content,
-    bool allow_restart, bool* restart) {
+    bool allow_restart, bool* restart, WrittenRange* written_range) {
   if (stripe == nullptr) {
     return make_unexpected(CacheError::NotInitialized);
   }
@@ -5892,6 +5967,12 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
     fill_ok = !(written < 0 || static_cast<size_t>(written) != fill.size());
   }
 #endif
+  // The range for the write-behind, as in commit_write: the whole slot
+  // (carried nodes and head, not the tail fill) when the head is a large
+  // document.
+  if (fill_ok && doc_size > kTailFillAboveBytes) {
+    *written_range = WrittenRange{write_offset, fill.size()};
+  }
 
   // Sync if configured.
   // ORDERING INVARIANT (power loss): this data sync MUST happen before the

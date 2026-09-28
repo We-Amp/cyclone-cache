@@ -1,0 +1,1015 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 3cf7bd4..1f48d9a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -80,6 +80,7 @@ set(CYCLONE_LIBRARY_SOURCES
+   src/core/crc32c.cpp
+   src/core/write_buffer.cpp
+   src/core/hit_tracker.cpp
++  src/core/write_admission.cpp
+   src/ram_cache/clfus.cpp
+   src/ram_cache/lru.cpp
+   src/io/mapped_file.cpp
+@@ -163,6 +164,7 @@ if(CYCLONE_BUILD_TESTS)
+     tests/unit/test_crc32c.cpp
+     tests/unit/test_alternate.cpp
+     tests/unit/test_hit_tracker.cpp
++    tests/unit/test_write_admission.cpp
+     tests/unit/test_clfus.cpp
+     tests/unit/test_lru.cpp
+     tests/unit/test_mapped_file.cpp
+diff --git a/benchmarks/kv_churn.cpp b/benchmarks/kv_churn.cpp
+index c3fc5d1..23f84af 100644
+--- a/benchmarks/kv_churn.cpp
++++ b/benchmarks/kv_churn.cpp
+@@ -125,6 +125,12 @@ struct Options {
+   // as the store allows.  Lets two trees be compared at the same
+   // offered load, so a latency difference is not just a throughput one.
+   double ops_per_second = 0.0;
++  // CacheConfig::fill_large_document_tail (unset = the library default).
++  std::optional<bool> fill_tail;
++  // CacheConfig::write_admission (issue #43): off unless --write-admission
++  // on; the knobs default to WriteAdmissionConfig's.
++  bool write_admission = false;
++  WriteAdmissionConfig admission;
+ };
+ 
+ // ---------------------------------------------------------------------------
+@@ -372,6 +378,11 @@ std::unique_ptr<Cache> open_store(const Options& opts) {
+   if (opts.wrap_retention) {
+     config.wrap_retention = *opts.wrap_retention;
+   }
++  if (opts.fill_tail) {
++    config.fill_large_document_tail = *opts.fill_tail;
++  }
++  config.write_admission = opts.admission;
++  config.write_admission.enabled = opts.write_admission;
+   auto created = Cache::create(config);
+   if (!created) {
+     std::cerr << "Cache::create failed: "
+@@ -634,6 +645,15 @@ void usage(const char* argv0) {
+                "(generate in place)\n"
+             << "  --ops-per-second R      pace each thread's measured phase at "
+                "R ops/s (default: closed loop)\n"
++            << "  --fill-tail on|off      fill_large_document_tail (default: "
++               "the library default)\n"
++            << "  --write-admission on|off  writer admission control "
++               "(default off)\n"
++            << "  --admission-target-us N   read await target (default "
++               "2000)\n"
++            << "  --admission-gain G        delay per unit of excess "
++               "(default 2)\n"
++            << "  --admission-max-delay-us N  delay bound (default 10000)\n"
+             << "  --print-vectors         print the stream heads and exit\n";
+ }
+ 
+@@ -705,6 +725,21 @@ int main(int argc, char* argv[]) {
+     } else if (a == "--ops-per-second" && has) {
+       args_ok = parse_double(argv[++i], opts.ops_per_second) &&
+                 opts.ops_per_second >= 0;
++    } else if (a == "--fill-tail" && has) {
++      opts.fill_tail = std::string(argv[++i]) == "on";
++    } else if (a == "--write-admission" && has) {
++      opts.write_admission = std::string(argv[++i]) == "on";
++    } else if (a == "--admission-target-us" && has) {
++      args_ok = parse_u64(argv[++i], u);
++      opts.admission.read_latency_target =
++          std::chrono::microseconds(static_cast<int64_t>(u));
++    } else if (a == "--admission-gain" && has) {
++      args_ok = parse_double(argv[++i], opts.admission.gain) &&
++                opts.admission.gain > 0;
++    } else if (a == "--admission-max-delay-us" && has) {
++      args_ok = parse_u64(argv[++i], u);
++      opts.admission.max_delay =
++          std::chrono::microseconds(static_cast<int64_t>(u));
+     } else if (a == "--print-vectors") {
+       vectors_only = true;
+     } else {
+@@ -952,6 +987,20 @@ int main(int argc, char* argv[]) {
+     << ",\"cy_tag_collision_evictions_total\":" << st1.tag_collision_evictions
+     << ",\"cy_entries_total\":" << st1.current_entries
+     << ",\"cy_readahead_hints\":" << st1.readahead_hints_issued
++    << ",\"cy_fill_tail\":"
++    << (opts.fill_tail.value_or(CacheConfig{}.fill_large_document_tail)
++            ? "true"
++            : "false")
++    << ",\"cy_write_admission\":" << (opts.write_admission ? "true" : "false")
++    << ",\"cy_admission_target_us\":"
++    << opts.admission.read_latency_target.count()
++    << ",\"cy_admission_gain\":" << opts.admission.gain
++    << ",\"cy_admission_max_delay_us\":" << opts.admission.max_delay.count()
++    << ",\"cy_admission_delays\":"
++    << (st1.write_admission_delays - st0.write_admission_delays)
++    << ",\"cy_admission_delay_us\":"
++    << (st1.write_admission_delay_us - st0.write_admission_delay_us)
++    << ",\"cy_admission_read_await_us\":" << st1.write_admission_read_await_us
+     << ",\"failed\":" << (failed ? "true" : "false") << "}";
+   std::cout << j.str() << "\n";
+   if (!opts.output.empty()) {
+diff --git a/include/cyclone/cache.hpp b/include/cyclone/cache.hpp
+index 2b01953..106000e 100644
+--- a/include/cyclone/cache.hpp
++++ b/include/cyclone/cache.hpp
+@@ -269,6 +269,17 @@ struct CacheStats {
+   // document was written recently (ends within 4 MiB behind its stripe's
+   // write cursor) and so is almost certainly resident.  PROCESS-LOCAL.
+   uint64_t recent_write_hint_skips = 0;
++
++  // Writer admission control (CacheConfig::write_admission; PROCESS-LOCAL,
++  // appended at the tail; NOT mirrored in CycloneCacheStats).  All stay 0
++  // when it is off or inert.
++  //   write_admission_delays: large writes that were delayed.
++  //   write_admission_delay_us: total time those writes slept.
++  //   write_admission_read_await_us: the latest smoothed device read await
++  //     the controller saw (a gauge; the largest across volumes).
++  uint64_t write_admission_delays = 0;
++  uint64_t write_admission_delay_us = 0;
++  uint64_t write_admission_read_await_us = 0;
+ };
+ 
+ // Thread-safe counters for stats updated from background threads (hit tracker).
+diff --git a/include/cyclone/config.hpp b/include/cyclone/config.hpp
+index 7453cb9..8183212 100644
+--- a/include/cyclone/config.hpp
++++ b/include/cyclone/config.hpp
+@@ -238,6 +238,37 @@ struct OptimizationConfig {
+   }
+ };
+ 
++// Writer admission control driven by device read latency (opt-in; issue
++// #43, doc/design/writer-admission-control.md).
++//
++// When enabled, a write of a document above 64 KiB is delayed before it
++// takes any lock whenever the volume device's reads are queueing: the delay
++// is gain x (smoothed read await - read_latency_target), clamped to
++// [0, max_delay].  The read await comes from the kernel's per-device
++// counters (Linux, /sys/dev/block/MAJ:MIN/stat of the volume file's
++// device), sampled by writers at most every 50 ms; readers are not
++// involved.  Where the counters are not available (other platforms, tmpfs,
++// overlay) it does nothing.  Small writes are never delayed.
++//
++// Meant to be paired with fill_large_document_tail: the fill removes the
++// ext4 read-before-write that used to slow inserts on a congested device,
++// and this puts back a bounded, congestion-only brake so reads do not queue
++// behind the extra write-back.  Not persisted; C++ only (not in the C API).
++// A caller on an event loop (nginx) must keep max_delay small: the delay is
++// a sleep on the calling thread.
++struct WriteAdmissionConfig {
++  bool enabled = false;
++  // Throttling starts when the smoothed device read await exceeds this.
++  // 2 ms is the kernel's blk-wbt read target for non-rotational devices; a
++  // device that is slower than that when idle (a rotational disk, a network
++  // block device) needs a higher target.
++  std::chrono::microseconds read_latency_target{2000};
++  // Delay per unit of excess await (2.0: 1 ms over target -> 2 ms delay).
++  double gain = 2.0;
++  // Upper bound on the delay of one write.
++  std::chrono::microseconds max_delay{10000};
++};
++
+ struct CacheConfig {
+   // In-memory (RAM) tier size.  0 disables the RAM tier outright: the cache
+   // runs disk-only (see Cache::Cache, which only builds a RamCache when this
+@@ -382,6 +413,9 @@ struct CacheConfig {
+   // read tail.  The default leaves writes byte-for-byte as before.
+   bool fill_large_document_tail = false;
+ 
++  // Writer admission control (opt-in, default off); see WriteAdmissionConfig.
++  WriteAdmissionConfig write_admission;
++
+   // Hit tracking
+   std::chrono::milliseconds hit_flush_interval{
+       1000};  // How often to flush hit counts to disk
+@@ -603,6 +637,10 @@ struct CacheConfig {
+     fill_large_document_tail = enable;
+     return *this;
+   }
++  CacheConfig &set_write_admission(const WriteAdmissionConfig &config) {
++    write_admission = config;
++    return *this;
++  }
+   CacheConfig &set_directory_sync_interval(std::chrono::milliseconds val) {
+     directory_sync_interval = val;
+     return *this;
+@@ -687,6 +725,10 @@ struct VolumeConfig {
+   // CacheConfig::fill_large_document_tail; see its documentation there.
+   bool fill_large_document_tail = false;
+ 
++  // Writer admission control (opt-in).  Normally set from
++  // CacheConfig::write_admission; see WriteAdmissionConfig.
++  WriteAdmissionConfig write_admission;
++
+   // Version compatibility behavior
+   // If true (default): automatically reset/purge cache on version mismatch
+   // If false: return IncompatibleVersion error instead
+diff --git a/src/core/cache.cpp b/src/core/cache.cpp
+index 816dda4..ba8227e 100644
+--- a/src/core/cache.cpp
++++ b/src/core/cache.cpp
+@@ -437,6 +437,9 @@ std::expected<void, CacheError> Cache::add_volume_locked(
+   // Tail fill on write (opt-in): configured on CacheConfig, applied by the
+   // volume's write path (see VolumeConfig::fill_large_document_tail).
+   vol_config.fill_large_document_tail = _impl->config.fill_large_document_tail;
++  // Writer admission control (opt-in): applied before a large write takes
++  // any lock (see WriteAdmissionConfig).
++  vol_config.write_admission = _impl->config.write_admission;
+   // Lease-pinning knobs are configured on CacheConfig.
+   vol_config.read_lease_duration = _impl->config.read_lease_duration;
+   vol_config.lease_wrap_ceiling = _impl->config.lease_wrap_ceiling;
+@@ -1028,6 +1031,11 @@ CacheStats Cache::stats() const {
+     result.cold_readahead_hints += vs.cold_readahead_hints;
+     result.sequential_readahead_hints += vs.sequential_readahead_hints;
+     result.recent_write_hint_skips += vs.recent_write_hint_skips;
++    result.write_admission_delays += vs.write_admission_delays;
++    result.write_admission_delay_us += vs.write_admission_delay_us;
++    result.write_admission_read_await_us =
++        std::max(result.write_admission_read_await_us,
++                 vs.write_admission_read_await_us);
+ 
+     // Wrap-cadence telemetry: sum wrap counts; take the minimum interval
+     // across volumes; last_* comes from the most recently wrapped volume.
+diff --git a/src/core/volume.cpp b/src/core/volume.cpp
+index 4a76266..59dc64e 100644
+--- a/src/core/volume.cpp
++++ b/src/core/volume.cpp
+@@ -9,6 +9,7 @@
+ #include <bitset>
+ #include <cerrno>
+ #include <chrono>
++#include <cmath>
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstring>
+@@ -1704,6 +1705,26 @@ std::expected<void, CacheError> Volume::open() {
+     return make_unexpected(CacheError::IoError);
+   }
+ 
++  // Writer admission control (opt-in): resolve the device's read counters
++  // once.  Created before any write can run and never destroyed before the
++  // Volume, so writers need no synchronisation to use it.
++  if (_config.write_admission.enabled && !_write_admission) {
++    const auto& wa = _config.write_admission;
++    WriteAdmissionParams params;
++    params.target_ns =
++        static_cast<uint64_t>(std::max<int64_t>(wa.read_latency_target.count(),
++                                                0)) *
++        1000;
++    params.gain = wa.gain;
++    params.max_delay_ns =
++        static_cast<uint64_t>(std::max<int64_t>(wa.max_delay.count(), 0)) *
++        1000;
++    if (params.gain > 0 && std::isfinite(params.gain) &&
++        params.max_delay_ns > 0) {
++      _write_admission = WriteAdmission::for_file(params, _fd);
++    }
++  }
++
+   _reset_gate_degraded.store(false, std::memory_order_relaxed);
+ 
+   // the two-stage open above only picks the CREATOR of the file
+@@ -4402,6 +4423,11 @@ VolumeStats Volume::stats() const {
+       _sequential_readahead_hints.load(std::memory_order_relaxed);
+   result.recent_write_hint_skips =
+       _recent_write_hint_skips.load(std::memory_order_relaxed);
++  if (_write_admission) {
++    result.write_admission_delays = _write_admission->delays();
++    result.write_admission_delay_us = _write_admission->delay_ns_total() / 1000;
++    result.write_admission_read_await_us = _write_admission->await_ns() / 1000;
++  }
+ 
+   // Wrap-cadence telemetry. Count: process-local counter (non-mmap
+   // stripes) plus the shared per-stripe counters (mmap stripes), so in
+@@ -4553,6 +4579,21 @@ class HeldWriteSlotReleaser {
+ };
+ }  // namespace
+ 
++// Writer admission control (issue #43; VolumeConfig::write_admission,
++// doc/design/writer-admission-control.md).  Called by both commit sites
++// before they take the stripe mutex, with no Cyclone lock held: the sleep
++// can hold up only the calling thread.  Readers never come here (invariant
++// 1 is untouched), and nothing is reserved yet, so a sleeping writer pins
++// no wrap, lease or frontier.  Only documents above kTailFillAboveBytes
++// are delayed, the ones whose write-back loads the device; the delay is
++// zero unless the device's smoothed read await is above target, and never
++// more than max_delay.
++void Volume::admit_large_write(size_t doc_size) {
++  if (_write_admission && doc_size > kTailFillAboveBytes) {
++    (void)_write_admission->admit();
++  }
++}
++
+ std::expected<void, CacheError> Volume::commit_write(
+     Stripe* stripe, const CacheKey& key, std::span<const std::byte> header,
+     std::span<const std::byte> content) {
+@@ -4597,6 +4638,11 @@ std::expected<void, CacheError> Volume::commit_write(
+     tail = {};
+   }
+ 
++  // Writer admission control (opt-in; see admit_large_write): a large write
++  // waits out device read congestion HERE, before the stripe mutex and the
++  // cross-process write lock, so no reader and no other writer waits on it.
++  admit_large_write(doc_size);
++
+   std::unique_lock lock(stripe->mutex);
+ 
+   // Allocate the write slot via the shared lease-gated helper
+@@ -5129,6 +5175,12 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
+   // in that wrap (see commit_alternate_write_once) retries once, and the
+   // retry carries the chain forward.  The retry cannot restart again: its
+   // head is retained or gone, and a carry never refuses its own links.
++  //
++  // Writer admission control first, with no lock held (see
++  // admit_large_write; the head's size is what decides, as in commit_write).
++  if (stripe != nullptr && stripe->owned) {
++    admit_large_write(Document::kHeaderSize + header.size() + content.size());
++  }
+   bool restart = false;
+   auto result =
+       commit_alternate_write_once(stripe, key, alternate_id, header, content,
+diff --git a/src/core/volume.hpp b/src/core/volume.hpp
+index 10c6fdb..c8f9945 100644
+--- a/src/core/volume.hpp
++++ b/src/core/volume.hpp
+@@ -39,6 +39,7 @@
+ #include "hit_tracker.hpp"
+ #include "mmap_directory.hpp"
+ #include "thread_shard.hpp"
++#include "write_admission.hpp"
+ 
+ namespace cyclone {
+ 
+@@ -1086,6 +1087,12 @@ struct VolumeStats {
+   // document ends within 4 MiB behind its stripe's write cursor (written
+   // recently, so almost certainly resident).  PROCESS-LOCAL.
+   uint64_t recent_write_hint_skips = 0;
++  // Writer admission control (VolumeConfig::write_admission): large writes
++  // delayed, total time slept, and the latest smoothed device read await.
++  // All 0 when it is off or inert (no device counters).  PROCESS-LOCAL.
++  uint64_t write_admission_delays = 0;
++  uint64_t write_admission_delay_us = 0;
++  uint64_t write_admission_read_await_us = 0;
+ };
+ 
+ class Volume;
+@@ -2324,6 +2331,15 @@ class Volume : public std::enable_shared_from_this<Volume> {
+   std::atomic<uint64_t> _cold_readahead_hints{0};
+   std::atomic<uint64_t> _sequential_readahead_hints{0};
+   std::atomic<uint64_t> _recent_write_hint_skips{0};
++
++  // Writer admission control (VolumeConfig::write_admission, issue #43).
++  // Created by open() when enabled and the device's read counters are
++  // available, then kept for the Volume's lifetime (a reopen reuses it, so
++  // a writer never races its destruction).  Null otherwise: the write path
++  // is then exactly the unthrottled one.  Touched by writers only, before
++  // any lock (admit_large_write).
++  std::unique_ptr<WriteAdmission> _write_admission;
++  void admit_large_write(size_t doc_size);
+ };
+ 
+ // Volume is always heap-allocated (make_shared).  Keep it small enough that a
+diff --git a/src/core/write_admission.cpp b/src/core/write_admission.cpp
+new file mode 100644
+index 0000000..e73657c
+--- /dev/null
++++ b/src/core/write_admission.cpp
+@@ -0,0 +1,190 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright (c) 2024-2026 We-Amp B.V.
++
++#include "write_admission.hpp"
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <thread>
++#include <utility>
++
++#ifdef __linux__
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <sys/sysmacros.h>
++#include <unistd.h>
++
++#include <array>
++#include <charconv>
++#include <cstdio>
++#endif
++
++namespace cyclone {
++
++bool WriteAdmissionController::observe(uint64_t now_ns,
++                                       DeviceReadSample sample) {
++  if (!_have_base) {
++    rebase(now_ns, sample);
++    return false;
++  }
++  // Counters that went backwards (a device reset, a wrapped 32-bit field) or
++  // a clock that did: start over.
++  if (sample.reads < _base.reads || sample.read_ms < _base.read_ms ||
++      now_ns < _base_ns) {
++    reset(now_ns, sample);
++    return true;
++  }
++  const uint64_t elapsed = now_ns - _base_ns;
++  if (elapsed < _params.window_ns) {
++    return false;
++  }
++  const uint64_t reads = sample.reads - _base.reads;
++  if (elapsed >= _params.idle_ns) {
++    // Too few reads for a whole idle period (the device is idle for reads),
++    // or nobody sampled for that long (no large writes): whatever the
++    // window says is stale.  Nothing to throttle against.
++    reset(now_ns, sample);
++    return true;
++  }
++  if (reads < _params.min_reads) {
++    return false;  // extend the window until it holds enough reads
++  }
++  const double await_ns = static_cast<double>(sample.read_ms - _base.read_ms) *
++                          1e6 / static_cast<double>(reads);
++  if (_have_ewma) {
++    _ewma_ns += (await_ns - _ewma_ns) / 4.0;
++  } else {
++    _ewma_ns = await_ns;
++    _have_ewma = true;
++  }
++  const double excess = _ewma_ns - static_cast<double>(_params.target_ns);
++  const double delay = excess > 0 ? _params.gain * excess : 0.0;
++  _delay_ns = static_cast<uint64_t>(
++      std::min(delay, static_cast<double>(_params.max_delay_ns)));
++  rebase(now_ns, sample);
++  return true;
++}
++
++WriteAdmission::WriteAdmission(const WriteAdmissionParams& params,
++                               CounterSource counters, NowNs now,
++                               Sleeper sleep)
++    : _counters(std::move(counters)),
++      _now(std::move(now)),
++      _sleep(std::move(sleep)),
++      _window_ns(params.window_ns),
++      _controller(params) {}
++
++void WriteAdmission::maybe_sample(uint64_t now_ns) {
++  if (now_ns < _pub.next_sample_ns.load(std::memory_order_relaxed)) {
++    return;
++  }
++  std::unique_lock lock(_sample_mutex, std::try_to_lock);
++  if (!lock.owns_lock()) {
++    return;  // another writer is sampling; use the published delay
++  }
++  if (now_ns < _pub.next_sample_ns.load(std::memory_order_relaxed)) {
++    return;  // sampled while we were getting here
++  }
++  _pub.next_sample_ns.store(now_ns + _window_ns, std::memory_order_relaxed);
++  const std::optional<DeviceReadSample> sample = _counters();
++  if (!sample) {
++    return;
++  }
++  if (_controller.observe(now_ns, *sample)) {
++    _pub.delay_ns.store(_controller.delay_ns(), std::memory_order_relaxed);
++    _await_ns.store(_controller.await_ns(), std::memory_order_relaxed);
++  }
++}
++
++uint64_t WriteAdmission::admit() {
++  maybe_sample(_now());
++  const uint64_t delay = _pub.delay_ns.load(std::memory_order_relaxed);
++  if (delay == 0) {
++    return 0;
++  }
++  _sleep(delay);
++  _delays.fetch_add(1, std::memory_order_relaxed);
++  _delay_ns_total.fetch_add(delay, std::memory_order_relaxed);
++  return delay;
++}
++
++#ifdef __linux__
++namespace {
++
++// /sys/dev/block/MAJ:MIN/stat of one device, kept open and re-read with
++// pread at offset 0 (sysfs regenerates the attribute on every such read).
++class SysfsBlockStat {
++ public:
++  explicit SysfsBlockStat(int fd) : _fd(fd) {}
++  SysfsBlockStat(const SysfsBlockStat&) = delete;
++  SysfsBlockStat& operator=(const SysfsBlockStat&) = delete;
++  ~SysfsBlockStat() { ::close(_fd); }
++
++  // Fields 1 and 4 of the stat file: reads completed, time reading (ms).
++  std::optional<DeviceReadSample> read() const {
++    std::array<char, 512> buf{};
++    const ssize_t n = ::pread(_fd, buf.data(), buf.size() - 1, 0);
++    if (n <= 0) {
++      return std::nullopt;
++    }
++    const char* p = buf.data();
++    const char* end = buf.data() + n;
++    std::array<uint64_t, 4> f{};
++    for (auto& v : f) {
++      while (p < end && (*p == ' ' || *p == '\t')) {
++        ++p;
++      }
++      const auto [q, ec] = std::from_chars(p, end, v);
++      if (ec != std::errc()) {
++        return std::nullopt;
++      }
++      p = q;
++    }
++    return DeviceReadSample{f[0], f[3]};
++  }
++
++ private:
++  int _fd;
++};
++
++uint64_t steady_now_ns() {
++  return static_cast<uint64_t>(
++      std::chrono::duration_cast<std::chrono::nanoseconds>(
++          std::chrono::steady_clock::now().time_since_epoch())
++          .count());
++}
++
++}  // namespace
++
++std::unique_ptr<WriteAdmission> WriteAdmission::for_file(
++    const WriteAdmissionParams& params, int fd) {
++  struct stat st{};
++  if (fd < 0 || ::fstat(fd, &st) != 0 || major(st.st_dev) == 0) {
++    return nullptr;  // no backing block device (tmpfs, overlay, btrfs subvol)
++  }
++  std::array<char, 64> path{};
++  std::snprintf(path.data(), path.size(), "/sys/dev/block/%u:%u/stat",
++                major(st.st_dev), minor(st.st_dev));
++  const int sfd = ::open(path.data(), O_RDONLY | O_CLOEXEC);
++  if (sfd < 0) {
++    return nullptr;
++  }
++  auto stat_file = std::make_shared<SysfsBlockStat>(sfd);
++  if (!stat_file->read()) {
++    return nullptr;
++  }
++  return std::make_unique<WriteAdmission>(
++      params, [stat_file] { return stat_file->read(); }, steady_now_ns,
++      [](uint64_t ns) {
++        std::this_thread::sleep_for(std::chrono::nanoseconds(ns));
++      });
++}
++#else
++std::unique_ptr<WriteAdmission> WriteAdmission::for_file(
++    const WriteAdmissionParams& /*params*/, int /*fd*/) {
++  return nullptr;  // no device read counters on this platform
++}
++#endif
++
++}  // namespace cyclone
+diff --git a/src/core/write_admission.hpp b/src/core/write_admission.hpp
+new file mode 100644
+index 0000000..35b94a0
+--- /dev/null
++++ b/src/core/write_admission.hpp
+@@ -0,0 +1,146 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright (c) 2024-2026 We-Amp B.V.
++
++#pragma once
++
++// Writer admission control driven by device read latency (issue #43;
++// doc/design/writer-admission-control.md).  Opt-in through
++// CacheConfig::write_admission.
++//
++// A large write is delayed before it takes any lock when the volume
++// device's reads are queueing: the delay is proportional to how far the
++// smoothed read await is above a target, and bounded.  The signal is the
++// kernel's per-device read counters (Linux: /sys/dev/block/MAJ:MIN/stat),
++// sampled by writers only, at most once per window, by whichever writer
++// wins a try_lock.  Readers are not involved.
++//
++// WriteAdmissionController is the pure control law (time and counters are
++// passed in, so unit tests drive it deterministically).  WriteAdmission
++// wires it to a counter source, a clock and a sleeper, all injectable.
++
++#include <atomic>
++#include <cstdint>
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <optional>
++
++namespace cyclone {
++
++// Cumulative read counters of one block device, as the kernel reports them.
++struct DeviceReadSample {
++  uint64_t reads = 0;    // reads completed
++  uint64_t read_ms = 0;  // total time those reads spent, in milliseconds
++};
++
++struct WriteAdmissionParams {
++  // Throttling starts when the smoothed read await exceeds this.
++  uint64_t target_ns = 2'000'000;
++  // Delay per unit of excess await: delay = gain * (await - target).
++  double gain = 2.0;
++  // Upper bound on the delay of one write.
++  uint64_t max_delay_ns = 10'000'000;
++  // A window closes after at least window_ns and at least min_reads reads.
++  uint64_t window_ns = 50'000'000;
++  uint64_t min_reads = 16;
++  // A window still open after idle_ns (too few reads: the device is idle for
++  // reads; or no writer sampled for that long) resets the estimate and the
++  // delay to zero.
++  uint64_t idle_ns = 1'000'000'000;
++};
++
++class WriteAdmissionController {
++ public:
++  explicit WriteAdmissionController(const WriteAdmissionParams& params)
++      : _params(params) {}
++
++  // Feed the device's cumulative counters at time now_ns.  Returns true when
++  // the sample closed a window (the delay may have changed).
++  bool observe(uint64_t now_ns, DeviceReadSample sample);
++
++  // The delay to apply before the next large write, in nanoseconds.
++  [[nodiscard]] uint64_t delay_ns() const noexcept { return _delay_ns; }
++  // The smoothed read await, in nanoseconds (0 when there is no estimate).
++  [[nodiscard]] uint64_t await_ns() const noexcept {
++    return _have_ewma ? static_cast<uint64_t>(_ewma_ns) : 0;
++  }
++
++ private:
++  void rebase(uint64_t now_ns, DeviceReadSample sample) noexcept {
++    _have_base = true;
++    _base_ns = now_ns;
++    _base = sample;
++  }
++  void reset(uint64_t now_ns, DeviceReadSample sample) noexcept {
++    _have_ewma = false;
++    _ewma_ns = 0;
++    _delay_ns = 0;
++    rebase(now_ns, sample);
++  }
++
++  WriteAdmissionParams _params;
++  bool _have_base = false;
++  uint64_t _base_ns = 0;
++  DeviceReadSample _base;
++  bool _have_ewma = false;
++  double _ewma_ns = 0;
++  uint64_t _delay_ns = 0;
++};
++
++class WriteAdmission {
++ public:
++  using CounterSource = std::function<std::optional<DeviceReadSample>()>;
++  using NowNs = std::function<uint64_t()>;
++  using Sleeper = std::function<void(uint64_t ns)>;
++
++  // Test / injection constructor.
++  WriteAdmission(const WriteAdmissionParams& params, CounterSource counters,
++                 NowNs now, Sleeper sleep);
++
++  // The production instance for the device holding `fd`: nullptr when the
++  // device's read counters are not available (non-Linux, a file system with
++  // no backing block device such as tmpfs or overlay, no /sys).
++  static std::unique_ptr<WriteAdmission> for_file(
++      const WriteAdmissionParams& params, int fd);
++
++  // Called before a large write, with no lock held.  Samples the device if a
++  // window is due (never waits for another sampler), then sleeps for the
++  // current delay.  Returns the delay slept, in nanoseconds.
++  uint64_t admit();
++
++  // Telemetry (process-local).
++  [[nodiscard]] uint64_t delays() const noexcept {
++    return _delays.load(std::memory_order_relaxed);
++  }
++  [[nodiscard]] uint64_t delay_ns_total() const noexcept {
++    return _delay_ns_total.load(std::memory_order_relaxed);
++  }
++  [[nodiscard]] uint64_t await_ns() const noexcept {
++    return _await_ns.load(std::memory_order_relaxed);
++  }
++
++ private:
++  void maybe_sample(uint64_t now_ns);
++
++  CounterSource _counters;
++  NowNs _now;
++  Sleeper _sleep;
++  uint64_t _window_ns;
++
++  // Writer-only state.  The controller is touched only under _sample_mutex
++  // (try_lock: a writer that loses simply uses the published delay).
++  std::mutex _sample_mutex;
++  WriteAdmissionController _controller;
++
++  // Published for every writer: one line, touched by writers only.
++  struct alignas(128) Published {
++    std::atomic<uint64_t> delay_ns{0};
++    std::atomic<uint64_t> next_sample_ns{0};
++  };
++  Published _pub;
++  std::atomic<uint64_t> _await_ns{0};
++  std::atomic<uint64_t> _delays{0};
++  std::atomic<uint64_t> _delay_ns_total{0};
++};
++
++}  // namespace cyclone
+diff --git a/tests/unit/test_write_admission.cpp b/tests/unit/test_write_admission.cpp
+new file mode 100644
+index 0000000..9c673ad
+--- /dev/null
++++ b/tests/unit/test_write_admission.cpp
+@@ -0,0 +1,292 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright (c) 2024-2026 We-Amp B.V.
++
++// Writer admission control (issue #43, doc/design/writer-admission-control.md).
++// The control law is driven with synthetic device counters and an injected
++// clock, so every expected delay is exact.
++
++#include <atomic>
++#include <catch2/catch_test_macros.hpp>
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include "core/write_admission.hpp"
++#include "cyclone/cache.hpp"
++#include "cyclone/key.hpp"
++#include "support/temp_cache.hpp"
++
++using namespace cyclone;
++
++namespace {
++
++constexpr uint64_t kMs = 1'000'000;  // ns
++
++WriteAdmissionParams params() {
++  WriteAdmissionParams p;
++  p.target_ns = 2 * kMs;
++  p.gain = 2.0;
++  p.max_delay_ns = 10 * kMs;
++  p.window_ns = 50 * kMs;
++  p.min_reads = 16;
++  p.idle_ns = 1000 * kMs;
++  return p;
++}
++
++// Feeds windows of `reads` reads at `await_ms` each, `window_ms` apart.
++struct Device {
++  uint64_t now_ns = 0;
++  DeviceReadSample c{1000, 5000};
++  bool step(WriteAdmissionController& ctl, uint64_t window_ms, uint64_t reads,
++            uint64_t await_ms) {
++    now_ns += window_ms * kMs;
++    c.reads += reads;
++    c.read_ms += reads * await_ms;
++    return ctl.observe(now_ns, c);
++  }
++};
++
++}  // namespace
++
++TEST_CASE("Write admission: no delay at or below the target",
++          "[write_admission]") {
++  WriteAdmissionController ctl(params());
++  Device d;
++  REQUIRE_FALSE(ctl.observe(d.now_ns, d.c));  // baseline only
++  REQUIRE(ctl.delay_ns() == 0);
++  REQUIRE(d.step(ctl, 50, 100, 1));
++  REQUIRE(ctl.await_ns() == 1 * kMs);
++  REQUIRE(ctl.delay_ns() == 0);
++  REQUIRE(d.step(ctl, 50, 100, 2));  // EWMA 1.25 ms: still below
++  REQUIRE(ctl.delay_ns() == 0);
++}
++
++TEST_CASE("Write admission: delay is gain x excess over the smoothed await",
++          "[write_admission]") {
++  WriteAdmissionController ctl(params());
++  Device d;
++  ctl.observe(d.now_ns, d.c);
++  // First window seeds the average: 4 ms -> excess 2 ms -> delay 4 ms.
++  REQUIRE(d.step(ctl, 50, 200, 4));
++  REQUIRE(ctl.await_ns() == 4 * kMs);
++  REQUIRE(ctl.delay_ns() == 4 * kMs);
++  // Then a quarter step per window: 4 + (2 - 4) / 4 = 3.5 ms -> 3 ms delay.
++  REQUIRE(d.step(ctl, 50, 200, 2));
++  REQUIRE(ctl.await_ns() == 3'500'000);
++  REQUIRE(ctl.delay_ns() == 3 * kMs);
++  // 3.5 + (2 - 3.5) / 4 = 3.125 ms -> 2.25 ms delay.
++  REQUIRE(d.step(ctl, 50, 200, 2));
++  REQUIRE(ctl.delay_ns() == 2'250'000);
++  // The output is continuous: it decays toward 0, never steps there.
++  uint64_t last = ctl.delay_ns();
++  for (int i = 0; i < 40; ++i) {
++    d.step(ctl, 50, 200, 2);
++    REQUIRE(ctl.delay_ns() <= last);
++    last = ctl.delay_ns();
++  }
++  REQUIRE(last < 1000);  // under a microsecond after 40 windows at target
++}
++
++TEST_CASE("Write admission: the delay is bounded by max_delay",
++          "[write_admission]") {
++  WriteAdmissionController ctl(params());
++  Device d;
++  ctl.observe(d.now_ns, d.c);
++  REQUIRE(d.step(ctl, 50, 100, 50));  // 50 ms reads: 96 ms raw delay
++  REQUIRE(ctl.delay_ns() == 10 * kMs);
++}
++
++TEST_CASE("Write admission: a window needs both time and reads",
++          "[write_admission]") {
++  WriteAdmissionController ctl(params());
++  Device d;
++  ctl.observe(d.now_ns, d.c);
++  // Too soon: nothing closes, whatever the counters say.
++  REQUIRE_FALSE(d.step(ctl, 10, 1000, 9));
++  REQUIRE(ctl.delay_ns() == 0);
++  // Due, but the window holds 1000 + 5 reads... closes (reads accumulate
++  // across the early sample, which did not rebase).
++  REQUIRE(d.step(ctl, 40, 5, 9));
++  REQUIRE(ctl.await_ns() == 9 * kMs);
++  // Now a window with too few reads is extended, not closed.
++  REQUIRE_FALSE(d.step(ctl, 60, 10, 1));
++  REQUIRE(ctl.await_ns() == 9 * kMs);
++  // ...until it holds enough: 10 + 10 reads at 1 ms.
++  REQUIRE(d.step(ctl, 60, 10, 1));
++  REQUIRE(ctl.await_ns() == 7 * kMs);  // 9 + (1 - 9) / 4
++}
++
++TEST_CASE("Write admission: an idle device resets the delay to zero",
++          "[write_admission]") {
++  WriteAdmissionController ctl(params());
++  Device d;
++  ctl.observe(d.now_ns, d.c);
++  REQUIRE(d.step(ctl, 50, 100, 6));
++  REQUIRE(ctl.delay_ns() == 8 * kMs);
++  // Few reads for a whole second: extended windows, then a reset.
++  for (int i = 0; i < 19; ++i) {
++    REQUIRE_FALSE(d.step(ctl, 50, 0, 0));
++    REQUIRE(ctl.delay_ns() == 8 * kMs);
++  }
++  REQUIRE(d.step(ctl, 50, 0, 0));
++  REQUIRE(ctl.delay_ns() == 0);
++  REQUIRE(ctl.await_ns() == 0);
++  // The next estimate starts fresh (no memory of 6 ms).
++  REQUIRE(d.step(ctl, 50, 100, 3));
++  REQUIRE(ctl.await_ns() == 3 * kMs);
++  REQUIRE(ctl.delay_ns() == 2 * kMs);
++}
++
++TEST_CASE("Write admission: a long gap between writers resets the estimate",
++          "[write_admission]") {
++  WriteAdmissionController ctl(params());
++  Device d;
++  ctl.observe(d.now_ns, d.c);
++  REQUIRE(d.step(ctl, 50, 100, 6));
++  REQUIRE(ctl.delay_ns() == 8 * kMs);
++  // Nobody sampled for 5 s, although the device was busy: stale, reset.
++  REQUIRE(d.step(ctl, 5000, 100000, 8));
++  REQUIRE(ctl.delay_ns() == 0);
++}
++
++TEST_CASE("Write admission: counters going backwards restart the estimate",
++          "[write_admission]") {
++  WriteAdmissionController ctl(params());
++  Device d;
++  ctl.observe(d.now_ns, d.c);
++  REQUIRE(d.step(ctl, 50, 100, 6));
++  REQUIRE(ctl.delay_ns() > 0);
++  d.now_ns += 50 * kMs;
++  REQUIRE(ctl.observe(d.now_ns, DeviceReadSample{1, 1}));
++  REQUIRE(ctl.delay_ns() == 0);
++}
++
++TEST_CASE("Write admission: admit samples once per window and sleeps the delay",
++          "[write_admission]") {
++  uint64_t now = 0;
++  int samples = 0;
++  DeviceReadSample c{0, 0};
++  std::vector<uint64_t> slept;
++  WriteAdmission wa(
++      params(),
++      [&]() -> std::optional<DeviceReadSample> {
++        ++samples;
++        return c;
++      },
++      [&] { return now; }, [&](uint64_t ns) { slept.push_back(ns); });
++
++  REQUIRE(wa.admit() == 0);  // baseline sample
++  REQUIRE(samples == 1);
++  // Within the window: no new sample, however many writes.
++  for (int i = 0; i < 100; ++i) {
++    now += kMs / 4;
++    REQUIRE(wa.admit() == 0);
++  }
++  REQUIRE(samples == 1);
++  // The device turns slow (5 ms reads); the next due sample sees it.
++  c.reads += 100;
++  c.read_ms += 500;
++  now = 50 * kMs;
++  REQUIRE(wa.admit() == 6 * kMs);  // 2 x (5 - 2)
++  REQUIRE(samples == 2);
++  REQUIRE(slept == std::vector<uint64_t>{6 * kMs});
++  now += kMs;
++  REQUIRE(wa.admit() == 6 * kMs);  // published delay, no new sample
++  REQUIRE(samples == 2);
++  REQUIRE(wa.delays() == 2);
++  REQUIRE(wa.delay_ns_total() == 12 * kMs);
++  REQUIRE(wa.await_ns() == 5 * kMs);
++}
++
++TEST_CASE("Write admission: an unreadable counter source never delays",
++          "[write_admission]") {
++  uint64_t now = 0;
++  int slept = 0;
++  WriteAdmission wa(
++      params(), []() -> std::optional<DeviceReadSample> { return std::nullopt; },
++      [&] { return now; }, [&](uint64_t) { ++slept; });
++  for (int i = 0; i < 10; ++i) {
++    now += 100 * kMs;
++    REQUIRE(wa.admit() == 0);
++  }
++  REQUIRE(slept == 0);
++  REQUIRE(wa.delays() == 0);
++}
++
++TEST_CASE("Write admission: concurrent writers share one sampler",
++          "[write_admission][concurrent]") {
++  std::atomic<uint64_t> now{0};
++  std::atomic<uint64_t> reads{0};
++  std::atomic<int> samples{0};
++  std::atomic<uint64_t> slept{0};
++  WriteAdmission wa(
++      params(),
++      [&]() -> std::optional<DeviceReadSample> {
++        samples.fetch_add(1);
++        const uint64_t r = reads.load();
++        return DeviceReadSample{r, r * 4};  // every read took 4 ms
++      },
++      [&] { return now.fetch_add(kMs / 8) + kMs / 8; },
++      [&](uint64_t ns) { slept.fetch_add(ns); });
++  std::vector<std::thread> threads;
++  for (int t = 0; t < 4; ++t) {
++    threads.emplace_back([&] {
++      for (int i = 0; i < 2000; ++i) {
++        reads.fetch_add(1);
++        wa.admit();
++      }
++    });
++  }
++  for (auto& th : threads) th.join();
++  // 8000 writes over 1 s of injected time: about one sample per 50 ms
++  // window, never one per write.
++  REQUIRE(samples.load() >= 2);
++  REQUIRE(samples.load() <= 1000 / 50 + 2);
++  REQUIRE(wa.await_ns() == 4 * kMs);
++  REQUIRE(wa.delays() > 0);
++  REQUIRE(slept.load() == wa.delay_ns_total());
++}
++
++TEST_CASE("Write admission: off by default; on, writes and reads still work",
++          "[write_admission][write]") {
++  REQUIRE_FALSE(CacheConfig{}.write_admission.enabled);
++  for (const bool mmap_dir : {false, true}) {
++    CAPTURE(mmap_dir);
++    TempCacheDir tmp("write_admission");
++    CacheConfig cfg;
++    cfg.set_ram_cache_size(0);
++    cfg.set_fill_large_document_tail(true);
++    WriteAdmissionConfig wa;
++    wa.enabled = true;
++    wa.max_delay = std::chrono::microseconds(500);
++    cfg.set_write_admission(wa);
++    if (mmap_dir) {
++      cfg.set_multi_process(0, 1);
++    }
++    auto created = Cache::create(cfg);
++    REQUIRE(created.has_value());
++    auto cache = std::move(*created);
++    REQUIRE(cache->add_volume(tmp.path(), 64 * 1024 * 1024).has_value());
++    REQUIRE(cache->start().has_value());
++    for (int i = 0; i < 40; ++i) {
++      const size_t size = (i % 2 == 0) ? 300 * 1024 + i : 1000 + i;
++      std::vector<std::byte> body(size, static_cast<std::byte>(i));
++      const CacheKey key("wa-" + std::to_string(i));
++      auto wh = cache->write_sync(key, body.size());
++      REQUIRE(wh.has_value());
++      REQUIRE(wh->write_sync(body).has_value());
++      REQUIRE(wh->close_sync().has_value());
++      auto rh = cache->read_sync(key);
++      REQUIRE(rh.has_value());
++      REQUIRE(rh->content().size() == size);
++      REQUIRE(rh->content()[size - 1] == static_cast<std::byte>(i));
++    }
++    const auto st = cache->stats();
++    // Whether the device counters resolve depends on the host (none on
++    // macOS or tmpfs); either way no write sleeps longer than max_delay.
++    REQUIRE(st.write_admission_delay_us <= st.write_admission_delays * 500);
++    cache->stop();
++  }
++}

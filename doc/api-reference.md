@@ -715,6 +715,19 @@ struct CacheConfig {
     // set_fill_large_document_tail().  See doc/kv-cache-benchmark.md,
     // "Insert tail".
     bool fill_large_document_tail = false;
+
+    // Opt-in (default off): after a document above 64 KiB is committed,
+    // the writing thread starts its write-back (Linux
+    // sync_file_range(SYNC_FILE_RANGE_WRITE); no wait, not a durability
+    // point), outside every lock.  Keeps dirty page cache small and the
+    // device's write queue shallow, and lets the block layer hold the
+    // writer back while the device is saturated.  Meant to pair with
+    // fill_large_document_tail.  Does nothing on other platforms.  Can
+    // block while the device queue is full: leave it off on an event
+    // loop.  C++ only.  Fluent setter: set_write_behind().  Telemetry:
+    // CacheStats::write_behind_ranges / write_behind_us.  See
+    // doc/design/writer-admission-control.md.
+    bool write_behind = false;
 };
 
 enum class RamCacheType {
