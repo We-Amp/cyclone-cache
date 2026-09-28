@@ -7,6 +7,24 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `CacheConfig::write_behind` (and `VolumeConfig::write_behind`, fluent
+  `set_write_behind()`), opt-in, default off (issue #43). When on, after a
+  document above 64 KiB is committed, the writing thread starts the
+  kernel's write-back of the range it wrote (Linux
+  `sync_file_range(SYNC_FILE_RANGE_WRITE)`; no wait, not a durability
+  point), after the stripe mutex and the cross-process write lock are
+  released; both commit paths. Elsewhere it does nothing. Not persisted and
+  not in the C API. New `CacheStats::write_behind_ranges` /
+  `write_behind_us`. Measured with `fill_large_document_tail` on the Linux
+  benchmark machine (2 MiB churn, saturated NVMe, four threads): cgroup
+  dirty data 300 → 8 MiB, miss+insert p99 20.8 → 11.0 ms (`zipf`) and
+  21.9 → 12.5 ms (`zipf+scan`) against the fill alone, hit p99 24.8 → 8.4
+  and 29.6 → 10.5 ms, and the churn latency clause is met on both patterns
+  (0.22× and 0.25× LMDB). Hit p50 rises 10–21 %. Can block while the
+  device queue is full, so not for event-loop callers. See
+  doc/design/writer-admission-control.md and doc/kv-cache-benchmark.md,
+  "Writer admission". `kv_churn` gained `--fill-tail on|off` and
+  `--write-behind on|off`.
 - `CacheConfig::fill_large_document_tail` (and
   `VolumeConfig::fill_large_document_tail`, fluent
   `set_fill_large_document_tail()`), opt-in, default off (issue #35). When

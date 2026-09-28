@@ -1,0 +1,77 @@
+diff --git a/src/core/volume.cpp b/src/core/volume.cpp
+index 59dc64e..1396cff 100644
+--- a/src/core/volume.cpp
++++ b/src/core/volume.cpp
+@@ -1090,8 +1090,10 @@ class VolumeWriteHandleBase : public WriteHandleImpl {
+ class VolumeWriteHandleImpl : public VolumeWriteHandleBase {
+  protected:
+   std::expected<void, CacheError> do_commit(Volume& vol) override {
+-    return vol.commit_write(stripe, key, std::span<const std::byte>(header),
+-                            std::span<const std::byte>(content));
++    auto r = vol.commit_write(stripe, key, std::span<const std::byte>(header),
++                              std::span<const std::byte>(content));
++    vol.write_behind();
++    return r;
+   }
+ };
+ 
+@@ -4588,6 +4590,34 @@ class HeldWriteSlotReleaser {
+ // are delayed, the ones whose write-back loads the device; the delay is
+ // zero unless the device's smoothed read await is above target, and never
+ // more than max_delay.
++#ifndef CYCLONE_WB_MODE
++#define CYCLONE_WB_MODE 1
++#endif
++namespace {
++thread_local uint64_t tl_wb_off = 0, tl_wb_len = 0;
++thread_local uint64_t tl_prev_off = 0, tl_prev_len = 0;
++}  // namespace
++void Volume::note_write_behind(uint64_t off, uint64_t len) {
++  tl_wb_off = off;
++  tl_wb_len = len;
++}
++void Volume::write_behind() {
++  if (tl_wb_len == 0) return;
++#ifdef __linux__
++  ::sync_file_range(_fd, static_cast<off64_t>(tl_wb_off),
++                    static_cast<off64_t>(tl_wb_len), SYNC_FILE_RANGE_WRITE);
++  if (CYCLONE_WB_MODE == 2 && tl_prev_len != 0) {
++    ::sync_file_range(_fd, static_cast<off64_t>(tl_prev_off),
++                      static_cast<off64_t>(tl_prev_len),
++                      SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE |
++                          SYNC_FILE_RANGE_WAIT_AFTER);
++  }
++#endif
++  tl_prev_off = tl_wb_off;
++  tl_prev_len = tl_wb_len;
++  tl_wb_len = 0;
++}
++
+ void Volume::admit_large_write(size_t doc_size) {
+   if (_write_admission && doc_size > kTailFillAboveBytes) {
+     (void)_write_admission->admit();
+@@ -4708,6 +4738,9 @@ std::expected<void, CacheError> Volume::commit_write(
+         std::span<const std::byte>(doc_head), tail};
+     fill_ok = pwrite_parts(_fd, fill_parts, write_offset);
+   }
++  if (fill_ok && doc_size > kTailFillAboveBytes) {
++    note_write_behind(write_offset, doc_size + tail_fill);
++  }
+ #endif
+ 
+   // Sync to ensure data is visible to mmap readers (if configured).
+diff --git a/src/core/volume.hpp b/src/core/volume.hpp
+index c8f9945..b6d4f7b 100644
+--- a/src/core/volume.hpp
++++ b/src/core/volume.hpp
+@@ -2340,6 +2340,10 @@ class Volume : public std::enable_shared_from_this<Volume> {
+   // any lock (admit_large_write).
+   std::unique_ptr<WriteAdmission> _write_admission;
+   void admit_large_write(size_t doc_size);
++
++ public:
++  void note_write_behind(uint64_t off, uint64_t len);
++  void write_behind();
+ };
+ 
+ // Volume is always heap-allocated (make_shared).  Keep it small enough that a
