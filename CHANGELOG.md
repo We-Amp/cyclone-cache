@@ -10,7 +10,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `CacheConfig::write_behind` (and `VolumeConfig::write_behind`, fluent
   `set_write_behind()`), opt-in, default off (issue #43). When on, after a
   document above 64 KiB is committed, the writing thread starts the
-  kernel's write-back of the range it wrote (Linux
+  kernel's write-back of the document up to its last whole page (Linux
   `sync_file_range(SYNC_FILE_RANGE_WRITE)`; no wait, not a durability
   point), after the stripe mutex and the cross-process write lock are
   released; both commit paths. Elsewhere it does nothing. Not persisted and

@@ -145,12 +145,27 @@ The first design was dropped in favour of the second.
 
 After a document above `Volume::kTailFillAboveBytes` (64 KiB) has been
 written and committed, the writing thread asks the kernel to start writing
-the range its `pwrite` filled (the document, and with the fill on, the
-zeros to the page boundary):
+the document, from its first byte to the last page boundary at or before
+its end:
 
 ```cpp
 sync_file_range(fd, offset, length, SYNC_FILE_RANGE_WRITE);
 ```
+
+**Why the range stops short of the last page.** The page a document ends
+in is shared with the next document: the tail fill's zeros start at the
+cursor, and the next document begins inside that page either way. Starting
+its write-back now would write it twice, and on devices with stable pages
+(T10-PI / integrity devices, some RAID) the next writer's `pwrite` into it
+would wait for that write-back while holding the stripe mutex and the
+cross-process write lock. The page is instead the first page of the next
+document's range, or left to the flusher, so every page is started once
+and no writer waits on another's write-back. The counters only count calls
+the kernel accepted (a file system that refuses `sync_file_range` returns
+`EINVAL` or `ESPIPE` and is not counted). The benchmark in section 5 and
+in `doc/kv-cache-benchmark.md` ran the first version, whose range included
+that last page and the fill's zeros; the difference is at most one page of
+a 2 MiB document.
 
 This neither waits for the write to finish nor makes anything durable. It
 moves the moment the pages are submitted from "whenever the flusher

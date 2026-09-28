@@ -3,8 +3,8 @@
 
 // Write-behind (issue #43; CacheConfig::write_behind,
 // doc/design/writer-admission-control.md).  With it on, every document above
-// 64 KiB has its write-back started right after its commit, over exactly the
-// range its fill wrote, with no stripe mutex or write lock held.  The kernel
+// 64 KiB has its write-back started right after its commit, over the range
+// its fill wrote up to the last whole page, with no lock held.  The kernel
 // call is Linux-only; Volume::s_write_behind_for_test fires on every platform
 // just before it, so these checks run everywhere.
 
@@ -29,7 +29,7 @@ constexpr size_t kKiB = 1024;
 constexpr size_t kMiB = 1024 * kKiB;
 constexpr uint64_t kPage = 4096;
 
-uint64_t round_up_page(uint64_t v) { return (v + kPage - 1) & ~(kPage - 1); }
+uint64_t round_down_page(uint64_t v) { return v & ~(kPage - 1); }
 
 std::vector<std::byte> body(size_t size, int seed) {
   std::vector<std::byte> b(size);
@@ -116,7 +116,7 @@ TEST_CASE("Write-behind: off by default, no range is started",
   cache->stop();
 }
 
-TEST_CASE("Write-behind: large documents only, over exactly the filled range",
+TEST_CASE("Write-behind: large documents only, up to the last whole page",
           "[write_behind][write]") {
   for (const bool mmap_dir : {false, true}) {
     for (const bool fill : {false, true}) {
@@ -144,21 +144,18 @@ TEST_CASE("Write-behind: large documents only, over exactly the filled range",
         ++large;
         REQUIRE(rec.ranges.size() == before + 1);
         const auto [off, len] = rec.ranges.back();
+        // From the document's start to the last page boundary at or before
+        // its end: never the tail fill, never the page the next document
+        // shares, fill on or off.
+        const uint64_t doc_end = wo + Document::kHeaderSize + size;
         REQUIRE(off == wo);
-        if (fill) {
-          // Runs through the tail fill: past the cursor, up to the next page
-          // boundary of the file (less if the frontier clamps the fill).
-          REQUIRE(off + len >= new_pos);
-          REQUIRE(off + len <= round_up_page(new_pos));
-        } else {
-          // Exactly the document's bytes (its unrounded size).
-          REQUIRE(len > doc_len - 8);
-          REQUIRE(len <= doc_len);
-        }
+        REQUIRE(off + len == round_down_page(doc_end));
+        REQUIRE(off + len <= new_pos);
       }
       REQUIRE(large == 3);
 #ifdef __linux__
-      REQUIRE(cache->stats().write_behind_ranges == large);
+      // Counted only when the kernel accepted the call.
+      REQUIRE(cache->stats().write_behind_ranges <= large);
 #else
       REQUIRE(cache->stats().write_behind_ranges == 0);  // no kernel call
 #endif
@@ -217,8 +214,10 @@ TEST_CASE("Write-behind: the alternate commit path starts it too",
   REQUIRE(rec.ranges.size() == 1);
   const auto [off, len] = rec.ranges.back();
   const auto [wo, new_pos] = rec.slots.back();
+  // The document's start to the last page boundary before its end.
   REQUIRE(off == wo);
-  REQUIRE(off + len >= new_pos);
-  REQUIRE(off + len <= round_up_page(new_pos));
+  REQUIRE((off + len) % kPage == 0);
+  REQUIRE(off + len <= new_pos);
+  REQUIRE(off + len + kPage > new_pos - 8);
   cache->stop();
 }

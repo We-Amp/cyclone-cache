@@ -4571,24 +4571,41 @@ class HeldWriteSlotReleaser {
 // but it submits the I/O from this thread, so the block layer holds the
 // thread back while the device queue is full or blk-wbt is throttling
 // writes for the sake of reads: that is the admission control.
+//
+// The range ends at the last page boundary at or before the document's end:
+// the page the document ends in is shared with the next document (with the
+// tail fill, the zeros from the cursor on; either way, the next document
+// starts inside it).  Starting that page's write-back now would write it
+// twice, and on devices with stable pages (T10-PI / integrity, some RAID)
+// the next writer's pwrite into it would wait for that write-back while
+// holding the stripe mutex and the cross-process write lock.  It is
+// written back with the next document's range instead (whose start page it
+// is), or by the flusher, so every page is started once.
 void Volume::start_write_behind(const WrittenRange& range) {
   if (!_config.write_behind || range.length == 0) {
     return;
   }
+  const uint64_t end = (range.offset + range.length) & ~(kTailFillPage - 1);
+  if (end <= range.offset) {
+    return;
+  }
+  const uint64_t length = end - range.offset;
   if (s_write_behind_for_test) {
-    s_write_behind_for_test(range.offset, range.length);
+    s_write_behind_for_test(range.offset, length);
   }
 #ifdef __linux__
   const auto t0 = std::chrono::steady_clock::now();
-  (void)::sync_file_range(_fd, static_cast<off_t>(range.offset),
-                          static_cast<off_t>(range.length),
-                          SYNC_FILE_RANGE_WRITE);
+  const int rc =
+      ::sync_file_range(_fd, static_cast<off_t>(range.offset),
+                        static_cast<off_t>(length), SYNC_FILE_RANGE_WRITE);
   const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                       std::chrono::steady_clock::now() - t0)
                       .count();
-  _write_behind_ranges.fetch_add(1, std::memory_order_relaxed);
-  _write_behind_ns.fetch_add(static_cast<uint64_t>(ns),
-                             std::memory_order_relaxed);
+  if (rc == 0) {  // not on a file system that refuses it (EINVAL, ESPIPE)
+    _write_behind_ranges.fetch_add(1, std::memory_order_relaxed);
+    _write_behind_ns.fetch_add(static_cast<uint64_t>(ns),
+                               std::memory_order_relaxed);
+  }
 #endif
 }
 
@@ -4712,10 +4729,11 @@ std::expected<void, CacheError> Volume::commit_write_impl(
   }
 #endif
   // The range for the write-behind (VolumeConfig::write_behind), started by
-  // commit_write once the stripe mutex is released.  Large documents only,
-  // the tail fill included.
+  // commit_write once the stripe mutex is released.  Large documents only;
+  // the document's own bytes (start_write_behind drops its last, shared
+  // page).
   if (fill_ok && doc_size > kTailFillAboveBytes) {
-    *written = WrittenRange{write_offset, doc_size + tail_fill};
+    *written = WrittenRange{write_offset, doc_size};
   }
 
   // Sync to ensure data is visible to mmap readers (if configured).
@@ -5950,9 +5968,10 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
   }
 #endif
   // The range for the write-behind, as in commit_write: the whole slot
-  // (carried nodes, head, tail fill) when the head is a large document.
+  // (carried nodes and head, not the tail fill) when the head is a large
+  // document.
   if (fill_ok && doc_size > kTailFillAboveBytes) {
-    *written_range = WrittenRange{write_offset, fill.size() + tail_fill};
+    *written_range = WrittenRange{write_offset, fill.size()};
   }
 
   // Sync if configured.
