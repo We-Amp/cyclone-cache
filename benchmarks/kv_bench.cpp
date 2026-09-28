@@ -290,6 +290,10 @@ struct Options {
   int64_t cold_readahead_min_bytes = -1;    // -1 = library default
   int64_t sequential_readahead_bytes = -1;  // -1 = library default
   double pause_before_warm = 0.0;           // seconds to sleep before phase 3
+  // CacheConfig::fill_large_document_tail / write_behind (unset = the
+  // library default).
+  std::optional<bool> fill_tail;
+  std::optional<bool> write_behind;
   std::string drop_caches_cmd;  // run before phases 2 and 4 (e.g. Linux
                                 // "sync; echo 3 > /proc/sys/vm/drop_caches")
 };
@@ -370,6 +374,12 @@ CacheConfig make_config(const Options &opts) {
   if (opts.sequential_readahead_bytes >= 0) {
     config.sequential_readahead_bytes =
         static_cast<size_t>(opts.sequential_readahead_bytes);
+  }
+  if (opts.fill_tail) {
+    config.fill_large_document_tail = *opts.fill_tail;
+  }
+  if (opts.write_behind) {
+    config.write_behind = *opts.write_behind;
   }
   config.enable_checksum = true;
   config.verify_checksum_on_read = !opts.no_verify;
@@ -821,6 +831,10 @@ void print_usage(const char *argv0) {
       << "  --sequential-readahead-bytes N  Override "
          "CacheConfig::sequential_readahead_bytes\n"
       << "                        (0 = no sequential window)\n"
+      << "  --fill-tail on|off    CacheConfig::fill_large_document_tail\n"
+      << "                        (default: the library default)\n"
+      << "  --write-behind on|off CacheConfig::write_behind (default: the\n"
+      << "                        library default)\n"
       << "  --pause-before-warm S Sleep S seconds before phase 3\n"
       << "  --drop-caches-cmd CMD Shell command run before phases 2 and 4\n"
       << "                        (e.g. \"sync; echo 3 > /proc/sys/vm/"
@@ -910,6 +924,10 @@ int main(int argc, char *argv[]) {
       opts.cold_readahead_min_bytes = std::stoll(argv[++i]);
     } else if (arg == "--sequential-readahead-bytes" && i + 1 < argc) {
       opts.sequential_readahead_bytes = std::stoll(argv[++i]);
+    } else if (arg == "--fill-tail" && i + 1 < argc) {
+      opts.fill_tail = std::string(argv[++i]) == "on";
+    } else if (arg == "--write-behind" && i + 1 < argc) {
+      opts.write_behind = std::string(argv[++i]) == "on";
     } else if (arg == "--pause-before-warm" && i + 1 < argc) {
       opts.pause_before_warm = std::stod(argv[++i]);
     } else if (arg == "--drop-caches-cmd" && i + 1 < argc) {
@@ -948,6 +966,10 @@ int main(int argc, char *argv[]) {
   // (Cache::add_volume_locked), so report what the store actually does.
   const bool mmap_dir = !opts.no_mmap_dir;
   const bool verify = mmap_dir ? true : !opts.no_verify;
+  const bool fill_tail =
+      opts.fill_tail.value_or(CacheConfig{}.fill_large_document_tail);
+  const bool write_behind =
+      opts.write_behind.value_or(CacheConfig{}.write_behind);
 
   const MachineInfo machine = collect_machine_info(opts.path);
   std::cerr << "Cyclone KV-cache storage-tier benchmark (workload spec v1)\n"
@@ -986,6 +1008,10 @@ int main(int argc, char *argv[]) {
             << "                            phase is a process restart, not a "
                "power-loss test)\n"
             << "  sync_on_write           = false (no per-put fsync)\n"
+            << "  fill_large_document_tail = " << (fill_tail ? "true" : "false")
+            << "\n"
+            << "  write_behind            = "
+            << (write_behind ? "true" : "false") << "\n"
             << "  metadata                = 64-byte set_header() slot (a "
                "dedicated\n"
             << "                            header, not a value prefix)\n"
@@ -997,7 +1023,10 @@ int main(int argc, char *argv[]) {
             << "\",\"cores\":\"" << machine.cores << "\",\"os\":\""
             << machine.os << "\",\"filesystem\":\"" << machine.filesystem
             << "\",\"version\":\"" << kStoreVersion << "\",\"commit\":\""
-            << machine.commit << "\"}\n";
+            << machine.commit
+            << "\",\"fill_tail\":" << (fill_tail ? "true" : "false")
+            << ",\"write_behind\":" << (write_behind ? "true" : "false")
+            << "}\n";
   json_out->flush();
 
   std::vector<Record> records;

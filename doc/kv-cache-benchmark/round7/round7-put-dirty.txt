@@ -1,0 +1,19 @@
+# kv_bench PUT runs (--seconds 1 --threads 1 --skip-multiprocess, four sizes):
+# peak global dirty page cache during the run (round6/sampler.sh nr_dirty)
+# and the device's mean write rate over the whole run (diskstats.sh).
+cyclone-put-1      peak dirty  2521 MiB  device write  284 MB/s over  53 s
+cyclone-put-2      peak dirty  2204 MiB  device write  307 MB/s over  49 s
+cyclone-put-3      peak dirty  2171 MiB  device write  301 MB/s over  50 s
+cyclone-put-4      peak dirty  2901 MiB  device write  255 MB/s over  59 s
+cyfill-put-1       peak dirty  2316 MiB  device write  279 MB/s over  56 s
+cyfill-put-2       peak dirty  2211 MiB  device write  297 MB/s over  51 s
+cyfill-put-3       peak dirty  2202 MiB  device write  307 MB/s over  49 s
+cyfill-put-4       peak dirty  2346 MiB  device write  295 MB/s over  51 s
+cyfillwb-put-1     peak dirty    23 MiB  device write  284 MB/s over  53 s
+cyfillwb-put-2     peak dirty   130 MiB  device write  301 MB/s over  52 s
+cyfillwb-put-3     peak dirty    20 MiB  device write  313 MB/s over  48 s
+cyfillwb-put-4     peak dirty    19 MiB  device write  300 MB/s over  50 s
+cywb-put-1         peak dirty    26 MiB  device write  295 MB/s over  51 s
+cywb-put-2         peak dirty   142 MiB  device write  302 MB/s over  52 s
+cywb-put-3         peak dirty    20 MiB  device write  313 MB/s over  48 s
+cywb-put-4         peak dirty    29 MiB  device write  314 MB/s over  48 s

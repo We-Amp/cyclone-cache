@@ -250,19 +250,20 @@ them instead of recomputing them.
 Where it fits, measured against LMDB, RocksDB and file-per-block in
 [doc/kv-cache-benchmark.md](doc/kv-cache-benchmark.md): a **node-local,
 multi-process tier for large blocks (2–32 MiB)** that evicts on its own. On
-Linux/NVMe it reads cold 8–32 MiB blocks faster than every peer (3.0–3.4
-GB/s), serves four reader processes 1.2× faster than LMDB, and under
-churn serves 1.1–1.3× what LMDB with an LRU serves, at one thread and at
-four. At four threads its hit-latency tail is 0.38–0.45× LMDB's, and with
-wrap retention on (the default) a bounded tier meets the benchmark's
-pre-registered bar against LMDB on that latency clause, with a thin margin
-on plain Zipf. It is not a general LMDB replacement: warm reads are in the
-same class, cold reads were behind LMDB up to 2 MiB in round 6 and are
-ahead of it at every size from 64 KiB since the small-cold-read readahead
-(issue #29; a same-day LMDB read slower than in round 6),
-writes match file-per-block at 2 MiB (about 1.5 GB/s per thread) but trail
-it at 8–32 MiB, and a one-thread insert has a 24 ms p99 against 6–16 ms
-for the peers.
+Linux/NVMe it reads cold blocks faster than a same-day LMDB at every size
+from 64 KiB to 32 MiB (2.5–3.4 GB/s), serves four reader processes 1.25×
+faster than LMDB, and under churn serves 1.07–1.22× what LMDB with an LRU
+serves, at one thread and at four. With the defaults, a bounded tier meets
+the benchmark's pre-registered bar against LMDB on scan-polluted Zipf
+(hit-latency tail 0.40× LMDB's at four threads) but not on plain Zipf
+(0.56× against the 0.5× bar). **With `write_behind` and
+`fill_large_document_tail` on** (both opt-in, Linux), it meets the bar on
+both patterns: hit p99 0.19× LMDB's while serving 1.55–1.66× as much, and a
+one-thread insert p99 of 4.6 ms against 10 ms for LMDB. The cost is a 6–22 %
+slower median hit and lower bulk-load throughput (round 7 of the
+benchmark). It is not a general LMDB replacement: warm reads are in the
+same class, and writes match file-per-block at 512 KiB–2 MiB (about 1.5
+GB/s per thread) but trail it at 8–32 MiB.
 
 - **Zero-copy loads.** On a disk hit `content()` aliases the mapped volume;
   acquiring a view costs about 0.4 µs regardless of size. For device
@@ -321,7 +322,13 @@ has no GPU-direct or RDMA path, and ships no Python bindings today. Write
 bandwidth at 2 MiB is about 1.5 GB/s per thread on Linux/NVMe (`kv_bench`:
 1.47 GB/s, against 1.52 for one file per block, same day). A producer that generates
 the blob itself can fill `w->reserve(n)` in place instead of calling
-`write_sync()`, which saves one copy of it.
+`write_sync()`, which saves one copy of it. A KV tier that writes from
+worker threads under churn should consider `config.write_behind = true`
+together with `config.fill_large_document_tail = true` (C++ API, Linux):
+in the benchmark's churn runs they cut the four-thread hit p99 by 52–67 %
+and the insert p99 by about three quarters. Leave them off where writes
+run on an event loop: the write-back call can block while the device queue
+is full.
 
 ## Concepts
 
