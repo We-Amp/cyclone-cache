@@ -2,8 +2,8 @@
 
 ## Summary
 
-Seven rounds of measurements, plus two fix studies, taken 2026-09-21 to
-2026-09-25 on two laptops. One is an Apple M5 running macOS, where only a
+Eight rounds of measurements, plus several fix studies, taken 2026-09-21 to
+2026-09-28 on two laptops. One is an Apple M5 running macOS, where only a
 warm page cache can be measured. The other is an i7-8750H with a Samsung
 970 PRO NVMe running Linux, where the page cache is dropped before each
 cold phase. The peers are LMDB, RocksDB (BlobDB) and one file per block
@@ -33,67 +33,86 @@ cold phase. The peers are LMDB, RocksDB (BlobDB) and one file per block
   for every comparison. Churn was run in both retention modes and with
   `--reserve`, at one and four threads for every store. The round also
   traced the one-thread insert tail.
+- **Small cold reads (#29), the insert tail (#35) and writer admission
+  (#43):** fix studies against main at the time, each with a same-day
+  LMDB. The last two added two opt-in write-path options,
+  `fill_large_document_tail` and `write_behind`.
+- **Round 7:** main at 8809717, which has both options, default off. The
+  round-6 matrix was repeated. Churn ran in four write-path configurations
+  (default, fill, write-behind, both), plus flush mode, and PUT was
+  measured with each option. The question was whether either option should
+  become a default for KV use. The machine was shared that day, so only
+  clean runs are used, and each cell gives its count.
 
 Each number is one machine's reading. Treat differences under about 20 % as
 noise unless a section says otherwise.
 
-Where Cyclone stands now (round 6, Linux, same-day peers):
+Where Cyclone wins and loses now (round 7 unless stated, Linux, same-day
+peers):
+
+- **Wins:** cold reads at every size from 64 KiB to 32 MiB, 1.05–1.4×
+  LMDB; four reader processes, 1.25× LMDB; churn served GB/s at one thread
+  (1.14–1.22× LMDB) and at four. With `write_behind` on, the churn
+  hit-latency tail is 0.15–0.19× LMDB's on both patterns.
+- **Level:** warm reads (0.97× LMDB `copy`, 1.1–1.2× `view`), and 2 MiB puts
+  against file-per-block (1.41 against 1.49 GB/s; file-per-block had one
+  clean run).
+- **Losses:** a churn hit ratio 3.4–4.1 points below an LRU; puts at 8 and
+  32 MiB behind file-per-block (1.18 / 0.84 against 1.40 / 1.38 GB/s); with
+  the defaults, a plain-Zipf hit tail no longer under half of LMDB's
+  (0.56×); with `write_behind`, a 6–22 % slower median hit and 18–31 %
+  lower bulk-load throughput.
+
+In more detail:
 
 - **Warm reads:** same class as LMDB. Both return a span into a mapping that
-  already exists, with no syscall per get. At 2 MiB, `copy` reads 12.1
-  against 12.5 GB/s and `view` 265 k against 242 k gets/s. This is not a
-  differentiator.
-- **Cold reads:** ahead of every peer at 8 and 32 MiB (3.00 and 3.39 GB/s;
-  LMDB 2.76 and 2.76). Behind LMDB below that: 1.14× at 2 MiB (2.39 against
-  2.73), 1.32× at 512 KiB (1.70 against 2.25), 1.5× at 1 MiB and 1.9× at
-  256 KiB. Below the 256 KiB readahead threshold it is far behind (64 KiB:
-  0.04 against 1.61 GB/s, issue #29). The checksum is verified in every
-  case. **Since round 6** ([small cold reads](#small-cold-reads-issue-29)):
-  cold-read and sequential readahead put Cyclone ahead of a same-day LMDB at
-  every size from 64 KiB to 32 MiB (64 KiB 2.15–2.63 against 1.42 GB/s,
-  512 KiB 2.93 against 1.70), with warm reads unchanged; LMDB read 12–27 %
-  below its round-6 rates that day, and Cyclone is ahead of those too except
-  at 2 MiB, where they tie.
-- **Writes:** faster than round 5 at every size (×1.25–2.1). Against a
-  same-day file-per-block, Cyclone is ahead at 512 KiB (1.62 against 1.38
-  GB/s) and level at 2 MiB (1.47 against 1.52). It is behind at 8 MiB
-  (1.27 against 1.43) and at 32 MiB (0.88 against 1.41); those were not
-  profiled.
-- **Bounded tier under churn:** with wrap retention on, the default,
-  Cyclone meets the pre-registered "significantly better than LMDB" bar
-  through the latency clause on both patterns at 4 threads. Its hit p99
-  is 0.45× (`zipf`) and 0.38× (`zipf+scan`) of LMDB's, while it serves
-  1.24× and 1.14× as much. The `zipf` margin is thin: 0.45× against the
-  0.5× bar, and 0.52× in the worst pairing of runs. In round 5 it was
-  0.27–0.37×; Cyclone's tail did not move, LMDB's got shorter. At one
-  thread Cyclone now serves the most of the three stores: 1.22–1.28×
-  LMDB and 1.22–1.26× file-per-block. Its hit ratio is still 3.6–4.1
-  points below an LRU. Flush mode (`wrap_retention = false`) is partial:
-  at 4 threads it serves 0.88–0.89× LMDB, just under the 0.9× floor.
-- **The one-thread insert tail is explained:** the miss+insert p99 is
-  24 ms, against 6 ms for file-per-block and 16 ms for LMDB. Documents
-  sit at 8-byte-aligned offsets, so each one ends partway through a page
-  whose other bytes are old data. When that page is not cached, ext4
-  reads it synchronously inside the `pwrite`. About 1 % of inserts wait
-  over 10–20 ms for that 4 KiB read behind the device's other I/O. The
-  peers never do this read
-  ([round 6](#the-one-thread-insert-tail-24-ms-p99)). Filling the last
-  page removes the read and cuts the insert p99 by 40–50 %, but the hit
-  p99 at four threads rises by 25–68 %, because the read was also a brake
-  on inserting into a saturated device. It is therefore an opt-in
-  (`fill_large_document_tail`, default off)
-  ([insert tail](#insert-tail-fill-the-last-page-issue-35)).
-- **Write-behind fixes both tails (#43):** with the fill on, starting each
-  large document's write-back from the writer as soon as it is committed
-  (`write_behind`, opt-in) keeps the page cache from piling up ~300 MiB of
-  dirty data for the flusher to write in deep batches. At four threads
-  the miss+insert p99 falls to 11.0 / 12.5 ms (`zipf` / `zipf+scan`;
-  main 44.5 / 43.9, fill alone 20.8 / 21.9), the hit p99 to 8.4 / 10.5 ms
-  (main 23.5 / 18.8) and both patterns pass the latency clause at 0.22×
-  and 0.25× LMDB, serving 1.38× and 1.48× as much. At one thread the
-  insert p99 is 4.2 / 3.75 ms. A delay driven by the device's read
-  latency, the first design, cut throughput by a third and did not help
-  ([writer admission](#writer-admission-issue-43)).
+  already exists, with no syscall per get. At 2 MiB, `copy` reads 9.18
+  against 9.45 GB/s and `view` 260 k against 235 k gets/s. This is not a
+  differentiator. Every store's DRAM-bound numbers read about 25 % below
+  round 6 on the day of round 7; the ratios did not move.
+- **Cold reads:** ahead of a same-day LMDB at every size from 64 KiB to
+  32 MiB, in both first touch and restart. First touch 2.48 / 2.81 /
+  2.76 / 3.25 / 3.41 GB/s at 64 KiB / 512 KiB / 2 MiB / 8 MiB / 32 MiB,
+  against 1.80 / 2.10 / 2.63 / 2.54 / 2.58. This comes from the cold and
+  sequential readahead ([small cold reads](#small-cold-reads-issue-29)); in
+  round 6 Cyclone was 1.1–1.9× behind LMDB from 256 KiB to 2 MiB and 40×
+  behind at 64 KiB. The checksum is verified in every case.
+- **Writes:** level with round 6 (1–7 % lower). Against file-per-block,
+  level at 512 KiB and 2 MiB (1.60 and 1.41 against 1.46 and 1.49 GB/s) and
+  behind at 8 MiB (1.18 against 1.40) and 32 MiB (0.84 against 1.38); not
+  profiled. The file-per-block figures rest on one clean run.
+  `write_behind` lowers bulk-load throughput by 18–31 %, because a load
+  that fits in the page cache's dirty headroom then pays for its device
+  writes itself. The tail fill costs nothing.
+- **Bounded tier under churn, defaults:** PARTIAL against the pre-registered
+  bar. It passes `zipf+scan` at 4 threads through the latency clause (hit
+  p99 0.40× LMDB's at 1.09× its served GB/s) and fails plain `zipf` (0.56×
+  against the 0.5× bar). Round 6 passed `zipf` at 0.45×. Cyclone's tail
+  did not move (26.0 against 29.9 ms); LMDB's shortened (46.6 against 67.0
+  ms), and the #43 night had already shown 0.62×. At one thread Cyclone
+  serves 1.14–1.22× LMDB. The hit ratio is 3.4–4.1 points below an LRU.
+  Flush mode sits on the 0.9× served floor (0.93–0.94× on two clean runs
+  per cell): borderline.
+- **Churn with `write_behind` (opt-in, #43/#45):** a WIN on both patterns
+  at 4 threads, in every pairing of runs. With the tail fill as well, hit
+  p99 is 8.6 / 9.6 ms (`zipf` / `zipf+scan`; default 26.0 / 19.9, LMDB
+  46.6 / 49.4), miss+insert p99 11.3 / 11.5 ms (default 44.5 / 49.4), and
+  served 3.48 / 2.40 GB/s. That is 1.55× and 1.66× LMDB, the first time
+  the throughput clause is met on both patterns (on the medians). At one
+  thread the insert p99 is 4.6 ms (default 17–19, LMDB 10–13). The cost is
+  a 6–22 % slower median hit. The fill alone fails both patterns. Round 7
+  recommends both options for KV-style writers on worker threads, as a KV
+  preset rather than a library-wide default
+  ([recommendation](#recommendation-which-options-should-default-on-for-kv-use)).
+  PageSpeed keeps both off: its nginx writes are inline on the event loop.
+- **The one-thread insert tail is explained**
+  ([round 6](#the-one-thread-insert-tail-24-ms-p99)): an ext4
+  read-before-write of each document's partially shared last page. The
+  fill removes the read, but that read was also a brake on a saturated
+  device, so the fill alone lengthens the hit tail
+  ([insert tail](#insert-tail-fill-the-last-page-issue-35)). Starting each
+  large document's write-back from the writer
+  ([writer admission](#writer-admission-issue-43)) fixes both tails.
 - **GPU transfer:** registering the whole volume mapping once reaches the
   PCIe ceiling (12.79 of 12.82 GB/s, 2.3× over staging). Pinning each
   returned span is slower than staging. LMDB also keeps every value in one
@@ -102,23 +121,25 @@ Where Cyclone stands now (round 6, Linux, same-day peers):
 | Current number (2 MiB unless stated) | Cyclone | Peers (same day unless stated) | Round |
 |---|---:|---|---|
 | Warm GET copy, 1 thread, macOS | 63.6 GB/s | LMDB 64.9, filedir 18.0 (round 1) | [3](#round-3-readahead-and-a-fast-crc32) |
-| Warm GET copy, 1 thread, Linux (DRAM-bound) | 12.1 GB/s | LMDB 12.5, filedir 6.9, RocksDB 2.9 | [6](#round-6-re-benchmark-at-main-b5c31e8) |
-| Cold first-touch GET, Linux | 2.39 GB/s | LMDB 2.73, filedir 1.77, RocksDB 0.81 | [6](#round-6-re-benchmark-at-main-b5c31e8) |
-| Cold restart GET, Linux | 2.08 GB/s | LMDB 2.71, filedir 1.77, RocksDB 0.83 | [6](#round-6-re-benchmark-at-main-b5c31e8) |
-| Cold first-touch, 512 KiB / 8 MiB / 32 MiB, Linux | 1.70 / 3.00 / 3.39 GB/s | LMDB 2.25 / 2.76 / 2.76 | [6](#round-6-re-benchmark-at-main-b5c31e8) |
-| Cold first-touch, 64 KiB / 256 KiB, Linux | 0.04 / 1.12 GB/s | LMDB 1.61 / 2.11 | [6](#cold-reads-from-64-kib-to-32-mib-issue-29-baseline) |
-| Cold first-touch, 64 KiB / 256 KiB / 512 KiB, Linux, after #29 | 2.15 / 2.69 / 2.93 GB/s | LMDB 1.42 / 1.60 / 1.70 (same day) | [#29](#small-cold-reads-issue-29) |
-| PUT, 1 thread, Linux, 512 KiB / 2 MiB / 32 MiB | 1.62 / 1.47 / 0.88 GB/s | filedir 1.38 / 1.52 / 1.41, RocksDB 0.52 / 0.44 / 0.41 | [6](#round-6-re-benchmark-at-main-b5c31e8) |
-| 4 reader processes, `view`, Linux | 743 k gets/s | LMDB 613 k | [6](#round-6-re-benchmark-at-main-b5c31e8) |
-| Churn, `zipf`, 4 threads, retention on: hit ratio / served / hit p99 | 0.814 / 2.40 GB/s / 29.9 ms | LMDB 0.850 / 1.94 / 67.0 ms; filedir 0.849 / 2.16 / 38.4 ms | [6](#churn-linux-2-mib-c--16-gib-4-gib-cgroup) |
-| Churn, `zipf+scan`, 4 threads, retention on | 0.685 / 1.45 GB/s / 22.9 ms | LMDB 0.726 / 1.27 / 60.8 ms; filedir 0.725 / 1.58 / 37.5 ms | [6](#churn-linux-2-mib-c--16-gib-4-gib-cgroup) |
-| Churn, `zipf`, 1 thread, retention on: served / miss+insert p50 / p99 | 1.78 GB/s / 1.49 / 24.4 ms | LMDB 1.46 / 1.66 / 15.6; filedir 1.41 / 1.46 / 6.4 | [6](#churn-linux-2-mib-c--16-gib-4-gib-cgroup) |
+| Warm GET copy, 1 thread, Linux (DRAM-bound) | 9.18 GB/s | LMDB 9.45, filedir 5.72, RocksDB 2.41 | [7](#round-7-write-path-options-at-main-8809717) |
+| Cold first-touch GET, Linux | 2.77 GB/s | LMDB 2.57, filedir 1.46, RocksDB 0.81 | [7](#round-7-write-path-options-at-main-8809717) |
+| Cold restart GET, Linux | 2.75 GB/s | LMDB 2.52, filedir 1.44, RocksDB 0.81 | [7](#round-7-write-path-options-at-main-8809717) |
+| Cold first-touch, 64 KiB / 512 KiB / 8 MiB / 32 MiB, Linux | 2.48 / 2.81 / 3.25 / 3.41 GB/s | LMDB 1.80 / 2.10 / 2.54 / 2.58 | [7](#round-7-write-path-options-at-main-8809717) |
+| PUT, 1 thread, Linux, 512 KiB / 2 MiB / 32 MiB | 1.60 / 1.41 / 0.84 GB/s | filedir 1.46 / 1.49 / 1.38, RocksDB 0.43 / 0.39 / 0.41 | [7](#round-7-write-path-options-at-main-8809717) |
+| PUT with `write_behind`, 512 KiB / 2 MiB / 32 MiB | 1.25 / 1.21 / 0.60 GB/s | default 1.60 / 1.48 / 0.87 (same binary) | [7](#put-with-each-write-option-kv_bench-single-writer-fresh-store) |
+| 4 reader processes, `view`, Linux | 551 k gets/s | LMDB 442 k | [7](#round-7-write-path-options-at-main-8809717) |
+| Churn, `zipf`, 4 threads, defaults: hit ratio / served / hit p99 | 0.814 / 2.40 GB/s / 26.0 ms | LMDB 0.849 / 2.24 / 46.6 ms | [7](#round-7-write-path-options-at-main-8809717) |
+| Churn, `zipf+scan`, 4 threads, defaults | 0.685 / 1.58 GB/s / 19.9 ms | LMDB 0.726 / 1.44 / 49.4 ms | [7](#round-7-write-path-options-at-main-8809717) |
+| Churn, `zipf` / `zipf+scan`, 4 threads, fill + `write_behind`: served / hit p99 | 3.48 / 2.40 GB/s, 8.6 / 9.6 ms | LMDB 2.24 / 1.44, 46.6 / 49.4 ms | [7](#round-7-write-path-options-at-main-8809717) |
+| Churn, `zipf`, 1 thread: served / miss+insert p50 / p99, defaults | 1.88 GB/s / 1.51 / 17.1 ms (one clean run) | LMDB 1.54 / 1.76 / 10.2; filedir 1.58 / 1.47 / 6.3 | [7](#round-7-write-path-options-at-main-8809717) |
+| Churn, `zipf`, 1 thread, fill + `write_behind` | 1.91 GB/s / 1.73 / 4.6 ms | as above | [7](#round-7-write-path-options-at-main-8809717) |
 | Host→GPU, mapping registered once (CUDA, batch 16) | 12.79 GB/s | LMDB 12.81, staged 5.51 | [CUDA](#device-transfer-cuda-gtx-1050-pcie) |
 
-All Linux rows are round-6 medians of three interleaved runs, with the
-peers run the same day. The macOS row and the CUDA row were not re-run.
-Churn rows are at 2 MiB, C = 16 GiB, in a 4 GiB cgroup; flush-mode and
-`--reserve` rows are in round 6.
+All Linux rows are round-7 medians of the clean runs (two to four per
+cell; the round-7 section gives each count), with the peers run the same
+day. file-per-block's sweep rows rest on one clean run. The macOS row and
+the CUDA row were not re-run. Churn rows are at 2 MiB, C = 16 GiB, in a
+4 GiB cgroup; flush-mode rows are in round 7, `--reserve` rows in round 6.
 
 ## The role being benchmarked
 
@@ -208,7 +229,7 @@ a 4 GiB memory cgroup and is measured for 120 s after a warm-up that inserts
 
 Store versions, as recorded in the raw JSON lines:
 
-| Store | macOS (rounds 1, 3, 5; Metal) | Linux (rounds 2, 3, 3b, 4, 5, 6; CUDA) |
+| Store | macOS (rounds 1, 3, 5; Metal) | Linux (rounds 2, 3, 3b, 4, 5, 6, 7; CUDA) |
 |---|---|---|
 | LMDB | 1.0.2 | 0.9.24 |
 | RocksDB | 11.8.1 | 9.10.0 (not in round 4) |
@@ -260,6 +281,15 @@ machine before every point and samples the cgroup beside it:
 SRC=$PWD PEER_BUILD=/path/to/peer/build doc/kv-cache-benchmark/round6/driver.sh sweep 3
 SRC=$PWD PEER_BUILD=/path/to/peer/build doc/kv-cache-benchmark/round6/driver.sh churn 3
 python3 doc/kv-cache-benchmark/round6/summarize.py "$R6/out" churn   # R6: the driver's output root
+```
+
+Round 7 used the same pattern with the write-path options as churn
+configurations and `kv_bench --fill-tail on|off --write-behind on|off`:
+
+```bash
+export SRC=$PWD PEER_BUILD=/path/to/peer/build OUTROOT=/path/to/out DATA=/path/to/store
+doc/kv-cache-benchmark/round7/driver.sh churn 3 && doc/kv-cache-benchmark/round7/driver.sh sweep 3
+python3 doc/kv-cache-benchmark/round7/summarize.py "$OUTROOT/out" churn   # and: sweep, marks
 ```
 
 The peer harness is not published. It contains the file-per-block, LMDB and
@@ -2591,6 +2621,400 @@ the fill's, it is about half of it (11.0 against 20.8 ms, 12.5 against
 - **macOS and Windows:** no `sync_file_range`; the option does nothing
   there. It was not measured on the M5.
 
+## Round 7: write-path options at main (8809717)
+
+> 2026-09-28, Linux machine only. main at 8809717: since round 6, cold and
+> sequential readahead (#41), the opt-in tail fill
+> (`fill_large_document_tail`, #40), close-on-exec descriptors (#44), the
+> write-lock liveness slot (#37) and the opt-in `write_behind` (#45). The
+> only change to the tree measured is a harness one: `kv_bench` gained
+> `--fill-tail` and `--write-behind`, which set the two options, print them,
+> and record them in the JSON `machine` line. Raw data, the driver, the
+> summariser and every summary are in
+> [`kv-cache-benchmark/round7/`](kv-cache-benchmark/round7/).
+
+The question: should `fill_large_document_tail` and/or `write_behind` be on
+by default for KV use? The round-6 matrix was repeated at main with
+same-day LMDB, file-per-block and RocksDB references. Four Cyclone churn
+configurations were run: the default (retention on, both options off), the
+fill, write-behind, and both. Flush mode (`wrap_retention = false`) was run
+as in round 6. `kv_bench` PUT rows were measured with each write option.
+
+**PageSpeed keeps both options off whatever this round finds.** Its nginx
+module writes inline on the event loop, and `write_behind`'s
+`sync_file_range` can block while the device queue is full
+([design, section 8](design/writer-admission-control.md#8-interactions)).
+Neither option is in the C API that module uses. Everything below is about
+KV-style callers, which write from worker threads.
+
+**Method.** The round-6 method, with the admission-control section's
+samplers: one clang-20 Release build (bundled SHA-256), kernel-default
+dirty limits (`vm.dirty_ratio = 20`, `dirty_background_ratio = 10`,
+recorded in `round7-machine.txt`, never changed), one benchmark at a time
+([`driver.sh`](kv-cache-benchmark/round7/driver.sh)). Before every point
+the driver waited until no runner job and no container job was running and
+the 1-minute load was below 1.0 (`small-reads/idle.sh`). The 1 Hz memory
+and device samplers, the 4 Hz blk-wbt sampler and a 5 s job watcher ran
+beside every point. The order was: the churn matrix, three interleaved
+repetitions, T=4 then T=1, `zipf` then `zipf+scan`, and within each cell
+default, fill, write-behind, both, flush, LMDB, file-per-block. Then three
+repetitions of the sweep. Then single re-runs of the decision-relevant T=4
+points and of the sweep points that had no clean run
+([`round7-progress.txt`](kv-cache-benchmark/round7/round7-progress.txt)).
+The reference vectors of `kv_bench`, `kv_churn` and the peer harness's
+`kvchurn` matched.
+
+**Disturbance, and the exclusion rule.** The machine was shared all day.
+Another session ran containerised system tests on it: short container jobs
+every few minutes, from late morning to the end of the sweep. The runner
+services had been stopped, so these were the only jobs. The idle check
+kept every point from *starting* during a job, but jobs started in the
+middle of points. **Only clean runs are used**: a churn run is left out
+when the job watcher or the sampler saw a job during its 120 s measured
+phase, and a sweep run is left out when a job was seen at any time during
+the run. The marked runs are listed in
+[`round7-marks.txt`](kv-cache-benchmark/round7/round7-marks.txt): 36 of 91
+churn runs and 14 of 42 sweep runs. The raw files keep them. Every table
+gives n = clean runs / runs made. **Cells with fewer than three clean runs
+are flagged. Where n is 1, a verdict on that cell is low-confidence.** The
+decision-relevant T=4 cells have 2 to 3 clean runs. The one exception is
+the fill alone on `zipf` at T=4, which has 1; its verdict does not depend
+on that cell.
+
+### Cold sweep, all phases (Linux, page cache dropped)
+
+The round-6 command (`kv_bench --seconds 10 --drop-caches-cmd …`, four block
+sizes, all phases), the 2 MiB `--no-mmap-dir --no-verify` run, and the peer
+harness's full sweep for LMDB, file-per-block and RocksDB, with the stores
+interleaved. GB/s, median of the clean runs, restart in parentheses. n is
+2 of 4 for Cyclone and LMDB, 2 of 3 for RocksDB, 3 of 3 for the
+verification-off run. **file-per-block had only one clean run of four
+(n = 1): its column is indicative only.**
+([`round7-sweep-summary.txt`](kv-cache-benchmark/round7/round7-sweep-summary.txt))
+
+| | round 6 | **round 7** | LMDB | filedir (n = 1) | RocksDB |
+|---|---:|---:|---:|---:|---:|
+| Cold first touch, 512 KiB | 1.70 (1.36) | **2.80 (2.77)** | 2.19 (1.65) | 1.07 (1.05) | 0.88 (0.91) |
+| Cold first touch, 2 MiB | 2.39 (2.08) | **2.77 (2.75)** | 2.57 (2.52) | 1.46 (1.44) | 0.81 (0.81) |
+| Cold first touch, 8 MiB | 3.00 (2.87) | **3.23 (3.19)** | 2.62 (2.59) | 2.68 (2.67) | 0.81 (0.81) |
+| Cold first touch, 32 MiB | 3.39 (3.27) | **3.42 (3.28)** | 2.70 (2.61) | 2.81 (2.80) | 0.83 (0.68) |
+| Cold first touch, 2 MiB, verification off | 2.47 | **2.41** | — | — | — |
+| PUT, 512 KiB | 1.62 | **1.60** | 0.06 | 1.46 | 0.43 |
+| PUT, 2 MiB | 1.47 | **1.41** | 0.15 | 1.49 | 0.39 |
+| PUT, 8 MiB | 1.27 | **1.18** | 0.30 | 1.40 | 0.41 |
+| PUT, 32 MiB | 0.88 | **0.84** | 0.38 | 1.38 | 0.41 |
+| Warm GET `copy`, 2 MiB, 1 thread | 12.1 | **9.18** | 9.45 | 5.72 | 2.41 |
+| Warm GET `view`, 2 MiB, 1 thread (gets/s) | 265 k | **260 k** | 235 k | 6.9 k | 1.5 k |
+| Warm GET `view`, 512 KiB, 1 thread (gets/s) | 776 k | **772 k** | 648 k | 24 k | 9.4 k |
+| 4 reader processes, 2 MiB, `view` (gets/s) | 743 k | **551 k** | 442 k | 24 k | — |
+| 4 reader processes, 2 MiB, `copy` | 11.8 | **8.35** | 8.73 | 8.32 | — |
+
+- **Cold reads: ahead of LMDB at every size**, first touch 1.08× at 2 MiB
+  up to 1.28× at 512 KiB, and restart at every size too. Round 6 had Cyclone behind at 512 KiB and
+  2 MiB; the change is #41's cold and sequential readahead. The 7-size
+  cold command agrees: first touch 2.48 / 2.55 / 2.81 / 2.92 / 2.76 /
+  3.25 / 3.41 GB/s from 64 KiB to 32 MiB, against LMDB's 1.80 / 1.83 /
+  2.10 / 2.58 / 2.63 / 2.54 / 2.58 (n = 3 of 4 each).
+- **The DRAM-bound phases read about a quarter lower than in round 6, for
+  every store.** Warm 2 MiB `copy` is 9.18 against 12.1 GB/s, and LMDB's
+  is 9.45 against 12.5. Four-process `view` is 551 k against 743 k, and
+  LMDB's is 442 k against 613 k. Same-day ratios did not move: `copy`
+  0.97× LMDB (round 6 0.97×), four-process `view` 1.25× (1.21×). The cause
+  was not identified. The machine was shared all day (above), and a
+  memory-bandwidth effect that no job watcher sees cannot be ruled out.
+- **Puts: no change beyond noise.** 1–7 % below round 6 at every size, with
+  the peers' puts level. At 8 and 32 MiB Cyclone is still behind
+  file-per-block.
+
+### PUT with each write option (`kv_bench`, single writer, fresh store)
+
+`kv_bench --seconds 1 --threads 1 --skip-multiprocess` over the four sizes,
+the four configurations interleaved, four repetitions. GB/s, median of the
+clean runs (p99 ms in parentheses); n = default 4, fill 2, write-behind 3,
+both 3.
+
+| GB/s (p99 ms) | default | fill | write-behind | fill + write-behind | write-behind / default |
+|---|---:|---:|---:|---:|---:|
+| 512 KiB | 1.60 (0.29) | 1.60 (0.30) | 1.25 (0.65) | 1.22 (0.58) | **0.78×** |
+| 2 MiB | 1.48 (2.0) | 1.46 (2.9) | 1.21 (3.4) | 1.14 (2.5) | **0.82×** |
+| 8 MiB | 1.20 (10.0) | 1.14 (21.8) | 0.88 (12.8) | 0.86 (12.8) | **0.73×** |
+| 32 MiB | 0.87 (40.7) | 0.86 (51.7) | 0.60 (55.0) | 0.60 (50.9) | **0.69×** |
+
+**The fill costs a bulk load nothing.** A fresh store's first lap has no
+old data under a page, so there is no read to remove. **Write-behind costs
+18–31 % of bulk-load throughput.** How it costs that is measured
+([`round7-put-dirty.txt`](kv-cache-benchmark/round7/round7-put-dirty.txt)).
+The PUT phase writes 4 GiB, which is below this machine's dirty limit.
+With the default, the global dirty page cache peaks at 2.2–2.9 GiB during
+the run, and the device writes most of the data after the timed phase. With
+write-behind the peak is 19–29 MiB, and each put runs at the rate the
+device accepts. Over the whole run the device wrote at the same rate either
+way (255–314 MB/s averaged over about 50 s). So a load that fits in the
+page cache's dirty headroom finishes sooner by default, because its device
+writes are deferred, not avoided. A load larger than the headroom, which is
+what the churn runs below are, gets the difference back.
+The 512 KiB and 2 MiB write-behind runs also vary more (512 KiB: 0.78–1.27
+GB/s over all four runs, the lowest in the first repetition).
+
+### Churn (Linux, 2 MiB, C = 16 GiB, 4 GiB cgroup)
+
+`run-churn.sh` at the round-6 settings (`--block-size 2097152
+--max-warmup-seconds 1800`, 120 s measured). Medians over clean runs;
+latencies in ms except hit p50 (µs); "held" is the time an insert spent in
+the write-behind call. n = clean / made; **bold n** marks a cell with fewer
+than three clean runs. Per-run values:
+[`round7-churn-summary.txt`](kv-cache-benchmark/round7/round7-churn-summary.txt).
+
+**T = 4**
+
+| pattern | configuration | n | hit ratio | served GB/s | hit p50 µs | hit p99 | hit p99.9 | miss+insert p50 | p99 | p99.9 | held |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `zipf` | default (retention) | **2/5** | 0.814 | 2.40 | 598 | 26.0 | 56.1 | 5.40 | 44.5 | 69.8 | — |
+| `zipf` | fill | **1/3** | 0.815 | 3.02 | 617 | 24.1 | 43.5 | 4.40 | 20.7 | 33.3 | — |
+| `zipf` | write-behind | 3/4 | 0.815 | 3.30 | 632 | **7.5** | 12.5 | 5.36 | 13.7 | 19.7 | 0.34 |
+| `zipf` | fill + write-behind | 3/4 | 0.815 | **3.48** | 646 | 8.6 | 14.6 | 4.51 | **11.3** | 17.1 | 0.32 |
+| `zipf` | flush | **2/3** | 0.758 | 2.08 | 529 | 14.3 | 45.6 | 5.75 | 58.5 | 85.2 | — |
+| `zipf` | LMDB | 3/4 | 0.849 | 2.24 | 531 | 46.6 | 143 | 6.24 | 41.0 | 77.5 | — |
+| `zipf` | filedir | **1/3** | 0.850 | 2.93 | 657 | 35.6 | 62.8 | 2.37 | 8.1 | 10.5 | — |
+| `zipf+scan` | default (retention) | 3/4 | 0.685 | 1.58 | 498 | 19.9 | 49.4 | 5.76 | 49.4 | 86.0 | — |
+| `zipf+scan` | fill | **2/3** | 0.685 | 1.75 | 493 | 37.3 | 63.6 | 4.43 | 27.6 | 45.9 | — |
+| `zipf+scan` | write-behind | 3/3 | 0.684 | 2.07 | 568 | **7.6** | 11.6 | 6.00 | 15.0 | 21.7 | 0.32 |
+| `zipf+scan` | fill + write-behind | 3/3 | 0.685 | **2.40** | 594 | 9.6 | 16.2 | 4.50 | **11.5** | 16.8 | 0.30 |
+| `zipf+scan` | flush | **2/3** | 0.641 | 1.35 | 445 | 11.3 | 44.4 | 5.81 | 59.3 | 112 | — |
+| `zipf+scan` | LMDB | 3/4 | 0.726 | 1.44 | 414 | 49.4 | 123 | 7.49 | 52.7 | 91.0 | — |
+| `zipf+scan` | filedir | **1/3** | 0.725 | 1.82 | 548 | 35.7 | 63.3 | 2.32 | 35.1 | 52.2 | — |
+
+**T = 1**
+
+| pattern | configuration | n | served GB/s | hit p50 µs | hit p99 | hit p99.9 | miss+insert p50 | p99 | p99.9 | held |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `zipf` | default (retention) | **1/3** | 1.88 | 266 | 5.4 | 34.0 | 1.51 | 17.1 | 36.4 | — |
+| `zipf` | fill | **2/3** | 1.76 | 271 | 8.8 | 48.3 | 1.45 | 14.9 | 34.3 | — |
+| `zipf` | write-behind | **2/3** | 1.90 | 313 | **4.0** | 7.5 | 1.85 | 5.3 | 8.0 | 0.22 |
+| `zipf` | fill + write-behind | **2/3** | 1.91 | 314 | 4.3 | 7.7 | 1.73 | **4.6** | 7.9 | 0.21 |
+| `zipf` | flush | **2/3** | 1.55 | 272 | 6.2 | 37.8 | 1.47 | 22.4 | 51.1 | — |
+| `zipf` | LMDB | **2/3** | 1.54 | 252 | 7.0 | 61.2 | 1.76 | 10.2 | 28.6 | — |
+| `zipf` | filedir | **2/3** | 1.58 | 227 | 15.7 | 65.3 | 1.47 | 6.3 | 7.7 | — |
+| `zipf+scan` | default (retention) | **2/3** | 1.29 | 283 | 7.8 | 43.9 | 1.39 | 19.5 | 43.1 | — |
+| `zipf+scan` | fill | **2/3** | 1.21 | 283 | 14.5 | 61.0 | 1.34 | 14.5 | 39.9 | — |
+| `zipf+scan` | write-behind | **2/3** | 1.40 | 345 | **4.3** | 7.7 | 1.71 | 5.2 | 8.1 | 0.21 |
+| `zipf+scan` | fill + write-behind | **1/3** | 1.37 | 343 | 5.1 | 9.2 | 1.61 | **4.6** | 7.8 | 0.21 |
+| `zipf+scan` | flush | **1/3** | 1.16 | 280 | 5.7 | 37.7 | 1.37 | 21.3 | 47.6 | — |
+| `zipf+scan` | LMDB | **1/3** | 1.14 | 261 | 10.1 | 91.2 | 1.62 | 12.6 | 37.1 | — |
+| `zipf+scan` | filedir | **1/3** | 1.11 | 240 | 19.7 | 62.3 | 1.45 | 6.3 | 7.8 | — |
+
+No run failed the content check or reported a read error. The write options
+do not change the hit ratio: 0.814–0.815 on `zipf` and 0.684–0.686 on
+`zipf+scan` in every retention configuration, and 0.758 / 0.641 in flush
+mode. Device bytes written per inserted byte were 1.00–1.01 in every clean
+run.
+Cyclone dropped 0–4 inserts per run to a live lease, all at T=4.
+
+- **Against round 6, the default moved little.** At T=4 it serves 2.40
+  and 1.58 GB/s (round 6: 2.40 and 1.45) with hit p99 26.0 and 19.9 ms
+  (29.9 and 22.9). LMDB is faster today: 2.24 and 1.44 GB/s (1.94 and
+  1.27), and its hit p99 is 46.6 and 49.4 ms (67.0 and 60.8).
+- **Write-behind moves everything at T=4.** Against the default, the
+  write-behind configuration serves +38 % (`zipf`) and +31 % (`zipf+scan`),
+  with hit p99 −71 % and −62 % and miss+insert p99 −69 % and −70 %. The
+  pair of options together serves +45 % and +52 %, with hit p99 −67 % and
+  −52 % and miss+insert p99 −75 % and −77 %. This reproduces the
+  admission-control section's result on a different day, with a different
+  LMDB.
+- **At T=1 write-behind leaves throughput alone and cuts the tails.** Served
+  is within 1–8 % of the default. Hit p99 falls to 4.0–4.3 ms (default
+  5.4–7.8) and miss+insert p99 to 4.6–5.3 ms (default 17.1–19.5, and
+  LMDB 10–13).
+- **The fill on top of write-behind trades the hit tail for the insert tail
+  and throughput.** Against write-behind alone, at T=4: served +5 % and
+  +16 %, miss+insert p99 −17 % and −24 %, and miss+insert p50 −16 % and
+  −25 %, but hit p99 +15 % and +27 % (7.5 → 8.6, 7.6 → 9.6 ms). At T=1
+  the insert p99 falls 12–13 % and the hit p99 rises 7–17 %.
+- **The fill alone is still the worst of both.** Its hit p99 on `zipf+scan`
+  is 37.3 ms, +88 % on the default, as in the insert-tail section.
+
+**Hit p50 and served, per configuration.** #45 measured hit p50 10–21 %
+higher with write-behind. Round 7 (µs, change against the default):
+
+| | T=4 `zipf` | T=4 `zipf+scan` | T=1 `zipf` | T=1 `zipf+scan` |
+|---|---:|---:|---:|---:|
+| default: hit p50 / served | 598 / 2.40 | 498 / 1.58 | 266 / 1.88 (n = 1) | 283 / 1.29 |
+| fill | 617 (+3 %) / 3.02 (n = 1) | 493 (−1 %) / 1.75 | 271 (+2 %) / 1.76 | 283 (0 %) / 1.21 |
+| write-behind | 632 (**+6 %**) / 3.30 | 568 (**+14 %**) / 2.07 | 313 (**+18 %**) / 1.90 | 345 (**+22 %**) / 1.40 |
+| fill + write-behind | 646 (**+8 %**) / 3.48 | 594 (**+19 %**) / 2.40 | 314 (**+18 %**) / 1.91 | 343 (**+21 %**) / 1.37 (n = 1) |
+| LMDB | 531 / 2.24 | 414 / 1.44 | 252 / 1.54 | 261 / 1.14 |
+
+The median hit gets 6–22 % slower with write-behind, as in #45: 47–62 µs
+at one thread, 34–96 µs at four. Every tail percentile falls, and so does
+the time per operation: served GB/s rises at T=4 and is level at T=1. The
+cause was not traced here. The device table below shows the same
+utilisation with a far shorter queue. That is consistent with each write
+going to the device right away, so that a read which does reach the
+device shares it with a steady stream of writes, where before it could
+land in a gap between the flusher's batches. This is inferred, not
+measured.
+
+What the device did at T=4 (medians of the clean runs' per-second samples,
+[`round7-device-medians.txt`](kv-cache-benchmark/round7/round7-device-medians.txt)):
+
+| T=4 | reads/s | read `await` ms | write MB/s | write `await` ms | queue | cgroup dirty | wbt at its tightest |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `zipf`, default | 6 416 | 1.94 | 526 | 13.2 | 34.9 | 283 MiB | 6.0 % |
+| `zipf`, fill | 7 961 | 1.82 | 651 | 9.6 | 35.0 | 282 MiB | 4.9 % |
+| `zipf`, write-behind | 8 872 | 1.10 | 706 | 0.8 | 11.2 | 7 MiB | 0 % |
+| `zipf`, fill + write-behind | 9 139 | 1.25 | 743 | 1.1 | 13.4 | 7 MiB | 0 % |
+| `zipf+scan`, default | 3 641 | 1.82 | 693 | 12.0 | 30.7 | 306 MiB | 6.0 % |
+| `zipf+scan`, fill | 3 766 | 4.64 | 758 | 12.4 | 44.3 | 345 MiB | 11.7 % |
+| `zipf+scan`, write-behind | 4 612 | 1.37 | 888 | 0.8 | 7.7 | 9 MiB | 0 % |
+| `zipf+scan`, fill + write-behind | 5 132 | 1.73 | 1 024 | 1.2 | 11.5 | 9 MiB | 0 % |
+
+### Verdict against the decision criteria, per configuration
+
+The criteria are from [`kv-churn-spec.md`](kv-cache-benchmark/kv-churn-spec.md),
+quoted verbatim: *"Cyclone counts as "significantly better than LMDB" for
+this use only if, on Linux at 2 MiB with the 4 GiB cgroup, for BOTH patterns
+at T=4: served GB/s ≥ 1.5× LMDB's, OR hit-get p99 ≤ 0.5× LMDB's at no worse
+than 0.9× the served GB/s. A win at T=1 only, or on one pattern only, is
+reported as "partial"."*
+
+Clause A is served ≥ 1.5×. Clause B is hit p99 ≤ 0.5× with served ≥ 0.9×.
+Ratios are Cyclone's median over the same-day LMDB median. Brackets give
+the range over every pairing of a clean Cyclone run with a clean LMDB run.
+"Pairings" counts how many of those pairings pass A or B on their own, and
+"worst" names the least favourable pairing.
+
+| configuration | pattern | T | n (Cy / LMDB) | served | hit p99 | A | B | pairings passing; worst |
+|---|---|---:|---|---:|---:|---|---|---|
+| default | `zipf` | 4 | **2** / 3 | 1.07× [0.91–1.12] | 0.56× [0.54–0.73] | no | **no** | 0/6; p99 0.73× |
+| default | `zipf+scan` | 4 | 3 / 3 | 1.09× [0.99–1.27] | 0.40× [0.30–0.47] | no | **yes** | 9/9; p99 0.47× |
+| fill | `zipf` | 4 | **1** / 3 | 1.35× [1.15–1.40] | 0.52× [0.50–0.67] | no | no | 0/3; p99 0.67× |
+| fill | `zipf+scan` | 4 | **2** / 3 | 1.21× [1.18–1.35] | 0.75× [0.62–0.79] | no | **no** | 0/6; p99 0.79× |
+| write-behind | `zipf` | 4 | 3 / 3 | 1.47× [1.14–1.56] | 0.16× [0.15–0.26] | no | **yes** | 9/9; p99 0.26×, served 1.14× |
+| write-behind | `zipf+scan` | 4 | 3 / 3 | 1.43× [1.38–1.65] | 0.15× [0.12–0.16] | no | **yes** | 9/9; p99 0.16× |
+| fill + write-behind | `zipf` | 4 | 3 / 3 | **1.55×** [1.25–1.63] | 0.19× [0.18–0.27] | **yes** | **yes** | 9/9; p99 0.27×, served 1.25× |
+| fill + write-behind | `zipf+scan` | 4 | 3 / 3 | **1.66×** [1.47–1.84] | 0.19× [0.16–0.33] | **yes** | **yes** | 9/9; p99 0.33×, served 1.47× |
+| flush | `zipf` | 4 | **2** / 3 | 0.93× [0.69–1.09] | 0.31× [0.24–0.48] | no | yes, thin | 2/6; served 0.69× |
+| flush | `zipf+scan` | 4 | **2** / 3 | 0.94× [0.86–1.10] | 0.23× [0.18–0.25] | no | yes, thin | 4/6; served 0.86× |
+| default | `zipf` | 1 | **1** / **2** | 1.22× | 0.78× | no | no | 0/2 |
+| default | `zipf+scan` | 1 | **2** / **1** | 1.14× | 0.77× | no | no | 0/2 |
+| fill | `zipf` / `zipf+scan` | 1 | **2** / **2**, **2** / **1** | 1.14×, 1.06× | 1.27×, 1.43× | no | no | 0/4, 0/2 |
+| write-behind | `zipf` | 1 | **2** / **2** | 1.23× | 0.58× | no | no | 0/4 |
+| write-behind | `zipf+scan` | 1 | **2** / **1** | 1.23× | 0.43× | no | yes | 2/2 |
+| fill + write-behind | `zipf` | 1 | **2** / **2** | 1.24× | 0.61× | no | no | 0/4 |
+| fill + write-behind | `zipf+scan` | 1 | **1** / **1** | 1.20× | 0.50× (0.503) | no | no, by 0.003 | 0/1 |
+| flush | `zipf` / `zipf+scan` | 1 | **2** / **2**, **1** / **1** | 1.01×, 1.02× | 0.89×, 0.56× | no | no | 0/4, 0/1 |
+
+Per configuration:
+
+- **Default (retention on, both options off): PARTIAL.** It passes
+  `zipf+scan` at T=4 through clause B (0.40×, every pairing), and fails
+  `zipf` at T=4 (hit p99 0.56× against the 0.5× bar). Only two of five
+  `zipf` runs were clean. The three marked runs read 23.3–25.9 ms, 0.50–0.56×
+  the same LMDB median, so the cell fails with them as well. Round 6
+  passed this cell at 0.45× (worst pairing 0.52×), and the admission-control
+  night failed it at 0.62×. Cyclone's tail is where it was (26.0 against
+  29.9 ms); LMDB's has fallen. The default's WIN from round 6 is gone.
+- **Fill alone: LOSS.** It fails both patterns at T=4 and both at T=1. The
+  `zipf` T=4 cell has one clean run, which makes that cell low-confidence.
+  The verdict does not rest on it: `zipf+scan` fails on every pairing
+  (0.62–0.79×), so the fill alone cannot win, and it fails every T=1 cell.
+  The admission-control night measured the same cell failing at 0.65× over
+  three clean runs.
+- **Write-behind alone: WIN**, through clause B on both patterns at T=4,
+  with every pairing passing (hit p99 0.15–0.16×, at worst 0.26×). It also
+  passes `zipf+scan` at T=1 (0.43×, low-confidence: one clean LMDB run).
+- **Fill + write-behind: WIN**, and **the first configuration in any round
+  to meet clause A on both patterns** (served 1.55× and 1.66× LMDB on the
+  medians). Clause A does not hold in every pairing (worst 1.25× and
+  1.47×), but clause B does (worst 0.27× and 0.33×), so every pairing
+  passes. On the admission-control night, with a faster LMDB (2.55 GB/s on
+  `zipf`), the same configuration served 1.38× and 1.48×. The clause-A
+  result depends on the day's LMDB; the clause-B result does not.
+- **Flush mode: WIN on the medians, not robust.** Its hit p99 is low (0.31×
+  and 0.23×), but its served ratio sits on the 0.9× floor (0.93× and
+  0.94×) with two clean runs per cell, and only 2 of 6 and 4 of 6 pairings
+  pass. Round 6 had it just under the floor (0.88–0.89×, PARTIAL). Read it
+  as borderline, not as a change.
+
+Hit ratios, separately, as the spec requires: every retention configuration
+is 3.4 points below LMDB's LRU on `zipf` (0.815 against 0.849) and 4.1 on
+`zipf+scan` (0.685 against 0.726). The write options do not move them. The
+served ratios above already pay that cost. What each store needed on top
+is unchanged from [round 4](#what-each-store-needed).
+
+### Recommendation: which options should default on for KV use
+
+This section recommends and changes nothing: every default in the code is
+as it was. The decision is the maintainer's.
+
+**Recommended for KV-style use (large documents written from worker
+threads): `write_behind` on, together with `fill_large_document_tail`.**
+Evidence (T=4, 2 MiB, 16 GiB tier in a 4 GiB cgroup, against the default):
+
+- It turns the default's PARTIAL into a WIN on both patterns, through both
+  clauses on the medians and through clause B in every pairing. Served
+  +45 % and +52 %; hit p99 26.0 → 8.6 ms and 19.9 → 9.6 ms; miss+insert
+  p99 44.5 → 11.3 and 49.4 → 11.5 ms; hit p99.9 56 → 15 and 49 → 16 ms.
+- At T=1 served is level (+2 % and +6 %), the miss+insert p99 falls from
+  17–19 to 4.6 ms, and the hit p99 from 5.4–7.8 to 4.3–5.1 ms.
+- It reproduces #45's result, which was measured on a different night
+  against a faster LMDB.
+- The fill should never be on without write-behind: alone it is this
+  round's only LOSS. With write-behind on, it adds throughput and shortens
+  the insert tail, at the cost of some hit tail. If only one option is
+  wanted, write-behind alone gives the lowest hit p99 of any configuration
+  (7.5 / 7.6 ms at T=4) and is also a WIN.
+
+Costs, measured:
+
+- **The median hit is 6–22 % slower** (34–96 µs at T=4, 47–62 µs at T=1),
+  and the median insert with write-behind alone about 0.3 ms slower at
+  T=1.
+  The pair recovers most of that insert median at T=4 (4.51 against 5.40
+  ms) but not at T=1 (1.73 against 1.51 ms). The call holds each writer
+  0.21 ms (T=1) to 0.34 ms (T=4) per 2 MiB insert.
+- **Bulk-load throughput falls 18–31 %** (`kv_bench` PUT). The default
+  defers the device writes of a load that fits in the dirty headroom, and
+  write-behind makes the writer pay them. A KV tier that is filled once and
+  read many times, from a cold start, will notice this. A tier under
+  steady churn will not.
+- **The call can block while the device queue is full.** That is fine on a
+  worker thread and wrong on an event loop. That is why PageSpeed keeps it
+  off, and why it should not become the library-wide default while
+  PageSpeed uses the same `CacheConfig`.
+- **Linux only.** macOS and Windows have no `sync_file_range`; the option
+  does nothing there, and the fill costs nothing there (APFS does not read
+  before a partial write).
+- **One machine, one device, one workload.** The admission-control section
+  asked for a second device before any default changes. This round does not
+  provide one. It repeats the result on the same device on a different day.
+
+**How to make it the KV default without changing PageSpeed's:** keep
+the library defaults off, and turn both on wherever the KV configuration is
+built: a KV preset (for example a `CacheConfig` helper) that a KV connector
+starts from, and the KV section of the README. A flip of the library-wide
+default would also turn write-behind on for any C++ embedder that writes
+large documents from an event loop. That flip is not recommended on this
+evidence. If the maintainer wants it anyway, the measured case for it is
+the table above, and the open items are a second device and the PageSpeed
+worker's write pattern.
+
+### Caveats
+
+- Shared machine: 36 of 91 churn runs and 14 of 42 sweep runs are excluded
+  (above). Several cells rest on one or two clean runs; they are marked.
+  The T=4 cells that decide the recommendation have three clean runs each
+  (write-behind, both) or two to three (default), against three clean LMDB
+  runs.
+- DRAM-bound phases read about 25 % lower than in round 6 for every store
+  (above); only same-day ratios are used.
+- The T=1 criteria rows use one or two clean LMDB runs and are
+  low-confidence; no verdict depends on them except write-behind's T=1
+  `zipf+scan` pass, which is reported, not used.
+- Not measured: a second device, XFS, a mixed small/large workload (write-
+  behind starts write-back only above 64 KiB), and more than one writer
+  process.
+
 ## Device transfer: does zero-copy pay off? (Metal, Apple silicon)
 
 The open question from rounds 1 and 2 is whether the zero-copy read pays
@@ -3039,8 +3463,9 @@ through nvcc in `kv_gpu_cuda.cu`, behind the plain-C seam in
 | A zero-copy C read entry point and a Python binding, which is what a vLLM/SGLang connector would call | Open | — |
 | Keep the previous lap resolvable until it is actually overwritten ([design](design/wrap-retention.md)) | **Done**: implemented and on by default (`wrap_retention = false` is the flush opt-out); see [CHANGELOG](../CHANGELOG.md). Measured: at 16 GiB it meets the churn decision criteria (latency clause, both patterns, T=4), in rounds 5 and 6; flush mode stays partial | [Round 5](#round-5-re-benchmark-at-main-2aed24c): hit ratio 0.758 → 0.814 (`zipf`) and 0.640 → 0.686 (`zipf+scan`), matching the replay within 0.002; served +16 % at T=1, within noise at T=4; hit p99 0.27–0.37× LMDB's. [Round 6](#round-6-re-benchmark-at-main-b5c31e8), with it on by default: hit p99 0.45× (`zipf`, worst run pairing 0.52×) and 0.38× LMDB's at 1.24× and 1.14× its served GB/s |
 | Profile insert latency (miss+insert p50 4.0 ms vs 1.4–1.6 ms for the peers) | **Done** (#16): two fresh 2 MiB heap buffers per put and their ~1,000 page faults were most of it. Removed; T=1 miss+insert p50 4.41 → 1.49 ms (file-per-block 1.43, same day) | [Insert path](#insert-path-profile-issue-16) |
-| The one-thread insert tail (miss+insert p99 24 ms against 6 for file-per-block and 16 for LMDB) | **Opt-in** (`CacheConfig::fill_large_document_tail`, default off). Filling each large document's last page (no format or space change) removes the read: insert p99 26.1 → 15.2 ms at T=1, 57.3 → 30.1 at T=4. But the read was also back-pressure on a saturated device: hit p99 at T=4 rises 25 % (`zipf`) and 68 % (`zipf+scan`), and `zipf+scan` then fails the latency clause (0.64× LMDB). A synchronous read per insert restores the hit tail but gives back the T=1 gain. **With `write_behind` (opt-in, #43)** as well: insert p99 4.2 ms at T=1 and 11.0 / 12.5 at T=4, hit p99 8.4 / 10.5 ms at T=4, latency clause met on both patterns (0.22×, 0.25× LMDB) | [Round 6](#the-one-thread-insert-tail-24-ms-p99), [insert tail](#insert-tail-fill-the-last-page-issue-35), [writer admission](#writer-admission-issue-43) |
-| Large-block puts: 8 MiB and 32 MiB behind file-per-block (1.27 against 1.43, 0.88 against 1.41 GB/s) | Open; not profiled. Faster than round 5 at both sizes (1.01, 0.48) | [Round 6](#regressions-and-losses-since-round-5) |
+| The one-thread insert tail (miss+insert p99 24 ms against 6 for file-per-block and 16 for LMDB) | **Opt-in** (`CacheConfig::fill_large_document_tail`, default off). Filling each large document's last page (no format or space change) removes the read: insert p99 26.1 → 15.2 ms at T=1, 57.3 → 30.1 at T=4. But the read was also back-pressure on a saturated device: hit p99 at T=4 rises 25 % (`zipf`) and 68 % (`zipf+scan`), and `zipf+scan` then fails the latency clause (0.64× LMDB). A synchronous read per insert restores the hit tail but gives back the T=1 gain. **With `write_behind` (opt-in, #43)** as well: insert p99 4.2 ms at T=1 and 11.0 / 12.5 at T=4, hit p99 8.4 / 10.5 ms at T=4, latency clause met on both patterns (0.22×, 0.25× LMDB). **Round 7** repeated it: both options together pass both patterns at T=4 in every run pairing (hit p99 0.19× LMDB's, served 1.55× / 1.66×), insert p99 4.6 ms at T=1 | [Round 6](#the-one-thread-insert-tail-24-ms-p99), [insert tail](#insert-tail-fill-the-last-page-issue-35), [writer admission](#writer-admission-issue-43), [round 7](#round-7-write-path-options-at-main-8809717) |
+| Make `write_behind` + `fill_large_document_tail` the default for KV use | **Decision pending.** Round 7 recommends both for KV writers on worker threads, as a KV preset rather than a library-wide default: PageSpeed's nginx writes run inline on the event loop and keep both off. Costs: median hit 6–22 % slower, bulk-load PUT 18–31 % lower, Linux only, one device measured | [Round 7 recommendation](#recommendation-which-options-should-default-on-for-kv-use) |
+| Large-block puts: 8 MiB and 32 MiB behind file-per-block (round 7: 1.18 against 1.40, 0.84 against 1.38 GB/s) | Open; not profiled. Faster than round 5 at both sizes (1.01, 0.48) | [Round 6](#regressions-and-losses-since-round-5), [round 7](#round-7-write-path-options-at-main-8809717) |
 | Scan resistance or admission control on the disk tier | Open | [Round 4](#why-the-hit-ratio-and-where-it-comes-from): a scan costs every store about 12 points |
 
 GPUDirect Storage (`cuFileRead` at `content_file_offset()`, NVMe to GPU with

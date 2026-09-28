@@ -1,0 +1,158 @@
+per run (* = a job ran during the measured phase; not in medians)
+run                                hit ratio    served   hit p50   hit p99 hit p99.9   ins p50   ins p99 ins p99.9  held/ins write amp    reopen  failed
+ret-zipf-t4-1                    *     0.814      2.25     0.739     25.67     54.59      6.16     43.08     66.75      0.00      1.06     0.813  False err=0 drop=0
+fill-zipf-t4-1                         0.815      3.02     0.617     24.12     43.46      4.40     20.65     33.29      0.00      1.00     0.806  False err=0 drop=0
+wb-zipf-t4-1                           0.815      3.37     0.646      7.27     12.42      5.22     13.53     19.72      0.34      1.00     0.813  False err=0 drop=2
+fillwb-zipf-t4-1                       0.815      3.51     0.657      8.43     14.57      4.57     11.31     17.06      0.33      1.00     0.812  False err=0 drop=1
+flush-zipf-t4-1                        0.759      2.36     0.534     11.37     37.70      5.55     46.17     64.70      0.00      1.00     0.781  False err=0 drop=2
+lmdb-zipf-t4-1                         0.850      2.64     0.531     35.84    119.49      5.99     31.70     63.92      0.00      1.00     0.853  False err=0 drop=-
+filedir-zipf-t4-1                      0.850      2.93     0.657     35.63     62.84      2.37      8.05     10.50      0.00      1.01     0.850  False err=0 drop=-
+ret-zipf-t4-2                          0.814      2.41     0.592     25.74     55.34      5.43     44.42     68.60      0.00      1.00     0.823  False err=0 drop=0
+fill-zipf-t4-2                   *     0.814      2.41     0.582     39.25     65.64      4.58     28.81     46.72      0.00      1.00     0.817  False err=0 drop=1
+wb-zipf-t4-2                           0.815      3.30     0.632      7.51     12.45      5.36     13.65     19.67      0.34      1.00     0.819  False err=0 drop=1
+fillwb-zipf-t4-2                       0.815      3.48     0.646      8.63     14.25      4.51     11.01     16.18      0.32      1.00     0.813  False err=0 drop=2
+flush-zipf-t4-2                  *     0.758      1.95     0.548     13.69     43.60      6.17     55.15     99.08      0.00      1.02     0.772  False err=0 drop=1
+lmdb-zipf-t4-2                   *     0.850      1.95     0.551     56.87    168.24      6.58     48.94    102.61      0.00      1.04     0.851  False err=0 drop=-
+filedir-zipf-t4-2                *     0.850      2.90     0.661     37.91     67.36      2.36      8.07     11.29      0.00      1.01     0.851  False err=0 drop=-
+ret-zipf-t4-3                    *     0.814      2.42     0.607     25.93     51.01      5.44     43.33     62.74      0.00      1.01     0.821  False err=0 drop=1
+fill-zipf-t4-3                   *     0.814      2.32     0.585     40.24     70.47      4.62     30.43     47.51      0.00      1.01     0.809  False err=0 drop=0
+wb-zipf-t4-3                     *     0.815      2.79     0.625     10.06     17.23      6.08     22.07     45.12      0.37      1.01     0.819  False err=0 drop=0
+fillwb-zipf-t4-3                 *     0.815      2.92     0.628     13.33     26.53      4.75     18.55     30.79      0.35      1.01     0.814  False err=0 drop=1
+flush-zipf-t4-3                        0.757      1.81     0.523     17.29     53.40      5.96     70.84    105.65      0.00      1.00     0.795  False err=0 drop=1
+lmdb-zipf-t4-3                         0.849      2.24     0.529     46.64    142.63      6.24     40.96     77.49      0.00      1.00     0.851  False err=0 drop=-
+filedir-zipf-t4-3                *     0.850      2.63     0.722     37.84     69.32      2.49      9.49     17.88      0.00      1.02     0.853  False err=0 drop=-
+ret-zipf-t4-4                    *     0.814      2.57     0.608     23.34     47.07      5.33     38.60     58.96      0.00      1.01     0.820  False err=0 drop=2
+wb-zipf-t4-4                           0.815      3.00     0.617      9.31     15.20      5.71     15.34     24.40      0.35      1.00     0.819  False err=0 drop=0
+fillwb-zipf-t4-4                       0.815      3.31     0.639      9.82     15.08      4.51     11.55     18.01      0.32      1.00     0.817  False err=0 drop=0
+lmdb-zipf-t4-4                         0.849      2.16     0.541     47.82    156.22      6.28     43.18     81.45      0.00      1.00     0.851  False err=0 drop=-
+ret-zipf-t4-5                          0.814      2.40     0.603     26.20     56.86      5.38     44.60     71.02      0.00      1.00     0.821  False err=0 drop=2
+ret-zipf+scan-t4-1                     0.685      1.58     0.492     19.88     49.40      5.76     49.43     86.02      0.00      1.00     0.769  False err=0 drop=1
+fill-zipf+scan-t4-1                    0.685      1.76     0.488     36.77     61.84      4.42     27.38     44.39      0.00      1.00     0.759  False err=0 drop=0
+wb-zipf+scan-t4-1                      0.685      2.16     0.575      7.14     11.62      5.74     14.62     21.27      0.32      1.00     0.766  False err=0 drop=1
+fillwb-zipf+scan-t4-1                  0.685      2.40     0.594      9.62     16.24      4.50     11.45     16.83      0.30      1.00     0.761  False err=0 drop=4
+flush-zipf+scan-t4-1                   0.641      1.44     0.444     10.59     39.31      5.72     51.89    111.44      0.00      1.00     0.701  False err=0 drop=0
+lmdb-zipf+scan-t4-1                    0.726      1.48     0.401     48.09    120.85      7.56     51.72     81.48      0.00      1.00     0.804  False err=0 drop=-
+filedir-zipf+scan-t4-1                 0.725      1.82     0.548     35.69     63.34      2.32     35.08     52.21      0.00      1.01     0.809  False err=0 drop=-
+ret-zipf+scan-t4-2               *     0.685      1.42     0.523     20.17     52.09      6.20     55.21     87.78      0.00      1.01     0.748  False err=0 drop=0
+fill-zipf+scan-t4-2                    0.685      1.74     0.497     37.86     65.32      4.44     27.89     47.42      0.00      1.00     0.756  False err=0 drop=0
+wb-zipf+scan-t4-2                      0.684      2.07     0.568      7.57     11.57      6.00     15.00     21.68      0.33      1.00     0.772  False err=0 drop=1
+fillwb-zipf+scan-t4-2                  0.685      2.41     0.605      9.34     14.94      4.53     11.11     14.95      0.30      1.00     0.735  False err=0 drop=3
+flush-zipf+scan-t4-2                   0.641      1.26     0.445     12.03     49.48      5.90     66.75    111.82      0.00      1.00     0.740  False err=0 drop=0
+lmdb-zipf+scan-t4-2              *     0.726      1.36     0.432     53.14    135.19      7.67     57.03     95.10      0.00      1.01     0.804  False err=0 drop=-
+filedir-zipf+scan-t4-2           *     0.725      2.08     0.551     35.30     60.38      2.14      9.16    154.38      0.00      1.01     0.807  False err=0 drop=-
+ret-zipf+scan-t4-3                     0.685      1.66     0.498     17.78     46.52      5.66     45.02     69.03      0.00      1.00     0.763  False err=0 drop=2
+fill-zipf+scan-t4-3              *     0.685      1.46     0.499     44.55     83.12      4.76     31.95     53.81      0.00      1.01     0.756  False err=0 drop=0
+wb-zipf+scan-t4-3                      0.684      2.04     0.568      7.78     12.25      6.06     15.27     22.88      0.32      1.00     0.768  False err=0 drop=0
+fillwb-zipf+scan-t4-3                  0.685      2.18     0.567     15.76     30.94      4.40     14.75     27.07      0.33      1.00     0.764  False err=0 drop=0
+flush-zipf+scan-t4-3             *     0.642      1.07     0.465     15.13     58.11      6.45     82.01    124.01      0.00      1.01     0.691  False err=0 drop=1
+lmdb-zipf+scan-t4-3                    0.726      1.44     0.415     49.43    123.21      7.42     55.37     90.97      0.00      1.00     0.803  False err=0 drop=-
+filedir-zipf+scan-t4-3           *     0.725      1.69     0.645     41.47     71.81      2.44     32.66    209.04      0.00      1.02     0.807  False err=0 drop=-
+ret-zipf+scan-t4-4                     0.685      1.46     0.502     22.46     54.53      5.90     57.27     93.75      0.00      1.00     0.745  False err=0 drop=0
+lmdb-zipf+scan-t4-4                    0.726      1.31     0.414     58.94    142.34      7.49     52.67    103.32      0.00      1.00     0.803  False err=0 drop=-
+ret-zipf-t1-1                          0.815      1.88     0.266      5.44     33.98      1.51     17.10     36.39      0.00      1.00     0.815  False err=0 drop=0
+fill-zipf-t1-1                         0.815      1.76     0.271      8.76     49.02      1.45     15.55     34.16      0.00      1.00     0.806  False err=0 drop=0
+wb-zipf-t1-1                           0.815      1.90     0.310      3.97      7.62      1.85      5.53      8.56      0.22      1.00     0.815  False err=0 drop=0
+fillwb-zipf-t1-1                       0.815      1.89     0.312      4.23      7.84      1.74      5.02      8.13      0.21      1.00     0.815  False err=0 drop=0
+flush-zipf-t1-1                        0.760      1.57     0.274      5.97     36.76      1.49     21.38     46.82      0.00      1.00     0.767  False err=0 drop=0
+lmdb-zipf-t1-1                         0.850      1.53     0.251      6.64     62.39      1.77     10.43     28.90      0.00      1.00     0.848  False err=0 drop=-
+filedir-zipf-t1-1                      0.851      1.45     0.234     17.85     65.61      1.48      6.33      8.43      0.00      1.01     0.845  False err=0 drop=-
+ret-zipf-t1-2                    *     0.815      1.65     0.278      6.26     40.93      1.58     21.36     43.93      0.00      1.03     0.813  False err=0 drop=0
+fill-zipf-t1-2                         0.815      1.76     0.270      8.87     47.49      1.46     14.25     34.51      0.00      1.00     0.806  False err=0 drop=0
+wb-zipf-t1-2                           0.815      1.91     0.315      4.03      7.34      1.84      5.04      7.51      0.22      1.00     0.813  False err=0 drop=0
+fillwb-zipf-t1-2                 *     0.815      1.66     0.333      5.70     11.61      1.85      6.51     14.87      0.23      1.03     0.813  False err=0 drop=0
+flush-zipf-t1-2                        0.760      1.54     0.270      6.40     38.78      1.44     23.46     55.38      0.00      1.00     0.765  False err=0 drop=0
+lmdb-zipf-t1-2                         0.850      1.56     0.252      7.26     59.91      1.75     10.01     28.34      0.00      1.00     0.848  False err=0 drop=-
+filedir-zipf-t1-2                      0.850      1.72     0.220     13.59     64.92      1.45      6.29      6.93      0.00      1.01     0.849  False err=0 drop=-
+ret-zipf-t1-3                    *     0.815      1.64     0.277      6.66     44.01      1.56     24.32     49.73      0.00      1.02     0.814  False err=0 drop=0
+fill-zipf-t1-3                   *     0.815      1.54     0.276     12.19     55.63      1.49     18.13     47.00      0.00      1.02     0.816  False err=0 drop=0
+wb-zipf-t1-3                     *     0.815      1.87     0.312      4.35      7.67      1.88      5.11      8.31      0.22      1.00     0.815  False err=0 drop=0
+fillwb-zipf-t1-3                       0.815      1.94     0.317      4.29      7.57      1.72      4.18      7.69      0.21      1.00     0.817  False err=0 drop=0
+flush-zipf-t1-3                  *     0.755      1.29     0.286      7.74     45.06      1.53     30.77     68.15      0.00      1.02     0.762  False err=0 drop=0
+lmdb-zipf-t1-3                   *     0.851      1.37     0.265      8.16     84.07      1.80     13.15     45.05      0.00      1.04     0.846  False err=0 drop=-
+filedir-zipf-t1-3                *     0.850      1.73     0.222     13.43     66.70      1.48      6.46      7.26      0.00      1.01     0.849  False err=0 drop=-
+ret-zipf+scan-t1-1                     0.686      1.32     0.281      7.65     41.49      1.40     17.61     38.92      0.00      1.00     0.768  False err=0 drop=0
+fill-zipf+scan-t1-1                    0.686      1.14     0.281     15.78     63.52      1.36     15.67     44.33      0.00      1.00     0.753  False err=0 drop=0
+wb-zipf+scan-t1-1                      0.686      1.40     0.342      4.26      7.81      1.71      5.37      8.50      0.21      1.00     0.768  False err=0 drop=0
+fillwb-zipf+scan-t1-1                  0.686      1.37     0.343      5.08      9.18      1.61      4.56      7.76      0.21      1.00     0.768  False err=0 drop=0
+flush-zipf+scan-t1-1                   0.643      1.16     0.280      5.68     37.65      1.37     21.30     47.56      0.00      1.00     0.713  False err=0 drop=0
+lmdb-zipf+scan-t1-1                    0.727      1.14     0.261     10.10     91.18      1.62     12.64     37.08      0.00      1.00     0.803  False err=0 drop=-
+filedir-zipf+scan-t1-1                 0.727      1.11     0.240     19.73     62.32      1.45      6.31      7.81      0.00      1.01     0.804  False err=0 drop=-
+ret-zipf+scan-t1-2                     0.686      1.27     0.285      7.86     46.36      1.39     21.35     47.19      0.00      1.00     0.765  False err=0 drop=0
+fill-zipf+scan-t1-2              *     0.686      1.19     0.284     14.94     64.66      1.35     15.60     41.18      0.00      1.01     0.762  False err=0 drop=0
+wb-zipf+scan-t1-2                *     0.686      1.38     0.348      4.36      7.51      1.74      5.34      8.60      0.21      1.00     0.768  False err=0 drop=0
+fillwb-zipf+scan-t1-2            *     0.686      1.44     0.347      4.78      7.62      1.60      3.99      7.20      0.21      1.00     0.757  False err=0 drop=0
+flush-zipf+scan-t1-2             *     0.640      0.95     0.290      8.19     39.13      1.40     29.42     61.74      0.00      1.01     0.700  False err=0 drop=0
+lmdb-zipf+scan-t1-2              *     0.727      1.04     0.265     16.19    106.04      1.64     17.06     45.43      0.00      1.02     0.805  False err=0 drop=-
+filedir-zipf+scan-t1-2           *     0.727      1.30     0.230     15.99     58.18      1.45      6.38      7.06      0.00      1.01     0.805  False err=0 drop=-
+ret-zipf+scan-t1-3               *     0.686      1.11     0.288     10.30     53.79      1.45     24.28     53.24      0.00      1.02     0.760  False err=0 drop=0
+fill-zipf+scan-t1-3                    0.686      1.28     0.286     13.14     58.45      1.33     13.28     35.44      0.00      1.00     0.767  False err=0 drop=0
+wb-zipf+scan-t1-3                      0.686      1.40     0.348      4.40      7.52      1.71      5.00      7.69      0.21      1.00     0.767  False err=0 drop=0
+fillwb-zipf+scan-t1-3            *     0.686      1.30     0.349      5.85     10.95      1.63      5.99     14.50      0.22      1.01     0.767  False err=0 drop=0
+flush-zipf+scan-t1-3             *     0.641      1.05     0.287      7.97     42.49      1.36     25.13     54.15      0.00      1.00     0.740  False err=0 drop=0
+lmdb-zipf+scan-t1-3              *     0.727      1.05     0.268     19.92    103.42      1.64     15.31     46.27      0.00      1.02     0.805  False err=0 drop=-
+filedir-zipf+scan-t1-3           *     0.727      1.24     0.232     17.21     62.96      1.46      6.48      7.86      0.00      1.01     0.805  False err=0 drop=-
+
+medians over clean runs (n)
+cell                               hit ratio    served   hit p50   hit p99 hit p99.9   ins p50   ins p99 ins p99.9  held/ins write amp    reopen
+zipf T=4 ret                (2/5)     0.814      2.40     0.598     25.97     56.10      5.40     44.51     69.81      0.00      1.00     0.822
+zipf T=4 fill               (1/3)     0.815      3.02     0.617     24.12     43.46      4.40     20.65     33.29      0.00      1.00     0.806
+zipf T=4 wb                 (3/4)     0.815      3.30     0.632      7.51     12.45      5.36     13.65     19.72      0.34      1.00     0.819
+zipf T=4 fillwb             (3/4)     0.815      3.48     0.646      8.63     14.57      4.51     11.31     17.06      0.32      1.00     0.813
+zipf T=4 flush              (2/3)     0.758      2.08     0.529     14.33     45.55      5.75     58.51     85.17      0.00      1.00     0.788
+zipf T=4 lmdb               (3/4)     0.849      2.24     0.531     46.64    142.63      6.24     40.96     77.49      0.00      1.00     0.851
+zipf T=4 filedir            (1/3)     0.850      2.93     0.657     35.63     62.84      2.37      8.05     10.50      0.00      1.01     0.850
+zipf+scan T=4 ret           (3/4)     0.685      1.58     0.498     19.88     49.40      5.76     49.43     86.02      0.00      1.00     0.763
+zipf+scan T=4 fill          (2/3)     0.685      1.75     0.493     37.32     63.58      4.43     27.64     45.91      0.00      1.00     0.758
+zipf+scan T=4 wb            (3/3)     0.684      2.07     0.568      7.57     11.62      6.00     15.00     21.68      0.32      1.00     0.768
+zipf+scan T=4 fillwb        (3/3)     0.685      2.40     0.594      9.62     16.24      4.50     11.45     16.83      0.30      1.00     0.761
+zipf+scan T=4 flush         (2/3)     0.641      1.35     0.445     11.31     44.40      5.81     59.32    111.63      0.00      1.00     0.720
+zipf+scan T=4 lmdb          (3/4)     0.726      1.44     0.414     49.43    123.21      7.49     52.67     90.97      0.00      1.00     0.803
+zipf+scan T=4 filedir       (1/3)     0.725      1.82     0.548     35.69     63.34      2.32     35.08     52.21      0.00      1.01     0.809
+zipf T=1 ret                (1/3)     0.815      1.88     0.266      5.44     33.98      1.51     17.10     36.39      0.00      1.00     0.815
+zipf T=1 fill               (2/3)     0.815      1.76     0.271      8.81     48.26      1.45     14.90     34.34      0.00      1.00     0.806
+zipf T=1 wb                 (2/3)     0.815      1.90     0.313      4.00      7.48      1.85      5.29      8.03      0.22      1.00     0.814
+zipf T=1 fillwb             (2/3)     0.815      1.91     0.314      4.26      7.71      1.73      4.60      7.91      0.21      1.00     0.816
+zipf T=1 flush              (2/3)     0.760      1.55     0.272      6.18     37.77      1.47     22.42     51.10      0.00      1.00     0.766
+zipf T=1 lmdb               (2/3)     0.850      1.54     0.252      6.95     61.15      1.76     10.22     28.62      0.00      1.00     0.848
+zipf T=1 filedir            (2/3)     0.851      1.58     0.227     15.72     65.27      1.47      6.31      7.68      0.00      1.01     0.847
+zipf+scan T=1 ret           (2/3)     0.686      1.29     0.283      7.75     43.93      1.39     19.48     43.06      0.00      1.00     0.766
+zipf+scan T=1 fill          (2/3)     0.686      1.21     0.283     14.46     60.99      1.34     14.48     39.89      0.00      1.00     0.760
+zipf+scan T=1 wb            (2/3)     0.686      1.40     0.345      4.33      7.66      1.71      5.19      8.09      0.21      1.00     0.768
+zipf+scan T=1 fillwb        (1/3)     0.686      1.37     0.343      5.08      9.18      1.61      4.56      7.76      0.21      1.00     0.768
+zipf+scan T=1 flush         (1/3)     0.643      1.16     0.280      5.68     37.65      1.37     21.30     47.56      0.00      1.00     0.713
+zipf+scan T=1 lmdb          (1/3)     0.727      1.14     0.261     10.10     91.18      1.62     12.64     37.08      0.00      1.00     0.803
+zipf+scan T=1 filedir       (1/3)     0.727      1.11     0.240     19.73     62.32      1.45      6.31      7.81      0.00      1.01     0.804
+
+criteria against same-day LMDB: A served >= 1.5x; B hit p99 <= 0.5x at served >= 0.9x
+[served range] [hit p99 range] over every clean pairing; worst = least favourable pairing
+T=4 zipf       ret      served 1.07x [0.91-1.12]  hit p99 0.56x [0.54-0.73]  A no   B no   pairings passing 0/6; worst p99 0.73x, worst served 0.91x (fails)
+T=4 zipf       fill     served 1.35x [1.15-1.40]  hit p99 0.52x [0.50-0.67]  A no   B no   pairings passing 0/3; worst p99 0.67x, worst served 1.15x (fails)
+T=4 zipf       wb       served 1.47x [1.14-1.56]  hit p99 0.16x [0.15-0.26]  A no   B yes  pairings passing 9/9; worst p99 0.26x, worst served 1.14x (holds)
+T=4 zipf       fillwb   served 1.55x [1.25-1.63]  hit p99 0.19x [0.18-0.27]  A yes  B yes  pairings passing 9/9; worst p99 0.27x, worst served 1.25x (holds)
+T=4 zipf       flush    served 0.93x [0.69-1.09]  hit p99 0.31x [0.24-0.48]  A no   B yes  pairings passing 2/6; worst p99 0.48x, worst served 0.69x (fails)
+T=4 zipf       filedir  served 1.30x [1.11-1.35]  hit p99 0.76x [0.74-0.99]  A no   B no   pairings passing 0/3; worst p99 0.99x, worst served 1.11x (fails)
+T=4 zipf+scan  ret      served 1.09x [0.99-1.27]  hit p99 0.40x [0.30-0.47]  A no   B yes  pairings passing 9/9; worst p99 0.47x, worst served 0.99x (holds)
+T=4 zipf+scan  fill     served 1.21x [1.18-1.35]  hit p99 0.75x [0.62-0.79]  A no   B no   pairings passing 0/6; worst p99 0.79x, worst served 1.18x (fails)
+T=4 zipf+scan  wb       served 1.43x [1.38-1.65]  hit p99 0.15x [0.12-0.16]  A no   B yes  pairings passing 9/9; worst p99 0.16x, worst served 1.38x (holds)
+T=4 zipf+scan  fillwb   served 1.66x [1.47-1.84]  hit p99 0.19x [0.16-0.33]  A yes  B yes  pairings passing 9/9; worst p99 0.33x, worst served 1.47x (holds)
+T=4 zipf+scan  flush    served 0.94x [0.86-1.10]  hit p99 0.23x [0.18-0.25]  A no   B yes  pairings passing 4/6; worst p99 0.25x, worst served 0.86x (fails)
+T=4 zipf+scan  filedir  served 1.26x [1.23-1.39]  hit p99 0.72x [0.61-0.74]  A no   B no   pairings passing 0/3; worst p99 0.74x, worst served 1.23x (fails)
+T=1 zipf       ret      served 1.22x [1.21-1.23]  hit p99 0.78x [0.75-0.82]  A no   B no   pairings passing 0/2; worst p99 0.82x, worst served 1.21x (fails)
+T=1 zipf       fill     served 1.14x [1.13-1.15]  hit p99 1.27x [1.21-1.33]  A no   B no   pairings passing 0/4; worst p99 1.33x, worst served 1.13x (fails)
+T=1 zipf       wb       served 1.23x [1.22-1.25]  hit p99 0.58x [0.55-0.61]  A no   B no   pairings passing 0/4; worst p99 0.61x, worst served 1.22x (fails)
+T=1 zipf       fillwb   served 1.24x [1.21-1.26]  hit p99 0.61x [0.58-0.65]  A no   B no   pairings passing 0/4; worst p99 0.65x, worst served 1.21x (fails)
+T=1 zipf       flush    served 1.01x [0.99-1.02]  hit p99 0.89x [0.82-0.96]  A no   B no   pairings passing 0/4; worst p99 0.96x, worst served 0.99x (fails)
+T=1 zipf       filedir  served 1.03x [0.93-1.12]  hit p99 2.26x [1.87-2.69]  A no   B no   pairings passing 0/4; worst p99 2.69x, worst served 0.93x (fails)
+T=1 zipf+scan  ret      served 1.14x [1.11-1.16]  hit p99 0.77x [0.76-0.78]  A no   B no   pairings passing 0/2; worst p99 0.78x, worst served 1.11x (fails)
+T=1 zipf+scan  fill     served 1.06x [1.00-1.13]  hit p99 1.43x [1.30-1.56]  A no   B no   pairings passing 0/2; worst p99 1.56x, worst served 1.00x (fails)
+T=1 zipf+scan  wb       served 1.23x [1.23-1.23]  hit p99 0.43x [0.42-0.44]  A no   B yes  pairings passing 2/2; worst p99 0.44x, worst served 1.23x (holds)
+T=1 zipf+scan  fillwb   served 1.20x [1.20-1.20]  hit p99 0.50x [0.50-0.50]  A no   B no   pairings passing 0/1; worst p99 0.50x, worst served 1.20x (fails)
+T=1 zipf+scan  flush    served 1.02x [1.02-1.02]  hit p99 0.56x [0.56-0.56]  A no   B no   pairings passing 0/1; worst p99 0.56x, worst served 1.02x (fails)
+T=1 zipf+scan  filedir  served 0.97x [0.97-0.97]  hit p99 1.95x [1.95-1.95]  A no   B no   pairings passing 0/1; worst p99 1.95x, worst served 0.97x (fails)
+
+verdict per configuration (WIN: both patterns pass at T=4; PARTIAL: a pass at T=1 only or on one pattern only; LOSS: none)
+ret      PARTIAL  T=4 zipf/zipf+scan [False, True]  T=1 [False, False]  T=4 worst pairing holds [False, True]
+fill     LOSS     T=4 zipf/zipf+scan [False, False]  T=1 [False, False]  T=4 worst pairing holds [False, False]
+wb       WIN      T=4 zipf/zipf+scan [True, True]  T=1 [False, True]  T=4 worst pairing holds [True, True]
+fillwb   WIN      T=4 zipf/zipf+scan [True, True]  T=1 [False, False]  T=4 worst pairing holds [True, True]
+flush    WIN      T=4 zipf/zipf+scan [True, True]  T=1 [False, False]  T=4 worst pairing holds [False, False]

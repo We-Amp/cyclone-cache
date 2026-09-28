@@ -63,3 +63,9 @@ insert-tail-samples
 admission-control-.*\.txt
 admission-control-.*\.patch
 admission-control-samples
+
+# Round 7 KV benchmark raw output and summaries
+# (doc/kv-cache-benchmark/round7/), and its per-run sampler files
+# (round7-samples/<run tag>.*).
+round7-.*\.txt
+round7-samples
