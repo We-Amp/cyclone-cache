@@ -32,7 +32,9 @@ jobs:
   build-and-test:
     name: Build & Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # macos-latest builds take 10-27 min depending on the runner, plus ~5 min
+    # of tests, so 30 min cancelled otherwise-green runs mid-test.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:

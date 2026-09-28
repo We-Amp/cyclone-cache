@@ -28,7 +28,8 @@ using namespace cyclone;
 namespace {
 
 // (dev, inode) of every regular file under `dir`.
-std::set<std::pair<dev_t, ino_t>> files_under(const std::filesystem::path& dir) {
+std::set<std::pair<dev_t, ino_t>> files_under(
+    const std::filesystem::path& dir) {
   std::set<std::pair<dev_t, ino_t>> ids;
   for (const auto& entry : std::filesystem::recursive_directory_iterator(dir)) {
     struct stat st{};
