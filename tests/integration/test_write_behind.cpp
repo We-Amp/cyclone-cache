@@ -221,3 +221,26 @@ TEST_CASE("Write-behind: the alternate commit path starts it too",
   REQUIRE(off + len + kPage > new_pos - 8);
   cache->stop();
 }
+
+TEST_CASE("Write-behind: a cache built from the KV-tier preset starts it",
+          "[write_behind][write][kv_preset]") {
+  TempCacheDir tmp("write_behind_kv_preset");
+  CacheConfig cfg = CacheConfig::for_kv_tier();
+  cfg.set_ram_cache_size(0);
+  auto created = Cache::create(cfg);
+  REQUIRE(created.has_value());
+  auto cache = std::move(*created);
+  REQUIRE(cache->add_volume(tmp.path(), 32 * kMiB).has_value());
+  REQUIRE(cache->start().has_value());
+  Recorder rec;
+  const auto big = body(300 * kKiB + 13, 4);
+  const auto small = body(1000, 5);
+  REQUIRE(put(*cache, "big", big));
+  REQUIRE(put(*cache, "small", small));
+  REQUIRE(reads_back(*cache, "big", big));
+  REQUIRE(reads_back(*cache, "small", small));
+  // The large document's write-back was started, the small one's was not.
+  REQUIRE(rec.ranges.size() == 1);
+  REQUIRE(rec.ranges.front().first == rec.slots.front().first);
+  cache->stop();
+}

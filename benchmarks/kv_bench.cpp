@@ -290,8 +290,12 @@ struct Options {
   int64_t cold_readahead_min_bytes = -1;    // -1 = library default
   int64_t sequential_readahead_bytes = -1;  // -1 = library default
   double pause_before_warm = 0.0;           // seconds to sleep before phase 3
+  // Base configuration: false = the library defaults, true =
+  // CacheConfig::for_kv_tier() (--preset kv).  The harness tuning and the
+  // explicit overrides below are applied on top of it.
+  bool kv_preset = false;
   // CacheConfig::fill_large_document_tail / write_behind (unset = the
-  // library default).
+  // base configuration's value).
   std::optional<bool> fill_tail;
   std::optional<bool> write_behind;
   std::string drop_caches_cmd;  // run before phases 2 and 4 (e.g. Linux
@@ -360,8 +364,12 @@ class VolumeFilesGuard {
   const Options &_opts;
 };
 
+CacheConfig base_config(const Options &opts) {
+  return opts.kv_preset ? CacheConfig::for_kv_tier() : CacheConfig{};
+}
+
 CacheConfig make_config(const Options &opts) {
-  CacheConfig config;
+  CacheConfig config = base_config(opts);
   config.ram_cache_size = 0;  // CLFUS is pointless for multi-MB blocks
   config.max_object_size = 0;
   if (opts.readahead_min_bytes >= 0) {
@@ -831,10 +839,14 @@ void print_usage(const char *argv0) {
       << "  --sequential-readahead-bytes N  Override "
          "CacheConfig::sequential_readahead_bytes\n"
       << "                        (0 = no sequential window)\n"
+      << "  --preset default|kv   Base configuration: the library "
+         "defaults, or\n"
+      << "                        CacheConfig::for_kv_tier() (default: "
+         "default)\n"
       << "  --fill-tail on|off    CacheConfig::fill_large_document_tail\n"
-      << "                        (default: the library default)\n"
+      << "                        (default: the preset's value)\n"
       << "  --write-behind on|off CacheConfig::write_behind (default: the\n"
-      << "                        library default)\n"
+      << "                        preset's value)\n"
       << "  --pause-before-warm S Sleep S seconds before phase 3\n"
       << "  --drop-caches-cmd CMD Shell command run before phases 2 and 4\n"
       << "                        (e.g. \"sync; echo 3 > /proc/sys/vm/"
@@ -924,6 +936,14 @@ int main(int argc, char *argv[]) {
       opts.cold_readahead_min_bytes = std::stoll(argv[++i]);
     } else if (arg == "--sequential-readahead-bytes" && i + 1 < argc) {
       opts.sequential_readahead_bytes = std::stoll(argv[++i]);
+    } else if (arg == "--preset" && i + 1 < argc) {
+      const std::string preset = argv[++i];
+      if (preset != "default" && preset != "kv") {
+        std::cerr << "Unknown preset: " << preset << "\n";
+        print_usage(argv[0]);
+        return 2;
+      }
+      opts.kv_preset = preset == "kv";
     } else if (arg == "--fill-tail" && i + 1 < argc) {
       opts.fill_tail = std::string(argv[++i]) == "on";
     } else if (arg == "--write-behind" && i + 1 < argc) {
@@ -967,9 +987,10 @@ int main(int argc, char *argv[]) {
   const bool mmap_dir = !opts.no_mmap_dir;
   const bool verify = mmap_dir ? true : !opts.no_verify;
   const bool fill_tail =
-      opts.fill_tail.value_or(CacheConfig{}.fill_large_document_tail);
+      opts.fill_tail.value_or(base_config(opts).fill_large_document_tail);
   const bool write_behind =
-      opts.write_behind.value_or(CacheConfig{}.write_behind);
+      opts.write_behind.value_or(base_config(opts).write_behind);
+  const char *preset_name = opts.kv_preset ? "kv" : "default";
 
   const MachineInfo machine = collect_machine_info(opts.path);
   std::cerr << "Cyclone KV-cache storage-tier benchmark (workload spec v1)\n"
@@ -984,6 +1005,10 @@ int main(int argc, char *argv[]) {
             << (kCapacityBytes / (1024 * 1024)) << " MiB)\n"
             << "\nCyclone tuning (spec allows store-specific tuning if "
                "printed):\n"
+            << "  preset                  = " << preset_name
+            << (opts.kv_preset ? " (CacheConfig::for_kv_tier())"
+                               : " (library defaults)")
+            << "\n"
             << "  max_object_size         = 0 (unbounded; blocks reach 32 "
                "MiB)\n"
             << "  ram_cache_size          = 0 (the CLFUS RAM tier is "
@@ -1023,7 +1048,7 @@ int main(int argc, char *argv[]) {
             << "\",\"cores\":\"" << machine.cores << "\",\"os\":\""
             << machine.os << "\",\"filesystem\":\"" << machine.filesystem
             << "\",\"version\":\"" << kStoreVersion << "\",\"commit\":\""
-            << machine.commit
+            << machine.commit << "\",\"preset\":\"" << preset_name
             << "\",\"fill_tail\":" << (fill_tail ? "true" : "false")
             << ",\"write_behind\":" << (write_behind ? "true" : "false")
             << "}\n";

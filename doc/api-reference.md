@@ -11,6 +11,7 @@ This document provides detailed API documentation for Cyclone Cache.
   - [WriteHandle](#writehandle)
 - [Configuration](#configuration)
   - [CacheConfig](#cacheconfig)
+  - [KV-Tier Preset](#kv-tier-preset)
   - [VolumeConfig](#volumeconfig)
 - [Plugin System](#plugin-system)
   - [CachePlugin](#cacheplugin)
@@ -728,6 +729,11 @@ struct CacheConfig {
     // CacheStats::write_behind_ranges / write_behind_us.  See
     // doc/design/writer-admission-control.md.
     bool write_behind = false;
+
+    // The recommended configuration for an LLM KV-cache tier: the
+    // defaults with fill_large_document_tail and write_behind on.  Not for
+    // event-loop callers.  See "KV-Tier Preset" below.
+    static CacheConfig for_kv_tier();
 };
 
 enum class RamCacheType {
@@ -1121,6 +1127,66 @@ pays nothing.
 
 Measurements: `doc/kv-cache-benchmark.md`, "Small cold reads (issue #29)".
 
+### KV-Tier Preset
+
+```cpp
+static CacheConfig CacheConfig::for_kv_tier();  // [[nodiscard]]
+```
+
+**The recommended configuration for an LLM KV-cache tier**: large documents
+(hundreds of KiB to tens of MiB) written from worker threads. It returns a
+default-constructed `CacheConfig` with exactly two fields changed:
+
+| Field | Default | `for_kv_tier()` |
+|---|---|---|
+| `fill_large_document_tail` | `false` | `true` |
+| `write_behind` | `false` | `true` |
+
+Every other field keeps its default. In particular wrap retention stays on,
+and the readahead settings (`readahead_min_bytes`,
+`cold_readahead_min_bytes`, `sequential_readahead_bytes`) are unchanged:
+round 7 of the KV benchmark found no reason to change them. Sizing is left
+to the caller: raise `max_object_size` and `stripe_size` for the largest
+block, and consider `ram_cache_size = 0` (see the README, "KV cache for LLM
+inference"). The result is an ordinary `CacheConfig`, so the fluent setters
+compose with it:
+
+```cpp
+CacheConfig config = CacheConfig::for_kv_tier();
+config.set_ram_cache_size(0).set_multi_process(rank, world_size);
+auto cache = Cache::create(config);
+```
+
+**Evidence** ([doc/kv-cache-benchmark.md](kv-cache-benchmark.md), round 7;
+Linux, one NVMe, 2 MiB blocks, a 16 GiB tier in a 4 GiB cgroup, against a
+same-day LMDB). At four threads the hit p99 is about 0.19× LMDB's on both
+access patterns (8.6 and 9.6 ms against 46.6 and 49.4 ms), and served GB/s
+is 1.55× and 1.66× LMDB's. The miss+insert p99 falls from 44–49 ms with the
+defaults to about 11 ms, and at one thread from 17–19 ms to 4.6 ms. The two
+options belong together: the tail fill alone lengthens the hit tail and was
+the round's only loss.
+
+**Costs**, measured in the same round:
+
+- The median hit is 6–22 % slower.
+- Bulk-load throughput (a fresh store filled once, `kv_bench` PUT) is
+  18–31 % lower: a load that fits in the page cache's dirty headroom now
+  pays for its own device writes. A tier under steady churn does not see
+  this.
+- `write_behind` is Linux-only (`sync_file_range`). Elsewhere it does
+  nothing, and the preset then only turns on the fill.
+- The write-back call can block the writing thread while the device queue
+  is full or congested.
+
+**Not for event-loop callers such as nginx.** A blocked write stalls every
+connection on that loop. PageSpeed keeps the library defaults, which this
+preset does not change.
+
+**No C API equivalent.** Neither option is in `CycloneCacheConfig`, so the
+C API has no preset; C callers get the library defaults. `kv_bench` and
+`kv_churn` take `--preset kv` to run with the preset (explicit
+`--fill-tail` / `--write-behind` still override it).
+
 ### Small-Object Tier
 
 Every key-routed `Cache` operation (`read_sync`, `write_sync`, `remove_sync`,
@@ -1404,6 +1470,11 @@ trailing field with the same ABI note as `small_tier_percent`: a caller
 compiled against an older header passes a smaller struct, so recompile
 against the new header when adopting it.  Every process sharing a cache must
 pass the same value (see ["Wrap Retention"](#wrap-retention)).
+
+**No KV-tier preset.** `CacheConfig::for_kv_tier()` has no C equivalent:
+the two fields it sets (`fill_large_document_tail`, `write_behind`) are not
+in `CycloneCacheConfig`, so a C caller always runs with both off (see
+["KV-Tier Preset"](#kv-tier-preset)).
 
 ### Error Codes
 

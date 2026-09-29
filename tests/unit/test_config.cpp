@@ -230,3 +230,99 @@ TEST_CASE("VolumeConfig defaults", "[config]") {
   REQUIRE(vol.max_fragments == 0);
   REQUIRE(vol.ram_cache_proportion == 1.0);
 }
+
+namespace {
+
+// Every CacheConfig field except fill_large_document_tail and write_behind,
+// which the KV-tier preset changes.  A field added to CacheConfig (or to the
+// nested OptimizationConfig / MultiProcessConfig) must be added here, so the
+// preset test keeps covering the whole struct.
+void require_same_except_preset_fields(const CacheConfig &a,
+                                       const CacheConfig &b) {
+  REQUIRE(a.ram_cache_size == b.ram_cache_size);
+  REQUIRE(a.ram_cache_type == b.ram_cache_type);
+  REQUIRE(a.max_mapped_size == b.max_mapped_size);
+  REQUIRE(a.directory_entry_overhead == b.directory_entry_overhead);
+  REQUIRE(a.num_segments == b.num_segments);
+  REQUIRE(a.max_object_size == b.max_object_size);
+  REQUIRE(a.target_frag_size == b.target_frag_size);
+  REQUIRE(a.avg_object_size == b.avg_object_size);
+  REQUIRE(a.bucket_multiplier == b.bucket_multiplier);
+  REQUIRE(a.gc_interval == b.gc_interval);
+  REQUIRE(a.gc_evacuate_threshold == b.gc_evacuate_threshold);
+  REQUIRE(a.enable_checksum == b.enable_checksum);
+  REQUIRE(a.verify_checksum_on_read == b.verify_checksum_on_read);
+  REQUIRE(a.enable_compression == b.enable_compression);
+  REQUIRE(a.io_queue_depth == b.io_queue_depth);
+  REQUIRE(a.readahead_min_bytes == b.readahead_min_bytes);
+  REQUIRE(a.cold_readahead_min_bytes == b.cold_readahead_min_bytes);
+  REQUIRE(a.sequential_readahead_bytes == b.sequential_readahead_bytes);
+  REQUIRE(a.hit_flush_interval == b.hit_flush_interval);
+  REQUIRE(a.hit_flush_threshold == b.hit_flush_threshold);
+  REQUIRE(a.enable_hit_tracking == b.enable_hit_tracking);
+  REQUIRE(a.small_tier_percent == b.small_tier_percent);
+  REQUIRE(a.gc_superseded_on_start == b.gc_superseded_on_start);
+  REQUIRE(a.unlink_superseded_alternates == b.unlink_superseded_alternates);
+  REQUIRE(a.wrap_retention == b.wrap_retention);
+  REQUIRE(a.cross_process_ram_coherence == b.cross_process_ram_coherence);
+  REQUIRE(a.directory_sync_interval == b.directory_sync_interval);
+  REQUIRE(a.read_lease_duration == b.read_lease_duration);
+  REQUIRE(a.lease_wrap_ceiling == b.lease_wrap_ceiling);
+  REQUIRE(a.alternate_selector == b.alternate_selector);
+
+  const OptimizationConfig &oa = a.optimization_config;
+  const OptimizationConfig &ob = b.optimization_config;
+  REQUIRE(oa.min_threads == ob.min_threads);
+  REQUIRE(oa.max_threads == ob.max_threads);
+  REQUIRE(oa.scale_up_threshold == ob.scale_up_threshold);
+  REQUIRE(oa.scale_down_threshold == ob.scale_down_threshold);
+  REQUIRE(oa.scale_check_interval == ob.scale_check_interval);
+  REQUIRE(oa.max_cpu_usage == ob.max_cpu_usage);
+  REQUIRE(oa.max_io_bandwidth_fraction == ob.max_io_bandwidth_fraction);
+  REQUIRE(oa.max_queue_size == ob.max_queue_size);
+  REQUIRE(oa.max_memory_bytes == ob.max_memory_bytes);
+  REQUIRE(oa.load_high_watermark == ob.load_high_watermark);
+  REQUIRE(oa.load_low_watermark == ob.load_low_watermark);
+  REQUIRE(oa.load_shedding_cooldown == ob.load_shedding_cooldown);
+  REQUIRE(oa.baseline_ops_per_sec == ob.baseline_ops_per_sec);
+  REQUIRE(oa.baseline_bytes_per_sec == ob.baseline_bytes_per_sec);
+  REQUIRE(oa.prioritize_by_hit_count == ob.prioritize_by_hit_count);
+  REQUIRE(oa.min_hits_before_optimize == ob.min_hits_before_optimize);
+  REQUIRE(oa.enabled == ob.enabled);
+
+  const MultiProcessConfig &ma = a.multi_process_config;
+  const MultiProcessConfig &mb = b.multi_process_config;
+  REQUIRE(ma.enabled == mb.enabled);
+  REQUIRE(ma.process_index == mb.process_index);
+  REQUIRE(ma.total_processes == mb.total_processes);
+  REQUIRE(ma.max_read_retries == mb.max_read_retries);
+}
+
+}  // namespace
+
+TEST_CASE("CacheConfig::for_kv_tier sets exactly the documented fields",
+          "[config][kv_preset]") {
+  const CacheConfig defaults;
+  const CacheConfig kv = CacheConfig::for_kv_tier();
+
+  // The two fields the preset documents, on...
+  REQUIRE(kv.fill_large_document_tail);
+  REQUIRE(kv.write_behind);
+  // ...and off in the library defaults, which the preset does not change.
+  REQUIRE_FALSE(defaults.fill_large_document_tail);
+  REQUIRE_FALSE(defaults.write_behind);
+
+  // Everything else is the library default, wrap retention and the
+  // readahead settings included.
+  require_same_except_preset_fields(kv, defaults);
+  REQUIRE(kv.wrap_retention == detail::default_wrap_retention());
+}
+
+TEST_CASE("CacheConfig::for_kv_tier composes with the fluent setters",
+          "[config][kv_preset]") {
+  CacheConfig kv = CacheConfig::for_kv_tier();
+  kv.set_ram_cache_size(0).set_write_behind(false);
+  REQUIRE(kv.ram_cache_size == 0);
+  REQUIRE_FALSE(kv.write_behind);
+  REQUIRE(kv.fill_large_document_tail);
+}

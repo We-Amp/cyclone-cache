@@ -256,11 +256,12 @@ faster than LMDB, and under churn serves 1.07–1.22× what LMDB with an LRU
 serves, at one thread and at four. With the defaults, a bounded tier meets
 the benchmark's pre-registered bar against LMDB on scan-polluted Zipf
 (hit-latency tail 0.40× LMDB's at four threads) but not on plain Zipf
-(0.56× against the 0.5× bar). **With `write_behind` and
-`fill_large_document_tail` on** (both opt-in, Linux), it meets the bar on
-both patterns: hit p99 0.19× LMDB's while serving 1.55–1.66× as much, and a
-one-thread insert p99 of 4.6 ms against 10 ms for LMDB. The cost is a 6–22 %
-slower median hit and lower bulk-load throughput (round 7 of the
+(0.56× against the 0.5× bar). **With the KV-tier preset,
+`CacheConfig::for_kv_tier()`** (`write_behind` and
+`fill_large_document_tail` on; Linux), it meets the bar on both patterns:
+hit p99 0.19× LMDB's while serving 1.55–1.66× as much, and a one-thread
+insert p99 of 4.6 ms against 10 ms for LMDB. The cost is a 6–22 % slower
+median hit and 18–31 % lower bulk-load throughput (round 7 of the
 benchmark). It is not a general LMDB replacement: warm reads are in the
 same class, and writes match file-per-block at 512 KiB–2 MiB (about 1.5
 GB/s per thread) but trail it at 8–32 MiB.
@@ -296,6 +297,12 @@ GB/s per thread) but trail it at 8–32 MiB.
   policy stays in your connector.
 
 ```cpp
+// The recommended KV configuration: the preset, plus your sizing.
+CacheConfig config = CacheConfig::for_kv_tier();
+config.set_ram_cache_size(0);        // the OS page cache is the RAM tier
+config.max_object_size = 0;          // or your largest block
+auto cache = std::move(*Cache::create(config));
+
 // prefix_digest: your 32-byte hash over the token prefix (full or chunked)
 CacheKey key = CacheKey::from_digest(prefix_digest);
 
@@ -322,13 +329,24 @@ has no GPU-direct or RDMA path, and ships no Python bindings today. Write
 bandwidth at 2 MiB is about 1.5 GB/s per thread on Linux/NVMe (`kv_bench`:
 1.47 GB/s, against 1.52 for one file per block, same day). A producer that generates
 the blob itself can fill `w->reserve(n)` in place instead of calling
-`write_sync()`, which saves one copy of it. A KV tier that writes from
-worker threads under churn should consider `config.write_behind = true`
-together with `config.fill_large_document_tail = true` (C++ API, Linux):
-in the benchmark's churn runs they cut the four-thread hit p99 by 52–67 %
-and the insert p99 by about three quarters. Leave them off where writes
-run on an event loop: the write-back call can block while the device queue
-is full.
+`write_sync()`, which saves one copy of it.
+
+**Recommended KV configuration: start from `CacheConfig::for_kv_tier()`.**
+It returns the library defaults with exactly two fields changed,
+`fill_large_document_tail` and `write_behind`, as round 7 of the benchmark
+recommends; wrap retention and the readahead settings keep their defaults,
+and sizing (`ram_cache_size`, `max_object_size`, `stripe_size`) stays
+yours. In the benchmark's churn runs (Linux, 2 MiB blocks, four threads)
+it cut the hit p99 by 52–67 % and the insert p99 by about three quarters
+against the defaults, and served 1.55–1.66× what LMDB served. Costs: a
+6–22 % slower median hit; 18–31 % lower bulk-load throughput for a store
+filled once from empty; `write_behind` is Linux-only (a no-op elsewhere,
+where the preset only turns on the fill); and the write-back call can
+block the writing thread while the device is congested. **It is not for
+event-loop callers such as nginx**: use it only where writes run on worker
+threads. The library defaults do not change, and the preset is C++ only:
+neither option is in the C API, so there is no C equivalent. `kv_bench`
+and `kv_churn` take `--preset kv` to run with it.
 
 ## Concepts
 
@@ -537,6 +555,7 @@ struct CacheConfig {
   // Both hints run only on checksum-verifying reads: with verify_checksum_on_read = false, small cold reads stay unhinted.
   bool         fill_large_document_tail = false;  // opt-in: zero-fill a >64 KiB doc's last page (insert p99 vs read tail)
   bool         write_behind = false;              // opt-in: start write-back of each >64 KiB doc after its commit (Linux)
+  static CacheConfig for_kv_tier();               // KV preset: the defaults with both options above on (worker-thread writers only)
   std::chrono::milliseconds directory_sync_interval{30000};  // multi-process durability cadence
   std::chrono::milliseconds read_lease_duration{5000};       // 0 disables leases
   std::chrono::milliseconds lease_wrap_ceiling{60000};

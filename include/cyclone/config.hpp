@@ -586,6 +586,49 @@ struct CacheConfig {
   // Multi-process configuration
   MultiProcessConfig multi_process_config;
 
+  // Preset for an LLM KV-cache tier: large documents (hundreds of KiB to
+  // tens of MiB) written from worker threads.  Returns the library defaults
+  // with exactly two fields changed:
+  //
+  //   fill_large_document_tail = true
+  //   write_behind             = true
+  //
+  // Everything else keeps its default, including wrap_retention (on) and
+  // every readahead setting; round 7 found no reason to change them.
+  // Sizing stays the caller's: raise max_object_size and stripe_size for the
+  // largest block, and consider ram_cache_size = 0 (README, "KV cache for
+  // LLM inference").  The library defaults themselves are unchanged, and
+  // the C API has no equivalent (neither option is in it).
+  //
+  // Evidence (doc/kv-cache-benchmark.md, round 7; Linux, one NVMe, 2 MiB
+  // blocks, a 16 GiB tier in a 4 GiB cgroup, same-day LMDB): at four
+  // threads the hit p99 is about 0.19x LMDB's on both access patterns
+  // (8.6 / 9.6 ms against 46.6 / 49.4 ms), served GB/s is 1.55x and 1.66x
+  // LMDB's, and the miss+insert p99 falls from 44-49 ms (defaults) to about
+  // 11 ms.  At one thread the insert p99 falls from 17-19 ms to 4.6 ms.
+  // The two options must go together: the tail fill alone lengthens the
+  // hit tail and was round 7's only loss.
+  //
+  // Costs, measured in the same round:
+  //   - The median hit is 6-22 % slower.
+  //   - Bulk-load throughput (a fresh store filled once, kv_bench PUT) is
+  //     18-31 % lower: a load that fits in the page cache's dirty headroom
+  //     now pays for its own device writes.
+  //   - write_behind is Linux-only (sync_file_range); elsewhere it does
+  //     nothing, and the preset then only turns on the fill.
+  //   - The write-back call can block the writing thread while the device
+  //     queue is full or congested.
+  //
+  // NOT for event-loop callers such as nginx: a blocked write stalls every
+  // connection on that loop.  Use it only where writes run on worker
+  // threads.  PageSpeed keeps the library defaults.
+  [[nodiscard]] static CacheConfig for_kv_tier() {
+    CacheConfig config;
+    config.fill_large_document_tail = true;
+    config.write_behind = true;
+    return config;
+  }
+
   CacheConfig &set_ram_cache_size(size_t size) {
     ram_cache_size = size;
     return *this;
