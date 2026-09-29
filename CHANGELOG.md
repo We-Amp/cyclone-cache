@@ -7,6 +7,22 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `CacheConfig::for_kv_tier()`: a static factory returning the recommended
+  configuration for an LLM KV-cache tier, as round 7 of the KV benchmark
+  recommends. It is a default `CacheConfig` with exactly
+  `fill_large_document_tail` and `write_behind` turned on; wrap retention,
+  the readahead settings and every other field keep their defaults, and
+  sizing stays the caller's. Measured in round 7 (Linux, 2 MiB churn, four
+  threads, same-day LMDB): hit p99 about 0.19× LMDB's on both patterns,
+  served 1.55–1.66× LMDB's. Costs: hit p50 +6–22 %, bulk-load PUT
+  throughput −18–31 %, `write_behind` Linux-only (a no-op elsewhere), and
+  the write-back call can block the writer under device congestion. Not for
+  event-loop callers such as nginx. Library defaults are unchanged,
+  PageSpeed is unaffected, and there is no C API equivalent (neither option
+  is in the C API). `kv_bench` and `kv_churn` gained `--preset default|kv`
+  (the explicit `--fill-tail` / `--write-behind` flags still override it),
+  and record the preset in their JSON output (`preset` / `cy_preset`). See
+  doc/api-reference.md, "KV-Tier Preset".
 - `CacheConfig::write_behind` (and `VolumeConfig::write_behind`, fluent
   `set_write_behind()`), opt-in, default off (issue #43). When on, after a
   document above 64 KiB is committed, the writing thread starts the

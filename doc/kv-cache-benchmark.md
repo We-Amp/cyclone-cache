@@ -104,6 +104,8 @@ In more detail:
   recommends both options for KV-style writers on worker threads, as a KV
   preset rather than a library-wide default
   ([recommendation](#recommendation-which-options-should-default-on-for-kv-use)).
+  That preset is now `CacheConfig::for_kv_tier()` (`kv_bench` /
+  `kv_churn --preset kv`); the library defaults are unchanged.
   PageSpeed keeps both off: its nginx writes are inline on the event loop.
 - **The one-thread insert tail is explained**
   ([round 6](#the-one-thread-insert-tail-24-ms-p99)): an ext4

@@ -125,9 +125,14 @@ struct Options {
   // as the store allows.  Lets two trees be compared at the same
   // offered load, so a latency difference is not just a throughput one.
   double ops_per_second = 0.0;
-  // CacheConfig::fill_large_document_tail (unset = the library default).
+  // Base configuration: false = the library defaults, true =
+  // CacheConfig::for_kv_tier() (--preset kv).  The harness tuning and the
+  // explicit overrides are applied on top of it.
+  bool kv_preset = false;
+  // CacheConfig::fill_large_document_tail (unset = the base configuration's
+  // value).
   std::optional<bool> fill_tail;
-  // CacheConfig::write_behind (unset = the library default).
+  // CacheConfig::write_behind (unset = the base configuration's value).
   std::optional<bool> write_behind;
 };
 
@@ -363,8 +368,12 @@ class VolumeFilesGuard {
   const Options& _opts;
 };
 
+CacheConfig base_config(const Options& opts) {
+  return opts.kv_preset ? CacheConfig::for_kv_tier() : CacheConfig{};
+}
+
 std::unique_ptr<Cache> open_store(const Options& opts) {
-  CacheConfig config;
+  CacheConfig config = base_config(opts);
   config.ram_cache_size = 0;
   config.max_object_size = 0;
   config.enable_checksum = true;
@@ -644,10 +653,14 @@ void usage(const char* argv0) {
                "(generate in place)\n"
             << "  --ops-per-second R      pace each thread's measured phase at "
                "R ops/s (default: closed loop)\n"
+            << "  --preset default|kv     base configuration: the library "
+               "defaults, or\n"
+            << "                          CacheConfig::for_kv_tier() "
+               "(default: default)\n"
             << "  --fill-tail on|off      fill_large_document_tail (default: "
-               "the library default)\n"
-            << "  --write-behind on|off   write_behind (default: the library "
-               "default)\n"
+               "the preset's value)\n"
+            << "  --write-behind on|off   write_behind (default: the preset's "
+               "value)\n"
             << "  --print-vectors         print the stream heads and exit\n";
 }
 
@@ -719,6 +732,10 @@ int main(int argc, char* argv[]) {
     } else if (a == "--ops-per-second" && has) {
       args_ok = parse_double(argv[++i], opts.ops_per_second) &&
                 opts.ops_per_second >= 0;
+    } else if (a == "--preset" && has) {
+      const std::string preset = argv[++i];
+      args_ok = preset == "default" || preset == "kv";
+      opts.kv_preset = preset == "kv";
     } else if (a == "--fill-tail" && has) {
       opts.fill_tail = std::string(argv[++i]) == "on";
     } else if (a == "--write-behind" && has) {
@@ -793,32 +810,41 @@ int main(int argc, char* argv[]) {
   }
   const uint64_t data_area =
       geo.stripe_bytes - geo.stripe_count * dir_bytes_per_stripe();
-  std::cerr << "Cyclone tuning:\n"
-            << "  volume size             = " << volume_size_for(opts.capacity)
-            << " B, " << geo.stripe_count << " stripes, "
-            << dir_bytes_per_stripe() << " B mmap directory each ("
-            << kDirBucketsPerStripe * MmapDirectory::kEntriesPerBucket
-            << " entries/stripe)\n"
-            << "  usable data area        = " << data_area << " B ("
-            << fixed(static_cast<double>(data_area) /
-                         static_cast<double>(opts.capacity),
-                     4)
-            << " x C), ~"
-            << data_area / geo.stripe_count / (opts.block_size + 256)
-            << " blocks/stripe\n"
-            << "  mmap directory ON, checksum ON + verify on read, readahead "
-               "default, max_object_size 0, ram_cache_size 0, sync_on_write "
-               "false, hit tracking/optimization/dir sync off\n"
-            << "  eviction                = FIFO by stripe wrap (no app "
-               "index), wrap retention "
-            << ((opts.wrap_retention ? *opts.wrap_retention
-                                     : kDefaultWrapRetention)
-                    ? "ON"
-                    : "OFF")
-            << "\n  insert                  = "
-            << (opts.reserve ? "WriteHandle::reserve() + generate in place"
-                             : "write_sync() of a generated block")
-            << "\n";
+  std::cerr
+      << "Cyclone tuning:\n"
+      << "  volume size             = " << volume_size_for(opts.capacity)
+      << " B, " << geo.stripe_count << " stripes, " << dir_bytes_per_stripe()
+      << " B mmap directory each ("
+      << kDirBucketsPerStripe * MmapDirectory::kEntriesPerBucket
+      << " entries/stripe)\n"
+      << "  usable data area        = " << data_area << " B ("
+      << fixed(static_cast<double>(data_area) /
+                   static_cast<double>(opts.capacity),
+               4)
+      << " x C), ~" << data_area / geo.stripe_count / (opts.block_size + 256)
+      << " blocks/stripe\n"
+      << "  mmap directory ON, checksum ON + verify on read, readahead "
+         "default, max_object_size 0, ram_cache_size 0, sync_on_write "
+         "false, hit tracking/optimization/dir sync off\n"
+      << "  eviction                = FIFO by stripe wrap (no app "
+         "index), wrap retention "
+      << ((opts.wrap_retention ? *opts.wrap_retention : kDefaultWrapRetention)
+              ? "ON"
+              : "OFF")
+      << "\n  insert                  = "
+      << (opts.reserve ? "WriteHandle::reserve() + generate in place"
+                       : "write_sync() of a generated block")
+      << "\n  preset                  = "
+      << (opts.kv_preset ? "kv (CacheConfig::for_kv_tier())"
+                         : "default (library defaults)")
+      << ", fill_large_document_tail "
+      << (opts.fill_tail.value_or(base_config(opts).fill_large_document_tail)
+              ? "ON"
+              : "OFF")
+      << ", write_behind "
+      << (opts.write_behind.value_or(base_config(opts).write_behind) ? "ON"
+                                                                     : "OFF")
+      << "\n";
 
   // Warm-up + measured phase.
   Shared shared;
@@ -970,13 +996,14 @@ int main(int argc, char* argv[]) {
     << ",\"cy_tag_collision_evictions_total\":" << st1.tag_collision_evictions
     << ",\"cy_entries_total\":" << st1.current_entries
     << ",\"cy_readahead_hints\":" << st1.readahead_hints_issued
+    << ",\"cy_preset\":\"" << (opts.kv_preset ? "kv" : "default") << "\""
     << ",\"cy_fill_tail\":"
-    << (opts.fill_tail.value_or(CacheConfig{}.fill_large_document_tail)
+    << (opts.fill_tail.value_or(base_config(opts).fill_large_document_tail)
             ? "true"
             : "false")
     << ",\"cy_write_behind\":"
-    << (opts.write_behind.value_or(CacheConfig{}.write_behind) ? "true"
-                                                               : "false")
+    << (opts.write_behind.value_or(base_config(opts).write_behind) ? "true"
+                                                                   : "false")
     << ",\"cy_write_behind_ranges\":"
     << (st1.write_behind_ranges - st0.write_behind_ranges)
     << ",\"cy_write_behind_us\":" << (st1.write_behind_us - st0.write_behind_us)
