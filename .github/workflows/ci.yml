@@ -41,10 +41,124 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v5
+      # Compiler cache: ccache on all three platforms, persisted with
+      # actions/cache.  CMake reads the CMAKE_<LANG>_COMPILER_LAUNCHER and
+      # CMAKE_GENERATOR environment variables set below, so the Configure
+      # command itself is unchanged.  Windows builds with Ninja Multi-Config
+      # (the Visual Studio generator ignores compiler launchers) and the same
+      # MSVC toolset the VS generator would pick; the multi-config generator
+      # keeps the build/Release/ output layout the Test step expects.
+      - name: Install ccache (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends ccache
+      - name: Install ccache (macOS)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: brew install ccache
+      - name: Install ccache and set up MSVC + Ninja (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install ccache --no-progress -y | Out-Null
+          # The launcher must be the real ccache.exe, not the chocolatey shim.
+          $ccache = Get-ChildItem -Recurse -Filter ccache.exe `
+            "$env:ChocolateyInstall\lib\ccache" | Select-Object -First 1
+          # Import the vcvars64 environment of the newest Visual Studio (the
+          # one the VS generator selects).  New PATH entries are APPENDED so
+          # the runner's own cmake keeps precedence over the VS-bundled one.
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
+            -latest -products * -property installationPath `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64
+          $old = @{}
+          Get-ChildItem env: | ForEach-Object { $old[$_.Name] = $_.Value }
+          $oldPath = $env:PATH -split ';'
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set" |
+            ForEach-Object {
+              if ($_ -notmatch '^([^=]+)=(.*)$') { return }
+              $name = $Matches[1]; $value = $Matches[2]
+              if ($name -eq 'PATH' -or $name -eq 'Path') {
+                $add = ($value -split ';') | Where-Object { $_ -and ($oldPath -notcontains $_) }
+                $value = (@($env:PATH) + $add) -join ';'
+                $name = 'PATH'
+              } elseif ($old[$name] -eq $value) { return }
+              "$name=$value" >> $env:GITHUB_ENV
+            }
+          @(
+            'CMAKE_GENERATOR=Ninja Multi-Config'
+            'CC=cl'
+            'CXX=cl'
+            "CCACHE_EXE=$($ccache.FullName -replace '\\', '/')"
+          ) >> $env:GITHUB_ENV
+      - name: Configure ccache
+        id: ccache
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            exe=$CCACHE_EXE
+            compiler=$(cl 2>&1 | head -n1 || true)
+          else
+            exe=$(command -v ccache)
+            compiler=$(c++ --version | head -n1 || true)
+            # Cross-image safety on Linux/macOS: hash the compiler's version
+            # output, not the mtime of the /usr/bin/c++ shim.
+            echo "CCACHE_COMPILERCHECK=%compiler% --version" >> "$GITHUB_ENV"
+          fi
+          echo "compiler: $compiler"
+          echo "compiler-id=$(printf '%s' "$compiler" | git hash-object --stdin | cut -c1-12)" >> "$GITHUB_OUTPUT"
+          {
+            echo "CMAKE_C_COMPILER_LAUNCHER=$exe"
+            echo "CMAKE_CXX_COMPILER_LAUNCHER=$exe"
+            echo "CMAKE_OBJCXX_COMPILER_LAUNCHER=$exe"
+            echo "CCACHE_DIR=${{ runner.temp }}/ccache"
+            # Rewrite absolute paths under the workspace (sources, build/,
+            # the FetchContent Catch2 tree) to relative ones, and keep the
+            # cwd out of the hash, so hits do not depend on the checkout path.
+            echo "CCACHE_BASEDIR=${{ github.workspace }}"
+            echo "CCACHE_NOHASHDIR=1"
+            # A fresh checkout stamps every file "now"; without this, ccache
+            # distrusts headers whose mtime/ctime is too recent.
+            echo "CCACHE_SLOPPINESS=include_file_ctime,include_file_mtime"
+            echo "CCACHE_COMPRESS=1"
+            echo "CCACHE_COMPRESSLEVEL=3"
+            # A full build is ~220 objects, 8-18 MB compressed depending on
+            # the OS; 100 MB keeps several generations per OS while each
+            # saved entry stays small against the repo's 10 GB cache quota.
+            echo "CCACHE_MAXSIZE=100M"
+          } >> "$GITHUB_ENV"
+      - name: Restore compiler cache
+        id: ccache-restore
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-${{ runner.os }}-${{ runner.arch }}-${{ steps.ccache.outputs.compiler-id }}-Release-${{ hashFiles('CMakeLists.txt') }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ runner.arch }}-${{ steps.ccache.outputs.compiler-id }}-Release-${{ hashFiles('CMakeLists.txt') }}-
+            ccache-${{ runner.os }}-${{ runner.arch }}-${{ steps.ccache.outputs.compiler-id }}-Release-
       - name: Configure
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCYCLONE_USE_BUNDLED_SHA256=ON
       - name: Build
-        run: cmake --build build --config Release -j
+        shell: bash
+        run: |
+          "$CMAKE_CXX_COMPILER_LAUNCHER" --zero-stats > /dev/null
+          rc=0
+          cmake --build build --config Release -j || rc=$?
+          "$CMAKE_CXX_COMPILER_LAUNCHER" --show-stats --verbose
+          exit "$rc"
+      # Saved right after the build (not in a post step) so a failing Test
+      # step still persists the objects.  The key carries the commit, so an
+      # exact hit (a rerun) has nothing new to save.
+      - name: Save compiler cache
+        if: >-
+          !cancelled() && steps.ccache-restore.outcome == 'success' &&
+          steps.ccache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ${{ steps.ccache-restore.outputs.cache-primary-key }}
       # Self-diagnosis (issue #38): the Test step prints the binary's exit
       # code, turns each Catch2 failure into a job annotation (so the failing
       # assertion shows on the run summary, not only deep in the log), and on
