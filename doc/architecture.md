@@ -604,11 +604,38 @@ implements HTTP-aware Vary/variant selection, exposed via `Cache::open_read_http
 ### Background Optimization Engine
 
 `optimization/optimization_engine.hpp` (`OptimizationEngine`) re-optimizes cached content in the
-background (fed by `on_write_complete`) through `OptimizationPlugin`s, using a
+background (fed by `on_write_complete`; the write path does not call it today,
+issue #52) through `OptimizationPlugin`s, using a
 priority `WorkQueue`, an autoscaling `AdaptiveThreadPool`, and a `LoadMonitor`
 for load-shedding. Its two-phase stop (`request_stop` / `join_threads`) lets its
 workers — which re-enter `Cache::read_sync` — be joined *outside* the teardown
 gate.
+
+### Process exit with open caches
+
+A process may exit with `Cache` objects still open (an embedder that never
+calls `Cache::stop()` / `cyclone_cache_destroy`). Every thread a started
+`Cache` owns — the `DirectorySyncer`, the `HitTracker` flush thread, the
+`OptimizationEngine` monitor and its pool workers — is a cooperative loop over
+heap objects that are never destroyed in that scenario, so no join and no
+destructor runs under it; `exit()` runs static destructors beside them and the
+OS reaps them. The one process-wide static a writer thread can reach, the
+liveness mutex (`liveness_mutex()` in `mmap_directory.cpp`, taken on a
+write-lock holder stalled past 50 ms), is immortal for that reason: Apple's
+libc++ `~mutex` calls `pthread_mutex_destroy`, and locking the destroyed mutex
+terminated the process. On Windows the same path is safe twice over: with
+Cyclone in a DLL, `ExitProcess` terminates the other threads before
+`DLL_PROCESS_DETACH` runs the DLL's static destructors; in a statically linked
+executable the UCRT's `exit()` runs the executable's static destructors with
+the other threads alive, and there the safety rests on MSVC's `~mutex` being a
+no-op in release builds (as glibc's is). Nothing is `detach()`ed, and
+`Executor::global()` — the only legitimate `leak_thread_on_shutdown` caller
+(`thread_util.hpp`) — has no caller. The guarantee covers Cyclone's own statics
+only: an embedder-owned object that a Cache thread can reach (a plugin, a
+callback's context) and that the embedder destroys at exit is the embedder's
+to sequence. What such an exit forgoes is the final hit-count flush and
+directory sync that `stop()` performs; the periodic ones have run. Pinned by
+`tests/integration/test_exit_with_open_cache.cpp`.
 
 ## Concurrency Model
 

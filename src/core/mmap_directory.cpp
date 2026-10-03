@@ -393,9 +393,20 @@ std::atomic<uint32_t> g_fork_epoch{0};
 // takes.  It is taken only on cold paths (claims, and probes after 50 ms
 // behind one holder), so sharing it between volumes costs nothing on the
 // hot path.
+//
+// Immortal: allocated once and never destroyed.  A process may exit with
+// Cache objects still open (an embedder that never calls
+// cyclone_cache_destroy), and then exit() runs static destructors while the
+// caches' writer threads are still alive; on a holder stalled past 50 ms one
+// of them probes through this mutex.  With a function-local std::mutex that
+// probe would lock a destroyed mutex: a no-op where ~mutex is trivial (glibc,
+// MSVC) but EINVAL -> std::system_error -> std::terminate on Apple's libc++,
+// whose ~mutex calls pthread_mutex_destroy.  The fork handlers below reach it
+// the same way.  Costs 64 bytes for the process lifetime, reachable, so not a
+// leak.  Regression: tests/integration/test_exit_with_open_cache.cpp.
 std::mutex &liveness_mutex() {
-  static std::mutex mu;
-  return mu;
+  static auto *const mu = new std::mutex;
+  return *mu;
 }
 
 #if !defined(_WIN32)

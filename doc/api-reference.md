@@ -1535,6 +1535,12 @@ CycloneError cyclone_cache_create(const CycloneCacheConfig *config,
 void cyclone_cache_destroy(CycloneCacheHandle *cache);
 ```
 
+A process may exit without calling `cyclone_cache_destroy`: the cache's
+background threads are safe to leave running through `exit()` / return from
+`main` (see "Process exit with open caches" in doc/architecture.md). Such an
+exit forgoes the final hit-count flush and directory sync that destroy
+performs; the periodic ones have run.
+
 #### Synchronous Operations
 
 ```c

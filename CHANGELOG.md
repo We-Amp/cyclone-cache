@@ -291,6 +291,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- A process may exit with `cyclone::Cache` objects still open (an embedder
+  that never calls `cyclone_cache_destroy`). The process-wide liveness mutex
+  (`liveness_mutex()` in `src/core/mmap_directory.cpp`) is now immortal: a
+  writer waiting on the cross-process write lock at exit locked it after its
+  static destructor had run, which terminated the process on Apple's libc++.
+  The rest of that exit path was audited safe; see "Process exit with open
+  caches" in doc/architecture.md and the new regression
+  `tests/integration/test_exit_with_open_cache.cpp`.
+
 - Every descriptor Cyclone opens on its cache files is now close-on-exec
   (`O_CLOEXEC`; `_O_NOINHERIT` on Windows CRT opens). A child the
   application exec's (for example a fetcher helper) no longer inherits the

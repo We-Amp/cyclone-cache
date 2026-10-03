@@ -23,6 +23,7 @@
 #define CYCLONE_TESTS_SUPPORT_SPAWNED_PEER_HPP
 
 #include <chrono>
+#include <cstring>
 #include <optional>
 #include <string>
 #include <vector>
@@ -48,6 +49,35 @@
 extern char** environ;
 #endif
 
+// True when `entry` ("NAME=value", `len` bytes) names a variable that one of
+// `extra_env`'s entries redefines.  A name is the text before the first '=';
+// an entry without one never matches.  Names compare case-insensitively on
+// Windows, where the environment is (an inherited "path=" is the same
+// variable as "PATH="), and exactly elsewhere.
+inline bool spawn_env_redefined(const char* entry, size_t len,
+                                const std::vector<std::string>& extra_env) {
+  const char* eq = static_cast<const char*>(std::memchr(entry, '=', len));
+  if (eq == nullptr) {
+    return false;
+  }
+  const size_t name_len = static_cast<size_t>(eq - entry) + 1;  // incl. '='
+  for (const auto& kv : extra_env) {
+    if (kv.size() < name_len) {
+      continue;
+    }
+#ifdef _WIN32
+    if (_strnicmp(kv.data(), entry, name_len) == 0) {
+      return true;
+    }
+#else
+    if (std::memcmp(kv.data(), entry, name_len) == 0) {
+      return true;
+    }
+#endif
+  }
+  return false;
+}
+
 class SpawnedPeer {
  public:
   SpawnedPeer() = default;
@@ -59,8 +89,14 @@ class SpawnedPeer {
   SpawnedPeer& operator=(SpawnedPeer&&) = delete;
 
   // Launch `exe` with `args` (argv[1..]); stdin/stdout wired to our pipes,
-  // stderr inherited so peer diagnostics land in the test log.
-  bool spawn(const std::string& exe, const std::vector<std::string>& args);
+  // stderr inherited so peer diagnostics land in the test log.  The child
+  // gets this process's environment with `extra_env` ("NAME=value" entries)
+  // REPLACING any inherited variable of the same name: the inherited entry
+  // is dropped, not shadowed.  Appending a duplicate would not override --
+  // getenv (macOS, glibc, UCRT) and the sanitizer runtimes' own environment
+  // readers all take the FIRST match.
+  bool spawn(const std::string& exe, const std::vector<std::string>& args,
+             const std::vector<std::string>& extra_env = {});
 
   // Read one status line ("READY" / "ERR ...") from the child's stdout.
   // Robust to partial writes: accumulates until '\n' (a trailing '\r' from a
@@ -100,7 +136,8 @@ class SpawnedPeer {
 #ifdef _WIN32
 
 inline bool SpawnedPeer::spawn(const std::string& exe,
-                               const std::vector<std::string>& args) {
+                               const std::vector<std::string>& args,
+                               const std::vector<std::string>& extra_env) {
   SECURITY_ATTRIBUTES sa{};
   sa.nLength = sizeof(sa);
   sa.bInheritHandle = TRUE;
@@ -138,10 +175,35 @@ inline bool SpawnedPeer::spawn(const std::string& exe,
   std::vector<char> cmdbuf(cmd.begin(), cmd.end());
   cmdbuf.push_back('\0');
 
+  // Environment block: a copy of ours (CreateProcess takes the whole block
+  // or nothing) minus the names extra_env redefines, then extra_env;
+  // "NAME=value\0" entries, "\0"-ended.  If our block cannot be read, the
+  // child inherits the environment unchanged (lpEnvironment = nullptr)
+  // rather than launching with only the extras and no SystemRoot or PATH.
+  std::vector<char> envbuf;
+  if (!extra_env.empty()) {
+    if (LPCH ours = GetEnvironmentStringsA(); ours != nullptr) {
+      for (const char* p = ours; *p != '\0';) {
+        const size_t len = std::strlen(p);
+        if (!spawn_env_redefined(p, len, extra_env)) {
+          envbuf.insert(envbuf.end(), p, p + len + 1);
+        }
+        p += len + 1;
+      }
+      FreeEnvironmentStringsA(ours);
+      for (const auto& kv : extra_env) {
+        envbuf.insert(envbuf.end(), kv.begin(), kv.end());
+        envbuf.push_back('\0');
+      }
+      envbuf.push_back('\0');
+    }
+  }
+
   PROCESS_INFORMATION pi{};
-  const BOOL ok =
-      CreateProcessA(exe.c_str(), cmdbuf.data(), nullptr, nullptr,
-                     /*bInheritHandles=*/TRUE, 0, nullptr, nullptr, &si, &pi);
+  const BOOL ok = CreateProcessA(exe.c_str(), cmdbuf.data(), nullptr, nullptr,
+                                 /*bInheritHandles=*/TRUE, 0,
+                                 envbuf.empty() ? nullptr : envbuf.data(),
+                                 nullptr, &si, &pi);
   // Close the CHILD-side ends in the parent regardless of outcome; keeping
   // out_w open here would mean reads on out_r never return EOF.
   CloseHandle(in_r);
@@ -295,7 +357,8 @@ inline void SpawnedPeer::kill() {
 #else  // POSIX
 
 inline bool SpawnedPeer::spawn(const std::string& exe,
-                               const std::vector<std::string>& args) {
+                               const std::vector<std::string>& args,
+                               const std::vector<std::string>& extra_env) {
   int in_pipe[2];   // parent -> child stdin
   int out_pipe[2];  // child stdout -> parent
   if (::pipe(in_pipe) != 0) {
@@ -328,9 +391,23 @@ inline bool SpawnedPeer::spawn(const std::string& exe,
   }
   argv.push_back(nullptr);
 
+  // Our environment minus the names extra_env redefines, then extra_env.
+  // An inherited entry must be DROPPED, not shadowed: getenv and the
+  // sanitizer runtimes take the first match of a name.
+  std::vector<char*> envp;
+  for (char** e = environ; e != nullptr && *e != nullptr; ++e) {
+    if (!spawn_env_redefined(*e, std::strlen(*e), extra_env)) {
+      envp.push_back(*e);
+    }
+  }
+  for (const auto& kv : extra_env) {
+    envp.push_back(const_cast<char*>(kv.c_str()));
+  }
+  envp.push_back(nullptr);
+
   pid_t pid = -1;
   const int rc =
-      ::posix_spawn(&pid, exe.c_str(), &fa, nullptr, argv.data(), environ);
+      ::posix_spawn(&pid, exe.c_str(), &fa, nullptr, argv.data(), envp.data());
   posix_spawn_file_actions_destroy(&fa);
   ::close(in_pipe[0]);
   ::close(out_pipe[1]);
