@@ -201,7 +201,10 @@ struct CacheStats {
   //   ram_coherence_put_rejections: RAM inserts declined because the bucket
   //     moved during the read that would have populated the entry.  A pure
   //     saving (the entry would have failed its first validation), but the
-  //     same crowding signal.
+  //     same crowding signal.  Counted in single-process mode too, where the
+  //     same re-check is the read path's publish guard: a same-key commit
+  //     published while the read was copying the OLD bytes, and the declined
+  //     insert would have replaced the newer copy with the superseded one.
   uint64_t ram_coherence_rejections = 0;
   uint64_t ram_coherence_put_rejections = 0;
 
