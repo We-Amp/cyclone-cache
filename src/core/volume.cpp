@@ -6166,9 +6166,26 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
   // transient, self-healing version dip.)  A generation bump that lands
   // inside the put's own critical section is still withdrawn, by the
   // reader's post-put re-check or by this eviction, whichever comes
-  // first.  The concurrency case in
-  // tests/integration/test_ram_alternate_invalidation.cpp now asserts the
-  // per-reader monotonicity this buys.
+  // first.
+  //
+  // What the generation alone does NOT buy is ORDER.  It moves here, after
+  // the publish, so between the insert above and this bump a reader that
+  // walked the OLD head and is copying the old bytes still passes its
+  // generation re-check — and a put on an existing RAM entry replaces the
+  // bytes in place.  If another reader has meanwhile read the NEW head from
+  // disk and admitted it, the stale put replaces the newer copy and every
+  // RAM hit until this eviction serves the superseded version: a served
+  // version going backwards by one step, then healing (measured in CI as a
+  // single 2207→2206 dip on a contended host; the window is the writer's
+  // scheduling latency between the insert and this line).  Closing it from
+  // this side would mean bumping BEFORE the publish as well, and a reader
+  // sampling between that bump and the insert still walks the old chain, so
+  // the window would only shrink.  It is closed on the reader's side
+  // instead: the put's predicate also re-checks the key's directory bucket
+  // version, which the insert above moved.  The concurrency case in
+  // tests/integration/test_ram_alternate_invalidation.cpp asserts the
+  // per-reader monotonicity the two re-checks buy together, and its
+  // seam-driven case pins this exact window (WriterSeam::kAfterPublish).
   //
   // SCOPE: process-local, like the remove paths this follows.  The RAM cache
   // lives in this process's heap and remove_epoch is a process-local counter,
@@ -6185,6 +6202,7 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
   // so the one-id argument above does not cover it: evict the whole key,
   // same mechanism and order.  (The carried copies are byte-identical to
   // their sources, so evicting them costs a RAM miss, never correctness.)
+  writer_seam(WriterSeam::kAfterPublish);
   if (_ram_cache) {
     stripe->remove_epoch.fetch_add(1, std::memory_order_acq_rel);
     if (carry.dropped != 0) {
@@ -6441,16 +6459,29 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
     // once more after a put that inserted.
     const uint64_t remove_epoch_start =
         stripe->remove_epoch.load(std::memory_order_acquire);
-    // RAM-coherence gate (a): the CROSS-PROCESS analogue of the process-local
-    // epoch above, and sampled in the same place and for the same reason —
-    // BEFORE the probe.  The bucket version only ever advances, so a stamp
-    // taken pre-probe means "nothing in this bucket has moved since we started
-    // looking"; once anything moves, the mismatch is PERMANENT and no window
-    // exists in which the entry could be served stale.  Taking a fresh
-    // reading at put time instead would reintroduce exactly that window.
+    // Publish guard: the seqlock version of the key's directory bucket,
+    // sampled in the same place and for the same reason — BEFORE the probe.
+    // The remove generation above moves only AFTER a commit has published its
+    // new head (see the invalidation at the end of
+    // commit_alternate_write_once), so on its own it cannot tell a put made
+    // against the chain as it stood BEFORE a publish from one made after: a
+    // reader that walked the old head and is copying the old bytes while the
+    // writer sits between its publish and its bump passes the generation
+    // re-check, and its put then REPLACES a newer copy another reader already
+    // admitted — a served version going backwards until the writer's
+    // eviction heals it (a one-step dip, measured in CI).  The bucket version
+    // moves AT the publish (the insert's seqlock bracket), so re-checking it
+    // in the put's predicate rejects exactly those puts.  It only ever
+    // advances, so a stamp taken pre-probe means "nothing in this bucket has
+    // moved since we started looking"; once anything moves, the mismatch is
+    // PERMANENT.  Taking a fresh reading at put time instead would reintroduce
+    // exactly that window.  One acquire load of the word the probe below
+    // loads next anyway.  In multi-process mode the same value is also
+    // RAM-coherence gate (a): the stamp the entry is admitted with and every
+    // RAM hit is validated against (gate (c) below), which extends the guard
+    // to peer writers.
     const bool ram_coherence = ram_coherence_active(stripe);
-    const uint32_t bucket_version_start =
-        ram_coherence ? stripe->bucket_version(key) : 0;
+    const uint32_t bucket_version_start = stripe->bucket_version(key);
 
     ProbeRejects rejects;
     const bool probe_complete = stripe->probe_each(
@@ -6767,19 +6798,28 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
           }
 
           // Cache the selected alternate in RAM for future reads —
-          // conditionally
-          //.  The predicate re-checks the stripe's remove generation
-          // while the RAM cache holds the write lock that also serializes the
-          // invalidation's eviction, so the insert is atomic with respect to
-          // the invalidation's bump+evict: a predicate evaluated after the
-          // eviction critical section happens-after the bump (sequenced before
-          // that section) and must observe it, so a put made against a
-          // superseded generation is dropped at insert time and NEVER becomes
-          // visible to another reader; one evaluated before it inserts an entry
-          // that stays visible until the eviction itself removes it.  Either
-          // way no superseded copy outlives the invalidation — closing the
-          // put-then-undo window where the older bytes were briefly served
-          // before the re-check below withdrew them.
+          // conditionally.  The predicate re-checks, while the RAM cache
+          // holds the write lock that also serializes the invalidation's
+          // eviction:
+          //  - the stripe's remove generation, so the insert is atomic with
+          //    respect to the invalidation's bump+evict: a predicate
+          //    evaluated after the eviction critical section happens-after
+          //    the bump (sequenced before that section) and must observe it,
+          //    so a put made against a superseded generation is dropped at
+          //    insert time and NEVER becomes visible to another reader; one
+          //    evaluated before it inserts an entry that stays visible until
+          //    the eviction itself removes it.  Either way no superseded copy
+          //    OUTLIVES the invalidation — closing the put-then-undo window
+          //    where the older bytes were briefly served before the re-check
+          //    below withdrew them;
+          //  - the key's directory bucket version, which moves at the PUBLISH
+          //    rather than at the bump, so a put whose chain walk predates a
+          //    same-key publish is dropped even when it lands inside the
+          //    committer's publish→bump window — where the generation alone
+          //    would admit it, and the put would replace a newer copy another
+          //    reader admitted after the publish (a served version going
+          //    backwards until the eviction).  This is what makes a served
+          //    version monotone per reader, not just eventually right.
           //
           // The post-put re-check below is still required, for two races no
           // insert-time predicate can exclude:
@@ -6806,17 +6846,21 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
                         remove_epoch_start) {
                       return false;
                     }
-                    if (!ram_coherence) {
-                      return true;
-                    }
-                    // RAM-coherence gate (b): the same guard the predicate
-                    // already applies process-locally, extended cross-process
-                    // and evaluated under the same RAM-cache write lock.  An
-                    // ODD sample means a peer writer held the bucket when we
-                    // sampled, so the stamp is guaranteed to mismatch on the
-                    // entry's very first hit -- skip the doomed insert.  Both
-                    // rejections are pure savings: the entry could never have
-                    // been served.
+                    // Publish guard (and, in multi-process mode, RAM-coherence
+                    // gate (b)): the key's bucket moved since the pre-probe
+                    // sample, so the chain this read walked is no longer the
+                    // published one — a same-key commit landed, in this
+                    // process or a peer.  Rejecting the put here, under the
+                    // same RAM-cache write lock the committer's eviction
+                    // takes, is what keeps a copy of the superseded version
+                    // from replacing a newer one already admitted (see the
+                    // sample's comment).  An ODD sample means a writer held
+                    // the bucket when we sampled; the probe then waited it
+                    // out and walked the post-publish chain, so the version
+                    // is guaranteed to mismatch here (and, cross-process, on
+                    // the entry's very first hit) -- skip the doomed insert.
+                    // Both rejections are pure savings: the entry could never
+                    // have been served correctly.
                     if ((bucket_version_start & 1U) != 0U ||
                         stripe->bucket_version(key) != bucket_version_start) {
                       _ram_coherence_put_rejections.fetch_add(

@@ -505,9 +505,14 @@ struct Stripe {
   // load-bearing
   //: a bump at the TOP of a remove lets a reader sample the bumped
   // value and still probe the not-yet-removed entry, and nothing ever
-  // withdraws that put.  PROCESS-LOCAL: in multi-process mode a REMOTE
-  // process's removes are not reflected here — that exposure predates the
-  // lock-free-reader work (non-owned-stripe reads never held the stripe
+  // withdraws that put.  The same placement means this generation covers
+  // SURVIVAL only, not ordering: it moves after the publish, so a put made
+  // against the pre-publish chain still passes it while the committer sits
+  // between its publish and its bump.  The put's predicate therefore also
+  // re-checks the key's directory bucket version, which moves AT the
+  // publish (see read_alternate_sync).  PROCESS-LOCAL: in multi-process mode a
+  // REMOTE process's removes are not reflected here — that exposure predates
+  // the lock-free-reader work (non-owned-stripe reads never held the stripe
   // lock) and is unchanged by it.
   std::atomic<uint64_t> remove_epoch{0};
   // Non-mmap counterpart of the shared wrap_intent flag at header
@@ -786,15 +791,21 @@ struct Stripe {
     return mask;
   }
 
-  // Cross-process invalidation signal for the key's directory bucket.
-  // 0 means "no shared signal available" — either this stripe is not backed
-  // by the mmap directory (single-process mode) or the directory is invalid.
-  // Callers must therefore gate on use_mmap_directory && mmap_directory
-  // rather than on the returned value, so that single-process mode compares
-  // 0 against 0 and stays inert.
+  // Seqlock version of the key's directory bucket (odd = a writer is inside
+  // its insert bracket), from whichever directory backs this stripe: the
+  // shared mmap directory in multi-process mode, else the in-memory one.  It
+  // moves at every publish into the bucket, which makes it the read path's
+  // publish guard for its RAM-cache put (process-local, in BOTH modes) and,
+  // with the mmap directory, the cross-process invalidation signal RAM hits
+  // are validated against.  0 only when neither directory is live.  The
+  // cross-process validation must still gate on use_mmap_directory &&
+  // mmap_directory (see ram_coherence_active), never on the returned value.
   [[nodiscard]] uint32_t bucket_version(const CacheKey &key) const {
     if (use_mmap_directory && mmap_directory) {
       return mmap_directory->bucket_version(key);
+    }
+    if (directory) {
+      return directory->bucket_version(key);
     }
     return 0;
   }
@@ -1268,13 +1279,20 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // shape and cost as s_write_tear_gate_for_test: one predicted-not-taken
   // branch, on the write path only, never on the lock-free read path.
   // Every seam fires with the stripe mutex held and, in multi-process mode,
-  // the cross-process write lock held.
+  // the cross-process write lock held -- except kAfterPublish, which fires
+  // after commit_write_slot has released that lock with the cursor.
   enum class WriterSeam : uint8_t {
     kAfterIntentSet,   // intent stored, gate loads not yet run
     kAfterGatePassed,  // gate said "proceed", nothing published yet
     kWrapAfterCursor,  // wrap only: cursor lowered to the data-area start,
                        // epoch not yet stored
     kAfterEpochStore,  // epoch stored, intent not yet cleared
+    kAfterPublish,     // alternate commit only: the new head is in the
+                       // directory (the publish) and the splice has run; the
+                       // RAM-cache invalidation (remove-generation bump +
+                       // eviction) has not.  A reader parked before its RAM
+                       // put with the OLD bytes copied sees the window the
+                       // put's bucket-version re-check exists for.
   };
   using WriterSeamHook = std::function<void(WriterSeam seam)>;
   static inline WriterSeamHook s_writer_seam_for_test{};
