@@ -193,6 +193,42 @@ TEST_CASE("OptimizationEngine basic lifecycle", "[optimization][integration]") {
   cleanup_temp(cache_path);
 }
 
+// Issue #52: the engine is opt-in.  A default CacheConfig must not construct
+// it, so a cache nobody feeds starts no LoadMonitor thread and no pool
+// workers; the accessor reports that as nullptr before and after start().
+TEST_CASE("OptimizationEngine absent with a default CacheConfig",
+          "[optimization][integration]") {
+  auto cache_path = temp_cache_path();
+
+  CacheConfig config;
+  REQUIRE_FALSE(config.optimization_config.enabled);
+  REQUIRE_FALSE(OptimizationConfig{}.enabled);
+
+  auto cache_result = Cache::create(config);
+  REQUIRE(cache_result.has_value());
+  auto &cache = *cache_result;
+  REQUIRE(cache->optimization_engine() == nullptr);
+
+  REQUIRE(cache->add_volume(cache_path + "/vol1", 10_MB).has_value());
+  REQUIRE(cache->start().has_value());
+  REQUIRE(cache->optimization_engine() == nullptr);
+  const Cache &const_cache = *cache;
+  REQUIRE(const_cache.optimization_engine() == nullptr);
+
+  // Writes and reads work without the engine: nothing feeds it anyway.
+  auto key = CacheKey::from_url("http://example.com/no-engine");
+  std::vector<std::byte> content(64, std::byte{0x42});
+  auto write_result = cache->write_sync(key, content.size());
+  REQUIRE(write_result.has_value());
+  REQUIRE(write_result->write_sync(content).has_value());
+  REQUIRE(write_result->close_sync().has_value());
+  REQUIRE(cache->read_sync(key).has_value());
+
+  cache->stop();
+  REQUIRE(cache->optimization_engine() == nullptr);
+  cleanup_temp(cache_path);
+}
+
 TEST_CASE("OptimizationEngine disabled when not enabled",
           "[optimization][integration]") {
   auto cache_path = temp_cache_path();

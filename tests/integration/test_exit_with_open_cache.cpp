@@ -27,7 +27,7 @@
 //     DirectorySyncer::thread_func      (cache.cpp; mmap directory only)
 //     HitTracker::flush_thread_func     (hit_tracker.cpp; enable_hit_tracking)
 //     OptimizationEngine::monitoring_loop and
-//     AdaptiveThreadPool::worker_loop   (optimization_config.enabled, the
+//     AdaptiveThreadPool::worker_loop   (optimization_config.enabled, off by
 //                                        default; min_threads workers)
 //   Executor::global() has no caller, so its leak_thread_on_shutdown path
 //   (thread_util.hpp) never runs.  Nothing is detach()ed.

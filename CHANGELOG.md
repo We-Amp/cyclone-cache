@@ -198,6 +198,22 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **The background optimization engine is off by default and
+  embedder-driven** (issue #52). `OptimizationConfig::enabled` now defaults
+  to `false`. `OptimizationEngine::on_write_complete()` has no caller in
+  Cyclone (`Volume::commit_write` / `Cache` never invoke it) nor in any known
+  embedder, so with the old default every `Cache::start()` spun up a
+  `LoadMonitor` thread and `min_threads` `AdaptiveThreadPool` workers per
+  cache instance that idled forever, and any registered `OptimizationPlugin`
+  was unreachable. With the engine off, `Cache::optimization_engine()`
+  returns `nullptr` and `start()` starts no engine threads; the fork-safety
+  and two-phase-stop paths already handle the absent engine. Migration for
+  an embedder that wants background optimization: set
+  `optimization_config.enabled = true`, register plugins on
+  `cache->optimization_engine()`, and call
+  `cache->optimization_engine()->on_write_complete(...)` after each of your
+  own writes; nothing in Cyclone calls that hook. The `OptimizationConfig`
+  layout is unchanged, and the C API has no optimization settings.
 - **Plain writes no longer assemble the document in a second and third
   buffer** (issue #16). `commit_write` used to copy the content into the
   document builder and again into one contiguous document, two fresh heap

@@ -259,7 +259,7 @@ Glossary's Stripe row carries the `num_segments` / `segment_hash()` details.
 6. **RAM Cache** (`ram_cache.hpp`, `clfus.cpp`, `lru.cpp`): In-memory caching
 7. **VolumeHeader** (`volume.hpp`): 64-byte header at offset 0 for version tracking
 8. **C API** (`cyclone_c.h`, `cyclone_c.cpp`): C ABI wrapper with miss callback hook and request coalescing
-9. **Optimization engine** (`src/optimization/`: `optimization_engine`, `adaptive_pool`, `load_monitor`, `work_queue`; public interface `include/cyclone/plugin/optimization.hpp`): background generation of optimized alternates (e.g. compression, transcoding) after writes, via a load-aware adaptive thread pool
+9. **Optimization engine** (`src/optimization/`: `optimization_engine`, `adaptive_pool`, `load_monitor`, `work_queue`; public interface `include/cyclone/plugin/optimization.hpp`): background generation of optimized alternates (e.g. compression, transcoding) via a load-aware adaptive thread pool. Opt-in (`optimization_config.enabled` defaults to false) and embedder-driven: nothing in Cyclone calls `on_write_complete`; the embedder calls `cache->optimization_engine()->on_write_complete(...)` after its own writes
 
 ### Version Compatibility
 
