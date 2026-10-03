@@ -441,10 +441,14 @@ TEST_CASE("Description", "[tag1][tag2]")
 
 ### Running Sanitizer Tests
 
-The suppressions files (`tools/{tsan,lsan}_suppressions.txt`) carry known false
-positives (seqlock directory access, intentional shutdown thread leak), so a
-sanitizer run must wire them in to stay signal-only; without them you see
-noise that the pinned configuration does not.
+The suppressions files (`tools/{tsan,lsan}_suppressions.txt`) carry only
+known false positives, each with a stated reason: the TSan file covers the
+per-bucket seqlock directory access (`Directory` / `MmapDirectory`) that TSan
+cannot model, and the LSan file is intentionally empty (every Cache-owned
+thread is joined by `Cache::stop()`, so nothing is leaked at shutdown).
+Wire them in so a sanitizer run stays signal-only. A TSan report that
+touches `~Stripe`, `Volume::close` or a worker loop is a real teardown race,
+not something to suppress.
 
 ```bash
 # ASan + UBSan (memory errors, undefined behavior)
