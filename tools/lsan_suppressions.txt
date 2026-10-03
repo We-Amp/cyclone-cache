@@ -4,8 +4,14 @@
 # LSan suppressions for Cyclone Cache
 #
 # See: https://github.com/google/sanitizers/wiki/AddressSanitizerLeakSanitizer
-
-# Intentional thread leak at shutdown (leak_thread_on_shutdown in thread_util.hpp).
-# A std::thread is heap-allocated and never joined to avoid UB from atexit
-# destruction ordering. The 8-byte leak is the std::thread object itself.
-leak:cyclone::leak_thread_on_shutdown
+#
+# Intentionally empty: the library has no known, accepted leak.  Every
+# Cache-owned thread is joined by Cache::stop(), so nothing is leaked at
+# shutdown.  The only remaining leak_thread_on_shutdown() caller is
+# Executor::stop() (src/io/executor.cpp), reached solely through the
+# process-lifetime Executor::global() singleton, which has no callers.
+#
+# The file is kept so the documented sanitizer invocation
+# (LSAN_OPTIONS=suppressions=tools/lsan_suppressions.txt, CLAUDE.md "Running
+# Sanitizer Tests") keeps working.  Add an entry only with the exact leaking
+# frame and a comment that says why the leak is accepted.

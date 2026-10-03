@@ -4,6 +4,13 @@
 # TSan suppressions for Cyclone Cache
 #
 # See: https://github.com/google/sanitizers/wiki/ThreadSanitizerSuppressions
+#
+# Every entry here is a known false positive with a stated reason.  Nothing in
+# this file covers a thread-teardown race: every Cache-owned thread (HitTracker
+# flush, OptimizationEngine monitor, AdaptiveThreadPool workers,
+# DirectorySyncer) is joined by Cache::stop() before the volumes are closed,
+# so a report that touches ~Stripe, Volume::close or a worker loop is a real
+# bug and must not be suppressed.
 
 # MmapDirectory::probe vs clear/insert — seqlock-protected access that
 # TSan cannot reason about (uses atomic seq + data fence pattern).
@@ -22,14 +29,3 @@ race:cyclone::Directory::probe_each
 race:cyclone::Directory::insert
 race:cyclone::Directory::remove
 race:cyclone::Directory::remove_at
-
-
-# Intentional thread leak at shutdown (leak_thread_on_shutdown).
-# Leaked threads may race with destructors during process exit.
-# This is a deliberate trade-off to avoid UB from atexit ordering.
-thread:cyclone::AdaptiveThreadPool::spawn_worker
-race:cyclone::Stripe::~Stripe
-race:cyclone::Volume::close
-# The leaked worker thread accesses pool state (via captured `this`)
-# after the pool is destroyed during shutdown.
-race:cyclone::AdaptiveThreadPool::worker_loop

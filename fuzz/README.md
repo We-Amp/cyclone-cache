@@ -67,9 +67,10 @@ The whole library is instrumented with
 mirroring the ASan CI job) — ASan covers heap-buffer-overflow /
 use-after-free, UBSan covers signed overflow and misaligned access on
 corrupted offsets. **LSan stays enabled**: `fuzz_c_api` tears its persistent
-cache down via `atexit`, and runs use
-`LSAN_OPTIONS=suppressions=tools/lsan_suppressions.txt` for the one
-intentional shutdown-thread leak.
+cache down via `atexit`, and runs pass
+`LSAN_OPTIONS=suppressions=tools/lsan_suppressions.txt` so that any accepted
+leak lives in that one file (it is currently empty: every Cache-owned thread
+is joined at teardown).
 
 ## CI
 
