@@ -164,6 +164,8 @@ const char *seam_name(Seam s) {
       return "wrap-after-cursor";
     case Seam::kAfterEpochStore:
       return "after-epoch-store";
+    case Seam::kAfterPublish:
+      return "after-publish";
   }
   return "?";
 }
