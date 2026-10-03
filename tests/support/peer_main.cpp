@@ -71,6 +71,16 @@
 //                                 and HOLD the handles until released or
 //                                 killed (a zero-copy reader; SIGKILL leaks
 //                                 its borrow counts).
+//   exitopen <dir> <size-bytes> <shape> <return|exit>
+//                                 open one or two caches under <dir> (see
+//                                 run_exitopen for the shapes), work them,
+//                                 say READY, and on release leave the
+//                                 process WITHOUT stopping or destroying
+//                                 them: background threads alive through
+//                                 static destruction (issue
+//                                 oschaaf/modpagespeed-2#1761).  Exit 0 is
+//                                 the contract; a sanitizer report, signal
+//                                 or hang is the finding.
 
 #include <atomic>
 #include <cerrno>
@@ -80,13 +90,21 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <memory>
+#include <span>
 #include <string>
+#include <system_error>
+#include <thread>
 #include <vector>
 
 #include "core/volume.hpp"
 #include "cyclone/cache.hpp"
 #include "cyclone/config.hpp"
+#include "cyclone/cyclone_c.h"
 #include "cyclone/key.hpp"
+#include "cyclone/plugin/optimization.hpp"
+#include "optimization/optimization_engine.hpp"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -101,6 +119,36 @@
 #else
 #include <fcntl.h>
 #include <unistd.h>
+#endif
+
+// Sanitizer hooks for the exitopen mode (see run_exitopen).  A process that
+// exits with its Cache threads alive has, by construction, threads that are
+// never joined; TSan would report every one as a "thread leak" and exit 66,
+// masking the real question (does any thread race a destroyed static).  The
+// hook only sets a default: a TSAN_OPTIONS in the environment still wins.
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+extern "C" const char* __tsan_default_options() {
+  return "report_thread_leaks=0";
+}
+#endif
+#if __has_feature(address_sanitizer)
+#include <sanitizer/lsan_interface.h>
+#define CYCLONE_PEER_HAS_LSAN 1
+#endif
+#endif
+#if defined(__SANITIZE_THREAD__) && !defined(__has_feature)
+extern "C" const char* __tsan_default_options() {
+  return "report_thread_leaks=0";
+}
+#endif
+#if defined(__SANITIZE_ADDRESS__) && !defined(_MSC_VER) && \
+    !defined(CYCLONE_PEER_HAS_LSAN)
+#include <sanitizer/lsan_interface.h>  // GCC ASan; MSVC ASan has no LSan
+#define CYCLONE_PEER_HAS_LSAN 1
+#endif
+#ifndef CYCLONE_PEER_HAS_LSAN
+#define CYCLONE_PEER_HAS_LSAN 0
 #endif
 
 namespace {
@@ -390,6 +438,348 @@ int run_borrow(const char* path, unsigned long long size, int nkeys,
   return 0;
 }
 
+// ---------------------------------------------------------------------------
+// exitopen: leave the process with Cache objects still OPEN.
+//
+// The host shape behind PageSpeed 2.x issue oschaaf/modpagespeed-2#1761: a
+// .NET host that never stop()s / destroys the caches its ps_cache_open
+// created, and exits while their DirectorySyncer, HitTracker and
+// OptimizationEngine threads are alive.  Everything below is heap-allocated
+// and deliberately leaked; the only teardown that runs is the process's own
+// (static destructors, atexit, then the OS reaping the threads).
+// ---------------------------------------------------------------------------
+
+// A plugin that turns every original write into one alternate write, so the
+// optimization workers are writing into the cache while the process exits.
+class EchoOptimizationPlugin : public cyclone::OptimizationPlugin {
+ public:
+  [[nodiscard]] cyclone::PluginInfo info() const override {
+    return {"exitopen-echo", "1.0.0", 7161};
+  }
+  cyclone::OptimizationPlan plan_optimization(
+      const cyclone::CacheKey& /*key*/, std::span<const std::byte> /*header*/,
+      uint64_t content_length, cyclone::AlternateId written_alternate,
+      uint32_t /*hit_count*/) override {
+    cyclone::OptimizationPlan plan;
+    if (written_alternate == cyclone::AlternateId::Original) {
+      plan.add(cyclone::AlternateId::Gzip, 10, true, content_length);
+    }
+    return plan;
+  }
+  std::expected<cyclone::TransformResult, cyclone::CacheError> transform(
+      cyclone::AlternateId target,
+      const cyclone::OptimizationContext& ctx) override {
+    if (ctx.is_cancelled()) {
+      return std::unexpected(cyclone::CacheError::OptimizationCancelled);
+    }
+    cyclone::TransformResult result;
+    result.alternate_id = target;
+    result.header.assign(ctx.source_header().begin(),
+                         ctx.source_header().end());
+    result.content.assign(ctx.source_content().begin(),
+                          ctx.source_content().end());
+    return result;
+  }
+};
+
+// Shared load state for the exitopen writer threads.  Heap-allocated and
+// leaked like the caches, so a thread still running at exit never touches a
+// destroyed object of ours (the subject under test is Cyclone's teardown,
+// not this file's).
+struct ExitOpenLoad {
+  std::atomic<bool> stop{false};
+  std::atomic<uint64_t> writes{0};
+  std::vector<std::thread> threads;
+};
+
+constexpr size_t kExitOpenDocBytes = 2048;
+
+void exit_open_write_loop(CycloneCacheHandle* c, int lane, ExitOpenLoad* load) {
+  const std::string payload(kExitOpenDocBytes, static_cast<char>('A' + lane));
+  for (uint64_t i = 0; !load->stop.load(std::memory_order_relaxed); ++i) {
+    const std::string key =
+        "exitopen-" + std::to_string(lane) + "-" + std::to_string(i % 512);
+    (void)cyclone_cache_write(c, key.data(), key.size(), payload.data(),
+                              payload.size());
+    CycloneReadHandle* rh = nullptr;
+    if (cyclone_cache_read(c, key.data(), key.size(), &rh) == CYCLONE_OK) {
+      cyclone_cache_read_close(rh);
+    }
+    load->writes.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+CycloneCacheHandle* exit_open_capi(const std::string& path,
+                                   unsigned long long size) {
+  CycloneCacheConfig cfg{};
+  cfg.cache_path = path.c_str();
+  cfg.cache_size_bytes = size;
+  cfg.ram_cache_size_bytes = 16ULL * 1024 * 1024;
+  cfg.enable_checksum = 1;
+  cfg.num_segments = 4;
+  cfg.enable_mmap_directory = 1;  // PageSpeed's cross-process shape
+  CycloneCacheHandle* h = nullptr;
+  if (cyclone_cache_create(&cfg, &h) != CYCLONE_OK) {
+    return nullptr;
+  }
+  return h;
+}
+
+// Modes (see main):
+//   capi1     one C-API cache, a burst of writes + reads, then exit
+//   capi2     cache A under write load; cache B (its own path) opened and
+//             loaded while A is being written; load threads joined; exit
+//   capi2same like capi2 but B opens the SAME volume file as A
+//   capi2live like capi2 but the load threads are still writing at exit
+//   cppbusy   C++ API, every background thread made busy: 1 ms directory
+//             sync, 1 ms hit flush, optimization engine with two workers
+//             and the echo plugin writing alternates; load threads joined
+//   lockwait  two C++ caches on ONE volume file; cache A's writer is parked
+//             inside the tear gate holding the cross-process write lock,
+//             cache B's writer waits on that lock and, past 50 ms, probes
+//             the holder's liveness through the process-wide liveness
+//             mutex after every sleep.  An atexit handler registered
+//             BEFORE the caches sleeps 500 ms, so static destructors
+//             (registered later, so run earlier) have run while B is still
+//             probing: a host whose own exit handlers take a while.  With a
+//             destructible liveness mutex this aborted on Apple's libc++
+//             (EINVAL -> std::system_error -> std::terminate); the mutex is
+//             immortal now.
+// Exit style: "return" returns from main (static destructors + atexit run
+// with the Cache threads alive, then the OS reaps them); "exit" calls
+// std::exit(0) from inside this function so main's locals never unwind.
+int run_exitopen(const char* raw_path, unsigned long long size,
+                 const std::string& shape, const std::string& how) {
+#if CYCLONE_PEER_HAS_LSAN
+  // Leaking the caches is the premise of this mode, not a finding: keep
+  // LeakSanitizer from turning the deliberate leak into a non-zero exit.
+  // Everything a background thread allocates hangs off these blocks, which
+  // LSan scans as roots once they are ignored.
+  __lsan_disable();
+#endif
+  const std::string path_a = std::string(raw_path) + "/a/cyclone.dat";
+  const std::string path_b = std::string(raw_path) + "/b/cyclone.dat";
+  std::error_code ec;
+  std::filesystem::create_directories(std::string(raw_path) + "/a", ec);
+  std::filesystem::create_directories(std::string(raw_path) + "/b", ec);
+  auto* load = new ExitOpenLoad();
+
+  if (shape == "lockwait") {
+    // Registered first, so it runs LAST at exit: everything constructed
+    // after it (the liveness mutex is constructed at the first attach) is
+    // destroyed before it sleeps.
+    std::atexit(
+        [] { std::this_thread::sleep_for(std::chrono::milliseconds(500)); });
+    auto open_same = [&]() -> cyclone::Cache* {
+      cyclone::CacheConfig config;
+      config.set_multi_process(0, 1);
+      config.set_ram_cache_size(0);
+      auto created = cyclone::Cache::create(config);
+      if (!created.has_value()) {
+        return nullptr;
+      }
+      cyclone::Cache* cache = created->release();  // never destroyed
+      if (!cache->add_volume(path_a, static_cast<size_t>(size)).has_value() ||
+          !cache->start().has_value()) {
+        return nullptr;
+      }
+      return cache;
+    };
+    cyclone::Cache* a = open_same();
+    cyclone::Cache* b = open_same();
+    if (a == nullptr || b == nullptr) {
+      say("ERR open");
+      return 1;
+    }
+    // The first writer to reach the tear gate (A's) parks there for the
+    // rest of the process, holding the cross-process write lock.
+    static std::atomic<bool> parked{false};
+    cyclone::Volume::s_write_tear_gate_for_test = [](uint64_t, uint64_t) {
+      if (!parked.exchange(true)) {
+        for (;;) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+      }
+    };
+    const std::vector<std::byte> content(kExitOpenDocBytes, std::byte{0x5A});
+    load->threads.emplace_back([a, &content] {
+      if (auto wh =
+              a->write_sync(cyclone::CacheKey("lockwait-a"), content.size());
+          wh.has_value()) {
+        [[maybe_unused]] const auto wrote = wh->write_sync(content);
+        [[maybe_unused]] const auto closed = wh->close_sync();
+      }
+    });
+    while (!parked.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    load->threads.emplace_back([b, load, &content] {
+      for (uint64_t i = 0; !load->stop.load(std::memory_order_relaxed); ++i) {
+        if (auto wh = b->write_sync(
+                cyclone::CacheKey("lockwait-b-" + std::to_string(i)),
+                content.size());
+            wh.has_value()) {
+          [[maybe_unused]] const auto wrote = wh->write_sync(content);
+          [[maybe_unused]] const auto closed = wh->close_sync();
+        }
+        load->writes.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    std::fprintf(stderr, "exitopen: lockwait b_writes=%llu\n",
+                 static_cast<unsigned long long>(load->writes.load()));
+    say("READY");
+    wait_for_release();
+    for (auto& t : load->threads) {
+      t.detach();  // A is parked for good; B keeps waiting on the lock
+    }
+    if (how == "exit") {
+      std::exit(0);
+    }
+    return 0;
+  }
+
+  if (shape == "cppbusy") {
+    cyclone::CacheConfig config;
+    config.set_multi_process(0, 1);
+    config.set_ram_cache_size(16ULL * 1024 * 1024);
+    config.set_directory_sync_interval(std::chrono::milliseconds(1));
+    config.hit_flush_interval = std::chrono::milliseconds(1);
+    config.optimization_config.set_enabled(true).set_min_threads(2);
+    config.optimization_config.min_hits_before_optimize = 0;
+    config.optimization_config.scale_check_interval =
+        std::chrono::milliseconds(1);
+    auto created = cyclone::Cache::create(config);
+    if (!created.has_value()) {
+      say("ERR " + std::to_string(static_cast<int>(created.error())));
+      return 1;
+    }
+    cyclone::Cache* cache = created->release();  // never destroyed
+    if (auto added = cache->add_volume(path_a, static_cast<size_t>(size));
+        !added.has_value()) {
+      say("ERR " + std::to_string(static_cast<int>(added.error())));
+      return 1;
+    }
+    if (auto started = cache->start(); !started.has_value()) {
+      say("ERR " + std::to_string(static_cast<int>(started.error())));
+      return 1;
+    }
+    cache->optimization_engine()->register_plugin(
+        std::make_shared<EchoOptimizationPlugin>());
+    const std::vector<std::byte> content(kExitOpenDocBytes, std::byte{0x5A});
+    for (int lane = 0; lane < 2; ++lane) {
+      load->threads.emplace_back([cache, lane, load, &content] {
+        for (uint64_t i = 0; !load->stop.load(std::memory_order_relaxed); ++i) {
+          cyclone::CacheKey k("exitopen-" + std::to_string(lane) + "-" +
+                              std::to_string(i % 512));
+          if (auto wh = cache->write_sync(k, content.size()); wh.has_value()) {
+            [[maybe_unused]] const auto wrote = wh->write_sync(content);
+            [[maybe_unused]] const auto closed = wh->close_sync();
+          }
+          // The write path does not feed the engine itself (see audit in
+          // test_exit_with_open_cache.cpp); hand it every write so its
+          // workers are writing alternates while the process exits.
+          cache->optimization_engine()->on_write_complete(
+              k, {}, content.size(), cyclone::AlternateId::Original, 5);
+          if (auto rh = cache->read_sync(k); rh.has_value()) {
+            (void)rh->content().size();
+          }
+          load->writes.fetch_add(1, std::memory_order_relaxed);
+        }
+      });
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    const auto st = cache->stats();
+    std::fprintf(stderr,
+                 "exitopen: cppbusy writes=%llu entries=%llu dir_syncs=%llu "
+                 "opt_tasks=%llu\n",
+                 static_cast<unsigned long long>(load->writes.load()),
+                 static_cast<unsigned long long>(st.current_entries),
+                 static_cast<unsigned long long>(st.directory_syncs),
+                 static_cast<unsigned long long>(
+                     cache->optimization_engine()->stats().completed));
+    say("READY");
+    wait_for_release();
+    load->stop.store(true);
+    for (auto& t : load->threads) {
+      t.join();
+    }
+    // Leave the workers something to do at the very end.
+    for (int i = 0; i < 64; ++i) {
+      cyclone::CacheKey k("exitopen-tail-" + std::to_string(i));
+      if (auto wh = cache->write_sync(k, content.size()); wh.has_value()) {
+        [[maybe_unused]] const auto wrote = wh->write_sync(content);
+        [[maybe_unused]] const auto closed = wh->close_sync();
+      }
+      cache->optimization_engine()->on_write_complete(
+          k, {}, content.size(), cyclone::AlternateId::Original, 5);
+    }
+    if (how == "exit") {
+      std::exit(0);
+    }
+    return 0;
+  }
+
+  CycloneCacheHandle* a = exit_open_capi(path_a, size);
+  if (a == nullptr) {
+    say("ERR create a");
+    return 1;
+  }
+  if (shape == "capi1") {
+    const std::string payload(kExitOpenDocBytes, 'x');
+    for (int i = 0; i < 256; ++i) {
+      const std::string key = "exitopen-" + std::to_string(i);
+      (void)cyclone_cache_write(a, key.data(), key.size(), payload.data(),
+                                payload.size());
+      CycloneReadHandle* rh = nullptr;
+      if (cyclone_cache_read(a, key.data(), key.size(), &rh) == CYCLONE_OK) {
+        cyclone_cache_read_close(rh);
+      }
+    }
+    say("READY");
+    wait_for_release();
+    if (how == "exit") {
+      std::exit(0);
+    }
+    return 0;
+  }
+
+  // capi2 / capi2same / capi2live: A under load from two threads while B
+  // opens.
+  for (int lane = 0; lane < 2; ++lane) {
+    load->threads.emplace_back(exit_open_write_loop, a, lane, load);
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  CycloneCacheHandle* b =
+      exit_open_capi(shape == "capi2same" ? path_a : path_b, size);
+  if (b == nullptr) {
+    say("ERR create b");
+    return 1;
+  }
+  for (int lane = 2; lane < 4; ++lane) {
+    load->threads.emplace_back(exit_open_write_loop, b, lane, load);
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  std::fprintf(stderr, "exitopen: %s writes=%llu\n", shape.c_str(),
+               static_cast<unsigned long long>(load->writes.load()));
+  say("READY");
+  wait_for_release();
+  if (shape == "capi2live") {
+    for (auto& t : load->threads) {
+      t.detach();  // still writing into A and B while the process exits
+    }
+  } else {
+    load->stop.store(true);
+    for (auto& t : load->threads) {
+      t.join();
+    }
+  }
+  if (how == "exit") {
+    std::exit(0);
+  }
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -408,6 +798,10 @@ int main(int argc, char** argv) {
                      std::strcmp(argv[5], "crash") == 0, argv[6],
                      std::strtoull(argv[7], nullptr, 10));
   }
+  if (argc >= 6 && std::strcmp(argv[1], "exitopen") == 0) {
+    return run_exitopen(argv[2], std::strtoull(argv[3], nullptr, 10), argv[4],
+                        argv[5]);
+  }
   if (argc >= 4 && std::strcmp(argv[1], "open") == 0) {
     return run_open(argv[2], std::strtoull(argv[3], nullptr, 10));
   }
@@ -416,6 +810,8 @@ int main(int argc, char** argv) {
   }
   say("ERR usage: cyclone-test-peer open <path> <size> | hold <file> | seam "
       "<path> <size> <seam> <crash|hang> <content-bytes> | carry <path> "
-      "<size> <step> <crash|hang> <key> <content-bytes>");
+      "<size> <step> <crash|hang> <key> <content-bytes> | exitopen <dir> "
+      "<size> <capi1|capi2|capi2same|capi2live|cppbusy|lockwait> "
+      "<return|exit>");
   return 2;
 }
