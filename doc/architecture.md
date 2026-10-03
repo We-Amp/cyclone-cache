@@ -834,8 +834,19 @@ with a new snapshot; the retry does not spend `max_read_retries` (at most
 `kMaxPublishRaceRetries` extra attempts). Every attempt still admits only
 against its own snapshot, so the phase-ABA positional guard is unchanged.
 `read_alternate_sync` additionally repopulates the RAM tier on a disk hit
-(the post-copy revalidation in `read_alternate_sync`) with a post-copy revalidation (`borrow_still_valid` +
-`remove_epoch` recheck) so it never caches torn or resurrected bytes.
+through a conditional put whose predicate, evaluated under the RAM cache's
+write lock, re-checks both the stripe's `remove_epoch` (a remove or commit
+already ran its eviction: the copy would be a resurrection) and the key's
+directory bucket version (a same-key commit published during the read: the
+copy is of the superseded chain and would replace a newer one), plus a
+post-copy revalidation (`borrow_still_valid` + `remove_epoch` recheck) so it
+never caches torn or resurrected bytes. The bucket re-check is what keeps a
+served version monotone per reader; the epoch alone only guarantees that no
+superseded copy outlives its invalidation. The residual is precise: a copy
+admitted BEFORE the publish may still be served by RAM hits until the
+committer's eviction (a read concurrent with a write still in flight, so still
+linearizable), while no copy of the pre-publish chain can be admitted AFTER
+the publish.
 
 ### Write
 

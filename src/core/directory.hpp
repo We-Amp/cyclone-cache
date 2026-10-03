@@ -701,6 +701,19 @@ class Directory {
   [[nodiscard]] std::span<const std::byte> serialize() const;
   void deserialize(std::span<const std::byte> data);
 
+  // Seqlock version of `key`'s bucket (acquire load; odd = a writer is inside
+  // its bracket).  It moves at every publish into the bucket, which is what
+  // the read path's RAM-cache put re-checks it for: a sample taken before the
+  // probe that no longer matches at put time means a same-key commit landed
+  // during the read (Volume::read_alternate_sync).  MmapDirectory offers the
+  // same accessor for the shared directory.
+  [[nodiscard]] uint32_t bucket_version(const CacheKey &key) const {
+    if (_num_buckets == 0) {
+      return 0;
+    }
+    return load_version(key.bucket_hash() % _num_buckets);
+  }
+
  private:
   [[nodiscard]] uint32_t load_version(size_t bucket_idx) const {
     return std::atomic_ref<uint32_t>(

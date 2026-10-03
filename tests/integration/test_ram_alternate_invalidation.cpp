@@ -42,15 +42,18 @@
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "core/volume.hpp"
 #include "cyclone/alternate.hpp"
 #include "cyclone/cache.hpp"
 #include "cyclone/config.hpp"
@@ -548,26 +551,33 @@ TEST_CASE("No stale alternate survives concurrent re-records with RAM on",
   // the last version written — no copy of a superseded one survives anywhere.
   REQUIRE(out.quiescent_stamp == out.final_version);
 
-  // Strict per-reader version monotonicity — asserted since the conditional-put
-  // guard.
+  // Strict per-reader version monotonicity.
   //
-  // Before the conditional put this did NOT hold with a RAM cache in front:
-  // the read path's resurrection guard was put-THEN-undo — a reader that
-  // raced a publish wrote its older copy into RAM and only then re-checked
-  // the remove generation and took it back out, so for those few
-  // instructions the older bytes were visible to another reader and a served
-  // version could go backwards (measured here: order one dip per several
-  // thousand re-records, shallow, always healing).  The conditional put
-  // evaluates the generation re-check under the same RAM-cache write lock
-  // the writer's eviction takes, making the insert atomic with respect to
-  // the invalidation's bump+evict: a superseded copy can no longer outlive
-  // the writer's completed invalidation, which is exactly the survival the
-  // dips measured here required.  (A put landing between publish and evict
-  // is still briefly served until that evict — in-flight invalidation, not
-  // survival.)
+  // Two guards in the read path's conditional RAM put buy it, and each was
+  // measured here as a dip when it was missing:
+  //
+  //   * The remove-generation re-check, evaluated under the same RAM-cache
+  //     write lock the writer's eviction takes.  Before it the resurrection
+  //     guard was put-THEN-undo — a reader that raced a publish wrote its
+  //     older copy into RAM and only then re-checked the generation and took
+  //     it back out, so for those few instructions the older bytes were
+  //     visible to another reader (order one dip per several thousand
+  //     re-records, shallow, always healing).  With it, no superseded copy
+  //     OUTLIVES the writer's completed invalidation.
+  //   * The bucket-version re-check, in the same predicate.  The generation
+  //     moves AFTER the publish, so a reader that walked the old head and
+  //     landed its put inside the writer's publish→bump window still passed
+  //     the generation re-check and replaced the newer copy another reader
+  //     had admitted after the publish; RAM hits then served the superseded
+  //     version until the eviction (CI: a single 2207→2206 dip on a
+  //     contended host; locally 2 in 400 runs under a CPU burner, never
+  //     unloaded).  The bucket version moves AT the publish, so that put is
+  //     now rejected.  The seam-driven case below hits this window every
+  //     time instead of by scheduling luck.
+  //
   // The RAM-OFF control below pins the other side: on the disk path alone
-  // monotonicity held all along, which is what localised the dips to the
-  // RAM layer's old put-then-undo shape.
+  // monotonicity held all along, which is what localised both dips to the
+  // RAM layer.
   REQUIRE_FALSE(out.saw_regression);
 }
 
@@ -597,6 +607,162 @@ TEST_CASE("Concurrent re-records: RAM on matches the RAM-off control",
   REQUIRE_FALSE(off.saw_regression);
   // Quiescence holds on the disk path alone, as it always did.
   REQUIRE(off.quiescent_stamp == off.final_version);
+}
+
+// ---------------------------------------------------------------------------
+// The publish→invalidate window, hit deterministically
+// ---------------------------------------------------------------------------
+//
+// The concurrency case above reaches this window only by scheduling luck (CI
+// did, on a contended runner: a one-step dip, 2207 then 2206).  This case
+// parks the threads at test seams so the window is hit every time:
+//
+//   stale reader   walks head vN, misses RAM, maps and verifies vN's bytes,
+//                  parks just before its RAM put (ReaderSeam::kBeforeBorrow);
+//   writer         commits vN+1 and parks after the publish, before the
+//                  remove-generation bump and eviction
+//                  (WriterSeam::kAfterPublish);
+//   fresh reader   reads vN+1 from disk and admits it into RAM;
+//   stale reader   resumes and lands its put of vN — the remove generation
+//                  has not moved, so that re-check passes.
+//
+// Without the bucket-version re-check in the put's predicate, that put
+// replaces the vN+1 entry's bytes in place, and the fresh reader's next read,
+// a RAM hit, goes backwards to vN until the writer's eviction heals it.  With
+// it, the put is rejected (the publish moved the bucket) and the fresh reader
+// stays on vN+1.  The stale reader itself legitimately returns vN: its read
+// began before the publish.
+namespace {
+
+struct Rendezvous {
+  std::mutex m;
+  std::condition_variable cv;
+  bool arrived = false;
+  bool released = false;
+  void arrive_and_wait() {
+    std::unique_lock<std::mutex> lk(m);
+    arrived = true;
+    cv.notify_all();
+    cv.wait(lk, [&] { return released; });
+  }
+  void wait_arrived() {
+    std::unique_lock<std::mutex> lk(m);
+    cv.wait(lk, [&] { return arrived; });
+  }
+  void release() {
+    std::unique_lock<std::mutex> lk(m);
+    released = true;
+    cv.notify_all();
+  }
+};
+
+// Parks the bound thread ONCE at `seam`; every other thread, and every other
+// seam, passes straight through.  Installed before the parked thread starts
+// and cleared after it joins, so the hook accesses are ordered.
+template <typename Seam, auto& Hook>
+struct SeamPause {
+  Rendezvous rv;
+  std::atomic<bool> fired{false};
+  std::atomic<std::thread::id> only{};
+  explicit SeamPause(Seam seam) {
+    Hook = [this, seam](Seam at) {
+      if (at == seam && std::this_thread::get_id() == only.load() &&
+          !fired.exchange(true)) {
+        rv.arrive_and_wait();
+      }
+    };
+  }
+  void bind_this_thread() { only.store(std::this_thread::get_id()); }
+  ~SeamPause() { Hook = nullptr; }
+  SeamPause(const SeamPause&) = delete;
+  SeamPause& operator=(const SeamPause&) = delete;
+};
+using ReaderPause =
+    SeamPause<Volume::ReaderSeam, Volume::s_reader_seam_for_test>;
+using WriterPause =
+    SeamPause<Volume::WriterSeam, Volume::s_writer_seam_for_test>;
+
+void run_publish_window(RamCacheType ram_type) {
+  TempCacheDir tmp("ram_alt_publish_window");
+  auto cache = make_cache(tmp, ram_config(ram_type));
+  const CacheKey key("ram-alt-publish-window");
+  constexpr auto id = AlternateId::Original;
+
+  // v1 admitted into RAM and proven served from it, then superseded by v2 so
+  // RAM holds NO copy of (key, id): both readers below must miss RAM and go
+  // to disk.  For CLFUS the warm also marks the key's admission-filter slot,
+  // so the fresh reader's put admits on its first try instead of only being
+  // marked (see warm_ram).
+  put_alt_ok(*cache, key, id, stamped(id, 1));
+  warm_ram(*cache, key, id, 1);
+  put_alt_ok(*cache, key, id, stamped(id, 2));
+  const uint64_t hits_before = cache->stats().ram_cache_hits;
+
+  // Stale reader: walks head v2, misses RAM, copies v2, parks before its put.
+  ReaderPause stale_pause(Volume::ReaderSeam::kBeforeBorrow);
+  uint32_t stale_saw = kNoStamp;
+  std::thread stale([&] {
+    stale_pause.bind_this_thread();
+    stale_saw = read_stamp(*cache, key, id);
+  });
+  stale_pause.rv.wait_arrived();
+
+  // Writer: publishes v3, parks before the bump + eviction.  It holds the
+  // stripe mutex while parked; readers take none (invariant 1), so the reads
+  // below proceed.  The one reader-side path that would take it is a
+  // synchronous HitTracker flush (a key crossing flush_threshold, 10000
+  // hits, rewrites its directory entry under the stripe mutex) and would
+  // deadlock against the parked writer; this key sees about ten hits here,
+  // so that path is unreachable.
+  WriterPause writer_pause(Volume::WriterSeam::kAfterPublish);
+  bool wrote = false;
+  std::thread writer([&] {
+    writer_pause.bind_this_thread();
+    wrote = put_alt(*cache, key, id, stamped(id, 3));
+  });
+  writer_pause.rv.wait_arrived();
+
+  // Fresh reader: v3 from disk, admitted into RAM.
+  REQUIRE(read_stamp(*cache, key, id) == 3);
+  REQUIRE(cache->stats().ram_cache_hits == hits_before);  // a disk read
+
+  // The stale reader lands its put of v2 — against an unmoved remove
+  // generation but a moved bucket.
+  stale_pause.rv.release();
+  stale.join();
+  REQUIRE(stale_saw == 2);  // began before the publish: v2 is legitimate
+
+  // The property: a reader that has been served v3 is not now served v2.
+  // Before the bucket-version re-check this read was a RAM hit on the entry
+  // the stale put had just overwritten, and returned 2.
+  const uint32_t again = read_stamp(*cache, key, id);
+  CAPTURE(again);
+  REQUIRE(again == 3);
+  REQUIRE(cache->stats().ram_cache_hits > hits_before);  // served from RAM
+
+  // Let the writer finish its invalidation; the quiescent state is v3 either
+  // way (the eviction heals the dip — survival was never the defect).
+  writer_pause.rv.release();
+  writer.join();
+  REQUIRE(wrote);
+  REQUIRE(read_stamp(*cache, key, id) == 3);
+
+  auto alts = cache->list_alternates_sync(key);
+  REQUIRE(alts.has_value());
+  REQUIRE(alts->size() == 1);
+  cache->stop();
+}
+
+}  // namespace
+
+TEST_CASE(
+    "A RAM put from before a publish cannot replace the newer copy admitted "
+    "after it",
+    "[alternate][ram][concurrency][regression]") {
+  SECTION("CLFUS (production default)") {
+    run_publish_window(RamCacheType::CLFUS);
+  }
+  SECTION("LRU") { run_publish_window(RamCacheType::LRU); }
 }
 
 // ---------------------------------------------------------------------------

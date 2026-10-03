@@ -374,8 +374,16 @@ typedef struct {
    *     responses are a smaller RAM tier, better write partitioning, or
    *     turning the knob back off.
    *   ram_coherence_put_rejections: RAM inserts declined because the bucket
-   *     moved during the read that would have populated the entry.  A pure
-   *     saving, but the same crowding signal. */
+   *     moved during the read that would have populated the entry.  A
+   *     saving or a one-read deferral: cross-process the entry would have
+   *     failed its first validation; single-process the declined copy is
+   *     stale when the publish landed after the reader's probe (it would
+   *     have replaced the newer copy with the superseded one) but fresh
+   *     when it landed between the reader's version sample and its probe,
+   *     costing the next read one extra disk read (about 0.5% of writes
+   *     under one hot key; hit rate unchanged).  Either way the same
+   *     crowding signal.  Counted in single-process mode too, where the
+   *     same re-check is the read path's publish guard. */
   uint64_t ram_coherence_rejections;
   uint64_t ram_coherence_put_rejections;
 

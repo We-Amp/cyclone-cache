@@ -300,6 +300,28 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   caches" in doc/architecture.md and the new regression
   `tests/integration/test_exit_with_open_cache.cpp`.
 
+- RAM tier: a served alternate version could go backwards by one step for
+  a few microseconds around a re-record. The read path's conditional RAM
+  put re-checked only the stripe's remove generation, which the commit
+  bumps AFTER publishing the new head; a reader that walked the old head
+  and landed its put inside that publish→bump window passed the re-check
+  and replaced the newer copy another reader had just admitted, so RAM hits
+  served the superseded version until the commit's eviction healed it (CI:
+  one 2207→2206 dip on a contended macOS runner; reproduced locally only
+  under CPU load, 2 in 400 runs). The put's predicate now also re-checks the
+  key's directory bucket version, which moves at the publish, in
+  single-process mode as well (it already did under
+  `cross_process_ram_coherence`); such puts are rejected and counted in
+  `ram_coherence_put_rejections`. No superseded copy ever outlived the
+  eviction before either; what changes is per-reader monotonicity, which
+  the concurrency test asserted and a new seam-driven test now pins
+  deterministically (`WriterSeam::kAfterPublish`). The residual is precise:
+  a copy admitted BEFORE the publish may still be served by RAM hits until
+  the committer's eviction (a read concurrent with a write still in flight,
+  so still linearizable), while no copy of the pre-publish chain can be
+  admitted AFTER the publish. One extra acquire load per
+  `read_alternate_sync`, of the bucket word the probe loads next anyway.
+
 - Every descriptor Cyclone opens on its cache files is now close-on-exec
   (`O_CLOEXEC`; `_O_NOINHERIT` on Windows CRT opens). A child the
   application exec's (for example a fetcher helper) no longer inherits the
