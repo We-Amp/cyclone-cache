@@ -842,7 +842,11 @@ copy is of the superseded chain and would replace a newer one), plus a
 post-copy revalidation (`borrow_still_valid` + `remove_epoch` recheck) so it
 never caches torn or resurrected bytes. The bucket re-check is what keeps a
 served version monotone per reader; the epoch alone only guarantees that no
-superseded copy outlives its invalidation.
+superseded copy outlives its invalidation. The residual is precise: a copy
+admitted BEFORE the publish may still be served by RAM hits until the
+committer's eviction (a read concurrent with a write still in flight, so still
+linearizable), while no copy of the pre-publish chain can be admitted AFTER
+the publish.
 
 ### Write
 

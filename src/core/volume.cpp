@@ -6859,8 +6859,14 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
                     // out and walked the post-publish chain, so the version
                     // is guaranteed to mismatch here (and, cross-process, on
                     // the entry's very first hit) -- skip the doomed insert.
-                    // Both rejections are pure savings: the entry could never
-                    // have been served correctly.
+                    // That branch is load-bearing only cross-process: the
+                    // bucket is even whenever no writer is inside it, so an
+                    // odd start can never equal the even value read at put
+                    // time single-process, and the inequality alone already
+                    // rejects it.  A rejection is a saving when the copy is
+                    // stale (publish after the probe) and a one-read
+                    // deferral when it is fresh (publish between the sample
+                    // and the probe): the next read repopulates from disk.
                     if ((bucket_version_start & 1U) != 0U ||
                         stripe->bucket_version(key) != bucket_version_start) {
                       _ram_coherence_put_rejections.fetch_add(

@@ -315,8 +315,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `ram_coherence_put_rejections`. No superseded copy ever outlived the
   eviction before either; what changes is per-reader monotonicity, which
   the concurrency test asserted and a new seam-driven test now pins
-  deterministically (`WriterSeam::kAfterPublish`). One extra acquire load
-  per `read_alternate_sync`, of the bucket word the probe loads next anyway.
+  deterministically (`WriterSeam::kAfterPublish`). The residual is precise:
+  a copy admitted BEFORE the publish may still be served by RAM hits until
+  the committer's eviction (a read concurrent with a write still in flight,
+  so still linearizable), while no copy of the pre-publish chain can be
+  admitted AFTER the publish. One extra acquire load per
+  `read_alternate_sync`, of the bucket word the probe loads next anyway.
 
 - Every descriptor Cyclone opens on its cache files is now close-on-exec
   (`O_CLOEXEC`; `_O_NOINHERIT` on Windows CRT opens). A child the

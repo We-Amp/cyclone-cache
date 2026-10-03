@@ -709,7 +709,11 @@ void run_publish_window(RamCacheType ram_type) {
 
   // Writer: publishes v3, parks before the bump + eviction.  It holds the
   // stripe mutex while parked; readers take none (invariant 1), so the reads
-  // below proceed.
+  // below proceed.  The one reader-side path that would take it is a
+  // synchronous HitTracker flush (a key crossing flush_threshold, 10000
+  // hits, rewrites its directory entry under the stripe mutex) and would
+  // deadlock against the parked writer; this key sees about ten hits here,
+  // so that path is unreachable.
   WriterPause writer_pause(Volume::WriterSeam::kAfterPublish);
   bool wrote = false;
   std::thread writer([&] {
