@@ -7,14 +7,24 @@
 /// @brief Background optimization plugin interface for Cyclone Cache.
 ///
 /// This header defines the OptimizationPlugin interface which allows plugins to
-/// automatically generate optimized alternates (e.g., compressed versions,
-/// transcoded images) in the background after content is written to the cache.
+/// generate optimized alternates (e.g., compressed versions, transcoded
+/// images) in the background after content is written to the cache.
+///
+/// ## Embedder contract
+///
+/// The engine is opt-in and embedder-driven.  Cyclone's own write path never
+/// feeds it: the embedder sets `CacheConfig::optimization_config.enabled =
+/// true`, registers its plugins with
+/// `cache->optimization_engine()->register_plugin(...)`, and calls
+/// `cache->optimization_engine()->on_write_complete(...)` after each write it
+/// wants optimized.  With `enabled` false (the default) the engine does not
+/// exist and `Cache::optimization_engine()` returns nullptr.
 ///
 /// ## Thread Safety
 ///
 /// The optimization system is fully concurrent:
-/// - `plan_optimization()` is called from the write path, potentially from
-/// multiple threads
+/// - `plan_optimization()` is called on the thread that calls
+/// `on_write_complete()`, potentially from multiple threads
 /// - `transform()` is called from worker threads in the adaptive thread pool
 /// - Multiple `transform()` calls may run concurrently for different keys
 /// - Plugins must ensure their implementations are thread-safe
@@ -148,8 +158,9 @@ struct OptimizationPlan {
 /// @brief Abstract interface for background optimization plugins.
 ///
 /// Plugins implement this interface to provide custom optimization logic.
-/// The optimization engine calls `plan_optimization()` after writes complete,
-/// then schedules `transform()` calls on worker threads.
+/// The optimization engine calls `plan_optimization()` from
+/// `OptimizationEngine::on_write_complete()`, which the embedder calls after
+/// its writes complete, then schedules `transform()` calls on worker threads.
 ///
 /// @note All methods must be thread-safe. Multiple threads may call methods
 /// concurrently.
@@ -163,7 +174,8 @@ class OptimizationPlugin {
   [[nodiscard]] virtual PluginInfo info() const = 0;
 
   // Determine what optimizations to queue after a write completes.
-  // Called for every write - should be fast and non-blocking.
+  // Called for every write the embedder reports via on_write_complete() -
+  // should be fast and non-blocking.
   //
   // Parameters:
   //   key: The cache key that was written

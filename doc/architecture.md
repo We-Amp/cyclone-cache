@@ -603,11 +603,22 @@ implements HTTP-aware Vary/variant selection, exposed via `Cache::open_read_http
 
 ### Background Optimization Engine
 
-`optimization/optimization_engine.hpp` (`OptimizationEngine`) re-optimizes cached content in the
-background (fed by `on_write_complete`; the write path does not call it today,
-issue #52) through `OptimizationPlugin`s, using a
-priority `WorkQueue`, an autoscaling `AdaptiveThreadPool`, and a `LoadMonitor`
-for load-shedding. Its two-phase stop (`request_stop` / `join_threads`) lets its
+`optimization/optimization_engine.hpp` (`OptimizationEngine`) generates
+optimized alternates of cached content in the background through
+`OptimizationPlugin`s, using a priority `WorkQueue`, an autoscaling
+`AdaptiveThreadPool`, and a `LoadMonitor` for load-shedding.
+
+The engine is **opt-in and embedder-driven** (issue #52).
+`OptimizationConfig::enabled` defaults to `false`, in which case `Cache` never
+constructs it, `Cache::optimization_engine()` returns `nullptr`, and
+`Cache::start()` starts no engine threads. Nothing in Cyclone feeds the engine:
+`Volume::commit_write` / `Cache` do not call `on_write_complete`. An embedder
+that wants background optimization enables it in the config, registers its
+plugins on `cache->optimization_engine()`, and calls
+`cache->optimization_engine()->on_write_complete(key, header, content_length,
+written_alternate, hit_count)` after each of its own writes; that call runs
+`plan_optimization()` on the calling thread and queues the resulting work on
+the pool. Its two-phase stop (`request_stop` / `join_threads`) lets its
 workers — which re-enter `Cache::read_sync` — be joined *outside* the teardown
 gate.
 

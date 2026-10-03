@@ -466,7 +466,7 @@ class Cache {
   bool cross_process_ram_coherence_active() const;
 
   PluginManager& plugin_manager();
-  OptimizationEngine* optimization_engine();
+  OptimizationEngine* optimization_engine();          // nullptr unless optimization_config.enabled
 };
 ```
 
@@ -561,7 +561,7 @@ struct CacheConfig {
   std::chrono::milliseconds lease_wrap_ceiling{60000};
   bool         wrap_retention = true;             // keep the previous lap readable; false = flush (persisted per volume)
   MultiProcessConfig multi_process_config;        // enabled, process_index, total_processes
-  OptimizationConfig optimization_config;         // background alternate generation
+  OptimizationConfig optimization_config;         // background alternate generation; opt-in, embedder-driven
   // fluent setters: set_ram_cache_size(), set_small_tier_percent(),
   // set_multi_process(index, total), set_directory_sync_interval(), …
 };
@@ -602,7 +602,11 @@ cache.plugin_manager().set_alternate_selector(cyclone::create_http_alternate_plu
 
 An `OptimizationPlugin` produces new alternates in the background after a
 write — compress with Brotli once a document is hot, transcode an image, and
-so on — on an adaptive thread pool that backs off under system load:
+so on — on an adaptive thread pool that backs off under system load. The
+engine is opt-in (`optimization_config.enabled` defaults to `false`; when off,
+`optimization_engine()` returns `nullptr` and no engine threads start) and
+embedder-driven: Cyclone's write path never feeds it, so after each write you
+want optimized, call `on_write_complete()` yourself:
 
 ```cpp
 class BrotliPlugin : public OptimizationPlugin {
@@ -627,6 +631,10 @@ class BrotliPlugin : public OptimizationPlugin {
 config.optimization_config.set_enabled(true).set_max_threads(4)
       .set_min_hits_before_optimize(5).set_load_high_watermark(0.8);
 cache.optimization_engine()->register_plugin(std::make_shared<BrotliPlugin>());
+
+// After your own write commits (nothing in Cyclone calls this for you):
+cache.optimization_engine()->on_write_complete(key, header_bytes, content.size(),
+                                               AlternateId::Original, hit_count);
 ```
 
 See [doc/plugin-development.md](doc/plugin-development.md).

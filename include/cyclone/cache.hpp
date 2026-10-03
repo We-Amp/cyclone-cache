@@ -433,6 +433,17 @@ class Cache {
   PluginManager &plugin_manager();
   [[nodiscard]] const PluginManager &plugin_manager() const;
 
+  // The background optimization engine, or nullptr unless
+  // CacheConfig::optimization_config.enabled was true at create() (it is
+  // false by default).  The engine is embedder-driven: Cyclone never calls
+  // its on_write_complete() hook, so the embedder registers its
+  // OptimizationPlugins here and calls
+  // optimization_engine()->on_write_complete(...) after its own writes.
+  // Valid for the Cache's lifetime once created; stop() stops the engine
+  // but keeps the pointer valid until the Cache is destroyed, except in a
+  // forked child, where stop() abandons the engine and the accessor
+  // returns nullptr afterwards (see the fork-safety handling in
+  // Cache::stop()).
   OptimizationEngine *optimization_engine();
   [[nodiscard]] const OptimizationEngine *optimization_engine() const;
 

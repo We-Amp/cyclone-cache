@@ -61,7 +61,11 @@ class OptimizationEngine : public TaskProvider {
   void unregister_plugin(uint32_t plugin_id);
   std::vector<std::shared_ptr<OptimizationPlugin>> plugins() const;
 
-  // Called when a write completes (from Cache)
+  // Entry point for work.  The EMBEDDER calls this after each of its own
+  // writes; nothing in Cyclone (Cache / Volume::commit_write) calls it.
+  // Plans optimizations via the registered plugins and queues them on the
+  // pool, honouring min_hits_before_optimize.  Safe to call from any thread
+  // while the engine is running; a no-op after request_stop().
   void on_write_complete(const CacheKey &key, std::span<const std::byte> header,
                          uint64_t content_length, AlternateId written_alternate,
                          uint32_t hit_count);

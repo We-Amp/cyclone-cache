@@ -146,8 +146,16 @@ struct OptimizationConfig {
   uint32_t min_hits_before_optimize =
       2;  // Require N hits before queuing optimization
 
-  // Enable/disable the entire optimization system
-  bool enabled = true;
+  // Enable the background optimization engine.  Off by default: the engine
+  // is embedder-driven.  Nothing inside Cyclone feeds it -- the write path
+  // does not call OptimizationEngine::on_write_complete() -- so an engine
+  // nobody feeds would only start a LoadMonitor thread and min_threads idle
+  // pool workers per Cache.  To use background optimization, set this to
+  // true, register OptimizationPlugins on cache->optimization_engine(), and
+  // call cache->optimization_engine()->on_write_complete(...) after each of
+  // your own writes.  When false, Cache::optimization_engine() returns
+  // nullptr and Cache::start() starts no engine threads.
+  bool enabled = false;
 
   // Builder methods for fluent configuration
   OptimizationConfig &set_enabled(bool val) {
@@ -580,7 +588,8 @@ struct CacheConfig {
 
   std::shared_ptr<CachePlugin> alternate_selector;
 
-  // Background optimization configuration
+  // Background optimization configuration.  Opt-in (enabled defaults to
+  // false) and embedder-driven; see OptimizationConfig::enabled.
   OptimizationConfig optimization_config;
 
   // Multi-process configuration
