@@ -8,10 +8,16 @@
 // cyclone_cache_create), never calls cyclone_cache_destroy, and returns from
 // main (or calls exit) while the caches' background threads are alive.  On
 // POSIX, exit() runs static destructors and atexit handlers with those
-// threads still running, then the OS reaps them; on Windows, ExitProcess
-// terminates the other threads first and then runs DLL_PROCESS_DETACH.  The
-// contract pinned here: that process exits 0, with no fault, no sanitizer
-// report and no hang.
+// threads still running, then the OS reaps them.  On Windows it depends on
+// how Cyclone is linked: in a DLL, ExitProcess terminates the other threads
+// before DLL_PROCESS_DETACH runs the DLL's static destructors; in a
+// statically linked executable (this test's peer, a native embedder) the
+// UCRT's exit() runs the executable's static destructors with the other
+// threads alive, as on POSIX, and the safety of a destroyed std::mutex there
+// rests on MSVC's ~mutex being a no-op in release builds.  The contract
+// pinned here: that process exits 0, with no fault, no sanitizer report and
+// no hang.  It covers Cyclone's own statics only, not embedder-owned objects
+// a Cache thread can reach that the embedder destroys at exit.
 //
 // Why this is safe (audit at the time of writing; keep it so):
 //
@@ -49,13 +55,20 @@
 // Each case spawns the helper in a shape of that scenario and requires exit
 // code 0 before a deadline.  The spawn transport is the same anonymous-pipe
 // protocol as test_reset_gate_spawn.cpp; the helper says READY when its
-// caches are open and loaded, and leaves the process on EXIT.  Under ASan
-// and TSan the helper disables leak and thread-leak reporting for this one
-// mode (the leak is the premise), so a non-zero exit there is a real
-// use-after-free, a data race on a destroyed object, or a crash.
+// caches are open and loaded, and leaves the process on EXIT.  Leaking the
+// caches is the premise, so for this mode only the leak reports are off:
+// the helper calls __lsan_disable() in the exitopen mode (a runtime call, so
+// the other peer modes, which stop their caches, keep LeakSanitizer), and
+// this test appends report_thread_leaks=0 to the TSAN_OPTIONS it spawns the
+// helper with (keeping the lane's suppressions file; TSan's thread-leak
+// report has no runtime switch, and a process-wide __tsan_default_options
+// in the helper would have hidden real thread leaks in the other modes).  A
+// non-zero exit is then a real use-after-free, a data race on a destroyed
+// object, or a crash.
 
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -79,6 +92,18 @@ std::string peer_exe() {
   return exe;
 }
 
+// TSAN_OPTIONS for the helper: the lane's own value (its suppressions file)
+// with report_thread_leaks=0 appended.  Harmless in a non-TSan build: an
+// unused environment variable.
+std::string peer_tsan_options() {
+  std::string opts;
+  if (const char* current = std::getenv("TSAN_OPTIONS");
+      current != nullptr && *current != '\0') {
+    opts = std::string(current) + ":";
+  }
+  return "TSAN_OPTIONS=" + opts + "report_thread_leaks=0";
+}
+
 // Spawn `shape` leaving the process by `how` ("return" from main or
 // std::exit(0)) and require a clean exit.  The test directory outlives the
 // peer (declared first by the caller), so the peer's mapping and handles are
@@ -88,8 +113,10 @@ void require_clean_exit(const TempCacheDir& dir, const std::string& shape,
   SpawnedPeer peer;
   const std::string exe = peer_exe();
   INFO("shape=" << shape << " how=" << how);
-  REQUIRE(peer.spawn(exe, {"exitopen", dir.dir().string(),
-                           std::to_string(kVolSize), shape, how}));
+  REQUIRE(peer.spawn(
+      exe,
+      {"exitopen", dir.dir().string(), std::to_string(kVolSize), shape, how},
+      {peer_tsan_options()}));
   auto ready = peer.wait_ready(kDeadline);
   REQUIRE(ready.has_value());
   REQUIRE(*ready == "READY");

@@ -292,27 +292,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - A process may exit with `cyclone::Cache` objects still open (an embedder
-  that never calls `cyclone_cache_destroy`, the shape of a downstream
-  embedder's package smoke test). The audit found every Cache-owned
-  thread (DirectorySyncer, HitTracker flush, OptimizationEngine monitor and
-  workers) to be a cooperative loop over heap objects that are never
-  destroyed in that scenario, so `exit()` running static destructors beside
-  them is safe; the one static a writer thread can reach, the process-wide
-  liveness mutex (`liveness_mutex()` in `src/core/mmap_directory.cpp`,
-  taken by a writer waiting on the cross-process write lock behind a holder
-  stalled past 50 ms, after every sleep), is now immortal (allocated once,
-  never destroyed). With a function-local `std::mutex` that probe locked a
-  destroyed mutex at exit: a no-op where `~mutex` is trivial (glibc, MSVC)
-  but, on Apple's libc++, EINVAL → `std::system_error` → `std::terminate`
-  (reproduced 10/10 on macOS: a second in-process cache's writer waiting on
-  the lock while the process exits, with a 500 ms atexit handler standing
-  in for a host's own exit work). New regression
-  `tests/integration/test_exit_with_open_cache.cpp` spawns the helper in
-  six shapes (one C-API cache; two caches, the second opened under write
-  load; two in-process opens of one volume file; embedder threads still
-  writing at exit; a writer waiting on the write lock at exit; every
-  background thread busy at 1 ms intervals) and requires a clean exit 0, on
-  all three CI platforms.
+  that never calls `cyclone_cache_destroy`). The process-wide liveness mutex
+  (`liveness_mutex()` in `src/core/mmap_directory.cpp`) is now immortal: a
+  writer waiting on the cross-process write lock at exit locked it after its
+  static destructor had run, which terminated the process on Apple's libc++.
+  The rest of that exit path was audited safe; see "Process exit with open
+  caches" in doc/architecture.md and the new regression
+  `tests/integration/test_exit_with_open_cache.cpp`.
 
 - Every descriptor Cyclone opens on its cache files is now close-on-exec
   (`O_CLOEXEC`; `_O_NOINHERIT` on Windows CRT opens). A child the

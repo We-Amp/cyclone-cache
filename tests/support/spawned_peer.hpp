@@ -35,6 +35,8 @@
 #define NOMINMAX  // windows.h min/max macros would break std::min/std::max
 #endif
 #include <windows.h>
+
+#include <cstring>
 #else
 #include <fcntl.h>
 #include <poll.h>
@@ -59,8 +61,12 @@ class SpawnedPeer {
   SpawnedPeer& operator=(SpawnedPeer&&) = delete;
 
   // Launch `exe` with `args` (argv[1..]); stdin/stdout wired to our pipes,
-  // stderr inherited so peer diagnostics land in the test log.
-  bool spawn(const std::string& exe, const std::vector<std::string>& args);
+  // stderr inherited so peer diagnostics land in the test log.  The child
+  // gets this process's environment plus `extra_env` ("NAME=value" entries,
+  // appended, so an entry overrides a same-named inherited variable in both
+  // getenv and the sanitizer runtimes, which take the last definition).
+  bool spawn(const std::string& exe, const std::vector<std::string>& args,
+             const std::vector<std::string>& extra_env = {});
 
   // Read one status line ("READY" / "ERR ...") from the child's stdout.
   // Robust to partial writes: accumulates until '\n' (a trailing '\r' from a
@@ -100,7 +106,8 @@ class SpawnedPeer {
 #ifdef _WIN32
 
 inline bool SpawnedPeer::spawn(const std::string& exe,
-                               const std::vector<std::string>& args) {
+                               const std::vector<std::string>& args,
+                               const std::vector<std::string>& extra_env) {
   SECURITY_ATTRIBUTES sa{};
   sa.nLength = sizeof(sa);
   sa.bInheritHandle = TRUE;
@@ -138,10 +145,28 @@ inline bool SpawnedPeer::spawn(const std::string& exe,
   std::vector<char> cmdbuf(cmd.begin(), cmd.end());
   cmdbuf.push_back('\0');
 
+  // Environment block: a copy of ours (CreateProcess takes the whole block
+  // or nothing) with extra_env appended; "NAME=value\0" entries, "\0"-ended.
+  std::vector<char> envbuf;
+  if (!extra_env.empty()) {
+    if (LPCH ours = GetEnvironmentStringsA(); ours != nullptr) {
+      for (const char* p = ours; *p != '\0'; p += std::strlen(p) + 1) {
+        envbuf.insert(envbuf.end(), p, p + std::strlen(p) + 1);
+      }
+      FreeEnvironmentStringsA(ours);
+    }
+    for (const auto& kv : extra_env) {
+      envbuf.insert(envbuf.end(), kv.begin(), kv.end());
+      envbuf.push_back('\0');
+    }
+    envbuf.push_back('\0');
+  }
+
   PROCESS_INFORMATION pi{};
-  const BOOL ok =
-      CreateProcessA(exe.c_str(), cmdbuf.data(), nullptr, nullptr,
-                     /*bInheritHandles=*/TRUE, 0, nullptr, nullptr, &si, &pi);
+  const BOOL ok = CreateProcessA(exe.c_str(), cmdbuf.data(), nullptr, nullptr,
+                                 /*bInheritHandles=*/TRUE, 0,
+                                 envbuf.empty() ? nullptr : envbuf.data(),
+                                 nullptr, &si, &pi);
   // Close the CHILD-side ends in the parent regardless of outcome; keeping
   // out_w open here would mean reads on out_r never return EOF.
   CloseHandle(in_r);
@@ -295,7 +320,8 @@ inline void SpawnedPeer::kill() {
 #else  // POSIX
 
 inline bool SpawnedPeer::spawn(const std::string& exe,
-                               const std::vector<std::string>& args) {
+                               const std::vector<std::string>& args,
+                               const std::vector<std::string>& extra_env) {
   int in_pipe[2];   // parent -> child stdin
   int out_pipe[2];  // child stdout -> parent
   if (::pipe(in_pipe) != 0) {
@@ -328,9 +354,20 @@ inline bool SpawnedPeer::spawn(const std::string& exe,
   }
   argv.push_back(nullptr);
 
+  // Our environment plus extra_env, appended (getenv and the sanitizer
+  // runtimes take the last definition of a name).
+  std::vector<char*> envp;
+  for (char** e = environ; e != nullptr && *e != nullptr; ++e) {
+    envp.push_back(*e);
+  }
+  for (const auto& kv : extra_env) {
+    envp.push_back(const_cast<char*>(kv.c_str()));
+  }
+  envp.push_back(nullptr);
+
   pid_t pid = -1;
   const int rc =
-      ::posix_spawn(&pid, exe.c_str(), &fa, nullptr, argv.data(), environ);
+      ::posix_spawn(&pid, exe.c_str(), &fa, nullptr, argv.data(), envp.data());
   posix_spawn_file_actions_destroy(&fa);
   ::close(in_pipe[0]);
   ::close(out_pipe[1]);

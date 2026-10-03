@@ -121,26 +121,17 @@
 #include <unistd.h>
 #endif
 
-// Sanitizer hooks for the exitopen mode (see run_exitopen).  A process that
-// exits with its Cache threads alive has, by construction, threads that are
-// never joined; TSan would report every one as a "thread leak" and exit 66,
-// masking the real question (does any thread race a destroyed static).  The
-// hook only sets a default: a TSAN_OPTIONS in the environment still wins.
+// LeakSanitizer hook for the exitopen mode (see run_exitopen), which leaks
+// its caches on purpose.  Scoped to that mode by a runtime call
+// (__lsan_disable), never process-wide: the other modes stop their caches,
+// and a leak there is a finding.  TSan's thread-leak report, which the same
+// mode would trip, has no runtime switch; the spawning test appends
+// report_thread_leaks=0 to TSAN_OPTIONS for that mode only.
 #if defined(__has_feature)
-#if __has_feature(thread_sanitizer)
-extern "C" const char* __tsan_default_options() {
-  return "report_thread_leaks=0";
-}
-#endif
 #if __has_feature(address_sanitizer)
 #include <sanitizer/lsan_interface.h>
 #define CYCLONE_PEER_HAS_LSAN 1
 #endif
-#endif
-#if defined(__SANITIZE_THREAD__) && !defined(__has_feature)
-extern "C" const char* __tsan_default_options() {
-  return "report_thread_leaks=0";
-}
 #endif
 #if defined(__SANITIZE_ADDRESS__) && !defined(_MSC_VER) && \
     !defined(CYCLONE_PEER_HAS_LSAN)
@@ -601,25 +592,29 @@ int run_exitopen(const char* raw_path, unsigned long long size,
         }
       }
     };
-    const std::vector<std::byte> content(kExitOpenDocBytes, std::byte{0x5A});
-    load->threads.emplace_back([a, &content] {
+    // Heap-allocated and leaked like `load`: both writers below outlive this
+    // frame in the "return" style, so a stack buffer would be read after
+    // return once the 5 s escalation lets B's writer proceed.
+    const auto* content =
+        new std::vector<std::byte>(kExitOpenDocBytes, std::byte{0x5A});
+    load->threads.emplace_back([a, content] {
       if (auto wh =
-              a->write_sync(cyclone::CacheKey("lockwait-a"), content.size());
+              a->write_sync(cyclone::CacheKey("lockwait-a"), content->size());
           wh.has_value()) {
-        [[maybe_unused]] const auto wrote = wh->write_sync(content);
+        [[maybe_unused]] const auto wrote = wh->write_sync(*content);
         [[maybe_unused]] const auto closed = wh->close_sync();
       }
     });
     while (!parked.load()) {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    load->threads.emplace_back([b, load, &content] {
+    load->threads.emplace_back([b, load, content] {
       for (uint64_t i = 0; !load->stop.load(std::memory_order_relaxed); ++i) {
         if (auto wh = b->write_sync(
                 cyclone::CacheKey("lockwait-b-" + std::to_string(i)),
-                content.size());
+                content->size());
             wh.has_value()) {
-          [[maybe_unused]] const auto wrote = wh->write_sync(content);
+          [[maybe_unused]] const auto wrote = wh->write_sync(*content);
           [[maybe_unused]] const auto closed = wh->close_sync();
         }
         load->writes.fetch_add(1, std::memory_order_relaxed);
@@ -628,6 +623,14 @@ int run_exitopen(const char* raw_path, unsigned long long size,
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     std::fprintf(stderr, "exitopen: lockwait b_writes=%llu\n",
                  static_cast<unsigned long long>(load->writes.load()));
+    // The case tests the probe path only while B is still waiting on the
+    // lock.  If B got through (the 5 s write-lock escalation took the lock
+    // from parked A on a runner that slow), it owns the lock, never probes
+    // again, and the case would pass without testing anything: fail loudly.
+    if (load->writes.load() != 0) {
+      say("ERR lockwait: B not blocked");
+      return 1;
+    }
     say("READY");
     wait_for_release();
     for (auto& t : load->threads) {
