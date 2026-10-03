@@ -77,8 +77,8 @@
 //                                 say READY, and on release leave the
 //                                 process WITHOUT stopping or destroying
 //                                 them: background threads alive through
-//                                 static destruction (issue
-//                                 oschaaf/modpagespeed-2#1761).  Exit 0 is
+//                                 static destruction (the shape of a
+//                                 downstream embedder's smoke test).  Exit 0 is
 //                                 the contract; a sanitizer report, signal
 //                                 or hang is the finding.
 
@@ -441,7 +441,7 @@ int run_borrow(const char* path, unsigned long long size, int nkeys,
 // ---------------------------------------------------------------------------
 // exitopen: leave the process with Cache objects still OPEN.
 //
-// The host shape behind PageSpeed 2.x issue oschaaf/modpagespeed-2#1761: a
+// The host shape behind a downstream embedder's smoke test: a
 // .NET host that never stop()s / destroys the caches its ps_cache_open
 // created, and exits while their DirectorySyncer, HitTracker and
 // OptimizationEngine threads are alive.  Everything below is heap-allocated

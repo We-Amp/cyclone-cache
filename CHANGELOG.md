@@ -292,8 +292,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - A process may exit with `cyclone::Cache` objects still open (an embedder
-  that never calls `cyclone_cache_destroy`, the shape behind PageSpeed 2.x
-  issue oschaaf/modpagespeed-2#1761). The audit found every Cache-owned
+  that never calls `cyclone_cache_destroy`, the shape of a downstream
+  embedder's package smoke test). The audit found every Cache-owned
   thread (DirectorySyncer, HitTracker flush, OptimizationEngine monitor and
   workers) to be a cooperative loop over heap objects that are never
   destroyed in that scenario, so `exit()` running static destructors beside

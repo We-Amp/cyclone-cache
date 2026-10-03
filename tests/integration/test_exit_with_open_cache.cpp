@@ -3,7 +3,7 @@
 
 // A process may exit with Cache objects still open.
 //
-// The embedder shape behind PageSpeed 2.x issue oschaaf/modpagespeed-2#1761:
+// The embedder shape behind a downstream package smoke test:
 // a .NET host creates caches through the C API (ps_cache_open ->
 // cyclone_cache_create), never calls cyclone_cache_destroy, and returns from
 // main (or calls exit) while the caches' background threads are alive.  On
