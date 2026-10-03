@@ -466,7 +466,7 @@ class Cache {
   bool cross_process_ram_coherence_active() const;
 
   PluginManager& plugin_manager();
-  OptimizationEngine* optimization_engine();
+  OptimizationEngine* optimization_engine();          // nullptr unless optimization_config.enabled
 };
 ```
 

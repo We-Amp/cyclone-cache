@@ -440,7 +440,10 @@ class Cache {
   // OptimizationPlugins here and calls
   // optimization_engine()->on_write_complete(...) after its own writes.
   // Valid for the Cache's lifetime once created; stop() stops the engine
-  // but keeps the pointer valid until the Cache is destroyed.
+  // but keeps the pointer valid until the Cache is destroyed, except in a
+  // forked child, where stop() abandons the engine and the accessor
+  // returns nullptr afterwards (see the fork-safety handling in
+  // Cache::stop()).
   OptimizationEngine *optimization_engine();
   [[nodiscard]] const OptimizationEngine *optimization_engine() const;
 

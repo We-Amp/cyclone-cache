@@ -212,8 +212,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `optimization_config.enabled = true`, register plugins on
   `cache->optimization_engine()`, and call
   `cache->optimization_engine()->on_write_complete(...)` after each of your
-  own writes; nothing in Cyclone calls that hook. The `OptimizationConfig`
-  layout is unchanged, and the C API has no optimization settings.
+  own writes; nothing in Cyclone calls that hook. Code that already
+  called `cache->optimization_engine()->...` (for example
+  `register_plugin`) without setting `optimization_config.enabled = true`
+  now dereferences a null pointer: set `enabled` first, or null-check the
+  accessor. The `OptimizationConfig` layout is unchanged, and the C API
+  has no optimization settings.
 - **Plain writes no longer assemble the document in a second and third
   buffer** (issue #16). `commit_write` used to copy the content into the
   document builder and again into one contiguous document, two fresh heap
