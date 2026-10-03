@@ -539,6 +539,20 @@ CycloneCacheHandle* exit_open_capi(const std::string& path,
 // Exit style: "return" returns from main (static destructors + atexit run
 // with the Cache threads alive, then the OS reaps them); "exit" calls
 // std::exit(0) from inside this function so main's locals never unwind.
+// The READY line of the exitopen mode echoes two variables of the
+// environment this process was spawned with, so the parent can assert that
+// SpawnedPeer::spawn's extra_env REPLACED the inherited values: the probe
+// variable the test sets to one value in itself and another in the extras,
+// and TSAN_OPTIONS, which the test extends with report_thread_leaks=0.
+std::string exit_open_ready_line() {
+  const auto value = [](const char* name) -> std::string {
+    const char* v = std::getenv(name);
+    return v == nullptr ? "-" : v;
+  };
+  return "READY probe=" + value("CYCLONE_PEER_PROBE") +
+         " tsan=" + value("TSAN_OPTIONS");
+}
+
 int run_exitopen(const char* raw_path, unsigned long long size,
                  const std::string& shape, const std::string& how) {
 #if CYCLONE_PEER_HAS_LSAN
@@ -631,7 +645,7 @@ int run_exitopen(const char* raw_path, unsigned long long size,
       say("ERR lockwait: B not blocked");
       return 1;
     }
-    say("READY");
+    say(exit_open_ready_line());
     wait_for_release();
     for (auto& t : load->threads) {
       t.detach();  // A is parked for good; B keeps waiting on the lock
@@ -701,7 +715,7 @@ int run_exitopen(const char* raw_path, unsigned long long size,
                  static_cast<unsigned long long>(st.directory_syncs),
                  static_cast<unsigned long long>(
                      cache->optimization_engine()->stats().completed));
-    say("READY");
+    say(exit_open_ready_line());
     wait_for_release();
     load->stop.store(true);
     for (auto& t : load->threads) {
@@ -739,7 +753,7 @@ int run_exitopen(const char* raw_path, unsigned long long size,
         cyclone_cache_read_close(rh);
       }
     }
-    say("READY");
+    say(exit_open_ready_line());
     wait_for_release();
     if (how == "exit") {
       std::exit(0);
@@ -765,7 +779,7 @@ int run_exitopen(const char* raw_path, unsigned long long size,
   std::this_thread::sleep_for(std::chrono::milliseconds(300));
   std::fprintf(stderr, "exitopen: %s writes=%llu\n", shape.c_str(),
                static_cast<unsigned long long>(load->writes.load()));
-  say("READY");
+  say(exit_open_ready_line());
   wait_for_release();
   if (shape == "capi2live") {
     for (auto& t : load->threads) {

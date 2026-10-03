@@ -59,12 +59,24 @@
 // caches is the premise, so for this mode only the leak reports are off:
 // the helper calls __lsan_disable() in the exitopen mode (a runtime call, so
 // the other peer modes, which stop their caches, keep LeakSanitizer), and
-// this test appends report_thread_leaks=0 to the TSAN_OPTIONS it spawns the
-// helper with (keeping the lane's suppressions file; TSan's thread-leak
-// report has no runtime switch, and a process-wide __tsan_default_options
-// in the helper would have hidden real thread leaks in the other modes).  A
-// non-zero exit is then a real use-after-free, a data race on a destroyed
-// object, or a crash.
+// this test spawns the helper with the lane's TSAN_OPTIONS extended by
+// report_thread_leaks=0 (SpawnedPeer::spawn's extra_env REPLACES the
+// inherited variable; a process-wide __tsan_default_options in the helper
+// would have hidden real thread leaks in the other modes).  That flag is
+// belt and braces: TSan reports a thread leak only for a thread that has
+// FINISHED without being joined or detached, and the Cache threads are
+// still running when the process exits while the helper joins or detaches
+// its own, so the mode is clean with the flag off as well.  A non-zero exit
+// is then a real use-after-free, a data race on a destroyed object, or a
+// crash.
+//
+// The READY line echoes the probe variable and TSAN_OPTIONS the helper saw,
+// and every case asserts the override took effect: this process sets
+// CYCLONE_PEER_PROBE to one value in its own environment and passes another
+// in extra_env, so the check proves replacement (getenv and the sanitizer
+// runtimes take the FIRST match of a name; an appended duplicate would not
+// have worked), on all three platforms, including the Windows environment
+// block.
 
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
@@ -72,6 +84,10 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+
+#ifndef _WIN32
+#include <stdlib.h>  // setenv
+#endif
 
 #include "support/spawned_peer.hpp"
 #include "support/temp_cache.hpp"
@@ -92,16 +108,32 @@ std::string peer_exe() {
   return exe;
 }
 
-// TSAN_OPTIONS for the helper: the lane's own value (its suppressions file)
-// with report_thread_leaks=0 appended.  Harmless in a non-TSan build: an
-// unused environment variable.
+// The lane's own TSAN_OPTIONS (its suppressions file), or empty.
+std::string lane_tsan_options() {
+  const char* current = std::getenv("TSAN_OPTIONS");
+  return current == nullptr ? std::string() : std::string(current);
+}
+
+// TSAN_OPTIONS for the helper: the lane's value with report_thread_leaks=0
+// appended.  Harmless in a non-TSan build: an unused environment variable.
 std::string peer_tsan_options() {
-  std::string opts;
-  if (const char* current = std::getenv("TSAN_OPTIONS");
-      current != nullptr && *current != '\0') {
-    opts = std::string(current) + ":";
+  std::string opts = lane_tsan_options();
+  if (!opts.empty()) {
+    opts += ":";
   }
   return "TSAN_OPTIONS=" + opts + "report_thread_leaks=0";
+}
+
+// Set CYCLONE_PEER_PROBE in THIS process so the helper's copy must have
+// replaced an inherited value, not filled an absent one.  Catch2 runs the
+// cases on one thread and every earlier case has joined its threads, so the
+// write cannot race a getenv.
+void set_parent_probe() {
+#ifdef _WIN32
+  _putenv_s("CYCLONE_PEER_PROBE", "parent");
+#else
+  ::setenv("CYCLONE_PEER_PROBE", "parent", 1);
+#endif
 }
 
 // Spawn `shape` leaving the process by `how` ("return" from main or
@@ -113,13 +145,23 @@ void require_clean_exit(const TempCacheDir& dir, const std::string& shape,
   SpawnedPeer peer;
   const std::string exe = peer_exe();
   INFO("shape=" << shape << " how=" << how);
+  set_parent_probe();
   REQUIRE(peer.spawn(
       exe,
       {"exitopen", dir.dir().string(), std::to_string(kVolSize), shape, how},
-      {peer_tsan_options()}));
+      {peer_tsan_options(), "CYCLONE_PEER_PROBE=child"}));
   auto ready = peer.wait_ready(kDeadline);
   REQUIRE(ready.has_value());
-  REQUIRE(*ready == "READY");
+  INFO("ready line: " << *ready);
+  // "READY probe=<CYCLONE_PEER_PROBE> tsan=<TSAN_OPTIONS>" as the helper saw
+  // them: the extras replaced the inherited values.
+  const std::string prefix = "READY probe=child tsan=";
+  REQUIRE(ready->starts_with(prefix));
+  const std::string seen_tsan = ready->substr(prefix.size());
+  REQUIRE(seen_tsan.find("report_thread_leaks=0") != std::string::npos);
+  if (const std::string lane = lane_tsan_options(); !lane.empty()) {
+    REQUIRE(seen_tsan.find(lane) != std::string::npos);  // suppressions kept
+  }
   peer.request_exit();
   auto code = peer.wait_exit(kDeadline);
   REQUIRE(code.has_value());  // nullopt = still alive at the deadline: a hang
