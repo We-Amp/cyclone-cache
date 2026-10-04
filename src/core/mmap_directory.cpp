@@ -902,8 +902,8 @@ bool MmapDirectory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
                            uint64_t verified_offset, bool *collision_evicted,
                            bool *bucket_full_evicted,
                            InsertAdmission *admission,
-                           std::span<const uint64_t> clear_offsets,
-                           bool *busy) {
+                           std::span<const uint64_t> clear_offsets, bool *busy,
+                           const PublishView *view, bool *stale) {
   if (_header == nullptr) {
     return false;
   }
@@ -944,6 +944,23 @@ bool MmapDirectory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
     // an independently opened writer in another process may have wrapped
     // or advanced since the caller's election (S9).
     admission->refresh();
+    // The conditional publish (see PublishView).  Another process may have
+    // published or removed this key since the caller resolved it; inside
+    // this bracket nothing can change the bucket any more, so the answer
+    // holds until the entry below is written.  A view that no longer holds
+    // publishes NOTHING: both locks are released untouched and the caller
+    // resolves again.
+    if (view != nullptr &&
+        !publish_view_is_current(bucket, kEntriesPerBucket, tag,
+                                 verified_offset, kMatchAnyTag,
+                                 kNoVerifiedEntry, *admission, *view, offset)) {
+      release_writer(bucket_idx, writer_token);
+      release_phase_lock(phase_token);
+      if (stale != nullptr) {
+        *stale = true;
+      }
+      return false;
+    }
     const InsertChoice choice = choose_insert_slot(
         bucket, kEntriesPerBucket, tag, verified_offset, kMatchAnyTag,
         *admission, collision_evicted, bucket_full_evicted, offset);

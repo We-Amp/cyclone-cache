@@ -4439,6 +4439,10 @@ VolumeStats Volume::stats() const {
       _alternate_max_chain_depth.load(std::memory_order_relaxed);
   result.alternate_wrap_refusals =
       _alternate_wrap_refusals.load(std::memory_order_relaxed);
+  result.alternate_publish_retries =
+      _alternate_publish_retries.load(std::memory_order_relaxed);
+  result.alternate_publish_rewrites =
+      _alternate_publish_rewrites.load(std::memory_order_relaxed);
   result.frontier_advances = _frontier_advances.load(std::memory_order_relaxed);
   result.advances_deferred_by_lease =
       _advances_deferred_by_lease.load(std::memory_order_relaxed);
@@ -5197,21 +5201,78 @@ std::expected<WriteHandle, CacheError> Volume::write_alternate_sync(
 std::expected<void, CacheError> Volume::commit_alternate_write(
     Stripe* stripe, const CacheKey& key, AlternateId alternate_id,
     std::span<const std::byte> header, std::span<const std::byte> content) {
-  // At most one restart: a wrap-raced write whose live chain became retained
-  // in that wrap (see commit_alternate_write_once) retries once, and the
-  // retry carries the chain forward.  The retry cannot restart again: its
-  // head is retained or gone, and a carry never refuses its own links.
-  bool restart = false;
+  // Two reasons to run an attempt again, and they are independent.
+  //
+  // (1) At most one WRAP restart: a wrap-raced write whose live chain became
+  //     retained in that wrap (see commit_alternate_write_once) retries
+  //     once, and the retry carries the chain forward.  That retry cannot
+  //     ask for another: its head is retained or gone, and a carry never
+  //     refuses its own links.
+  //
+  // (2) STALE-PUBLISH retries, as many as it takes.  An attempt resolves the
+  //     key's chain under the stripe mutex, which is per process, and
+  //     publishes after its data is written.  Another process can publish
+  //     or remove the same key in between.  The attempt notices -- right
+  //     after it holds the write lock, before it writes, or else at the
+  //     publish itself (PublishView) -- publishes nothing, and is run again
+  //     from the top: a fresh snapshot, a fresh walk, a fresh slot.
+  //
+  //     WHY THERE IS NO BOUND.  A write goes stale once per other directory
+  //     change to its key that lands in its window, so any fixed number of
+  //     attempts is wrong for some number of concurrent writers, and giving
+  //     up would turn "another process was faster" into a failed write.
+  //     WHY IT TERMINATES.  A round is lost only when another process
+  //     COMPLETED an insert or a removal for this key's bucket and tag
+  //     since the round's probe, or when an entry the probe's snapshot did
+  //     not admit became admissible -- at most the bucket's three other
+  //     slots, each of which is in the next round's view.  Every lost round
+  //     is therefore paid for by someone else's finished operation: the
+  //     system as a whole always progresses, and with a finite set of
+  //     writers each of them publishes.  The loop holds no lock between
+  //     rounds (the stripe mutex and the write lock are released when an
+  //     attempt returns), so a waiting writer is never the reason another
+  //     one cannot finish.
+  //
+  //     KNOWN LIMIT (wrap retention, rare).  A round that carries a
+  //     RETAINED chain forward copies it before its allocation, and that
+  //     allocation may move the frontier over the retained head.  If the
+  //     round's publish is then refused although the head's entry is still
+  //     in the bucket -- an unseen same-tag entry appeared: a colliding
+  //     foreign key published in the window, or a stale entry the cursor
+  //     advance made admissible -- the next round's probe no longer admits
+  //     the head, sees no key, and writes a fresh chain WITHOUT the carry.
+  //     The retained alternates are then dropped (a cache loss, re-created
+  //     on demand; never a wrong serve).  Carry rounds are deliberately NOT
+  //     exempt from the unseen-entry rule: the far likelier unseen entry is
+  //     this key's own, published by another process, and publishing beside
+  //     it is the second head this loop exists to prevent.  Closing the
+  //     limit needs the retry to keep the verified offset and the copied
+  //     carry across rounds.
+  //
+  //     The two interact in one corner: a stale-publish retry that follows
+  //     a wrap restart runs with allow_restart == false, so a SECOND wrap
+  //     inside that attempt takes the link-refusal path (a fresh chain; the
+  //     retained one is orphaned) instead of carrying it forward.  That is
+  //     the pre-existing outcome for a write that wraps twice.
+  bool allow_restart = true;
   WrittenRange written;
-  auto result =
-      commit_alternate_write_once(stripe, key, alternate_id, header, content,
-                                  /*allow_restart=*/true, &restart, &written);
-  if (restart) {
-    restart = false;
+  std::expected<void, CacheError> result;
+  for (;;) {
+    bool restart = false;
+    bool stale_publish = false;
     written = {};
     result = commit_alternate_write_once(stripe, key, alternate_id, header,
-                                         content, /*allow_restart=*/false,
-                                         &restart, &written);
+                                         content, allow_restart, &restart,
+                                         &stale_publish, &written);
+    if (restart) {
+      allow_restart = false;
+      continue;
+    }
+    if (stale_publish) {
+      _alternate_publish_retries.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
+    break;
   }
   start_write_behind(written);  // stripe mutex released by now
   return result;
@@ -5398,7 +5459,8 @@ Volume::CarryPlan Volume::carry_retained_chain(
 std::expected<void, CacheError> Volume::commit_alternate_write_once(
     Stripe* stripe, const CacheKey& key, AlternateId alternate_id,
     std::span<const std::byte> header, std::span<const std::byte> content,
-    bool allow_restart, bool* restart, WrittenRange* written_range) {
+    bool allow_restart, bool* restart, bool* stale_publish,
+    WrittenRange* written_range) {
   if (stripe == nullptr) {
     return make_unexpected(CacheError::NotInitialized);
   }
@@ -5460,6 +5522,11 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
   AdmitClass head_cls = AdmitClass::kReject;
   std::array<uint64_t, Directory::kEntriesPerBucket> clear_offsets{};
   size_t clear_count = 0;
+  // Every same-tag entry this probe is handed -- this key's and any
+  // colliding foreign key's.  Handed to the publish below, which refuses to
+  // publish into a bucket that no longer matches it (PublishView).
+  std::array<uint64_t, Directory::kEntriesPerBucket> seen_offsets{};
+  size_t seen_count = 0;
   {
     struct HeadCandidate {
       uint64_t rel;
@@ -5469,8 +5536,24 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
     std::array<HeadCandidate, Directory::kEntriesPerBucket> heads{};
     size_t head_count = 0;
     const bool probe_complete = writer_probe(
-        stripe, key, snap, [&] { head_count = 0; },
+        stripe, key, snap,
+        [&] {
+          head_count = 0;
+          seen_count = 0;
+        },
         [&](const DirEntry& dir_entry, AdmitClass cls) {
+          // Recorded before anything can skip the entry: the publish must
+          // know about every entry this probe was shown, usable or not.
+          bool already_seen = false;
+          for (size_t i = 0; i < seen_count; ++i) {
+            if (seen_offsets[i] == dir_entry.offset()) {
+              already_seen = true;
+              break;
+            }
+          }
+          if (!already_seen && seen_count < seen_offsets.size()) {
+            seen_offsets[seen_count++] = dir_entry.offset();
+          }
           // A version change may retry the scan: never record an entry
           // twice.
           for (size_t i = 0; i < head_count; ++i) {
@@ -5841,6 +5924,79 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
   // (see HeldWriteSlotReleaser at commit_write).
   HeldWriteSlotReleaser slot_releaser(stripe, slot);
 
+  // ---- Has the key changed while this write waited for the lock? ---------
+  //
+  // The chain was resolved before the write lock was asked for, and under
+  // contention most of a write's time is spent waiting for it -- behind the
+  // very writers that change the key.  So look again now, before anything
+  // is written: one lock-free probe of the key's bucket.  If the verified
+  // head is gone, or a same-tag entry is there that the first probe did not
+  // see, this attempt is already stale: give the reserved slot back
+  // unfilled (the cursor has not moved; commit_write_slot releases the
+  // write lock and publishes nothing) and let the caller resolve again.  A
+  // lost round then costs a chain walk instead of a written document.
+  //
+  // This is an optimisation of the common case, not the guarantee: a change
+  // that lands after this look is caught by the conditional publish below.
+  // It runs only where a wrong "stale" answer costs nothing but the round:
+  //
+  //   * ONLY FOR AN ABSENT KEY OR A CURRENT HEAD.  The probe hands over
+  //     admitted entries only, and a RETAINED head stops being admitted as
+  //     soon as the frontier passes it -- which this attempt's own
+  //     allocation may just have done.  The look would then call the head
+  //     gone, and the next round, unable to see the key at all, would write
+  //     a fresh chain and drop the retained alternates this round has
+  //     already copied for its carry.  The publish has no such problem (it
+  //     finds the verified entry by offset, whatever its class), so a round
+  //     with a retained head goes straight to it.  A current head cannot
+  //     lose admission short of a wrap: the cursor only grows within a
+  //     pass, and a frontier advance touches the retained class alone.
+  //   * not when this attempt's own allocation wrapped the stripe -- the
+  //     wrap changes how every entry is admitted, and the wrap paths below
+  //     decide what to do about that;
+  //   * not when the probe could not complete (the bucket's contents are
+  //     then unknown; the publish decides);
+  //   * not when the slot cannot be given back (its cursor advance was
+  //     published at the reservation; test seam only).
+  if (slot.deferred_publish && !wrapped_since(stripe, snap) &&
+      (!key_exists || head_cls == AdmitClass::kCurrent)) {
+    const StripeSnapshot recheck = snapshot(stripe);
+    bool verified_still_there = !key_exists;
+    bool unseen_entry = false;
+    const bool recheck_complete = writer_probe(
+        stripe, key, recheck,
+        [&] {
+          verified_still_there = !key_exists;
+          unseen_entry = false;
+        },
+        [&](const DirEntry& dir_entry, AdmitClass /*cls*/) {
+          if (key_exists && dir_entry.offset() == head_relative_offset) {
+            verified_still_there = true;
+            return true;
+          }
+          bool seen = false;
+          for (size_t i = 0; i < seen_count; ++i) {
+            if (seen_offsets[i] == dir_entry.offset()) {
+              seen = true;
+              break;
+            }
+          }
+          if (!seen) {
+            unseen_entry = true;
+          }
+          return true;
+        });
+    if (recheck_complete && (!verified_still_there || unseen_entry)) {
+      // Releases the write lock and publishes nothing; a Busy (usurped
+      // lock) changes nothing for the retry, which re-acquires it.
+      [[maybe_unused]] const auto released =
+          commit_write_slot(stripe, slot, /*fill_ok=*/false);
+      slot_releaser.disarm();
+      *stale_publish = true;
+      return make_unexpected(CacheError::Busy);
+    }
+  }
+
   // Link the carried nodes now that their offsets are known: head -> newest
   // carried -> ... -> oldest -> 0, every hop downward inside this slot, so
   // the whole chain lies in ONE pass (D5) and no link names a byte outside
@@ -6023,14 +6179,38 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
   // refused -- never inserted beside it with kNoVerifiedEntry, which would
   // leave the old head resolvable as a stale duplicate.  Every other
   // same-key entry found above is cleared in the same bracket.
+  //
+  // CONDITIONAL on the bucket still holding what the probe above saw.  The
+  // chain this document links to was resolved before the allocation, under
+  // a mutex no other process shares; if another process has since published
+  // or removed this key, updating "the verified head" would not find it and
+  // the entry would land BESIDE the key's real one -- two heads, of which
+  // the next write keeps one and clears the other together with every
+  // alternate only it held.  So: publish nothing, and let the caller
+  // resolve again.
   StripeAdmission admission(*this, *stripe);
   bool insert_busy = false;
+  bool insert_stale = false;
+  const PublishView publish_view{
+      std::span<const uint64_t>(seen_offsets.data(), seen_count)};
   if (!stripe->insert(
           key, relative_offset, doc_size,
           key_exists ? head_relative_offset : Directory::kNoVerifiedEntry,
           &collision_evicted, &bucket_full_evicted, &admission,
           std::span<const uint64_t>(clear_offsets.data(), clear_count),
-          &insert_busy)) {
+          &insert_busy, &publish_view, &insert_stale)) {
+    if (insert_stale) {
+      // Nothing was published and nothing below runs: no splice, no
+      // counter, no write-behind for bytes nothing refers to.  The document
+      // this attempt wrote stays behind as dead space until the stripe
+      // wraps; the caller writes it again.  It is as reachable as the
+      // document of a publish that gave up on a capped lock wait (below):
+      // only through a stale same-tag entry already naming this offset.
+      _alternate_publish_rewrites.fetch_add(1, std::memory_order_relaxed);
+      *written_range = {};
+      *stale_publish = true;
+      return make_unexpected(CacheError::Busy);
+    }
     // As in commit_write: a capped lock wait that gave up published nothing.
     return make_unexpected(insert_busy ? CacheError::Busy
                                        : CacheError::InternalError);
@@ -7119,12 +7299,31 @@ std::expected<void, CacheError> Volume::remove_alternate_sync(
     uint64_t head_relative_offset = 0;
     bool found_head = false;
     AdmitClass head_cls = AdmitClass::kReject;
+    // Every same-tag entry this probe is handed, for the conditional
+    // publish of a head removal below (PublishView).  The probe therefore
+    // runs over the whole bucket instead of stopping at the head.
+    std::array<uint64_t, Directory::kEntriesPerBucket> seen_offsets{};
+    size_t seen_count = 0;
 
     const bool probe_complete = writer_probe(
-        stripe, key, snap, [&] { found_head = false; },
+        stripe, key, snap,
+        [&] {
+          found_head = false;
+          seen_count = 0;
+        },
         [&](const DirEntry& dir_entry, AdmitClass cls) {
+          bool already_seen = false;
+          for (size_t i = 0; i < seen_count; ++i) {
+            if (seen_offsets[i] == dir_entry.offset()) {
+              already_seen = true;
+              break;
+            }
+          }
+          if (!already_seen && seen_count < seen_offsets.size()) {
+            seen_offsets[seen_count++] = dir_entry.offset();
+          }
           if (found_head) {
-            return false;
+            return true;  // only recording the rest of the bucket now
           }
 
           uint64_t doc_offset = stripe->offset + dir_entry.offset();
@@ -7152,7 +7351,7 @@ std::expected<void, CacheError> Volume::remove_alternate_sync(
           head_cls = cls;
           found_head = true;
           _mapped_file->unmap_region(*mapped);
-          return false;
+          return true;
         });
 
     if (!found_head && !probe_complete) {
@@ -7272,13 +7471,34 @@ std::expected<void, CacheError> Volume::remove_alternate_sync(
         size_t next_doc_size = next_reader.document().len;
         _mapped_file->unmap_region(*next_mapped);
 
+#ifdef CYCLONE_TEST_SEAMS
+        // TEST SEAM: the head and its successor are resolved, nothing is
+        // published yet (see s_remove_republish_gate_for_test).
+        if (s_remove_republish_gate_for_test) {
+          s_remove_republish_gate_for_test();
+        }
+#endif
+
         // head_relative_offset was verified by full first_key comparison
         // above — repoint exactly that entry, never a same-tag collider.
+        //
+        // CONDITIONAL, like an alternate write's publish: if another process
+        // published or removed this key since the probe above, the head
+        // resolved there is no longer the key's entry, and republishing its
+        // successor would add a second head beside the real one.  Publish
+        // nothing and resolve again -- this loop's next attempt.
         StripeAdmission admission(*this, *stripe);
         bool busy = false;
+        bool stale = false;
+        const PublishView publish_view{
+            std::span<const uint64_t>(seen_offsets.data(), seen_count)};
         stripe->insert(key, target_next_offset, next_doc_size,
                        head_relative_offset, nullptr, nullptr, &admission, {},
-                       &busy);
+                       &busy, &publish_view, &stale);
+        if (stale) {
+          _alternate_publish_retries.fetch_add(1, std::memory_order_relaxed);
+          continue;  // Nothing repointed: the head moved under us
+        }
         if (busy) {
           return make_unexpected(CacheError::Busy);  // Nothing repointed
         }

@@ -638,7 +638,8 @@ class MmapDirectory {
               bool *bucket_full_evicted = nullptr,
               InsertAdmission *admission = nullptr,
               std::span<const uint64_t> clear_offsets = {},
-              bool *busy = nullptr);
+              bool *busy = nullptr, const PublishView *view = nullptr,
+              bool *stale = nullptr);
 
   /// Remove an entry
   /// Returns true if entry was found and removed

@@ -335,10 +335,47 @@ InsertChoice choose_insert_slot(const DirEntry *bucket, size_t slots,
   return {oldest, oldest >= 0, false};
 }
 
+bool publish_view_is_current(const DirEntry *bucket, size_t slots, uint16_t tag,
+                             uint64_t verified_offset, uint64_t match_any_tag,
+                             uint64_t no_verified_entry,
+                             const InsertAdmission &adm,
+                             const PublishView &view, uint64_t new_offset) {
+  bool verified_found =
+      verified_offset == match_any_tag || verified_offset == no_verified_entry;
+  for (size_t i = 0; i < slots; ++i) {
+    const DirEntry &e = bucket[i];
+    if (e.is_empty() || e.tag() != tag) {
+      continue;
+    }
+    if (e.offset() == verified_offset) {
+      verified_found = true;
+      continue;
+    }
+    if (new_offset != 0 && e.offset() == new_offset) {
+      continue;  // the dead entry at the offset just written
+    }
+    if (adm.classify(e.offset(), e.phase()) == AdmitClass::kReject) {
+      continue;  // resolves nothing
+    }
+    bool seen = false;
+    for (const uint64_t off : view.seen_offsets) {
+      if (off == e.offset()) {
+        seen = true;
+        break;
+      }
+    }
+    if (!seen) {
+      return false;  // published since the writer's probe
+    }
+  }
+  return verified_found;
+}
+
 bool Directory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
                        uint64_t verified_offset, bool *collision_evicted,
                        bool *bucket_full_evicted, InsertAdmission *admission,
-                       std::span<const uint64_t> clear_offsets) {
+                       std::span<const uint64_t> clear_offsets,
+                       const PublishView *view, bool *stale) {
   uint32_t bucket_idx = key.bucket_hash() % _num_buckets;
   uint16_t tag = key.tag();
   bool cur_phase = current_phase();
@@ -350,6 +387,18 @@ bool Directory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
     // and the choice need no bracket of their own; the mutation below is
     // published through one odd->even bracket.
     admission->refresh();
+    // The conditional publish (see PublishView).  With writers serialized
+    // the view cannot have moved here; the check is kept so both directory
+    // kinds answer the same question the same way.
+    if (view != nullptr &&
+        !publish_view_is_current(bucket, kEntriesPerBucket, tag,
+                                 verified_offset, kMatchAnyTag,
+                                 kNoVerifiedEntry, *admission, *view, offset)) {
+      if (stale != nullptr) {
+        *stale = true;
+      }
+      return false;
+    }
     const InsertChoice choice = choose_insert_slot(
         bucket, kEntriesPerBucket, tag, verified_offset, kMatchAnyTag,
         *admission, collision_evicted, bucket_full_evicted, offset);

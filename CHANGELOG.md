@@ -311,6 +311,45 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Two processes writing alternates of one key at the same moment could lose
+  one of them. An alternate write resolves the key's chain before it writes
+  and publishes afterwards; when another process published or removed the
+  same key in between, the write published a second directory entry for the
+  key, and the next write of that key kept one chain and cleared the other,
+  dropping every alternate only that chain held, with no error reported.
+  Removing a key's head alternate republished its successor the same way.
+  Both publishes are now conditional: when the key's directory entries are
+  no longer the ones the operation resolved, nothing is published and the
+  operation resolves again. So a concurrent write or head removal can no
+  longer silently drop a stored alternate or leave a key with two heads --
+  once every process sharing the volume runs this version (a process on an
+  older build still publishes unconditionally; newer writers clear the
+  second entry at their next write of the key, as before), and apart from
+  the wrap-retention limit named below. A write resolves again until it is published, for any number of concurrent
+  writers: each round it loses is another writer's completed operation, so
+  the writers always make progress together, and the delay a write can see
+  is bounded by the other writers' completions, not by a time limit. A
+  write with a current head that notices the change before writing (the
+  usual case under contention) only walks the chain again; one that notices
+  it at the publish writes its document a second time. A head removal
+  resolves again within its existing bound of eight attempts and then
+  reports `Busy`, having removed nothing. `VolumeStats` gains
+  `alternate_publish_retries` and `alternate_publish_rewrites`. Without
+  concurrent writers of one key the added cost is one more pass over the
+  key's four-entry directory bucket per write, and one more lock-free read
+  of that bucket. No on-disk change. The plain (non-alternate) write path
+  is unchanged. Not changed, and still not coordinated with a concurrent
+  write of the same key: removing an alternate from the middle or the tail
+  of a chain, and the unlinking of superseded copies after a publish. Such
+  a removal can report success and leave the alternate listed, or have it
+  listed again; no other alternate is dropped by it. Known limit, with wrap
+  retention only: a write that carries a retained chain forward and whose
+  publish is refused because an unrelated entry with the same tag appeared
+  in the bucket meanwhile starts over without the carry, so the retained
+  alternates are dropped (a cache loss, never a wrong serve). New
+  regressions: `tests/integration/test_alternate_publish_race.cpp` and a
+  carry case in `tests/integration/test_wrap_retention.cpp`.
+
 - A process may exit with `cyclone::Cache` objects still open (an embedder
   that never calls `cyclone_cache_destroy`). The process-wide liveness mutex
   (`liveness_mutex()` in `src/core/mmap_directory.cpp`) is now immortal: a

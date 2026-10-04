@@ -138,6 +138,44 @@ struct InsertChoice {
     const InsertAdmission &adm, bool *collision_evicted,
     bool *bucket_full_evicted, uint64_t new_offset = 0);
 
+// What a publishing writer saw when it resolved the key it is about to
+// publish: the offset of every same-tag entry its directory probe handed it
+// -- the key's own entries and any colliding foreign key's -- as admitted
+// against the writer's snapshot.
+//
+// WHY A WRITER HANDS THIS OVER.  An alternate write resolves the key's chain
+// first and publishes later, after its data is written; the stripe mutex it
+// holds in between is per PROCESS.  Another process can publish or remove
+// the same key in that window.  A publish made against the old state would
+// then land beside the key's real entry (the entry it meant to update in
+// place is gone), giving the key two heads -- and the next write of the key
+// elects one and clears the other, silently dropping every alternate only
+// the cleared chain held.  The insert therefore publishes only when the
+// bucket still holds what the writer saw; see publish_view_is_current.
+struct PublishView {
+  std::span<const uint64_t> seen_offsets;
+};
+
+// True iff the bucket's entries for `tag` are still what `view` describes:
+//   * the entry the writer verified (verified_offset, unless it is one of
+//     the two sentinels) is still there; and
+//   * no admitted same-tag entry has appeared that the writer's probe did
+//     not see.  An entry at `new_offset` (the offset just written) is the
+//     dead entry choose_insert_slot takes over, not a new one; an entry the
+//     admission rejects resolves nothing and is ignored.
+// A same-tag entry that DISAPPEARED (other than the verified one) is not a
+// change that matters: nothing can resolve through it any more.
+//
+// Evaluated inside the same bracket as the insert, on memory only.  A false
+// answer can be spurious -- a colliding foreign key published in the window
+// looks the same as this key -- and costs the writer one more attempt, never
+// correctness.  Shared by Directory and MmapDirectory.
+[[nodiscard]] bool publish_view_is_current(
+    const DirEntry *bucket, size_t slots, uint16_t tag,
+    uint64_t verified_offset, uint64_t match_any_tag,
+    uint64_t no_verified_entry, const InsertAdmission &adm,
+    const PublishView &view, uint64_t new_offset);
+
 // Waiting primitives shared by the seqlock readers (SeqlockReadWait) and the
 // cross-process CAS locks of MmapDirectory (LockHolderWait).
 namespace wait_detail {
@@ -666,7 +704,8 @@ class Directory {
               bool *collision_evicted = nullptr,
               bool *bucket_full_evicted = nullptr,
               InsertAdmission *admission = nullptr,
-              std::span<const uint64_t> clear_offsets = {});
+              std::span<const uint64_t> clear_offsets = {},
+              const PublishView *view = nullptr, bool *stale = nullptr);
 
   // WARNING: matches on the 12-bit tag only (a DirEntry holds no key
   // material), so a colliding foreign key's entry can be removed.

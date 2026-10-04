@@ -212,6 +212,7 @@ if(CYCLONE_BUILD_TESTS)
     tests/integration/test_readahead.cpp
     tests/integration/test_wrap_retention.cpp
     tests/integration/test_publish_after_snapshot.cpp
+    tests/integration/test_alternate_publish_race.cpp
     tests/integration/test_seqlock_read_wait.cpp
     tests/integration/test_write_reserve.cpp
     tests/integration/test_tail_fill.cpp
