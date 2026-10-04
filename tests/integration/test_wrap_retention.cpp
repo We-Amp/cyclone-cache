@@ -1807,6 +1807,76 @@ TEST_CASE(
   }
 }
 
+TEST_CASE(
+    "Retention 9: an alternate write whose own allocation moves the frontier "
+    "over its retained head still carries the whole chain forward",
+    "[retention][uniqueness][alternate]") {
+  // The write resolves a retained head, copies the retained chain for its
+  // carry, and only then allocates -- and that allocation is what advances
+  // the frontier over the head's chunk.  From then on a directory probe no
+  // longer admits the head.  The write must not take that for "another
+  // process removed the key" and start over: starting over cannot see the
+  // key any more and would write a fresh chain without the retained
+  // alternates it had already copied.
+  RetentionVolume v("ret9e", true, std::chrono::milliseconds(600000),
+                    std::chrono::milliseconds(300));
+  const uint64_t c = 5;
+  const uint64_t h = c * v.per_chunk;  // the chain starts at the chunk start
+  const std::string key = "carried-K";
+  // Original (deepest) at h, Brotli (the head) right above it.
+  fill_pass0_with(v, key,
+                  {{h, AlternateId::Original}, {h + 1, AlternateId::Brotli}});
+  // A borrow elsewhere in chunk c pins the frontier at the chunk start, so
+  // the retained chain stays admissible while the cursor walks up to it.
+  auto pin = v.read(0, h + 2);
+  REQUIRE(pin.has_value());
+  for (uint64_t i = 0; i < h; ++i) {
+    REQUIRE(v.put(1, i));
+  }
+  REQUIRE(alternate_count(*v.cache, key) == 2);
+  const uint64_t entries_before = v.cache->stats().current_entries;
+
+  // The cursor sits on the chunk start.  The first attempt's mandatory
+  // advance defers; past the ceiling the second is forced, inside the
+  // write's own allocation.  A third id, so both retained nodes are carried:
+  // the slot is [Original copy][Brotli copy][Gzip].
+  const auto newer = doc_content(11, h);
+  REQUIRE_FALSE(put_alternate(*v.cache, key, AlternateId::Gzip, newer));
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+  REQUIRE(put_alternate(*v.cache, key, AlternateId::Gzip, newer));
+  const auto st = v.cache->stats();
+  REQUIRE(st.wraps_forced_past_lease == 1);
+  REQUIRE(st.alternates_carried_forward == 2);
+  REQUIRE(st.alternate_carry_bytes == 2 * kDoc);
+  REQUIRE(st.alternates_carry_dropped == 0);
+  // One entry for the key, updated in place.
+  REQUIRE(st.current_entries == entries_before);
+
+  auto alts = v.cache->list_alternates_sync(CacheKey(key));
+  REQUIRE(alts.has_value());
+  REQUIRE(alts->size() == 3);
+  REQUIRE((*alts)[0].id == AlternateId::Gzip);
+  REQUIRE((*alts)[1].id == AlternateId::Brotli);
+  REQUIRE((*alts)[2].id == AlternateId::Original);
+  {
+    auto g = read_alternate(*v.cache, key, AlternateId::Gzip);
+    REQUIRE(g.has_value());
+    REQUIRE(content_equals(g->content(), newer));
+  }
+  {
+    auto b = read_alternate(*v.cache, key, AlternateId::Brotli);
+    REQUIRE(b.has_value());
+    REQUIRE(content_equals(b->content(), doc_content(0, h + 1)));
+  }
+  {
+    auto o = read_alternate(*v.cache, key, AlternateId::Original);
+    REQUIRE(o.has_value());
+    REQUIRE(content_equals(o->content(), doc_content(0, h)));
+  }
+  pin.reset();
+  v.cache->stop();
+}
+
 // ---------------------------------------------------------------------------
 // Test 10 -- purging a retained key removes every entry of it; removing an
 // alternate from a retained chain removes the whole entry (S7).

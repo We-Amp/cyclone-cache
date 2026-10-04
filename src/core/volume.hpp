@@ -738,16 +738,19 @@ struct Stripe {
               bool *bucket_full_evicted = nullptr,
               InsertAdmission *admission = nullptr,
               std::span<const uint64_t> clear_offsets = {},
-              bool *busy = nullptr) {
+              bool *busy = nullptr, const PublishView *view = nullptr,
+              bool *stale = nullptr) {
     if (use_mmap_directory && mmap_directory) {
       // *busy: a capped cross-process lock wait gave up; nothing published.
-      return mmap_directory->insert(key, offset, size, verified_offset,
-                                    collision_evicted, bucket_full_evicted,
-                                    admission, clear_offsets, busy);
+      // *stale: the bucket no longer holds what `view` describes; nothing
+      // published (see PublishView in directory.hpp).
+      return mmap_directory->insert(
+          key, offset, size, verified_offset, collision_evicted,
+          bucket_full_evicted, admission, clear_offsets, busy, view, stale);
     } else if (directory) {
       return directory->insert(key, offset, size, verified_offset,
                                collision_evicted, bucket_full_evicted,
-                               admission, clear_offsets);
+                               admission, clear_offsets, view, stale);
     }
     return false;
   }
@@ -1019,6 +1022,19 @@ struct VolumeStats {
   // the chain retained, and the write retries and carries it forward.
   uint64_t alternate_wrap_refusals = 0;
 
+  // Rounds of an alternate write, or of a head removal, that found the
+  // key's directory entries changed since the round resolved them, published
+  // nothing, and resolved again.  Each one is a publish that would otherwise
+  // have added a second head for the key.  Process-local.  Expected to be
+  // zero without concurrent writers of one key in other processes.
+  uint64_t alternate_publish_retries = 0;
+
+  // Of those, the rounds that had already written their document when the
+  // change was noticed (it landed between the write-lock release and the
+  // directory insert).  Each one is a document's worth of dead space until
+  // the stripe wraps; the other lost rounds cost a chain walk.
+  uint64_t alternate_publish_rewrites = 0;
+
   // 1 iff the cross-process reset gate is NOT in effect for this volume, so an
   // incompatible open will reset even under a live peer.  A GAUGE, cleared on
   // every open().  One cause, on every platform: the filesystem lacks working
@@ -1272,6 +1288,18 @@ class Volume : public std::enable_shared_from_this<Volume> {
   using WriteTearGateHook =
       std::function<void(uint64_t write_offset, uint64_t new_write_pos)>;
   static inline WriteTearGateHook s_write_tear_gate_for_test{};
+
+  // TEST SEAM ONLY -- never installed in production.  Invoked by
+  // remove_alternate_sync when the alternate being removed is the key's head
+  // and has a successor: AFTER the head and its chain were resolved and
+  // BEFORE the successor is republished in the head's place.  Fires with the
+  // stripe mutex held (which is per process) and no cross-process lock held,
+  // so a test can let another process change the key inside exactly the
+  // window the removal's conditional publish exists for.  Same shape and
+  // cost as s_write_tear_gate_for_test: default-empty, one
+  // predicted-not-taken branch on the removal path only.
+  using RemoveRepublishGateHook = std::function<void()>;
+  static inline RemoveRepublishGateHook s_remove_republish_gate_for_test{};
 
   // TEST SEAM ONLY -- never installed in production.  Points inside the
   // writer's wrap-intent window at which a test can pause the writer (to
@@ -1768,6 +1796,8 @@ class Volume : public std::enable_shared_from_this<Volume> {
   std::atomic<uint64_t> _alternate_splice_deferred{0};
   std::atomic<uint64_t> _alternate_chain_resets{0};
   std::atomic<uint64_t> _alternate_max_chain_depth{0};
+  std::atomic<uint64_t> _alternate_publish_retries{0};
+  std::atomic<uint64_t> _alternate_publish_rewrites{0};
   std::atomic<uint64_t> _alternate_wrap_refusals{0};
 
   // Cross-process write-lock recovery telemetry (process-local; see
@@ -2285,10 +2315,15 @@ class Volume : public std::enable_shared_from_this<Volume> {
     uint64_t offset = 0;
     uint64_t length = 0;
   };
+  // *stale_publish: this attempt found the key's directory entries changed
+  // since it resolved the chain -- before writing (the reserved slot was
+  // given back) or at the publish (the written document is dead space) --
+  // published nothing and returned Busy; the caller runs it again.
   std::expected<void, CacheError> commit_alternate_write_once(
       Stripe *stripe, const CacheKey &key, AlternateId alternate_id,
       std::span<const std::byte> header, std::span<const std::byte> content,
-      bool allow_restart, bool *restart, WrittenRange *written);
+      bool allow_restart, bool *restart, bool *stale_publish,
+      WrittenRange *written);
   std::expected<void, CacheError> commit_write_impl(
       Stripe *stripe, const CacheKey &key, std::span<const std::byte> header,
       std::span<const std::byte> content, WrittenRange *written);
