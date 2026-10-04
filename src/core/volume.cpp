@@ -6203,7 +6203,9 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
       // Nothing was published and nothing below runs: no splice, no
       // counter, no write-behind for bytes nothing refers to.  The document
       // this attempt wrote stays behind as dead space until the stripe
-      // wraps; the caller writes it again.
+      // wraps; the caller writes it again.  It is as reachable as the
+      // document of a publish that gave up on a capped lock wait (below):
+      // only through a stale same-tag entry already naming this offset.
       _alternate_publish_rewrites.fetch_add(1, std::memory_order_relaxed);
       *written_range = {};
       *stale_publish = true;
@@ -7469,11 +7471,13 @@ std::expected<void, CacheError> Volume::remove_alternate_sync(
         size_t next_doc_size = next_reader.document().len;
         _mapped_file->unmap_region(*next_mapped);
 
+#ifdef CYCLONE_TEST_SEAMS
         // TEST SEAM: the head and its successor are resolved, nothing is
         // published yet (see s_remove_republish_gate_for_test).
         if (s_remove_republish_gate_for_test) {
           s_remove_republish_gate_for_test();
         }
+#endif
 
         // head_relative_offset was verified by full first_key comparison
         // above — repoint exactly that entry, never a same-tag collider.

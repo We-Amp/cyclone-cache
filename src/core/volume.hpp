@@ -1289,17 +1289,18 @@ class Volume : public std::enable_shared_from_this<Volume> {
       std::function<void(uint64_t write_offset, uint64_t new_write_pos)>;
   static inline WriteTearGateHook s_write_tear_gate_for_test{};
 
-  // TEST SEAM ONLY -- never installed in production.  Invoked by
+#ifdef CYCLONE_TEST_SEAMS
+  // TEST-SEAM BUILDS ONLY (see the reader seams below): the release library
+  // has no hook, no branch and no symbol here.  Invoked by
   // remove_alternate_sync when the alternate being removed is the key's head
   // and has a successor: AFTER the head and its chain were resolved and
   // BEFORE the successor is republished in the head's place.  Fires with the
   // stripe mutex held (which is per process) and no cross-process lock held,
   // so a test can let another process change the key inside exactly the
-  // window the removal's conditional publish exists for.  Same shape and
-  // cost as s_write_tear_gate_for_test: default-empty, one
-  // predicted-not-taken branch on the removal path only.
+  // window the removal's conditional publish exists for.  Default-empty.
   using RemoveRepublishGateHook = std::function<void()>;
   static inline RemoveRepublishGateHook s_remove_republish_gate_for_test{};
+#endif
 
   // TEST SEAM ONLY -- never installed in production.  Points inside the
   // writer's wrap-intent window at which a test can pause the writer (to

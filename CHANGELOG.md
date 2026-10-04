@@ -321,8 +321,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Both publishes are now conditional: when the key's directory entries are
   no longer the ones the operation resolved, nothing is published and the
   operation resolves again. So a concurrent write or head removal can no
-  longer silently drop a stored alternate or leave a key with two heads. A
-  write resolves again until it is published, for any number of concurrent
+  longer silently drop a stored alternate or leave a key with two heads --
+  once every process sharing the volume runs this version (a process on an
+  older build still publishes unconditionally; newer writers clear the
+  second entry at their next write of the key, as before), and apart from
+  the wrap-retention limit named below. A write resolves again until it is published, for any number of concurrent
   writers: each round it loses is another writer's completed operation, so
   the writers always make progress together, and the delay a write can see
   is bounded by the other writers' completions, not by a time limit. A
