@@ -387,6 +387,26 @@ The read hot path is lock-free (the read-path scaling series). Before refactorin
     Guard: `tests/integration/test_fork_storm.cpp`,
     `tests/integration/test_lifecycle.cpp` (`[fork]`).
 
+11. **A handle call counts itself in before it looks at the teardown
+    flags** (`Volume::HandleCall`, `src/core/volume.hpp`). Closing a
+    `ReadHandle`, renewing its lease and polling its forced-wrap deadline
+    dereference a raw `Stripe*` outside the cache gate, on any thread, while
+    another thread may be in `Cache::stop()`. The call increments its
+    thread shard's in-flight counter, THEN loads the anchor's `torn` latch
+    and `Volume::_teardown`; `Volume::close()` stores `_teardown`, THEN
+    waits for every shard to read zero, and only then frees the stripes.
+    All `seq_cst` (a Dekker handshake, like invariant 3): don't hoist a
+    latch check out of the `HandleCall`, don't weaken the order, and keep a
+    handle call free of locks and application code so the wait stays short.
+    Counts carry the fork epoch they were made in, so a forked child never
+    waits for a thread of its parent. A new handle-facing path that touches
+    a stripe needs its own `HandleCall`. NOT yet covered: the `WriteHandle`
+    commit (`commit_write` / `commit_alternate_write`), which dereferences
+    its stripe outside the gate with no teardown check; until it is, a write
+    handle must be committed or abandoned before `stop()`.
+    Guard: `tests/integration/test_lifecycle.cpp` ("stop() waits for a
+    handle call that is already using its stripe").
+
 ### Error Handling
 
 All fallible operations return `std::expected<T, CacheError>`. Never use exceptions.

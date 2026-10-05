@@ -754,6 +754,26 @@ gate their stripe-touching paths on `anchor->torn`, so a `ReadHandle` may safely
 outlive `Cache::stop()`. (Volumes not owned by a Cache — e.g. in unit tests —
 fall back to the `weak_ptr` path.)
 
+**A handle call on one thread, `stop()` on another.** Closing a handle, renewing
+its lease and polling its forced-wrap deadline run outside the cache's gate, on
+whatever thread the embedder serves from, and each dereferences the handle's
+stripe. The latch alone does not order such a call against a `stop()` that
+frees the stripes: a call could load "not torn" just before the latch is set.
+So every handle call counts itself into a per-thread-shard in-flight counter
+*before* it loads the latch and the volume's teardown flag, and
+`Volume::close()` publishes teardown *before* it loads the counters, all
+`seq_cst` (`Volume::HandleCall` in `volume.hpp`; the same handshake as the wrap
+gate). Either the call sees teardown and touches no stripe, or `close()` sees
+the call and waits for it to leave. The wait is bounded by one handle call, which
+takes no lock and runs no application code. The embedder therefore needs no
+lock of its own between releasing read handles and stopping the cache; what stays
+its job is not to *use* one `ReadHandle` object from two threads at once.
+Write handles are not covered: a `WriteHandle` commit also dereferences its
+stripe outside the gate and has no such handshake yet, so every write must be
+committed or abandoned before `stop()`. Pinned by
+`tests/integration/test_lifecycle.cpp` ("stop() waits for a handle call that is
+already using its stripe").
+
 ### Lease-based region pinning
 
 The mechanism that makes a **borrowed, zero-copy read safe under eviction**. A
