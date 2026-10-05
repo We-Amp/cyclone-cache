@@ -35,9 +35,10 @@ class LeaseTestClock {
   // in a volume (a lease stamped before this object existed) stay in the
   // past.
   LeaseTestClock() {
-    const auto real_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                             std::chrono::steady_clock::now().time_since_epoch())
-                             .count();
+    const auto real_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
     _now_ns = real_ns > 0 ? static_cast<uint64_t>(real_ns) : 1;
     publish();
   }
