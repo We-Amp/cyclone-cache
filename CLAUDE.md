@@ -81,7 +81,8 @@ Cyclone Cache is a high-performance C++23 disk cache library inspired by Apache 
 - Language: C++23 (requires GCC 13+, Clang 16+, or MSVC 2022+)
 - Build System: CMake 3.20+
 - Testing: Catch2
-- Dependencies: OpenSSL, or the bundled SHA-256 (`CYCLONE_USE_BUNDLED_SHA256`)
+- Dependencies: none by default (bundled SHA-256); OpenSSL only with
+  `-DCYCLONE_USE_BUNDLED_SHA256=OFF`
 
 ## Build Commands
 
@@ -104,11 +105,12 @@ ctest --test-dir build
 rm -rf build && cmake -B build && cmake --build build
 ```
 
-The bare `cmake -B build` defaults to `find_package(OpenSSL REQUIRED)`. CI
-instead builds hermetically with `-DCYCLONE_USE_BUNDLED_SHA256=ON`, which is
-also required on machines without OpenSSL dev headers. See
-`CYCLONE_USE_BUNDLED_SHA256` in `CMakeLists.txt` and the README build-options
-table.
+The bare `cmake -B build` hashes keys with the bundled SHA-256 and links no
+crypto library (`CYCLONE_USE_BUNDLED_SHA256` defaults to ON). CI passes
+`-DCYCLONE_USE_BUNDLED_SHA256=ON` explicitly, and one extra job builds the
+OpenSSL key hash with `-DCYCLONE_USE_BUNDLED_SHA256=OFF`
+(`find_package(OpenSSL REQUIRED)`). See `CYCLONE_USE_BUNDLED_SHA256` in
+`CMakeLists.txt` and "Key hash backend" in the README.
 
 `CMakePresets.json` provides per-platform presets (`cmake --list-presets` shows
 only the presets whose host condition matches the current OS; the full set is

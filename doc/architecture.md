@@ -646,9 +646,9 @@ threads still inside cache calls when the process exits: the only state of a
 dependency they reach is the key hash, and both backends compute it on the
 caller's stack. The OpenSSL backend uses the `SHA256_Init` / `_Update` /
 `_Final` functions for that reason and not EVP, which resolves the digest
-through OpenSSL 3's default library context on every call; OpenSSL frees that
-context in an exit handler (`OPENSSL_cleanup`), and a thread hashing a key at
-that moment faulted. The guarantee covers Cyclone's own statics
+through OpenSSL 3's default library context on every call; OpenSSL (1.1.x as
+well as 3) frees its global state in an exit handler (`OPENSSL_cleanup`), and
+a thread hashing a key at that moment faulted. The guarantee covers Cyclone's own statics
 only: an embedder-owned object that a Cache thread can reach (a plugin, a
 callback's context) and that the embedder destroys at exit is the embedder's
 to sequence. What such an exit forgoes is the final hit-count flush and

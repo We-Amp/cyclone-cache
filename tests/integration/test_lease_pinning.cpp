@@ -31,6 +31,7 @@
 #include "cyclone/cache.hpp"
 #include "cyclone/config.hpp"
 #include "cyclone/key.hpp"
+#include "support/lease_test_clock.hpp"
 
 #ifdef _WIN32
 #include <process.h>
@@ -168,6 +169,9 @@ struct OverwriteOutcome {
 OverwriteOutcome run_overwrite_under_borrow(
     std::chrono::milliseconds lease_duration, bool retention) {
   std::string cache_path = create_temp_file("overwrite", kCacheSizeMB);
+  // The test owns the clock: the lease stamped by the read below holds for
+  // the whole flood, however long a slow build takes over it.
+  LeaseTestClock clock;
 
   CacheConfig config;
   config.wrap_retention = retention;
@@ -292,10 +296,11 @@ StripeRetentionOutcome run_stripe_retention(size_t vol_size_mb,
 
 TEST_CASE("Lease pinning keeps borrowed bytes intact under wrap pressure",
           "[lease][eviction]") {
-  // Default T (5s): the borrow's lease defers every wrap for the duration
-  // of this test, so the flood drops its fills and the borrowed bytes
-  // survive untouched.  THE PROTECTION IS WHAT MAKES THIS GREEN — see the
-  // companion test below, which demonstrates the corruption with T=0.
+  // Default T (5s), on a clock that stands still (LeaseTestClock): the
+  // borrow's lease defers every wrap for the duration of this test, so the
+  // flood drops its fills and the borrowed bytes survive untouched.  THE
+  // PROTECTION IS WHAT MAKES THIS GREEN — see the companion test below,
+  // which demonstrates the corruption with T=0.
   const bool retention = GENERATE(false, true);
   auto outcome =
       run_overwrite_under_borrow(std::chrono::milliseconds(5000), retention);
@@ -463,6 +468,11 @@ TEST_CASE("Sharded borrow accounting: cross-thread borrows all gate the wrap",
   // counted.
   std::string cache_path = create_temp_file("shards", kCacheSizeMB);
   const bool retention = GENERATE(false, true);
+  // The test owns the clock, so the 5 s lease the readers stamp cannot
+  // lapse while the flood below runs.  On the real clock a sanitizer build
+  // on a busy machine took longer than that over the flood, a wrap went
+  // through, and the wrap count below was off by one (issue #58).
+  LeaseTestClock clock;
 
   CacheConfig config;
   config.wrap_retention = retention;
@@ -551,6 +561,8 @@ TEST_CASE("renew_lease extends protection past T; lapsing frees the writer",
           "[lease][eviction]") {
   std::string cache_path = create_temp_file("renew", kCacheSizeMB);
   const bool retention = GENERATE(false, true);
+  // Time passes only where this test says so (clock.advance).
+  LeaseTestClock clock;
 
   CacheConfig config;
   config.wrap_retention = retention;
@@ -576,27 +588,21 @@ TEST_CASE("renew_lease extends protection past T; lapsing frees the writer",
   REQUIRE(rh.has_value());
   REQUIRE_FALSE(rh->is_ram_cache_hit());
 
-  // Fill the remaining tail so every further fill needs a wrap.  Renew the
-  // victim lease each iteration: this is setup, and under a heavily
-  // instrumented build (TSan) filling the tail can take longer than T, which
-  // would otherwise let the lease lapse mid-setup and turn the terminal
-  // wrap-needing write into an accepted wrap instead of the intended drop
-  // (an unbounded loop).  Keeping the lease live is the precondition the test
-  // means to establish; the drop-vs-renew behaviour under load is exercised
-  // by Phase 1 below.
+  // Fill the remaining tail so every further fill needs a wrap.  The clock
+  // stands still, so the lease stamped by the read above is live for the
+  // whole fill and the loop ends on the first borrow-deferred drop.
   size_t warm = 0;
   auto filler = make_content(9999, kChunkSize);
   while (write_entry(*cache, "warm-" + std::to_string(warm), filler)) {
-    REQUIRE(rh->renew_lease());
     ++warm;
     REQUIRE(warm < 2000);  // Safety bound (free tail is deterministic in size)
   }
 
-  // Phase 1: hold the borrow for ~1.5s (> T) while renewing at a cadence
+  // Phase 1: hold the borrow for 1.5s (> T) while renewing every 250 ms,
   // well under the 3T/4 protection floor.  Every wrap-needing fill must
   // keep dropping and the borrowed bytes must stay intact.
   for (int i = 0; i < 6; ++i) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    clock.advance(std::chrono::milliseconds(250));
     REQUIRE(rh->renew_lease());
     REQUIRE_FALSE(write_entry(*cache, "p1-" + std::to_string(i), filler));
   }
@@ -608,9 +614,13 @@ TEST_CASE("renew_lease extends protection past T; lapsing frees the writer",
     REQUIRE(stats.wraps_forced_past_lease == 0);
   }
 
-  // Phase 2: stop renewing and let the lease lapse (sleep well past T).
-  // The wrap then proceeds naturally — no ceiling forcing involved.
-  std::this_thread::sleep_for(std::chrono::milliseconds(1600));
+  // Phase 2: stop renewing and let the lease lapse.  700 ms after the last
+  // renewal the lease still holds (a renewal guarantees at least 3T/4);
+  // 1100 ms after it (> T) it has lapsed and the wrap proceeds naturally —
+  // no ceiling forcing involved.
+  clock.advance(std::chrono::milliseconds(700));
+  REQUIRE_FALSE(write_entry(*cache, "p2-still-leased", filler));
+  clock.advance(std::chrono::milliseconds(400));
   REQUIRE(write_entry(*cache, "p2", filler));
   {
     auto stats = cache->stats();
@@ -629,6 +639,9 @@ TEST_CASE(
     "wrap restores write capacity",
     "[lease][eviction]") {
   std::string cache_path = create_temp_file("ceiling", kCacheSizeMB);
+  // Time passes only where this test says so (clock.advance): 25 ms per
+  // attempt below, so the 500 ms ceiling passes after about twenty drops.
+  LeaseTestClock clock;
 
   CacheConfig config;
   config.ram_cache_size = 0;
@@ -677,9 +690,8 @@ TEST_CASE(
   // (wraps_forced_past_lease increments) and the fill SUCCEEDS again.
   bool fill_succeeded_after_force = false;
   uint64_t dropped_before_force = 0;
-  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
   int attempt = 0;
-  while (std::chrono::steady_clock::now() < deadline) {
+  while (attempt < 600) {  // 15 s of test-clock time at most
     bool ok = write_entry(*cache, "c-" + std::to_string(attempt++), filler);
     auto stats = cache->stats();
     if (stats.wraps_forced_past_lease >= 1) {
@@ -687,7 +699,7 @@ TEST_CASE(
       break;
     }
     dropped_before_force = stats.writes_dropped_by_lease;
-    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    clock.advance(std::chrono::milliseconds(25));
   }
 
   auto stats = cache->stats();
@@ -1065,6 +1077,8 @@ TEST_CASE(
     "trigger)",
     "[lease][renew][eviction]") {
   std::string cache_path = create_temp_file("renewfail", kCacheSizeMB);
+  // Time passes only where this test says so (clock.advance).
+  LeaseTestClock clock;
 
   CacheConfig config;
   config.ram_cache_size = 0;
@@ -1100,13 +1114,12 @@ TEST_CASE(
 
   // Sustain the lease (our held borrow + fresh reads) and push fills until
   // the anti-starvation ceiling forces a wrap over the borrowed region.
-  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
   int attempt = 0;
-  while (std::chrono::steady_clock::now() < deadline) {
+  while (attempt < 750) {                // 15 s of test-clock time at most
     (void)cache->read_sync(victim_key);  // keep the lease live
     (void)write_entry(*cache, "c-" + std::to_string(attempt++), filler);
     if (cache->stats().wraps_forced_past_lease >= 1) break;
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    clock.advance(std::chrono::milliseconds(20));
   }
   REQUIRE(cache->stats().wraps_forced_past_lease >= 1);
 
@@ -1348,6 +1361,8 @@ TEST_CASE(
     "wrap moves the epoch",
     "[lease][renew][strict][eviction]") {
   std::string cache_path = create_temp_file("strictfail", kCacheSizeMB);
+  // Time passes only where this test says so (clock.advance).
+  LeaseTestClock clock;
 
   CacheConfig config;
   config.ram_cache_size = 0;
@@ -1380,13 +1395,12 @@ TEST_CASE(
     REQUIRE(warm < 1000);
   }
 
-  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
   int attempt = 0;
-  while (std::chrono::steady_clock::now() < deadline) {
+  while (attempt < 750) {                // 15 s of test-clock time at most
     (void)cache->read_sync(victim_key);  // keep the lease live
     (void)write_entry(*cache, "c-" + std::to_string(attempt++), filler);
     if (cache->stats().wraps_forced_past_lease >= 1) break;
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    clock.advance(std::chrono::milliseconds(20));
   }
   REQUIRE(cache->stats().wraps_forced_past_lease >= 1);
 

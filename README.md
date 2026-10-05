@@ -194,7 +194,9 @@ presets, and `dev` / `asan` / `tsan` / `ci-release` for contributors:
 cmake --preset macos-arm64 && cmake --build --preset macos-arm64
 ```
 
-Windows/vcpkg presets need `VCPKG_ROOT`; the `*-zig` presets disable tests,
+Windows/vcpkg presets need `VCPKG_ROOT` and build the OpenSSL key hash from
+the vcpkg-provided OpenSSL (they set `CYCLONE_USE_BUNDLED_SHA256=OFF`); every
+other preset uses the bundled SHA-256. The `*-zig` presets disable tests,
 examples, and benchmarks.
 
 ### Requirements
@@ -202,8 +204,10 @@ examples, and benchmarks.
 - CMake 3.20+ and a C++23 compiler (CI builds with each GitHub runner's
   default toolchain: GCC on Ubuntu, Apple Clang on macOS, MSVC on Windows;
   LLVM 20 is the formatting/lint toolchain, see [CONTRIBUTING.md](CONTRIBUTING.md))
-- OpenSSL **or** `-DCYCLONE_USE_BUNDLED_SHA256=ON` (hermetic, what CI uses
-  except for one job that builds the OpenSSL backend)
+- No crypto library: keys are hashed with a bundled SHA-256 by default.
+  OpenSSL (1.1.1 or 3.x, or a compatible libcrypto) only for the opt-in
+  OpenSSL key hash, `-DCYCLONE_USE_BUNDLED_SHA256=OFF` (see
+  [Key hash backend](#key-hash-backend))
 - Catch2 3 for tests (found via `find_package`, else fetched at configure)
 
 ### Build options
@@ -217,7 +221,34 @@ examples, and benchmarks.
 | `CYCLONE_BUILD_CUDA_BENCHMARKS` | OFF | Also build `kv_gpu_cuda` (needs the CUDA toolkit; not on Windows) |
 | `CYCLONE_BUILD_FUZZERS` | OFF | Build the libFuzzer harnesses in `fuzz/` (Clang only) |
 | `CYCLONE_ENABLE_ASAN` | OFF | AddressSanitizer for a quick local check |
-| `CYCLONE_USE_BUNDLED_SHA256` | OFF | Bundled SHA-256 instead of OpenSSL; ON in CI except for the OpenSSL-backend job, required where OpenSSL headers are absent |
+| `CYCLONE_USE_BUNDLED_SHA256` | ON | Hash keys with the bundled SHA-256, no crypto library linked. OFF hashes with OpenSSL's libcrypto instead (`find_package(OpenSSL REQUIRED)`). Same digest either way |
+
+### Key hash backend
+
+A cache key is the SHA-256 of what the application passes in. Two
+implementations compute it, selected at build time:
+
+- **Bundled (default).** A self-contained SHA-256 in the library. Nothing
+  else is linked, and the library reaches no process-wide state of a crypto
+  library (its initialisation, its exit handler, its behaviour across
+  `fork()`).
+- **OpenSSL (opt-in, `-DCYCLONE_USE_BUNDLED_SHA256=OFF`).** `SHA256_Init` /
+  `SHA256_Update` / `SHA256_Final` from libcrypto. Faster where libcrypto has
+  hardware SHA: about 0.3 µs less per key on a two-block key on an Apple
+  M-series core. Meant for applications that link a crypto library anyway.
+  These low-level functions do not go through an OpenSSL provider, so in a
+  FIPS-configured process the key hash is not computed by the FIPS module;
+  the hash names a cache entry and protects nothing.
+
+Both produce the same digest, so cache files are interchangeable between the
+two builds, and between processes that share a cache.
+
+The default was OpenSSL before; a build that does not pass the option now
+links no libcrypto. To keep the OpenSSL key hash, pass
+`-DCYCLONE_USE_BUNDLED_SHA256=OFF` (or `set(CYCLONE_USE_BUNDLED_SHA256 OFF)`
+before `FetchContent_MakeAvailable`). An existing build directory keeps the
+value in its `CMakeCache.txt` until it is reconfigured with the option or
+recreated.
 
 ### Consuming
 
@@ -229,13 +260,14 @@ FetchContent_Declare(cyclone-cache
   GIT_REPOSITORY https://github.com/We-Amp/cyclone-cache.git
   GIT_TAG        <commit>)
 set(CYCLONE_BUILD_TESTS OFF)
-set(CYCLONE_USE_BUNDLED_SHA256 ON)
 FetchContent_MakeAvailable(cyclone-cache)
 target_link_libraries(myapp PRIVATE cyclone-cache)
 ```
 
 `cmake --install` also exports `cyclone::cyclone-cache` for
-`find_package(cyclone-cache)`.
+`find_package(cyclone-cache)`. The installed package finds what the target
+links: `Threads`, and `OpenSSL` when the library was built static with the
+OpenSSL key hash. There is no pkg-config file.
 
 ## KV cache for LLM inference
 
