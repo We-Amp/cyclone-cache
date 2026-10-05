@@ -30,6 +30,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     functions (`no-deprecated`) the bundled implementation is compiled
     instead; no option needs to change.
 
+- Optimization engine (opt-in): a work item whose finished result could not
+  be written because the engine was stopped at that moment was dropped
+  without a trace. It is now reported like any other cancelled transform:
+  the plugin's `on_cancelled()` is called and the item is counted in
+  `OptimizationStats::cancelled`.
+
 - A process that forked while a cache was running could leave the child
   blocked for good. The parent's background threads take in-process locks
   while they work (the hit-count flush sweeps the hit-tracker stripe
