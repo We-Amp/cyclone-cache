@@ -31,7 +31,12 @@ if(CYCLONE_BUILD_CUDA_BENCHMARKS)
   endif()
 endif()
 option(CYCLONE_ENABLE_ASAN "Enable AddressSanitizer" OFF)
-option(CYCLONE_USE_BUNDLED_SHA256 "Use bundled SHA-256 instead of OpenSSL (for cross-compilation)" OFF)
+# The key hash.  ON (the default) compiles the bundled SHA-256: no crypto
+# library is linked.  OFF hashes with OpenSSL's libcrypto, which is faster
+# where it has hardware SHA and is meant for applications that link a crypto
+# library anyway.  The digest is the same either way, so a cache file is
+# valid across both.
+option(CYCLONE_USE_BUNDLED_SHA256 "Hash keys with the bundled SHA-256 (no crypto library); OFF uses OpenSSL's libcrypto" ON)
 
 if(CYCLONE_ENABLE_ASAN AND NOT MSVC)
   add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
@@ -61,10 +66,10 @@ endif()
 
 # Cross-compilation OpenSSL hints
 if(CMAKE_CROSSCOMPILING AND NOT OPENSSL_ROOT_DIR AND NOT CYCLONE_USE_BUNDLED_SHA256)
-  message(STATUS "Cross-compiling: set OPENSSL_ROOT_DIR if OpenSSL not found, or use -DCYCLONE_USE_BUNDLED_SHA256=ON")
+  message(STATUS "Cross-compiling: set OPENSSL_ROOT_DIR if OpenSSL not found, or leave CYCLONE_USE_BUNDLED_SHA256 at its default (ON)")
 endif()
 
-# OpenSSL is optional when using bundled SHA-256
+# OpenSSL is needed only for the opt-in OpenSSL key hash
 if(NOT CYCLONE_USE_BUNDLED_SHA256)
   find_package(OpenSSL REQUIRED)
 endif()
@@ -138,7 +143,9 @@ endfunction()
 add_library(cyclone-cache ${CYCLONE_LIBRARY_SOURCES})
 cyclone_configure_library(cyclone-cache)
 if(CYCLONE_USE_BUNDLED_SHA256)
-  message(STATUS "Using bundled SHA-256 implementation (no OpenSSL dependency)")
+  message(STATUS "Key hash: bundled SHA-256 (no OpenSSL dependency)")
+else()
+  message(STATUS "Key hash: OpenSSL libcrypto ${OPENSSL_VERSION} (CYCLONE_USE_BUNDLED_SHA256=OFF)")
 endif()
 
 if(CYCLONE_BUILD_TESTS)
@@ -440,7 +447,24 @@ install(DIRECTORY include/cyclone
 )
 
 install(EXPORT cyclone-cache-targets
-  FILE cyclone-cache-config.cmake
+  FILE cyclone-cache-targets.cmake
   NAMESPACE cyclone::
+  DESTINATION lib/cmake/cyclone-cache
+)
+
+# The package config finds what the exported target links before it loads
+# the target: Threads always, and OpenSSL when a static library was built
+# with the OpenSSL key hash (a static archive passes its private
+# dependencies on to whatever links it; a shared library does not).
+get_target_property(CYCLONE_LIBRARY_TYPE cyclone-cache TYPE)
+if(NOT CYCLONE_USE_BUNDLED_SHA256 AND
+   CYCLONE_LIBRARY_TYPE STREQUAL "STATIC_LIBRARY")
+  set(CYCLONE_CONFIG_NEEDS_OPENSSL ON)
+else()
+  set(CYCLONE_CONFIG_NEEDS_OPENSSL OFF)
+endif()
+configure_file(cmake/cyclone-cache-config.cmake.in
+  "${CMAKE_CURRENT_BINARY_DIR}/cyclone-cache-config.cmake" @ONLY)
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/cyclone-cache-config.cmake"
   DESTINATION lib/cmake/cyclone-cache
 )
