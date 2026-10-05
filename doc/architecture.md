@@ -774,7 +774,9 @@ content and commits at close, outside the gate, into the stripe it was created
 for. The commit counts itself in like a read-handle call; `close()` waits for
 it, which here means for a whole commit (the stripe mutex, a capped wait for
 a cross-process lock, the write to the file), as `stop()` would for a commit
-that was already running. A write handle has no anchor, so its generation is
+that was already running. That is at most one commit per writing thread;
+behind a peer process that is stopped while it holds the write lock, a commit
+waits about 5 seconds before the lock is taken over. A write handle has no anchor, so its generation is
 a counter in the `Volume` that `close()` moves on, after publishing teardown
 and before it looks for calls in flight, and that never moves back: a handle
 from before a `stop()` is refused with `CacheError::Closed` and writes

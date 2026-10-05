@@ -34,8 +34,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   with a wider window: everything between obtaining the handle and
   committing it. Typical shape: a multi-threaded server that stops,
   restarts or resets a cache while other threads are still writing to it.
-  The outcome ranged from nothing visible to a crash; cache files and the
-  shared mapping of other processes were not at risk. Now:
+  The outcome ranged from nothing visible to a crash. No effect on cache
+  files is known; an entry damaged this way would be rejected by the read
+  checksum. Now:
   - A commit that runs while another thread is in `stop()` either
     completes, and `stop()` waits for it (not for handles that are merely
     open), or is refused.
@@ -45,6 +46,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     That stays so after `start()`: write the entry again through a new
     handle. `write_sync()` and `reserve()` on such a handle return `Closed`
     too. `abort()` and destruction were and are safe.
+  - `stop()` waits for at most one commit per writing thread. A commit is
+    short, except behind another process that holds the cross-process
+    write lock while it is stopped (a debugger, `SIGSTOP`): then about
+    5 seconds, until the lock is taken over.
   - No new error code, no API, on-disk or shared-mapping change. Callers
     already had to handle `Closed` from a commit (a handle whose cache had
     been destroyed returned it).

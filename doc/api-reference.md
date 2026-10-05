@@ -553,6 +553,11 @@ Handle for writing content to cache.
 > written, also after the cache was started again.
 > `write_sync()` and `reserve()` return `Closed` on such a handle; `abort()`
 > and destruction are always safe.
+> `stop()` waits for at most one commit per writing thread; behind another
+> process that holds the cross-process write lock while it is stopped (a
+> debugger, `SIGSTOP`), that is about 5 seconds, until the lock is taken
+> over. After the first `close()` / `close_sync()` the handle is closed:
+> a later call writes nothing and does not repeat the error.
 
 ```cpp
 void set_header(std::span<const std::byte> header);

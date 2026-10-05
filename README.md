@@ -551,8 +551,11 @@ own between the threads that use handles and the thread that stops the cache.
 A `ReadHandle` held across `stop()` keeps its bytes valid until it is closed.
 A `WriteHandle` commit that races `stop()` either completes (`stop()` waits
 for it) or is refused; one that begins after `stop()` returned is always
-refused: `CacheError::Closed`, nothing written, also after a restart. Do not hold a disk-hit `ReadHandle` across
-writes to the same cache — it pins its stripe against wraps.
+refused: `CacheError::Closed`, nothing written, also after a restart.
+`stop()` waits for at most one commit per writing thread (about 5 seconds
+behind a peer process stopped while it holds the cross-process write lock).
+Do not hold a disk-hit `ReadHandle` across writes to the same cache — it pins
+its stripe against wraps.
 
 ### Errors
 
