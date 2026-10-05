@@ -106,10 +106,21 @@ struct UpdateHandleImpl {
 /// ReadHandle provides access to cached data via memory-mapped I/O.
 /// The handle holds a reference to the underlying mapped region.
 ///
-/// **IMPORTANT: Lifetime Requirement**
-/// ReadHandles must be destroyed (or closed) before calling Cache::stop().
-/// The handle references memory owned by the cache; destroying the cache
-/// while handles are outstanding results in undefined behavior.
+/// **Lifetime**
+/// A ReadHandle may be held across Cache::stop() and destroyed after it,
+/// or after the Cache itself: a disk-hit handle keeps the mapping it reads
+/// from alive, so header() and content() stay valid until the handle is
+/// closed.  Closing or renewing a handle on one thread while another
+/// thread is in Cache::stop() is safe as well; the application needs no
+/// lock of its own for that.  After stop() the handle protects nothing
+/// any more: renew_lease() returns false, renew_lease_strict() returns
+/// LeaseRenewal::kTorn and ns_until_forced_wrap() returns UINT64_MAX.
+/// One ReadHandle object must not be used from two threads at once.
+/// This holds for read handles only; see WriteHandle for the stricter
+/// rule there.
+///
+/// Releasing handles promptly is still the rule: each one pins mapped
+/// memory.
 ///
 /// A disk-hit handle also pins its stripe against write-buffer wraps while
 /// it is open: at cache-full, wrap-needing fills to that stripe
@@ -128,7 +139,7 @@ struct UpdateHandleImpl {
 ///         // Use content...
 ///     }
 /// } // Handle destroyed here
-/// cache->stop(); // Safe - no handles outstanding
+/// cache->stop();
 /// ```
 class ReadHandle {
  public:
@@ -245,6 +256,18 @@ class ReadHandle {
       : _impl(std::move(impl)) {}
 };
 
+/// Handle for writing one cache entry.
+///
+/// **Lifetime: finish every write before Cache::stop().**
+/// A WriteHandle must be committed (close() / close_sync()) or abandoned
+/// (abort(), or destroyed) BEFORE Cache::stop() is called, and no thread
+/// may be inside one of those calls while another thread stops the cache.
+/// Unlike a ReadHandle, a WriteHandle that is committed during or after
+/// stop() is not protected by the library: the commit uses per-stripe
+/// state that stop() frees, and the behavior is undefined.  This also
+/// rules out carrying a WriteHandle across a stop()/start() cycle.  An
+/// application that stops or restarts a cache while other threads write
+/// must wait for those writes itself.
 class WriteHandle {
  public:
   WriteHandle() = default;

@@ -36,6 +36,7 @@
 #include "cyclone/task.hpp"
 #include "directory.hpp"
 #include "document.hpp"
+#include "fork_gate.hpp"
 #include "hit_tracker.hpp"
 #include "mmap_directory.hpp"
 #include "thread_shard.hpp"
@@ -1156,10 +1157,11 @@ struct VolumeReadAnchor {
   // (ASan-confirmed use-after-free during review).  Old-generation
   // anchors stay torn forever; start() builds fresh ones.
   //
-  // Residual (pre-existing, same shape as the legacy weak path's
-  // _teardown check): a handle destructor that loads torn == false while
-  // stop() is concurrently mid-phase-3 can still reach a stripe being
-  // freed — the latch is a deterministic-generation guard, not a lock.
+  //
+  // The latch alone is a generation guard, not a lock: a handle call that
+  // loaded torn == false while stop() was freeing the stripes on another
+  // thread used to reach a stripe being freed.  It is therefore loaded
+  // only inside a Volume::HandleCall (see there), which close() waits for.
   std::atomic<bool> torn{false};
 };
 
@@ -1381,6 +1383,20 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // compare lease stamps across processes must not use it.
   static inline std::atomic<uint64_t> s_steady_clock_ns_for_test{0};
 
+  // Pause points of the handle-call / close() handshake (see HandleCall in
+  // the private section).  Same rules as the reader seams: test-seam
+  // builds only.
+  enum class TeardownSeam : uint8_t {
+    kHandleCallAdmitted,  // a handle call passed the teardown checks and is
+                          // about to dereference its Stripe* (fires on the
+                          // calling thread, inside the HandleCall)
+    kCloseWaiting,        // close() published teardown, found a handle call
+                          // in flight and waits for it (fires once per
+                          // close(), on the closing thread)
+  };
+  using TeardownSeamHook = std::function<void(TeardownSeam seam)>;
+  static inline TeardownSeamHook s_teardown_seam_for_test{};
+
   // Park a writer inside its odd window on `key`'s directory bucket: take the
   // stripe mutex exclusively (the writer serialization every production
   // mutator holds) and publish "writer active" on the bucket, then hold both
@@ -1586,8 +1602,14 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // write-avoidance guard).  Called by ReadHandle::renew_lease() for
   // client-paced transfers.  Returns false when leases are disabled
   // (T == 0), i.e. there is no protection to renew.
+  //
+  // `generation_torn`, here and on the three calls below: the anchor latch
+  // of the handle's stripe generation (VolumeReadAnchor::torn), or null on
+  // the legacy path.  It is checked inside the call's HandleCall, together
+  // with _teardown; a call that finds either set touches no stripe.
   bool renew_read_lease(Stripe *stripe, const BorrowEpoch &epoch_start,
-                        const BorrowToken &token);
+                        const BorrowToken &token,
+                        const std::atomic<bool> *generation_torn = nullptr);
   // Lease amendment (2026-07-07): intent-checked lease renewal for the ALIASED
   // zero-copy serve path.  Stamps the lease FIRST, then Dekker-revalidates
   // (borrow_still_valid: wrap_intent loaded before epoch) so a normal wrap
@@ -1596,12 +1618,14 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // renew_read_lease() above is safe ONLY for the copy-then-verify path,
   // whose read is observable; an aliased writev's read is not.  See
   // LeaseRenewal for how the embedder must act on each result.
-  LeaseRenewal renew_read_lease_strict(Stripe *stripe,
-                                       const BorrowEpoch &epoch_start,
-                                       const BorrowToken &token);
+  LeaseRenewal renew_read_lease_strict(
+      Stripe *stripe, const BorrowEpoch &epoch_start, const BorrowToken &token,
+      const std::atomic<bool> *generation_torn = nullptr);
   // Lease-protocol STEP-3: ns until a ceiling-forced wrap could overwrite a
   // borrow on this stripe (UINT64_MAX = none deferred / leases off).
-  [[nodiscard]] uint64_t ns_until_forced_wrap(const Stripe *stripe) const;
+  [[nodiscard]] uint64_t ns_until_forced_wrap(
+      const Stripe *stripe,
+      const std::atomic<bool> *generation_torn = nullptr) const;
 
   // drop a live borrow from the stripe's outstanding-borrow
   // slot.  Called by the disk-hit ReadHandle on close/destruction (public
@@ -1609,7 +1633,8 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // the class).  Generation-checked: a release that arrives after a
   // ceiling-forced wrap reset the slot is a no-op.  Inert tokens (RAM hit,
   // leases disabled, saturated-slot ride-alongs) are ignored.
-  void release_borrow(Stripe *stripe, BorrowToken token);
+  void release_borrow(Stripe *stripe, BorrowToken token,
+                      const std::atomic<bool> *generation_torn = nullptr);
 
   // Read-handle anchors (see VolumeReadAnchor above).  The Cache
   // calls make_read_anchors() after open() succeeds (requires this Volume
@@ -1649,15 +1674,112 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // Set at the TOP of close(), BEFORE _stripes is destroyed, and cleared
   // on (re)open.  The handle-facing entry points that dereference a raw
   // Stripe* (release_borrow, the renew paths, ns_until_forced_wrap) bail
-  // out when set: a ReadHandle outliving Cache::stop() violates the
-  // documented handle-lifetime contract, but — like the volume_weak pin
-  // those paths already take — this makes the common violation (a
-  // client-paced drain, or a handle destroyed after stop() while the
-  // Volume object itself is still alive) fail cleanly instead of touching
-  // freed stripes.  A borrow release skipped here is the documented
-  // leaked-count case: process-local slots die with the process, shared
-  // (mmap) slots are cleared by the next ceiling-forced wrap's reset.
+  // out when set: a ReadHandle may outlive Cache::stop() (a client-paced
+  // drain, or a handle destroyed after stop() while the Volume object
+  // itself is still alive), and its calls then touch no stripe.  A borrow
+  // release skipped here is the documented leaked-count case:
+  // process-local slots die with the process, shared (mmap) slots are
+  // cleared by the next ceiling-forced wrap's reset.
+  //
+  // The flag orders nothing by itself.  A handle call on one thread and
+  // close() on another are ordered by the HandleCall handshake below.
   std::atomic<bool> _teardown{false};
+
+  // Handle calls in flight, and the handshake that keeps close() from
+  // freeing a stripe under one of them.
+  //
+  // A ReadHandle is closed, renewed and polled outside the Cache's gate, on
+  // whatever thread the embedder serves from, while another thread may
+  // stop the cache (shutdown, reload).  Each such call dereferences the
+  // handle's raw Stripe*.  Checking a teardown flag first is not enough:
+  // the call could load "not torn down", close() could then publish
+  // teardown and free the stripes, and the call would go on into freed
+  // memory (seen under ThreadSanitizer as Volume::close against
+  // release_borrow).
+  //
+  // So a call counts itself in BEFORE it loads the flags, and close()
+  // publishes _teardown BEFORE it loads the counts -- all seq_cst, the same
+  // Dekker handshake as the wrap gate (invariant 3).  Either the call sees
+  // teardown and touches no stripe, or close() sees the call and waits
+  // until it has left.  The wait is short and bounded by the call: a
+  // handle call takes no lock, runs no application code and does a handful
+  // of atomic operations.
+  //
+  // The counts are per-thread shards (kShardPad apart) so that the two
+  // RMWs a read handle's close adds stay on a line only its own thread
+  // writes; close() sums nothing, it waits for each shard to read zero.
+  //
+  // fork(): a count held by an application thread at the instant another
+  // thread forks is copied into a child that does not have that thread,
+  // and nothing there will ever take it back.  So every count carries the
+  // fork epoch it was made in (high half of the word; fork_epoch() moves in
+  // every child): a call that finds a count from another epoch starts its
+  // shard afresh, and close() waits only for counts of its own epoch.  A
+  // child therefore never waits for a thread of its parent -- whether it
+  // closes the inherited volume, reopens it, or opened it itself -- and
+  // still waits for its own calls.  (The forking thread itself is never
+  // inside a call: a handle call runs no application code.)
+  struct alignas(kShardPad) HandleCallShard {
+    // (fork epoch << 32) | calls in flight
+    std::atomic<uint64_t> in_flight{0};
+  };
+  static constexpr size_t kHandleCallShards = 64;
+  static constexpr uint64_t kHandleCallCountMask = 0xFFFFFFFFULL;
+  mutable std::array<HandleCallShard, kHandleCallShards> _handle_calls{};
+
+  // One handle call.  Construct it FIRST, then ask admitted(); dereference
+  // the Stripe* only if it returned true, and only while this object lives.
+  class HandleCall {
+   public:
+    explicit HandleCall(const Volume &volume) noexcept
+        : _volume(volume),
+          _in_flight(volume._handle_calls[thread_shard_index(kHandleCallShards)]
+                         .in_flight) {
+      const uint64_t epoch = uint64_t{fork_epoch()} << 32;
+      uint64_t seen = _in_flight.load(std::memory_order_relaxed);
+      for (;;) {
+        // A count of another epoch belongs to threads of another process.
+        const uint64_t next =
+            (seen & ~kHandleCallCountMask) == epoch ? seen + 1 : (epoch | 1);
+        if (_in_flight.compare_exchange_weak(seen, next,
+                                             std::memory_order_seq_cst,
+                                             std::memory_order_seq_cst)) {
+          break;
+        }
+      }
+    }
+    ~HandleCall() { _in_flight.fetch_sub(1, std::memory_order_seq_cst); }
+    HandleCall(const HandleCall &) = delete;
+    HandleCall &operator=(const HandleCall &) = delete;
+
+    // False when the handle's stripe generation (`generation_torn`, may be
+    // null) or the volume was torn down: the stripes are, or are about to
+    // be, freed.  The generation latch is loaded first and inside the
+    // call, so a handle that survived a stop()/start() cycle never passes
+    // on the strength of the re-armed _teardown.
+    [[nodiscard]] bool admitted(
+        const std::atomic<bool> *generation_torn) const noexcept {
+      if (generation_torn != nullptr &&
+          generation_torn->load(std::memory_order_seq_cst)) {
+        return false;
+      }
+      if (_volume._teardown.load(std::memory_order_seq_cst)) {
+        return false;
+      }
+#ifdef CYCLONE_TEST_SEAMS
+      teardown_seam(TeardownSeam::kHandleCallAdmitted);
+#endif
+      return true;
+    }
+
+   private:
+    const Volume &_volume;
+    std::atomic<uint64_t> &_in_flight;
+  };
+  // close(): returns once no admitted handle call is in flight.  Call it
+  // after _teardown was published and before anything a call may touch is
+  // freed.
+  void wait_for_handle_calls() noexcept;
 #ifdef _WIN32
   std::mutex _fd_mutex;  // Serializes _lseeki64+_write/_read (not atomic like
                          // pwrite/pread)
@@ -2378,6 +2500,11 @@ class Volume : public std::enable_shared_from_this<Volume> {
   static void reader_seam(ReaderSeam seam) {
     if (s_reader_seam_for_test) {
       s_reader_seam_for_test(seam);
+    }
+  }
+  static void teardown_seam(TeardownSeam seam) {
+    if (s_teardown_seam_for_test) {
+      s_teardown_seam_for_test(seam);
     }
   }
 #endif
