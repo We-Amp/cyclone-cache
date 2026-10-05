@@ -999,8 +999,13 @@ TEST_CASE(
   CHECK((code == kScenarioOk || code == kScenarioOkSerialized));
 #if defined(__linux__) && defined(__GLIBC__) && defined(__GLIBC_PREREQ)
 #if __GLIBC_PREREQ(2, 36)
-  // glibc from 2.36 on lets two forks run their handlers side by side, so
-  // the full scenario must have run there (CI's Linux is one of those).
+  // Where two forks run their handlers side by side the full scenario must
+  // have run.  The scenario decides that with a run-time probe; this check
+  // only pins the answer where it is known, so that a probe gone wrong
+  // cannot quietly reduce the test.  glibc 2.36 is the oldest version this
+  // was confirmed on with this test (CI's Linux is newer), not the version
+  // that introduced the behaviour: older glibc (2.28 and 2.35, measured
+  // with a reduction of the scenario) runs the handlers side by side too.
   CHECK(code == kScenarioOk);
 #endif
 #endif
@@ -1088,6 +1093,153 @@ TEST_CASE(
   CHECK(fork_was_pending);
   CHECK(waited);
   CHECK(entered == 0);  // Returned while the fork was still pending
+  REQUIRE(child.load() > 0);
+  CHECK(exit_code_within_deadline(child.load()) == 0);
+}
+
+namespace {
+
+// A plugin whose transform() returns a good result, but only once the
+// engine has been asked to stop.
+class FinishesAfterStopPlugin : public OptimizationPlugin {
+ public:
+  [[nodiscard]] PluginInfo info() const override {
+    return {"finishes-after-stop-plugin", "1.0.0", 4243};
+  }
+
+  OptimizationPlan plan_optimization(const CacheKey& /*key*/,
+                                     std::span<const std::byte> /*header*/,
+                                     uint64_t content_length,
+                                     AlternateId written_alternate,
+                                     uint32_t /*hit_count*/) override {
+    OptimizationPlan plan;
+    if (written_alternate == AlternateId::Original) {
+      plan.add(AlternateId::Gzip, 5, true, content_length * 2);
+    }
+    return plan;
+  }
+
+  std::expected<TransformResult, CacheError> transform(
+      AlternateId target_alternate, const OptimizationContext& ctx) override {
+    in_transform.store(true, std::memory_order_release);
+    const auto deadline = Clock::now() + kChildDeadline;
+    while (!ctx.is_cancelled()) {
+      if (Clock::now() > deadline) {
+        return std::unexpected(CacheError::IoError);
+      }
+      std::this_thread::sleep_for(Ms{1});
+    }
+    // Ignores the cancellation and delivers, as a transform that was
+    // already past its last check would.
+    TransformResult result;
+    result.alternate_id = target_alternate;
+    result.header = std::vector<std::byte>(ctx.source_header().begin(),
+                                           ctx.source_header().end());
+    result.content = std::vector<std::byte>(ctx.source_content().begin(),
+                                            ctx.source_content().end());
+    return result;
+  }
+
+  void on_cancelled(const CacheKey& /*key*/, AlternateId target) override {
+    if (target == AlternateId::Gzip) {
+      cancelled_calls.fetch_add(1, std::memory_order_acq_rel);
+    }
+  }
+
+  std::atomic<bool> in_transform{false};
+  std::atomic<int> cancelled_calls{0};
+};
+
+}  // namespace
+
+TEST_CASE(
+    "Fork gate: a result whose write pass is refused at stop is reported "
+    "as cancelled",
+    "[fork][forkgate][optimization]") {
+  // A worker has a finished transform result in hand when the engine is
+  // stopped while a fork is pending.  Its write pass is refused (the pass
+  // gives up so that stop() is not held up by the fork) and the result is
+  // dropped.  The plugin and the stats must hear of it like of any other
+  // cancelled transform; it used to vanish without a trace.
+  TempCacheDir dir("fork_refused_write");
+  CacheConfig cache_config;
+  cache_config.set_ram_cache_size(0);
+  cache_config.optimization_config.enabled = true;
+  cache_config.optimization_config.min_threads = 1;
+  cache_config.optimization_config.max_threads = 1;
+  cache_config.optimization_config.min_hits_before_optimize = 0;
+  cache_config.optimization_config.load_high_watermark = 1e12;
+  auto created = Cache::create(cache_config);
+  REQUIRE(created.has_value());
+  std::unique_ptr<Cache> cache = std::move(*created);
+  REQUIRE(cache->add_volume(dir.path(), size_t{64} << 20).has_value());
+  REQUIRE(cache->start().has_value());
+  OptimizationEngine* engine = cache->optimization_engine();
+  REQUIRE(engine != nullptr);
+  auto plugin = std::make_shared<FinishesAfterStopPlugin>();
+  engine->register_plugin(plugin);
+
+  const CacheKey key("fork-refused-write");
+  const std::string body(2048, 'x');
+  const std::vector<std::byte> header(16, std::byte{1});
+  REQUIRE(write_document(*cache, key, body));
+  engine->on_write_complete(key, header, body.size(), AlternateId::Original,
+                            10);
+  const auto transform_deadline = Clock::now() + kChildDeadline;
+  while (!plugin->in_transform.load(std::memory_order_acquire) &&
+         Clock::now() < transform_deadline) {
+    std::this_thread::sleep_for(Ms{1});
+  }
+  REQUIRE(plugin->in_transform.load(std::memory_order_acquire));
+
+  // The worker is in transform(), between its two passes.  Make a fork
+  // pending: it waits in its prepare handler for `blocker`'s pass.
+  std::atomic<bool> blocker_running{true};
+  std::atomic<bool> release_blocker{false};
+  std::atomic<bool> blocker_in_pass{false};
+  std::thread blocker([&] {
+    ForkGatedPass pass(blocker_running);
+    blocker_in_pass.store(true, std::memory_order_release);
+    while (!release_blocker.load(std::memory_order_acquire)) {
+      std::this_thread::sleep_for(Ms{1});
+    }
+  });
+  while (!blocker_in_pass.load(std::memory_order_acquire)) {
+    std::this_thread::sleep_for(Ms{1});
+  }
+  std::atomic<pid_t> child{0};
+  std::thread forker([&] {
+    const pid_t pid = ::fork();
+    if (pid == 0) {
+      ::_exit(0);
+    }
+    child.store(pid, std::memory_order_release);
+  });
+  const auto pending_deadline = Clock::now() + kChildDeadline;
+  while (forks_pending_for_test() == 0 && Clock::now() < pending_deadline) {
+    std::this_thread::sleep_for(Ms{1});
+  }
+  const bool fork_was_pending = forks_pending_for_test() == 1;
+
+  // stop() cancels the item, transform() returns its result, and the write
+  // pass finds the fork pending and the engine stopped.  stop() joins the
+  // worker, so the counts below are final when it returns.
+  cache->stop();
+  const bool fork_still_pending = forks_pending_for_test() == 1;
+  const OptimizationStats stats = engine->stats();
+  const int cancelled_calls = plugin->cancelled_calls.load();
+
+  // Unblock everything before asserting, so a failure cannot hang the run.
+  release_blocker.store(true, std::memory_order_release);
+  blocker.join();
+  forker.join();
+
+  CHECK(fork_was_pending);
+  CHECK(fork_still_pending);
+  CHECK(cancelled_calls == 1);
+  CHECK(stats.cancelled == 1);
+  CHECK(stats.completed == 0);
+  CHECK(stats.failed == 0);
   REQUIRE(child.load() > 0);
   CHECK(exit_code_within_deadline(child.load()) == 0);
 }

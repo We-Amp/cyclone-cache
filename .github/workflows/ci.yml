@@ -12,9 +12,10 @@ name: CI
 #
 # The build mirrors the private lanes: bundled SHA-256 (no OpenSSL/vcpkg
 # dependency) and Catch2 via FetchContent.  One extra Linux job builds the
-# OpenSSL key-hash backend instead (see openssl-backend below). Tests run as a single process
-# (the binary directly, not `ctest -j`): the Catch2 cases share a fixed
-# on-disk temp path, so parallel test processes race on file sharing.
+# OpenSSL key-hash backend instead (see openssl-backend below).  Tests run
+# as a single process (the binary directly, not `ctest -j`): the Catch2
+# cases share a fixed on-disk temp path, so parallel test processes race on
+# file sharing.
 
 on:
   push:
@@ -227,9 +228,11 @@ jobs:
           if-no-files-found: ignore
           retention-days: 1
 
-  # The jobs above hash keys with the bundled SHA-256.  This one builds the
-  # other backend, the default of a plain `cmake -B build`: OpenSSL's
-  # libcrypto.  It differs in more than speed: the crypto library brings
+  # The jobs above hash keys with the bundled SHA-256, the default.  This
+  # one builds the other backend, which an application opts into with
+  # -DCYCLONE_USE_BUNDLED_SHA256=OFF: OpenSSL's libcrypto.  The option is
+  # passed explicitly here so the job keeps building that backend whatever
+  # the default is.  It differs in more than speed: the crypto library brings
   # process-wide state and an exit handler of its own, and a fault in how the
   # key hash meets them (see the note in src/core/key.cpp) never shows in a
   # bundled build.  The whole suite runs, since every cache operation starts
@@ -247,6 +250,7 @@ jobs:
       - name: Configure
         run: >-
           cmake -B build -DCMAKE_BUILD_TYPE=Release
+          -DCYCLONE_USE_BUNDLED_SHA256=OFF
           -DCYCLONE_BUILD_BENCHMARKS=OFF -DCYCLONE_BUILD_EXAMPLES=OFF
       - name: Build
         run: cmake --build build --target cyclone-tests cyclone-test-peer -j

@@ -213,7 +213,9 @@ class OptimizationPlugin {
   virtual std::expected<TransformResult, CacheError> transform(
       AlternateId target_alternate, const OptimizationContext &ctx) = 0;
 
-  // Called when a queued work item is cancelled.
+  // Called when a work item is cancelled: transform() returned
+  // OptimizationCancelled, or it returned a result that the engine could
+  // not write any more because it was stopped (the result is dropped).
   // Optional - override to clean up resources or log.
   virtual void on_cancelled(const CacheKey &key, AlternateId target) {
     (void)key;
