@@ -545,6 +545,11 @@ if (result) {
 
 Handle for writing content to cache.
 
+> **Lifetime**: commit (`close()` / `close_sync()`) or abandon (`abort()`,
+> or destroy) every WriteHandle before `Cache::stop()`, and let no thread be
+> inside a commit while another thread stops the cache. Unlike a ReadHandle,
+> a WriteHandle committed during or after `stop()` is undefined behavior.
+
 ```cpp
 void set_header(std::span<const std::byte> header);
 ```

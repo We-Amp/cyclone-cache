@@ -3,14 +3,20 @@
 
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <memory>
+#include <optional>
+#include <span>
 #include <thread>
 #include <vector>
 
+#include "core/fork_gate.hpp"
+#include "core/volume.hpp"  // Volume::TeardownSeam (test-seam builds)
 #include "cyclone/cache.hpp"
 #include "cyclone/key.hpp"
 #include "support/temp_cache.hpp"
@@ -928,6 +934,273 @@ TEST_CASE("Concurrent stop with in-flight reads must not crash",
   REQUIRE_FALSE(cache->is_running());
 }
 
+// =============================================================================
+// A handle call on one thread while another thread stops the cache
+// =============================================================================
+//
+// An embedder serves from borrowed handles on its request threads and stops
+// the cache at shutdown or reload on another.  Closing a handle, renewing its
+// lease and polling its forced-wrap deadline all dereference the handle's
+// stripe, outside the cache's gate.  stop() frees the stripes.  A call that
+// had already passed the "torn down?" check when stop() published teardown
+// used to go on into freed memory (ThreadSanitizer: Volume::close against
+// release_borrow, from the case "Concurrent stop with in-flight reads must
+// not crash" above).  Now close() waits for such a call.
+//
+// The cases below make that window deterministic with the teardown seams:
+// the call is parked right after it was admitted, stop() runs meanwhile, and
+// the call is let go only when close() reports that it is waiting for it --
+// or, in a library without the wait, when stop() has returned, which fails
+// the case.
+
+namespace {
+
+enum class HandleCallKind : uint8_t {
+  kClose,
+  kRenew,
+  kRenewStrict,
+  kForcedWrapPoll,
+};
+
+const char *to_string(HandleCallKind kind) {
+  switch (kind) {
+    case HandleCallKind::kClose:
+      return "close";
+    case HandleCallKind::kRenew:
+      return "renew_lease";
+    case HandleCallKind::kRenewStrict:
+      return "renew_lease_strict";
+    case HandleCallKind::kForcedWrapPoll:
+      return "ns_until_forced_wrap";
+  }
+  return "?";
+}
+
+// Parks the handle call made on `caller` right after it was admitted, until
+// close() waits for it, the test says stop() returned, or a deadline.
+struct TeardownWindow {
+  std::atomic<std::thread::id> caller{};
+  std::atomic<bool> admitted{false};
+  std::atomic<bool> close_waiting{false};
+  std::atomic<bool> stop_returned{false};
+  // What the parked call saw when it was let go.
+  std::atomic<bool> let_go_by_close_waiting{false};
+  std::atomic<bool> let_go_by_stop_returned{false};
+
+  TeardownWindow() {
+    Volume::s_teardown_seam_for_test = [this](Volume::TeardownSeam seam) {
+      if (seam == Volume::TeardownSeam::kCloseWaiting) {
+        close_waiting.store(true, std::memory_order_release);
+        return;
+      }
+      if (std::this_thread::get_id() !=
+          caller.load(std::memory_order_acquire)) {
+        return;
+      }
+      admitted.store(true, std::memory_order_release);
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(60);
+      while (std::chrono::steady_clock::now() < deadline) {
+        if (close_waiting.load(std::memory_order_acquire)) {
+          let_go_by_close_waiting.store(true, std::memory_order_release);
+          return;
+        }
+        if (stop_returned.load(std::memory_order_acquire)) {
+          let_go_by_stop_returned.store(true, std::memory_order_release);
+          return;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+      }
+    };
+  }
+  ~TeardownWindow() { Volume::s_teardown_seam_for_test = nullptr; }
+  TeardownWindow(const TeardownWindow &) = delete;
+  TeardownWindow &operator=(const TeardownWindow &) = delete;
+
+  bool wait_admitted() const {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (!admitted.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+    return admitted.load(std::memory_order_acquire);
+  }
+};
+
+void run_handle_call_against_stop(HandleCallKind kind, bool mmap_directory) {
+  CAPTURE(to_string(kind), mmap_directory);
+  TempCacheDir tmp;
+  CacheConfig config;
+  config.set_ram_cache_size(0);  // Disk hits: the handle borrows the mapping
+  if (mmap_directory) {
+    config.set_multi_process(0, 1);
+  }
+  auto created = Cache::create(config);
+  REQUIRE(created.has_value());
+  auto &cache = *created;
+  VolumeConfig vol_config;
+  vol_config.path = tmp.path();
+  vol_config.size = static_cast<size_t>(10 * 1024 * 1024);
+  REQUIRE(cache->add_volume(vol_config).has_value());
+  REQUIRE(cache->start().has_value());
+
+  const CacheKey key("handle-call-against-stop");
+  const std::vector<std::byte> body(4096, std::byte{0x5A});
+  {
+    auto wh = cache->write_sync(key, body.size());
+    REQUIRE(wh.has_value());
+    REQUIRE(wh->write_sync(std::span<const std::byte>(body)).has_value());
+    REQUIRE(wh->close_sync().has_value());
+  }
+  auto read = cache->read_sync(key);
+  REQUIRE(read.has_value());
+  REQUIRE_FALSE(read->is_ram_cache_hit());
+  std::optional<ReadHandle> handle(std::move(*read));
+
+  TeardownWindow window;
+  bool renewed = false;
+  LeaseRenewal strict = LeaseRenewal::kTorn;
+  uint64_t forced_wrap_ns = 0;
+  std::thread caller([&] {
+    window.caller.store(std::this_thread::get_id(), std::memory_order_release);
+    switch (kind) {
+      case HandleCallKind::kClose:
+        handle.reset();
+        break;
+      case HandleCallKind::kRenew:
+        renewed = handle->renew_lease();
+        break;
+      case HandleCallKind::kRenewStrict:
+        strict = handle->renew_lease_strict();
+        break;
+      case HandleCallKind::kForcedWrapPoll:
+        forced_wrap_ns = handle->ns_until_forced_wrap();
+        break;
+    }
+  });
+  const bool admitted = window.wait_admitted();
+
+  // The call is inside the library, past the teardown checks, about to use
+  // its stripe.  Stop the cache under it.
+  cache->stop();
+  window.stop_returned.store(true, std::memory_order_release);
+  caller.join();
+
+  REQUIRE(admitted);
+  // close() saw the call and waited; the call ran on live stripes, and
+  // stop() returned only after it had left.
+  CHECK(window.close_waiting.load());
+  CHECK(window.let_go_by_close_waiting.load());
+  CHECK_FALSE(window.let_go_by_stop_returned.load());
+  // An admitted call completes normally.
+  switch (kind) {
+    case HandleCallKind::kClose:
+      break;
+    case HandleCallKind::kRenew:
+      CHECK(renewed);
+      break;
+    case HandleCallKind::kRenewStrict:
+      CHECK(strict == LeaseRenewal::kOk);
+      break;
+    case HandleCallKind::kForcedWrapPoll:
+      CHECK(forced_wrap_ns == UINT64_MAX);  // No wrap is being deferred
+      break;
+  }
+
+  // A handle that outlives stop() stays safe to use and to close: its calls
+  // find the generation torn down and touch no stripe.
+  if (handle.has_value()) {
+    CHECK_FALSE(handle->renew_lease());
+    CHECK(handle->renew_lease_strict() == LeaseRenewal::kTorn);
+    CHECK(handle->ns_until_forced_wrap() == UINT64_MAX);
+    CHECK(handle->content().size() == body.size());
+    handle.reset();
+  }
+  CHECK_FALSE(window.let_go_by_stop_returned.load());
+}
+
+}  // namespace
+
+TEST_CASE("stop() waits for a handle call that is already using its stripe",
+          "[lifecycle][concurrency][borrow]") {
+  const HandleCallKind kind =
+      GENERATE(HandleCallKind::kClose, HandleCallKind::kRenew,
+               HandleCallKind::kRenewStrict, HandleCallKind::kForcedWrapPoll);
+  const bool mmap_directory = GENERATE(false, true);
+  run_handle_call_against_stop(kind, mmap_directory);
+}
+
+TEST_CASE("A handle from before a stop()/start() cycle touches no stripe",
+          "[lifecycle][concurrency][borrow]") {
+  // The stripes the handle points at were freed by stop(); start() built
+  // new ones and re-armed the volume.  The old handle's calls must be
+  // refused by its generation, not admitted on the strength of the reopened
+  // volume: an admitted call would fire the seam below.
+  TempCacheDir tmp;
+  CacheConfig config;
+  config.set_ram_cache_size(0);
+  auto created = Cache::create(config);
+  REQUIRE(created.has_value());
+  auto &cache = *created;
+  VolumeConfig vol_config;
+  vol_config.path = tmp.path();
+  vol_config.size = static_cast<size_t>(10 * 1024 * 1024);
+  REQUIRE(cache->add_volume(vol_config).has_value());
+  REQUIRE(cache->start().has_value());
+  const CacheKey key("handle-across-restart");
+  const std::vector<std::byte> body(4096, std::byte{0x3C});
+  {
+    auto wh = cache->write_sync(key, body.size());
+    REQUIRE(wh.has_value());
+    REQUIRE(wh->write_sync(std::span<const std::byte>(body)).has_value());
+    REQUIRE(wh->close_sync().has_value());
+  }
+  auto read = cache->read_sync(key);
+  REQUIRE(read.has_value());
+  REQUIRE_FALSE(read->is_ram_cache_hit());
+  std::optional<ReadHandle> stale(std::move(*read));
+
+  cache->stop();
+  REQUIRE(cache->start().has_value());
+  const CacheKey fresh_key("handle-after-restart");
+  {
+    auto wh = cache->write_sync(fresh_key, body.size());
+    REQUIRE(wh.has_value());
+    REQUIRE(wh->write_sync(std::span<const std::byte>(body)).has_value());
+    REQUIRE(wh->close_sync().has_value());
+  }
+  auto fresh_read = cache->read_sync(fresh_key);
+  REQUIRE(fresh_read.has_value());
+  REQUIRE_FALSE(fresh_read->is_ram_cache_hit());
+  std::optional<ReadHandle> fresh(std::move(*fresh_read));
+
+  std::atomic<int> admitted_calls{0};
+  Volume::s_teardown_seam_for_test = [&](Volume::TeardownSeam seam) {
+    if (seam == Volume::TeardownSeam::kHandleCallAdmitted) {
+      admitted_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+  };
+  const bool renewed = stale->renew_lease();
+  const LeaseRenewal strict = stale->renew_lease_strict();
+  const uint64_t forced_wrap_ns = stale->ns_until_forced_wrap();
+  stale.reset();
+  const int stale_admitted = admitted_calls.load();
+  // A handle of the new generation is admitted as usual.
+  const bool fresh_renewed = fresh->renew_lease();
+  fresh.reset();
+  const int fresh_admitted = admitted_calls.load() - stale_admitted;
+  Volume::s_teardown_seam_for_test = nullptr;
+
+  CHECK_FALSE(renewed);
+  CHECK(strict == LeaseRenewal::kTorn);
+  CHECK(forced_wrap_ns == UINT64_MAX);
+  CHECK(stale_admitted == 0);
+  CHECK(fresh_renewed);
+  CHECK(fresh_admitted == 2);  // The renew and the close
+  cache->stop();
+}
+
 TEST_CASE("Concurrent stop with in-flight writes must not crash",
           "[lifecycle][concurrency]") {
   TempCacheDir tmp;
@@ -1152,4 +1425,116 @@ TEST_CASE("Cache teardown is fork-safe in a forked child",
   REQUIRE(WIFEXITED(status));
   REQUIRE(WEXITSTATUS(status) == 0);
 }
+
+// Not under ThreadSanitizer: the parent has a test thread alive at the
+// fork, and the sanitizer's exit hook in the child reports that thread as
+// leaked and replaces the exit code this case reads.
+#if defined(__SANITIZE_THREAD__)
+#define CYCLONE_LIFECYCLE_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define CYCLONE_LIFECYCLE_TSAN 1
+#endif
+#endif
+#if !defined(CYCLONE_LIFECYCLE_TSAN)
+TEST_CASE(
+    "close() in a forked child does not wait for a handle call of "
+    "the parent",
+    "[lifecycle][fork][borrow]") {
+  // close() waits for handle calls in flight.  A call that an application
+  // thread was in at the instant another thread forked is counted in the
+  // child's copy of the volume too, by a thread the child does not have:
+  // the child must not wait for it -- not when it closes the inherited
+  // volume, and not when it then reopens the volume and closes it again
+  // (the count is still there; only its fork epoch says whose it is).
+  const bool reopen = GENERATE(false, true);
+  CAPTURE(reopen);
+  REQUIRE(install_fork_handlers());
+  TempCacheDir tmp;
+  VolumeConfig vol_config;
+  vol_config.path = tmp.path();
+  vol_config.size = static_cast<size_t>(8 * 1024 * 1024);
+  auto volume = std::make_shared<Volume>(vol_config);
+  REQUIRE(volume->open().has_value());
+  const CacheKey key("handle-call-across-fork");
+  const std::vector<std::byte> body(4096, std::byte{0x77});
+  {
+    auto wh = volume->write_sync(key, body.size());
+    REQUIRE(wh.has_value());
+    REQUIRE(wh->write_sync(std::span<const std::byte>(body)).has_value());
+    REQUIRE(wh->close_sync().has_value());
+  }
+  auto read = volume->read_sync(key);
+  REQUIRE(read.has_value());
+  REQUIRE_FALSE(read->is_ram_cache_hit());
+  std::optional<ReadHandle> handle(std::move(*read));
+
+  TeardownWindow window;
+  std::thread caller([&] {
+    window.caller.store(std::this_thread::get_id(), std::memory_order_release);
+    handle.reset();  // Parks inside the release, counted as in flight
+  });
+  const bool admitted = window.wait_admitted();
+
+  pid_t pid = -1;
+  bool exited = false;
+  int status = 0;
+  if (admitted) {
+    pid = ::fork();
+    if (pid == 0) {
+      volume->close();
+      if (reopen) {
+        if (!volume->open().has_value()) {
+          ::_exit(2);
+        }
+        // The child's own handle calls work on the reopened volume.
+        {
+          const CacheKey own_key("written-by-the-child");
+          auto wh = volume->write_sync(own_key, body.size());
+          if (!wh.has_value() ||
+              !wh->write_sync(std::span<const std::byte>(body)).has_value() ||
+              !wh->close_sync().has_value()) {
+            ::_exit(3);
+          }
+          auto own = volume->read_sync(own_key);
+          if (!own.has_value()) {
+            ::_exit(4);
+          }
+          if (!own->renew_lease()) {
+            ::_exit(5);
+          }
+        }
+        volume->close();
+      }
+      ::_exit(0);
+    }
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (pid > 0 && std::chrono::steady_clock::now() < deadline) {
+      if (::waitpid(pid, &status, WNOHANG) == pid) {
+        exited = true;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    if (pid > 0 && !exited) {
+      ::kill(pid, SIGKILL);
+      ::waitpid(pid, &status, 0);
+    }
+  }
+  // Let the parked call go and finish in the parent.
+  window.stop_returned.store(true, std::memory_order_release);
+  caller.join();
+  volume->close();
+
+  REQUIRE(admitted);
+  REQUIRE(pid > 0);
+  INFO(
+      "the child must leave close() at once; a timeout means it waited "
+      "for a handle call of a thread it does not have");
+  REQUIRE(exited);
+  REQUIRE(WIFEXITED(status));
+  REQUIRE(WEXITSTATUS(status) == 0);
+}
+#endif  // !CYCLONE_LIFECYCLE_TSAN
 #endif  // _WIN32

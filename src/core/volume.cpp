@@ -29,6 +29,7 @@
 #include "../ram_cache/ram_cache.hpp"
 #include "cyclone/detail/expected_compat.hpp"
 #include "document.hpp"
+#include "fork_gate.hpp"
 #include "hit_tracker.hpp"
 
 #ifdef _WIN32
@@ -768,11 +769,12 @@ class VolumeReadHandleImpl : public ReadHandleImpl {
       // strongly pinned.  The raw Stripe* is NOT — anchor->torn (see its
       // comment in volume.hpp) says this handle's stripe generation was
       // freed, so the borrow count died with it and must not be touched.
-      // The unmap is unconditional: the pinned MappedFile owns that
-      // mapping regardless of stripe teardown.
-      if (borrow.active && stripe != nullptr &&
-          !anchor->torn.load(std::memory_order_seq_cst)) {
-        anchor->volume->release_borrow(stripe, borrow);
+      // release_borrow loads the latch itself, inside its HandleCall: a
+      // check out here would not be ordered against a stop() that frees
+      // the stripes on another thread.  The unmap is unconditional: the
+      // pinned MappedFile owns that mapping regardless of stripe teardown.
+      if (borrow.active && stripe != nullptr) {
+        anchor->volume->release_borrow(stripe, borrow, &anchor->torn);
       }
       if (!mapping.empty()) {
         anchor->mapped_file->unmap_region(mapping);
@@ -843,10 +845,10 @@ class VolumeReadHandleImpl : public ReadHandleImpl {
     // mapping but NOT the Volume/_stripes -> a use-after-free under nginx
     // reload / worker exit).  Expired == cache torn down: nothing to renew.
     if (anchor) {  // strong pin, Volume always reachable
-      if (anchor->torn.load(std::memory_order_seq_cst)) {
-        return false;  // this handle's stripe generation was torn down
-      }
-      return anchor->volume->renew_read_lease(stripe, epoch_start, borrow);
+      // False when this handle's stripe generation was torn down (the
+      // latch is loaded inside the call, see Volume::HandleCall).
+      return anchor->volume->renew_read_lease(stripe, epoch_start, borrow,
+                                              &anchor->torn);
     }
     auto vol = volume_weak.lock();
     if (!vol) {
@@ -863,12 +865,9 @@ class VolumeReadHandleImpl : public ReadHandleImpl {
     if (is_ram_hit || stripe == nullptr) {
       return LeaseRenewal::kLeasesOff;
     }
-    if (anchor) {  // strong pin; torn generation => do not alias
-      if (anchor->torn.load(std::memory_order_seq_cst)) {
-        return LeaseRenewal::kTorn;
-      }
+    if (anchor) {  // strong pin; torn generation => kTorn, do not alias
       return anchor->volume->renew_read_lease_strict(stripe, epoch_start,
-                                                     borrow);
+                                                     borrow, &anchor->torn);
     }
     auto vol = volume_weak.lock();
     if (!vol) {
@@ -882,11 +881,8 @@ class VolumeReadHandleImpl : public ReadHandleImpl {
     if (is_ram_hit || stripe == nullptr) {
       return UINT64_MAX;
     }
-    if (anchor) {  // strong pin
-      if (anchor->torn.load(std::memory_order_seq_cst)) {
-        return UINT64_MAX;  // torn generation: no ceiling to report
-      }
-      return anchor->volume->ns_until_forced_wrap(stripe);
+    if (anchor) {  // strong pin; torn generation => no ceiling to report
+      return anchor->volume->ns_until_forced_wrap(stripe, &anchor->torn);
     }
     auto vol = volume_weak.lock();
     if (!vol) {
@@ -2058,11 +2054,48 @@ std::expected<void, CacheError> Volume::open_locked(bool created_new) {
   return init_stripes(exclusive_open);
 }
 
+void Volume::wait_for_handle_calls() noexcept {
+  // Only counts made in this process (this fork epoch): a count inherited
+  // across fork() belongs to a thread this process does not have (see
+  // _handle_calls in volume.hpp).
+  const uint64_t epoch = uint64_t{fork_epoch()} << 32;
+  const auto busy = [epoch](const HandleCallShard& shard) {
+    const uint64_t seen = shard.in_flight.load(std::memory_order_seq_cst);
+    return (seen & ~kHandleCallCountMask) == epoch &&
+           (seen & kHandleCallCountMask) != 0;
+  };
+#ifdef CYCLONE_TEST_SEAMS
+  bool announced = false;
+#endif
+  for (const HandleCallShard& shard : _handle_calls) {
+    unsigned rounds = 0;
+    while (busy(shard)) {
+#ifdef CYCLONE_TEST_SEAMS
+      if (!announced) {
+        announced = true;
+        teardown_seam(TeardownSeam::kCloseWaiting);
+      }
+#endif
+      // A handle call is a handful of atomic operations: yield, and fall
+      // back to short sleeps only if its thread was descheduled inside it.
+      if (++rounds < 64) {
+        std::this_thread::yield();
+      } else {
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+      }
+    }
+  }
+}
+
 void Volume::close() {
-  // Publish teardown BEFORE freeing the stripes: handle-facing paths that
+  // Publish teardown BEFORE freeing the stripes, then wait for the handle
+  // calls that were already past the check: the handle-facing paths that
   // dereference a raw Stripe* (release_borrow, renew, ns_until_forced_wrap)
-  // check this and bail (see the field's comment in volume.hpp).
+  // run on other threads, outside any lock close() could take.  From here
+  // on a new call bails; the wait covers the ones in flight (see
+  // _handle_calls in volume.hpp).
   _teardown.store(true, std::memory_order_seq_cst);
+  wait_for_handle_calls();
   _stripes.clear();
   _mapped_file.reset();
   // After the stripes (nothing can take the write lock any more), before the
@@ -3541,11 +3574,13 @@ BorrowToken Volume::acquire_borrow(Stripe* stripe, uint32_t chunk) const {
           static_cast<uint8_t>(chunk)};
 }
 
-void Volume::release_borrow(Stripe* stripe, BorrowToken token) {
+void Volume::release_borrow(Stripe* stripe, BorrowToken token,
+                            const std::atomic<bool>* generation_torn) {
   if (!token.active || !token.counted || stripe == nullptr) {
     return;  // RAM hit, leases disabled, or saturated ride-along.
   }
-  if (_teardown.load(std::memory_order_seq_cst)) {
+  const HandleCall call(*this);
+  if (!call.admitted(generation_torn)) {
     return;  // close() freed the stripes: leaked-count case, documented.
   }
   if (stripe->use_mmap_directory && stripe->mmap_directory) {
@@ -3729,13 +3764,15 @@ bool Volume::probe_raced_publish(const Stripe* stripe,
 }
 
 bool Volume::renew_read_lease(Stripe* stripe, const BorrowEpoch& epoch_start,
-                              const BorrowToken& token) {
+                              const BorrowToken& token,
+                              const std::atomic<bool>* generation_torn) {
   if (_lease_t_ns == 0) {
     // Leases disabled: no protection to extend.  The embedder treats a
     // false renew as "cannot prove this borrow still safe" and copies.
     return false;
   }
-  if (_teardown.load(std::memory_order_seq_cst)) {
+  const HandleCall call(*this);
+  if (!call.admitted(generation_torn)) {
     return false;  // close() freed the stripes: nothing left to renew.
   }
   // Read-side acquire fence: order the caller's PRECEDING data reads (the
@@ -3783,9 +3820,9 @@ bool Volume::renew_read_lease(Stripe* stripe, const BorrowEpoch& epoch_start,
   return true;
 }
 
-LeaseRenewal Volume::renew_read_lease_strict(Stripe* stripe,
-                                             const BorrowEpoch& epoch_start,
-                                             const BorrowToken& token) {
+LeaseRenewal Volume::renew_read_lease_strict(
+    Stripe* stripe, const BorrowEpoch& epoch_start, const BorrowToken& token,
+    const std::atomic<bool>* generation_torn) {
   // Lease amendment (2026-07-07): the ALIASED zero-copy path's per-send
   // validation.  Unlike renew_read_lease (epoch-only, safe only for
   // copy-then-verify where the read is observable), an aliased writev's read
@@ -3811,7 +3848,8 @@ LeaseRenewal Volume::renew_read_lease_strict(Stripe* stripe,
   // LoadLoad barrier pins the preceding reads ahead of the epoch verdict
   // regardless.  No-op on x86.
   std::atomic_thread_fence(std::memory_order_acquire);
-  if (_teardown.load(std::memory_order_seq_cst)) {
+  const HandleCall call(*this);
+  if (!call.admitted(generation_torn)) {
     return LeaseRenewal::kTorn;  // Cache stopping mid-drain: do not alias.
   }
   stamp_read_lease(stripe);  // Stamp FIRST — Dekker (matches the borrow).
@@ -3972,10 +4010,14 @@ void Volume::publish_wrap_deferred_deadline(Stripe* stripe,
   }
 }
 
-uint64_t Volume::ns_until_forced_wrap(const Stripe* stripe) const {
-  if (_lease_t_ns == 0 || stripe == nullptr ||
-      _teardown.load(std::memory_order_seq_cst)) {
-    return UINT64_MAX;  // Leases disabled / closing: no ceiling force.
+uint64_t Volume::ns_until_forced_wrap(
+    const Stripe* stripe, const std::atomic<bool>* generation_torn) const {
+  if (_lease_t_ns == 0 || stripe == nullptr) {
+    return UINT64_MAX;  // Leases disabled: no ceiling force.
+  }
+  const HandleCall call(*this);
+  if (!call.admitted(generation_torn)) {
+    return UINT64_MAX;  // Closing: no ceiling force.
   }
   uint32_t deadline_ms;
   if (stripe->use_mmap_directory && stripe->mmap_directory) {
