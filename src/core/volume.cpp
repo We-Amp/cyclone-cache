@@ -1671,7 +1671,6 @@ std::expected<void, CacheError> Volume::open() {
   if (_fd >= 0) {
     return make_unexpected(CacheError::AlreadyOpen);
   }
-  _open_fork_epoch = fork_epoch();
   _teardown.store(false, std::memory_order_seq_cst);  // (Re)opening.
 
   // Two-stage open to prevent TOCTOU race when multiple processes initialize
@@ -2056,17 +2055,21 @@ std::expected<void, CacheError> Volume::open_locked(bool created_new) {
 }
 
 void Volume::wait_for_handle_calls() noexcept {
-  if (fork_epoch() != _open_fork_epoch) {
-    // A forked child: a count it inherited belongs to a thread it does not
-    // have (see _handle_calls in volume.hpp).
-    return;
-  }
+  // Only counts made in this process (this fork epoch): a count inherited
+  // across fork() belongs to a thread this process does not have (see
+  // _handle_calls in volume.hpp).
+  const uint64_t epoch = uint64_t{fork_epoch()} << 32;
+  const auto busy = [epoch](const HandleCallShard& shard) {
+    const uint64_t seen = shard.in_flight.load(std::memory_order_seq_cst);
+    return (seen & ~kHandleCallCountMask) == epoch &&
+           (seen & kHandleCallCountMask) != 0;
+  };
 #ifdef CYCLONE_TEST_SEAMS
   bool announced = false;
 #endif
   for (const HandleCallShard& shard : _handle_calls) {
     unsigned rounds = 0;
-    while (shard.in_flight.load(std::memory_order_seq_cst) != 0) {
+    while (busy(shard)) {
 #ifdef CYCLONE_TEST_SEAMS
       if (!announced) {
         announced = true;

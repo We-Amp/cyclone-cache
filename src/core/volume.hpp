@@ -36,6 +36,7 @@
 #include "cyclone/task.hpp"
 #include "directory.hpp"
 #include "document.hpp"
+#include "fork_gate.hpp"
 #include "hit_tracker.hpp"
 #include "mmap_directory.hpp"
 #include "thread_shard.hpp"
@@ -1697,18 +1698,22 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // writes; close() sums nothing, it waits for each shard to read zero.
   //
   // fork(): a count held by an application thread at the instant another
-  // thread forks is copied into a child that does not have that thread.
-  // close() in such a child (reached through ~Volume) must not wait for
-  // it, so the wait is skipped when the process is not the one that opened
-  // the volume (fork_epoch() moved); no call of THIS process can be in
-  // flight there, because ~Volume runs only when no handle pins the
-  // Volume any more.
+  // thread forks is copied into a child that does not have that thread,
+  // and nothing there will ever take it back.  So every count carries the
+  // fork epoch it was made in (high half of the word; fork_epoch() moves in
+  // every child): a call that finds a count from another epoch starts its
+  // shard afresh, and close() waits only for counts of its own epoch.  A
+  // child therefore never waits for a thread of its parent -- whether it
+  // closes the inherited volume, reopens it, or opened it itself -- and
+  // still waits for its own calls.  (The forking thread itself is never
+  // inside a call: a handle call runs no application code.)
   struct alignas(kShardPad) HandleCallShard {
-    std::atomic<uint32_t> in_flight{0};
+    // (fork epoch << 32) | calls in flight
+    std::atomic<uint64_t> in_flight{0};
   };
   static constexpr size_t kHandleCallShards = 64;
+  static constexpr uint64_t kHandleCallCountMask = 0xFFFFFFFFULL;
   mutable std::array<HandleCallShard, kHandleCallShards> _handle_calls{};
-  uint32_t _open_fork_epoch = 0;  // fork_epoch() at open()
 
   // One handle call.  Construct it FIRST, then ask admitted(); dereference
   // the Stripe* only if it returned true, and only while this object lives.
@@ -1718,7 +1723,18 @@ class Volume : public std::enable_shared_from_this<Volume> {
         : _volume(volume),
           _in_flight(volume._handle_calls[thread_shard_index(kHandleCallShards)]
                          .in_flight) {
-      _in_flight.fetch_add(1, std::memory_order_seq_cst);
+      const uint64_t epoch = uint64_t{fork_epoch()} << 32;
+      uint64_t seen = _in_flight.load(std::memory_order_relaxed);
+      for (;;) {
+        // A count of another epoch belongs to threads of another process.
+        const uint64_t next =
+            (seen & ~kHandleCallCountMask) == epoch ? seen + 1 : (epoch | 1);
+        if (_in_flight.compare_exchange_weak(seen, next,
+                                             std::memory_order_seq_cst,
+                                             std::memory_order_seq_cst)) {
+          break;
+        }
+      }
     }
     ~HandleCall() { _in_flight.fetch_sub(1, std::memory_order_seq_cst); }
     HandleCall(const HandleCall &) = delete;
@@ -1746,7 +1762,7 @@ class Volume : public std::enable_shared_from_this<Volume> {
 
    private:
     const Volume &_volume;
-    std::atomic<uint32_t> &_in_flight;
+    std::atomic<uint64_t> &_in_flight;
   };
   // close(): returns once no admitted handle call is in flight.  Call it
   // after _teardown was published and before anything a call may touch is

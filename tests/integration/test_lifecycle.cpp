@@ -1444,7 +1444,11 @@ TEST_CASE(
   // close() waits for handle calls in flight.  A call that an application
   // thread was in at the instant another thread forked is counted in the
   // child's copy of the volume too, by a thread the child does not have:
-  // the child must not wait for it.
+  // the child must not wait for it -- not when it closes the inherited
+  // volume, and not when it then reopens the volume and closes it again
+  // (the count is still there; only its fork epoch says whose it is).
+  const bool reopen = GENERATE(false, true);
+  CAPTURE(reopen);
   REQUIRE(install_fork_handlers());
   TempCacheDir tmp;
   VolumeConfig vol_config;
@@ -1479,6 +1483,29 @@ TEST_CASE(
     pid = ::fork();
     if (pid == 0) {
       volume->close();
+      if (reopen) {
+        if (!volume->open().has_value()) {
+          ::_exit(2);
+        }
+        // The child's own handle calls work on the reopened volume.
+        {
+          const CacheKey own_key("written-by-the-child");
+          auto wh = volume->write_sync(own_key, body.size());
+          if (!wh.has_value() ||
+              !wh->write_sync(std::span<const std::byte>(body)).has_value() ||
+              !wh->close_sync().has_value()) {
+            ::_exit(3);
+          }
+          auto own = volume->read_sync(own_key);
+          if (!own.has_value()) {
+            ::_exit(4);
+          }
+          if (!own->renew_lease()) {
+            ::_exit(5);
+          }
+        }
+        volume->close();
+      }
       ::_exit(0);
     }
     const auto deadline =
