@@ -5,7 +5,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <optional>
 
+#include "../core/fork_gate.hpp"
 #include "cyclone/cache.hpp"
 
 namespace cyclone {
@@ -42,6 +44,11 @@ void OptimizationEngine::start() {
   if (_running.exchange(true, std::memory_order_acq_rel)) {
     return;  // Already running
   }
+
+  // Before any worker exists: their cache work is fork-gated (see
+  // process_work_item), and on_write_complete() compares this epoch.
+  install_fork_handlers();
+  _start_epoch.store(fork_epoch(), std::memory_order_release);
 
   // Start thread pool
   _thread_pool->start();
@@ -139,6 +146,14 @@ void OptimizationEngine::on_write_complete(const CacheKey &key,
   if (!_running.load(std::memory_order_acquire) || !_config.enabled) {
     return;
   }
+  // A forked child that inherited a running engine (a caller that kept the
+  // pointer from before the fork; Cache::optimization_engine() returns
+  // nullptr there).  No worker exists in this process to run what would be
+  // queued, and the queue and stats locks below may have been fork-copied
+  // while a thread of the parent held them: touch nothing.
+  if (_start_epoch.load(std::memory_order_acquire) != fork_epoch()) {
+    return;
+  }
 
   // Check minimum hits threshold
   if (hit_count < _config.min_hits_before_optimize) {
@@ -223,6 +238,23 @@ TaskFunction OptimizationEngine::get_task() {
 size_t OptimizationEngine::queue_depth() const { return _work_queue.size(); }
 
 void OptimizationEngine::process_work_item(WorkItem item) {
+  // Fork gating (see fork_gate.hpp).  The item reads and writes the cache
+  // on this worker thread, taking the cache gate, hit-tracker stripes and
+  // volume stripe locks on the way; a child forked meanwhile would inherit
+  // whichever of them this thread held, locked for good.  So the read of
+  // the source and the write of the result are each ONE fork-gated pass,
+  // and fork() waits for them.
+  //
+  // The plugin's transform() runs BETWEEN the two passes, never inside
+  // one: it is application code, it may take as long as it likes and it
+  // may itself start a process, and neither must ever hold up, or be held
+  // up by, a fork (a pass runs no application code).  What transform()
+  // does with the cache through its context is therefore covered like a
+  // call from any other application thread, not like library work.
+  //
+  // A false pass means the engine was stopped while a fork was pending:
+  // drop the item, as stop() does with everything still queued.
+
   // Create cancellation token
   auto cancelled = std::make_shared<std::atomic<bool>>(false);
   {
@@ -253,16 +285,33 @@ void OptimizationEngine::process_work_item(WorkItem item) {
   // the read will fail. This is expected behavior - we simply increment the
   // 'failed' stat and move on. The optimization can be re-queued on next
   // access.
-  auto read_result = _cache->read_sync(item.id.key);
-  if (!read_result) {
-    std::lock_guard stats_lock(_stats_mutex);
-    ++_stats.failed;
+  //
+  // The handle stays open across transform() (its spans are the plugin's
+  // input) and is closed after the write, as before.  Holding or closing it
+  // outside a pass is fine: a read handle is a lease, not a lock.
+  std::optional<ReadHandle> source;
+  bool read_pass_entered = false;
+  {
+    ForkGatedPass pass(_running);
+    if (pass) {
+      read_pass_entered = true;
+      auto read_result = _cache->read_sync(item.id.key);
+      if (read_result) {
+        source.emplace(std::move(*read_result));
+      }
+    }
+  }
+  if (!source) {
+    if (read_pass_entered) {
+      std::lock_guard stats_lock(_stats_mutex);
+      ++_stats.failed;
+    }
     std::lock_guard lock(_active_work_mutex);
     _active_work.erase(item.id);
     return;
   }
 
-  auto &handle = *read_result;
+  auto &handle = *source;
 
   // Get header and content
   auto header_data = handle.header();
@@ -293,7 +342,13 @@ void OptimizationEngine::process_work_item(WorkItem item) {
     return;
   }
 
-  // Write the new alternate to cache
+  // Write the new alternate to cache: the second pass, to the end of the
+  // function.
+  ForkGatedPass write_pass(_running);
+  if (!write_pass) {
+    return;
+  }
+
   auto write_result =
       _cache->write_alternate_sync(item.id.key, transform_result->alternate_id,
                                    transform_result->content.size());

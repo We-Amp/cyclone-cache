@@ -205,6 +205,11 @@ class OptimizationPlugin {
   // Returns:
   //   TransformResult on success
   //   CacheError on failure (OptimizationCancelled if cancelled)
+  //
+  // Starting a helper process from here: prefer posix_spawn().  fork() is
+  // allowed; like every fork in the process it first waits for the
+  // library's background passes (see the fork contract on Cache::start()
+  // in cyclone/cache.hpp), and the child should exec or _exit promptly.
   virtual std::expected<TransformResult, CacheError> transform(
       AlternateId target_alternate, const OptimizationContext &ctx) = 0;
 

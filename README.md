@@ -803,6 +803,46 @@ Each invariant is pinned by a test — `tests/integration/test_lockfree_read_rac
 `tests/unit/multi_process_test.cpp` — and documented in
 [doc/architecture.md](doc/architecture.md#concurrency-model).
 
+### Forking with an open cache
+
+A forking server opens the cache in its parent process and lets the workers
+it forks use the inherited object. That is supported on Linux and macOS, with
+this contract (the authoritative text is on `Cache::start()` /
+`Cache::stop()` in [`cache.hpp`](include/cyclone/cache.hpp)):
+
+- **`fork()` waits for the library's background threads.** A hit-count flush,
+  a directory sync, or an optimization worker's read of its source or write
+  of its result that is in flight finishes first, and new ones are held off
+  until `fork()` returns, so a child never inherits a lock held by a thread
+  it does not have. The wait is at most one pass: normally microseconds, as
+  long as an fsync of the volume when a directory sync is in flight. It has
+  no timeout. It never waits for plugin code: a plugin's `transform()` runs
+  between passes.
+- **The child reads and writes through the inherited `Cache`, without
+  background threads.** None are started for it. Pending hit counts are
+  written when `hit_flush_threshold` (per key) or the total pending bound is
+  reached instead of on a timer; the periodic directory sync is the parent's
+  and covers the shared mapping; `optimization_engine()` returns `nullptr`.
+- **Teardown in the child is local.** `stop()` there joins nothing and takes
+  no lock, and the destructor, a second `stop()`, or exiting without either
+  are all safe. Afterwards that `Cache` is finished in the child
+  (`start()` returns `CacheError::Closed`); the parent's keeps running. A
+  child that wants background threads of its own creates a new `Cache`.
+- **Yours to avoid:** forking while *another thread of your application* is
+  inside a cache call (the library can only vouch for its own threads), using
+  the cache in a child made with `vfork()` or a direct `clone()`, and using
+  in the child a read or write handle that was open at the fork.
+- **Optimization plugins** count as application code, although they run on a
+  library thread: a cache call a plugin makes from `transform()` is not
+  covered if another thread forks at that instant. A plugin that needs a
+  helper process should start it with `posix_spawn()`, which runs no fork
+  handlers; a plain `fork()` in `transform()` also works and waits for the
+  background passes like any other fork.
+
+A single-process application is unaffected unless it forks; if it does (to
+spawn a helper, say), the only visible change is the short wait above.
+Pinned by `tests/integration/test_fork_storm.cpp`.
+
 ## Security and robustness
 
 Cache files are untrusted input. Deserialization validates every count and

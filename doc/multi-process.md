@@ -306,6 +306,50 @@ takes around `fork()`, so a child never inherits it locked; everything done
 under it is non-blocking (`F_OFD_GETLK`, `F_OFD_SETLK`, never `SETLKW`), so
 a fork waits for at most a few syscalls.
 
+**Background threads and `fork()`.** The same handler first waits for the
+library's own threads. The process that started the cache runs a hit-count
+flush thread and a directory sync thread (and optimization workers when the
+engine is enabled); each does its work in passes, and a pass takes
+in-process locks: the 4096 hit-tracker stripe mutexes one after another, a
+shard of the cache gate for a whole msync/fsync sweep, volume stripe locks.
+A child forked in the middle of a pass would inherit such a lock held by a
+thread that does not exist in it, and block for good on its first use of it.
+So `fork()` waits for the pass in flight and holds new passes off until it
+returns (`ForkGatedPass`, `src/core/fork_gate.hpp`): two atomic counters,
+nothing the child could itself inherit locked. The order inside the handler
+is fixed: passes first, the liveness mutex second, because a flush pass may
+need that mutex.
+
+A pass runs no application code. An optimization worker reads its source in
+one pass and writes its result in another, and the plugin's `transform()`
+runs between the two, so a fork never waits for plugin code and a plugin
+that starts a helper process is an ordinary forker. The reason is that a
+fork from *inside* a pass cannot be made to work:
+
+- It cannot wait for the other passes: two threads doing that wait for each
+  other for good. So such a fork bypasses the gate (it announces nothing and
+  waits for nothing; only the liveness mutex is taken and released, as
+  before the gate existed), and its child is unprotected: a lock another
+  pass held at that instant is locked for good in the child, which may
+  therefore only exec or `_exit`.
+- Where the C library runs the fork handlers of one `fork()` at a time
+  (measured on macOS; glibc and musl versions differ), a fork from outside a
+  pass that is waiting for the pass holds the C library's own fork lock, the
+  pass blocks on entering `fork()`, and neither moves again. No handler can
+  prevent that.
+
+Nothing in the library forks from inside a pass, and with no application
+code inside a pass nothing else can.
+
+The child keeps the inherited `Cache` for reads and writes and gets no
+background threads: hit counts are flushed on thresholds only, the periodic
+directory sync remains the parent's, the optimization engine is not
+available. `stop()` and the destructor in the child join nothing and take
+no lock inherited from the parent. Threads of the application are outside
+this guarantee: a fork while another application thread is inside a cache
+call can still hand the child a locked mutex. The full contract is on
+`Cache::start()` / `Cache::stop()` in `include/cyclone/cache.hpp`.
+
 **Network filesystems.** Byte-range lock behaviour on NFS and SMB shares is
 unverified. The one-host requirement above already rules out sharing a
 volume between hosts; on a network mount used by one host, a claim that

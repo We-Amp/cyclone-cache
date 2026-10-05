@@ -5,6 +5,38 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- A process that forked while a cache was running could leave the child
+  blocked for good. The parent's background threads take in-process locks
+  while they work (the hit-count flush sweeps the hit-tracker stripe
+  mutexes, the directory sync holds a shard of the cache gate for its
+  msync/fsync sweep), and a child forked at that instant inherited the lock
+  held by a thread it does not have. Such a child blocked on its first read
+  of a key that hashed to that stripe, or, at exit, in the destructor after
+  an explicit `stop()`. This affects forking servers that open the cache in
+  the parent; a blocked worker did not go away on a graceful restart. Now
+  `fork()` waits (in the library's `pthread_atfork` handler) for a
+  background pass in flight and holds new ones off until it returns, and
+  `stop()` in a forked child marks the inherited `Cache` finished, so a
+  later `stop()` or the destructor returns without taking a lock. Update
+  recommended for forking servers.
+  - Behaviour: `fork()` can now wait for one background pass, normally
+    microseconds and at most as long as an fsync of the volume. No timeout.
+    It never waits for application code: the optimization engine runs a
+    plugin's `transform()` between two passes (read the source, write the
+    result), not inside one. A plugin that starts a helper process should
+    use `posix_spawn()`; a `fork()` in `transform()` also works.
+  - Behaviour: in a forked child that inherited a running cache,
+    `optimization_engine()` returns `nullptr` from the fork on (it used to
+    return a pointer to an engine whose threads were not there, until
+    `stop()`), and `start()` after `stop()` returns `CacheError::Closed`
+    (it used to fail with `AlreadyOpen` and close the volumes).
+  - No API, on-disk format or shared-mapping change. The fork contract is
+    now written down on `Cache::start()` / `Cache::stop()`, in
+    `cyclone_c.h` and in the README ("Forking with an open cache").
+    Windows is unaffected (no fork).
+
 ### Added
 
 - `CacheConfig::for_kv_tier()`: a static factory returning the recommended

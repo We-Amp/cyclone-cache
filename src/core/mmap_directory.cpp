@@ -9,6 +9,8 @@
 #include <thread>
 #include <vector>
 
+#include "fork_gate.hpp"
+
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
 #include <immintrin.h>
 #endif
@@ -21,6 +23,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -377,8 +380,34 @@ static_assert(sizeof(off_t) == 8,
 
 // Bumped in every forked child (pthread_atfork), so a WriterLiveness can
 // tell that it runs in a new process whatever PIDs say.  Windows has no
-// fork: it stays 0 there.
+// fork: it stays 0 there.  Read through fork_epoch() (fork_gate.hpp).
 std::atomic<uint32_t> g_fork_epoch{0};
+
+#if !defined(_WIN32)
+// The fork gate (see fork_gate.hpp).  Two counters and a Dekker handshake:
+// a pass announces itself (g_passes_active) and THEN looks for a pending
+// fork; fork's prepare handler announces itself (g_forks_pending) and THEN
+// looks for active passes.  Both sides use seq_cst, so at least one of them
+// sees the other: either the pass backs out and waits, or the fork waits
+// for the pass to end.  Don't weaken the memory order.
+//
+// g_forks_pending is a count, not a flag: two threads may fork at once.
+std::atomic<uint32_t> g_forks_pending{0};
+// Threads inside a pass (a thread counts once however deep it nests), plus
+// threads that are announcing themselves and about to back out.
+std::atomic<uint32_t> g_passes_active{0};
+// This thread's pass nesting depth.  Nonzero in the fork handlers means the
+// thread is forking from INSIDE a pass, which no code of the library does
+// and no pass is meant to allow (a pass runs no application code); the
+// handlers then leave the gate alone, see on_fork_prepare().
+thread_local uint32_t t_pass_depth = 0;
+
+void fork_gate_sleep(long nanoseconds) {
+  struct timespec ts{};
+  ts.tv_nsec = nanoseconds;
+  (void)::nanosleep(&ts, nullptr);
+}
+#endif
 
 // ONE mutex for every WriterLiveness of the process: claim, probe and detach
 // run under it.  It is fork-safe by construction: the pthread_atfork
@@ -410,25 +439,168 @@ std::mutex &liveness_mutex() {
 }
 
 #if !defined(_WIN32)
-void on_fork_prepare() { liveness_mutex().lock(); }
-void on_fork_parent() { liveness_mutex().unlock(); }
+// ONE set of handlers for the whole library, so the order between the fork
+// gate and the liveness mutex is fixed here and does not depend on which
+// component registered first.
+//
+// PREPARE: quiesce the background passes FIRST, take the liveness mutex
+// SECOND.  A pass may itself need the liveness mutex (a hit-count flush
+// takes the cross-process write lock, whose slot claim and probe run under
+// it); taking the mutex first and then waiting for that pass would deadlock.
+// Once no pass is in flight, the mutex is only ever held for a few
+// non-blocking syscalls.
+//
+// The wait is unbounded on purpose.  A pass is one finite sweep, but it can
+// take as long as its slowest fsync; returning early would hand the child
+// the very locks this exists to keep out of it, and a child blocked for good
+// is worse than a fork that is late.
+//
+// A FORK FROM INSIDE A PASS BYPASSES THE GATE.  It does not announce
+// itself, waits for no pass and holds no pass off; only the liveness mutex
+// is handled, exactly as before the gate existed.  Waiting is not an
+// option for such a thread: it would wait for passes while a second thread
+// doing the same waits for ITS pass (neither ever ends), and announcing
+// itself would freeze every other pass and fork behind that.  The price is
+// that its child gets no protection: another pass may be in flight when
+// the memory is copied, so the child may only exec or _exit (see the
+// contract in fork_gate.hpp).  A fork from outside a pass still waits for
+// the forking thread's pass like any other, and that pass ends as soon as
+// its fork returns -- provided the C library lets two threads be inside
+// fork() at once.  Where it runs the handlers of one fork at a time, the
+// outside fork holds the library's own fork lock while it waits here and
+// the pass can never get into fork(): that deadlock cannot be undone from
+// a handler, which is why a pass must not run code that forks at all.
+void on_fork_prepare() {
+  if (t_pass_depth == 0) {
+    g_forks_pending.fetch_add(1, std::memory_order_seq_cst);
+    for (unsigned round = 0;
+         g_passes_active.load(std::memory_order_seq_cst) != 0; ++round) {
+      if (round < 64) {
+        std::this_thread::yield();
+      } else {
+        fork_gate_sleep(50'000);  // 50 us
+      }
+    }
+  }
+  liveness_mutex().lock();
+}
+
+// t_pass_depth cannot change between a thread's prepare handler and its
+// parent or child handler, so all three agree on whether this fork
+// bypassed the gate.
+void on_fork_parent() {
+  liveness_mutex().unlock();
+  if (t_pass_depth == 0) {
+    g_forks_pending.fetch_sub(1, std::memory_order_seq_cst);
+  }
+}
+
+// Runs in the child, where only the forking thread exists.  Everything here
+// is a store to an atomic or the unlock of a mutex this very thread locked
+// in on_fork_prepare: no allocation, no lock acquisition, nothing that can
+// wait.  (t_pass_depth is this thread's own, and on_fork_prepare already
+// read it, so its storage exists.)  The counters are reset rather than
+// decremented: they may still include a thread that was announcing itself
+// at the instant of the fork, or a second thread that was forking at the
+// same time, and neither exists here.  A child forked from inside a pass
+// is still inside it (and will leave it): it is the one active pass.
 void on_fork_child() {
   g_fork_epoch.fetch_add(1, std::memory_order_relaxed);
   liveness_mutex().unlock();  // Taken by this thread in on_fork_prepare
+  g_passes_active.store(t_pass_depth != 0 ? 1U : 0U, std::memory_order_seq_cst);
+  g_forks_pending.store(0, std::memory_order_seq_cst);
 }
-#endif
 
-void install_fork_hook() {
-#if !defined(_WIN32)
-  static const bool installed = [] {
-    return ::pthread_atfork(&on_fork_prepare, &on_fork_parent,
-                            &on_fork_child) == 0;
-  }();
-  (void)installed;
+// 0 = not registered, 1 = registered.  A failed registration (ENOMEM) is
+// not latched: the next call tries again.
+std::atomic<int> g_handlers_installed{0};
+std::atomic_flag g_handlers_installing = ATOMIC_FLAG_INIT;
 #endif
-}
 
 }  // namespace
+
+bool install_fork_handlers() noexcept {
+#if defined(_WIN32)
+  return true;
+#else
+  // Not a function-local static and not a mutex: a caller that returns
+  // from here must find the handlers registered (or know they are not),
+  // and nothing here may be a lock that a fork could copy while held.
+  for (;;) {
+    if (g_handlers_installed.load(std::memory_order_acquire) != 0) {
+      return true;
+    }
+    if (!g_handlers_installing.test_and_set(std::memory_order_acquire)) {
+      break;
+    }
+    std::this_thread::yield();  // Another thread is registering right now.
+  }
+  bool ok = g_handlers_installed.load(std::memory_order_acquire) != 0;
+  if (!ok) {
+    ok = ::pthread_atfork(&on_fork_prepare, &on_fork_parent, &on_fork_child) ==
+         0;
+    if (ok) {
+      g_handlers_installed.store(1, std::memory_order_release);
+    }
+  }
+  g_handlers_installing.clear(std::memory_order_release);
+  return ok;
+#endif
+}
+
+uint32_t fork_epoch() noexcept {
+  return g_fork_epoch.load(std::memory_order_relaxed);
+}
+
+#ifdef CYCLONE_TEST_SEAMS
+uint32_t forks_pending_for_test() noexcept {
+#if defined(_WIN32)
+  return 0;
+#else
+  return g_forks_pending.load(std::memory_order_seq_cst);
+#endif
+}
+#endif
+
+#if defined(_WIN32)
+ForkGatedPass::ForkGatedPass(
+    const std::atomic<bool> & /*keep_running*/) noexcept
+    : _entered(true) {}
+
+ForkGatedPass::~ForkGatedPass() = default;
+#else
+ForkGatedPass::ForkGatedPass(const std::atomic<bool> &keep_running) noexcept {
+  if (t_pass_depth != 0) {
+    // Nested on a thread that is already counted: a pending fork is waiting
+    // for the outer pass, so waiting for that fork here would never end.
+    ++t_pass_depth;
+    _entered = true;
+    return;
+  }
+  for (;;) {
+    g_passes_active.fetch_add(1, std::memory_order_seq_cst);
+    if (g_forks_pending.load(std::memory_order_seq_cst) == 0) {
+      t_pass_depth = 1;
+      _entered = true;
+      return;
+    }
+    // A fork is in progress: back out (holding nothing) and wait for it.
+    g_passes_active.fetch_sub(1, std::memory_order_seq_cst);
+    while (g_forks_pending.load(std::memory_order_seq_cst) != 0) {
+      if (!keep_running.load(std::memory_order_acquire)) {
+        return;  // The owner is stopping: skip the pass.
+      }
+      fork_gate_sleep(200'000);  // 200 us
+    }
+  }
+}
+
+ForkGatedPass::~ForkGatedPass() {
+  if (_entered && --t_pass_depth == 0) {
+    g_passes_active.fetch_sub(1, std::memory_order_seq_cst);
+  }
+}
+#endif
 
 uint32_t WriterLiveness::current_pid() {
 #ifdef CYCLONE_TEST_SEAMS
@@ -445,7 +617,7 @@ uint32_t WriterLiveness::current_pid() {
 }
 
 void WriterLiveness::attach(int probe_fd, const std::string &path) {
-  install_fork_hook();
+  install_fork_handlers();
   detach();
   std::lock_guard<std::mutex> lock(liveness_mutex());
   _probe_fd = probe_fd;
