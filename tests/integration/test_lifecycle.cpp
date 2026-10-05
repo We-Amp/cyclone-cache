@@ -1396,6 +1396,23 @@ TEST_CASE("A stale write handle on a bare Volume is refused after reopen",
   REQUIRE(volume->open().has_value());
   check_refused(use_stale_write_handle(*wh, std::span<const std::byte>(body)));
   CHECK_FALSE(volume->exists_sync(key).value_or(true));
+
+  // The coroutine close() of a stale handle: refused once; the handle is
+  // then released, so close() reports success and close_sync()
+  // InvalidArgument (as documented on WriteHandle).
+  auto stale = volume->write_sync(key, body.size());
+  REQUIRE(stale.has_value());
+  REQUIRE(stale->write_sync(std::span<const std::byte>(body)).has_value());
+  volume->close();
+  REQUIRE(volume->open().has_value());
+  const auto first = stale->close().sync_wait();
+  REQUIRE_FALSE(first.has_value());
+  CHECK(first.error() == CacheError::Closed);
+  CHECK(stale->close().sync_wait().has_value());
+  const auto after_release = stale->close_sync();
+  REQUIRE_FALSE(after_release.has_value());
+  CHECK(after_release.error() == CacheError::InvalidArgument);
+  CHECK_FALSE(volume->exists_sync(key).value_or(true));
   volume->close();
 }
 

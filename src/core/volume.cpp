@@ -3162,6 +3162,12 @@ std::expected<ReadHandle, CacheError> Volume::read_sync(const CacheKey& key) {
 
 std::expected<WriteHandle, CacheError> Volume::write_sync(
     const CacheKey& key, uint64_t content_length) {
+  // The generation BEFORE the stripe: if a close() runs in between, the
+  // handle carries the older generation and its commit is refused, never
+  // the other way round (a stripe of the old generation paired with the
+  // new value).  Under a Cache the gate already rules that out; a bare
+  // Volume relies on this order.
+  const uint64_t generation = stripe_generation();
   Stripe* stripe = select_stripe(key);
   if (stripe == nullptr) {
     return make_unexpected(CacheError::NotInitialized);
@@ -3186,7 +3192,7 @@ std::expected<WriteHandle, CacheError> Volume::write_sync(
   // pointer stands.
   impl->guarded = (impl->volume_weak.use_count() > 0);
   impl->stripe = stripe;
-  impl->generation = stripe_generation();
+  impl->generation = generation;
   impl->key = key;
   impl->expected_length = content_length;
 
@@ -5246,6 +5252,12 @@ uint16_t Volume::expected_retain_chunks() const {
 
 std::expected<WriteHandle, CacheError> Volume::write_alternate_sync(
     const CacheKey& key, AlternateId alternate_id, uint64_t content_length) {
+  // The generation BEFORE the stripe: if a close() runs in between, the
+  // handle carries the older generation and its commit is refused, never
+  // the other way round (a stripe of the old generation paired with the
+  // new value).  Under a Cache the gate already rules that out; a bare
+  // Volume relies on this order.
+  const uint64_t generation = stripe_generation();
   Stripe* stripe = select_stripe(key);
   if (stripe == nullptr) {
     return make_unexpected(CacheError::NotInitialized);
@@ -5269,7 +5281,7 @@ std::expected<WriteHandle, CacheError> Volume::write_alternate_sync(
   // pointer stands.
   impl->guarded = (impl->volume_weak.use_count() > 0);
   impl->stripe = stripe;
-  impl->generation = stripe_generation();
+  impl->generation = generation;
   impl->key = key;
   impl->alternate_id = alternate_id;
   impl->expected_length = content_length;

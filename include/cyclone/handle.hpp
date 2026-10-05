@@ -276,6 +276,19 @@ class ReadHandle {
 ///  - write_sync() and reserve() on such a handle return
 ///    CacheError::Closed as well.  abort() and the destructor are always
 ///    safe.
+///  - The first close() / close_sync() closes the handle, whatever its
+///    result.  A later call writes nothing and does not repeat the error:
+///    close_sync() after close_sync() returns success, and after the
+///    coroutine close() (which also releases the handle) close() returns
+///    success and close_sync() returns CacheError::InvalidArgument.  Only
+///    the result of the first call says whether the entry was written.
+///  - How long stop() can wait: for the commits already in flight, at most
+///    one commit per writing thread.  A commit is short (a lock and a
+///    write to the file), except behind another process that holds the
+///    cross-process write lock: if that process is alive but stopped (for
+///    example by a debugger or SIGSTOP), the commit waits about 5 seconds
+///    before the lock is taken over.  Slow storage delays it as it delays
+///    every write.
 /// One WriteHandle object must not be used from two threads at once.
 class WriteHandle {
  public:
