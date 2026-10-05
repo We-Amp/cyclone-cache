@@ -641,7 +641,14 @@ executable the UCRT's `exit()` runs the executable's static destructors with
 the other threads alive, and there the safety rests on MSVC's `~mutex` being a
 no-op in release builds (as glibc's is). Nothing is `detach()`ed, and
 `Executor::global()` — the only legitimate `leak_thread_on_shutdown` caller
-(`thread_util.hpp`) — has no caller. The guarantee covers Cyclone's own statics
+(`thread_util.hpp`) — has no caller. The same holds for the embedder's own
+threads still inside cache calls when the process exits: the only state of a
+dependency they reach is the key hash, and both backends compute it on the
+caller's stack. The OpenSSL backend uses the `SHA256_Init` / `_Update` /
+`_Final` functions for that reason and not EVP, which resolves the digest
+through OpenSSL 3's default library context on every call; OpenSSL frees that
+context in an exit handler (`OPENSSL_cleanup`), and a thread hashing a key at
+that moment faulted. The guarantee covers Cyclone's own statics
 only: an embedder-owned object that a Cache thread can reach (a plugin, a
 callback's context) and that the embedder destroys at exit is the embedder's
 to sequence. What such an exit forgoes is the final hit-count flush and

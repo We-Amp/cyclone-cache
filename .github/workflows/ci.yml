@@ -11,7 +11,8 @@ name: CI
 # the private fleet and are deliberately not part of this workflow.
 #
 # The build mirrors the private lanes: bundled SHA-256 (no OpenSSL/vcpkg
-# dependency) and Catch2 via FetchContent. Tests run as a single process
+# dependency) and Catch2 via FetchContent.  One extra Linux job builds the
+# OpenSSL key-hash backend instead (see openssl-backend below). Tests run as a single process
 # (the binary directly, not `ctest -j`): the Catch2 cases share a fixed
 # on-disk temp path, so parallel test processes race on file sharing.
 
@@ -225,6 +226,49 @@ jobs:
           path: crashdumps/
           if-no-files-found: ignore
           retention-days: 1
+
+  # The jobs above hash keys with the bundled SHA-256.  This one builds the
+  # other backend, the default of a plain `cmake -B build`: OpenSSL's
+  # libcrypto.  It differs in more than speed: the crypto library brings
+  # process-wide state and an exit handler of its own, and a fault in how the
+  # key hash meets them (see the note in src/core/key.cpp) never shows in a
+  # bundled build.  The whole suite runs, since every cache operation starts
+  # with a key hash.
+  openssl-backend:
+    name: Build & Test (ubuntu-latest, OpenSSL key hash)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install OpenSSL headers
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends libssl-dev
+      - name: Configure
+        run: >-
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          -DCYCLONE_BUILD_BENCHMARKS=OFF -DCYCLONE_BUILD_EXAMPLES=OFF
+      - name: Build
+        run: cmake --build build --target cyclone-tests cyclone-test-peer -j
+      - name: The key hash is OpenSSL's
+        run: |
+          grep -q '^OPENSSL_CRYPTO_LIBRARY:' build/CMakeCache.txt
+          ldd build/cyclone-test-peer | grep -q libcrypto
+      - name: Test
+        run: |
+          set +e
+          ./build/cyclone-tests 2>&1 | tee test-output.txt
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "cyclone-tests exit code: $rc"
+          if [ "$rc" -ne 0 ]; then
+            grep -A1 -E ': FAILED:$' test-output.txt | grep -v '^--$' |
+              paste - - | head -n 20 |
+              while IFS= read -r line; do
+                printf '::error title=cyclone-tests failure::%s\n' "$line"
+              done || true
+          fi
+          exit "$rc"
 
   license-audit:
     name: License audit (Apache RAT)
