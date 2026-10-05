@@ -523,9 +523,17 @@ bool install_fork_handlers() noexcept {
 #if defined(_WIN32)
   return true;
 #else
-  // Not a function-local static and not a mutex: a caller that returns
-  // from here must find the handlers registered (or know they are not),
-  // and nothing here may be a lock that a fork could copy while held.
+  // Not a function-local static: a caller that returns from here must
+  // find the handlers registered (or know they are not), and a failed
+  // registration must be retried by the next call, not latched.
+  //
+  // g_handlers_installing is a small spinlock, and like any lock it can be
+  // copied by a fork while held: only by a fork from another application
+  // thread during the first registration in the process, before any
+  // handler exists that could wait for it.  The child of such a fork would
+  // spin in its own next call here.  That is the application-thread case
+  // the fork contract in cyclone/cache.hpp excludes, and the function-local
+  // static this replaced had the same exposure.
   for (;;) {
     if (g_handlers_installed.load(std::memory_order_acquire) != 0) {
       return true;

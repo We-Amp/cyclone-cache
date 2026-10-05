@@ -252,8 +252,11 @@ void OptimizationEngine::process_work_item(WorkItem item) {
   // does with the cache through its context is therefore covered like a
   // call from any other application thread, not like library work.
   //
-  // A false pass means the engine was stopped while a fork was pending:
-  // drop the item, as stop() does with everything still queued.
+  // A false pass means the engine was stopped while a fork was pending.
+  // Before the read that drops the item, as stop() does with everything
+  // still queued.  Before the write the plugin has already produced a
+  // result that is now thrown away, so the item is reported like any other
+  // cancelled transform: on_cancelled() and the cancelled count.
 
   // Create cancellation token
   auto cancelled = std::make_shared<std::atomic<bool>>(false);
@@ -346,6 +349,10 @@ void OptimizationEngine::process_work_item(WorkItem item) {
   // function.
   ForkGatedPass write_pass(_running);
   if (!write_pass) {
+    // No pass is open here, so calling the plugin is allowed.
+    plugin->on_cancelled(item.id.key, item.id.target_alternate);
+    std::lock_guard stats_lock(_stats_mutex);
+    ++_stats.cancelled;
     return;
   }
 
