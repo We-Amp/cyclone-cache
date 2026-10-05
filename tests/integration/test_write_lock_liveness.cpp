@@ -210,7 +210,9 @@ constexpr Ms kLiveWindow{400};
 constexpr Ms kPromptRecovery{1000};
 
 bool kill_reports_dead(uint32_t pid) {
-  return signal_child(static_cast<pid_t>(pid), 0) != 0 && errno == ESRCH;
+  // Any pid, not a child: probe_pid() sends signal 0, which delivers
+  // nothing.
+  return probe_pid(static_cast<pid_t>(pid)) != 0 && errno == ESRCH;
 }
 
 // Limit the claimable slots for one test.
@@ -701,7 +703,10 @@ TEST_CASE(
   CHECK(d.dir.get_shared_write_pos() == kBase);
 
   const auto killed_at = Clock::now();
-  signal_child(static_cast<pid_t>(real_pid), SIGKILL);
+  // The holder is our grandchild: `middle` (our child) reaps it, so it is
+  // signalled through the narrow grandchild path (see signal_child.hpp).
+  REQUIRE(signal_grandchild(middle, static_cast<pid_t>(real_pid), SIGKILL) ==
+          0);
   int status = 0;
   ::waitpid(middle, &status, 0);  // the middle reaps the holder first
   waiter.thread.join();

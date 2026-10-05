@@ -230,6 +230,7 @@ if(CYCLONE_BUILD_TESTS)
     tests/integration/test_exit_with_open_cache.cpp
     tests/integration/test_fork_storm.cpp
     tests/unit/test_signal_child.cpp
+    tests/support/sigchld_default.cpp
   )
   # Compile guard: cyclone_c.h is the C ABI header, so it must stay valid C11
   # (it once used C++ alias declarations and did not compile as C).  Built as
