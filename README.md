@@ -164,7 +164,7 @@ int main() {
     // ... use content before r goes out of scope
   }
 
-  cache.stop();                            // finish every write first
+  cache.stop();                            // waits for commits in flight
 }
 ```
 
@@ -514,12 +514,13 @@ class WriteHandle {                        // RAII: an unclosed handle aborts
 };
 ```
 
-Commit or abandon every `WriteHandle` before `Cache::stop()`, and let no
-thread be inside a commit while another stops the cache: a write handle
-committed during or after `stop()` is undefined behavior. A `ReadHandle` may
-be held across `stop()` and closed afterwards, also from another thread while
-`stop()` runs. Do not hold a disk-hit `ReadHandle` across writes to the same
-cache — it pins its stripe against wraps.
+Handles may outlive `Cache::stop()`, and the application needs no lock of its
+own between the threads that use handles and the thread that stops the cache.
+A `ReadHandle` held across `stop()` keeps its bytes valid until it is closed.
+A `WriteHandle` commit that races `stop()` either completes (`stop()` waits
+for it) or is refused; one that begins after `stop()` returned is always
+refused: `CacheError::Closed`, nothing written, also after a restart. Do not hold a disk-hit `ReadHandle` across
+writes to the same cache — it pins its stripe against wraps.
 
 ### Errors
 
