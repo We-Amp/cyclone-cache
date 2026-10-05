@@ -811,11 +811,13 @@ this contract (the authoritative text is on `Cache::start()` /
 `Cache::stop()` in [`cache.hpp`](include/cyclone/cache.hpp)):
 
 - **`fork()` waits for the library's background threads.** A hit-count flush,
-  a directory sync or an optimization work item that is in flight finishes
-  first, and new ones are held off until `fork()` returns, so a child never
-  inherits a lock held by a thread it does not have. The wait is at most one
-  pass: normally microseconds, as long as an fsync of the volume when a
-  directory sync is in flight. It has no timeout.
+  a directory sync, or an optimization worker's read of its source or write
+  of its result that is in flight finishes first, and new ones are held off
+  until `fork()` returns, so a child never inherits a lock held by a thread
+  it does not have. The wait is at most one pass: normally microseconds, as
+  long as an fsync of the volume when a directory sync is in flight. It has
+  no timeout. It never waits for plugin code: a plugin's `transform()` runs
+  between passes.
 - **The child reads and writes through the inherited `Cache`, without
   background threads.** None are started for it. Pending hit counts are
   written when `hit_flush_threshold` (per key) or the total pending bound is
@@ -830,6 +832,12 @@ this contract (the authoritative text is on `Cache::start()` /
   inside a cache call (the library can only vouch for its own threads), using
   the cache in a child made with `vfork()` or a direct `clone()`, and using
   in the child a read or write handle that was open at the fork.
+- **Optimization plugins** count as application code, although they run on a
+  library thread: a cache call a plugin makes from `transform()` is not
+  covered if another thread forks at that instant. A plugin that needs a
+  helper process should start it with `posix_spawn()`, which runs no fork
+  handlers; a plain `fork()` in `transform()` also works and waits for the
+  background passes like any other fork.
 
 A single-process application is unaffected unless it forks; if it does (to
 spawn a helper, say), the only visible change is the short wait above.

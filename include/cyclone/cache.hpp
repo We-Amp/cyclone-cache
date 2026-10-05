@@ -343,9 +343,10 @@ class Cache {
   //     pass in flight and holds new ones off until it returns.  So a child
   //     never inherits a lock held by a thread that does not exist in it.
   //     The wait is one pass long at most -- normally microseconds, as long
-  //     as an fsync of the volume when a directory sync is in flight, and
-  //     as long as a plugin's transform when the optimization engine is
-  //     working.  It has no timeout.
+  //     as an fsync of the volume when a directory sync is in flight.  It
+  //     has no timeout.  A pass never runs application code: with the
+  //     optimization engine, fork() waits for a worker's read of the source
+  //     or write of the result, never for a plugin's transform().
   //   - The parent is unaffected by the fork: its threads carry on.
   //   - In the child, the inherited Cache reads and writes as before
   //     (read_sync, write_sync, exists, remove, stats, ...).  In
@@ -373,6 +374,14 @@ class Cache {
   //     fork()+exec() are fine.
   //   - ReadHandles and WriteHandles open at the fork belong to the
   //     parent; the child must not use or close its copies.
+  //   - Optimization plugins.  A plugin's code runs on a library thread but
+  //     counts as the application's: what transform() does with the cache
+  //     through its context is covered like a call from any other
+  //     application thread, i.e. not at all if another thread forks at that
+  //     instant.  A plugin that needs a helper process should start it with
+  //     posix_spawn(), which runs no fork handlers.  A plain fork() in
+  //     transform() works too, and waits for the background passes like any
+  //     other fork.
   std::expected<void, CacheError> start();
   void stop();
 

@@ -27,13 +27,19 @@
 // Runtime: the default iteration counts take a few seconds.  Set
 // CYCLONE_FORK_STORM_ITERATIONS to soak (for example 20000).
 //
-// Sanitizers: the children start no thread, so this runs under
-// ThreadSanitizer as well (it only refuses a forked child that creates
-// threads); the iteration count and deadline are scaled for the slower
-// build.
+// Sanitizers.  The storm children start no thread, so the storms and the
+// child-contract case run under ThreadSanitizer too (it only refuses a
+// forked child that creates threads); iteration counts and deadlines are
+// scaled for the slower build.  Three cases do NOT run under
+// ThreadSanitizer and are compiled out there, each with its reason at the
+// case: the two that run a scenario in a forked subprocess which starts
+// threads, and, on macOS only, the one whose child exits while a thread of
+// the parent is still alive (the sanitizer reports that thread as leaked
+// in the child and turns the child's exit code into its own).
 
 #ifndef _WIN32
 
+#include <pthread.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -58,7 +64,17 @@
 #include "cyclone/cache.hpp"
 #include "cyclone/config.hpp"
 #include "cyclone/key.hpp"
+#include "cyclone/plugin/optimization.hpp"
+#include "optimization/optimization_engine.hpp"
 #include "support/temp_cache.hpp"
+
+#if defined(__SANITIZE_THREAD__)
+#define CYCLONE_FORK_STORM_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define CYCLONE_FORK_STORM_TSAN 1
+#endif
+#endif
 
 #if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
 #define CYCLONE_FORK_STORM_SANITIZED 1
@@ -576,71 +592,432 @@ int exit_code_within_deadline(pid_t pid) {
 
 }  // namespace
 
+// Not under ThreadSanitizer on macOS: the child below exits while the
+// parent's worker thread is still alive, and the sanitizer's exit hook in
+// the child reports that thread (which the child does not have) as leaked
+// and replaces the exit code this test reads.  On Linux it runs.
+#if !(defined(CYCLONE_FORK_STORM_TSAN) && defined(__APPLE__))
 TEST_CASE("Fork gate: fork() waits for a background pass in flight",
           "[fork][forkgate]") {
-  install_fork_handlers();
+  REQUIRE(install_fork_handlers());
   const auto kPassLength = Ms{300};
   std::atomic<bool> keep_running{true};
-  std::atomic<bool> in_pass{false};
+  std::atomic<int> entered{-1};  // Set by the worker: 1 entered, 0 refused
   std::atomic<bool> pass_over{false};
   std::thread worker([&] {
     ForkGatedPass pass(keep_running);
-    REQUIRE(static_cast<bool>(pass));
-    in_pass.store(true, std::memory_order_release);
+    entered.store(pass ? 1 : 0, std::memory_order_release);
     std::this_thread::sleep_for(kPassLength);
     pass_over.store(true, std::memory_order_release);
   });
-  while (!in_pass.load(std::memory_order_acquire)) {
+  while (entered.load(std::memory_order_acquire) < 0) {
     std::this_thread::sleep_for(Ms{1});
   }
 
   const uint32_t epoch_before = fork_epoch();
   const pid_t pid = ::fork();
-  REQUIRE(pid >= 0);
   if (pid == 0) {
     // The pass had ended before the child's memory was copied, and the
     // child knows it is a new process.
     ::_exit(pass_over.load() && fork_epoch() == epoch_before + 1 ? 0 : 1);
   }
   // fork() returned in the parent only after the pass was over.
-  CHECK(pass_over.load(std::memory_order_acquire));
-  CHECK(fork_epoch() == epoch_before);
+  const bool over_when_fork_returned =
+      pass_over.load(std::memory_order_acquire);
   worker.join();
+  REQUIRE(pid > 0);
+  CHECK(entered.load() == 1);
+  CHECK(over_when_fork_returned);
+  CHECK(fork_epoch() == epoch_before);
   CHECK(exit_code_within_deadline(pid) == 0);
 
   // The gate is open again: a pass enters at once.
   ForkGatedPass again(keep_running);
   CHECK(static_cast<bool>(again));
 }
+#endif
 
-TEST_CASE("Fork gate: a thread inside a pass can itself fork",
-          "[fork][forkgate]") {
-  // An optimization plugin that spawns a helper process forks from inside
-  // a work item, which is a pass: prepare must not wait for its own caller.
-  install_fork_handlers();
-  std::atomic<bool> keep_running{true};
-  ForkGatedPass outer(keep_running);
-  REQUIRE(static_cast<bool>(outer));
-  ForkGatedPass nested(keep_running);  // Nesting never waits
-  REQUIRE(static_cast<bool>(nested));
+// ---------------------------------------------------------------------------
+// Forks that meet each other.
+//
+// A scenario here can only fail by hanging, and a hung fork() cannot be
+// recovered inside the process (its thread never comes back and the gate
+// stays shut for everything else).  So each scenario runs in a forked
+// SUBPROCESS: it watches its own progress and leaves with an exit code when
+// nothing has moved for a while, and the test reads that code with a
+// deadline.  The subprocess starts threads, which ThreadSanitizer refuses
+// in a forked child ("starting new threads after multi-threaded fork"), so
+// these cases are compiled out under it.
+// ---------------------------------------------------------------------------
+#if !defined(CYCLONE_FORK_STORM_TSAN)
+namespace {
 
+constexpr int kScenarioOk = 0;
+constexpr int kScenarioOkSerialized = 40;  // Passed in the reduced form
+constexpr int kScenarioStalled = 50;       // A fork or a pass hung
+constexpr int kScenarioWrong = 51;         // Finished, but something is off
+
+// Runs `scenario` in a forked child and returns its exit code, or -1 when
+// it did not exit within `budget` (it is killed) or died of a signal.
+int run_in_subprocess(const std::function<int()>& scenario, Ms budget) {
   const pid_t pid = ::fork();
-  REQUIRE(pid >= 0);
-  if (pid == 0) {
-    ::alarm(30);
-    // Still inside the inherited passes; a further fork works here too.
-    const pid_t grandchild = ::fork();
-    if (grandchild == 0) {
-      ::_exit(0);
-    }
-    int status = 0;
-    const bool ok = grandchild > 0 &&
-                    ::waitpid(grandchild, &status, 0) == grandchild &&
-                    WIFEXITED(status) && WEXITSTATUS(status) == 0;
-    ::_exit(ok ? 0 : 1);
+  if (pid < 0) {
+    return -1;
   }
-  CHECK(exit_code_within_deadline(pid) == 0);
+  if (pid == 0) {
+    int rc = 90;
+    try {
+      rc = scenario();
+    } catch (...) {
+      rc = 91;
+    }
+    ::_exit(rc);
+  }
+  int status = 0;
+  const auto deadline = Clock::now() + budget;
+  pid_t done = 0;
+  while ((done = ::waitpid(pid, &status, WNOHANG)) == 0 &&
+         Clock::now() < deadline) {
+    std::this_thread::sleep_for(Ms{5});
+  }
+  if (done != pid) {
+    ::kill(pid, SIGKILL);
+    ::waitpid(pid, &status, 0);
+    return -1;
+  }
+  return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
+
+// Forks a child that exits at once and reaps it.
+bool fork_and_reap() {
+  const pid_t pid = ::fork();
+  if (pid == 0) {
+    ::_exit(0);
+  }
+  if (pid < 0) {
+    return false;
+  }
+  int status = 0;
+  return ::waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+         WEXITSTATUS(status) == 0;
+}
+
+// Leaves the process with kScenarioStalled when `progress` has not moved
+// for `patience`.  Runs on its own thread until `done`.
+void watch_progress(const std::atomic<long>& progress,
+                    const std::atomic<bool>& done, Ms patience) {
+  long last = -1;
+  auto last_change = Clock::now();
+  while (!done.load(std::memory_order_acquire)) {
+    std::this_thread::sleep_for(Ms{50});
+    const long now = progress.load(std::memory_order_acquire);
+    if (now != last) {
+      last = now;
+      last_change = Clock::now();
+    } else if (Clock::now() - last_change > patience) {
+      ::_exit(kScenarioStalled);
+    }
+  }
+}
+
+// Does this C library run the fork handlers of one fork() at a time?
+// Measured, not assumed: a prepare handler that waits a moment for a second
+// fork's handler to show up next to it.  If the library holds a lock of its
+// own around the handlers, the second one cannot.  Registers a handler for
+// good, so it is only ever called in a scenario subprocess.
+std::atomic<bool> g_probe_on{false};
+std::atomic<int> g_probe_inside{0};
+std::atomic<bool> g_probe_met{false};
+
+void probe_prepare() {
+  if (!g_probe_on.load(std::memory_order_acquire)) {
+    return;
+  }
+  if (g_probe_inside.fetch_add(1, std::memory_order_acq_rel) + 1 >= 2) {
+    g_probe_met.store(true, std::memory_order_release);
+  }
+  const auto until = Clock::now() + Ms{300};
+  while (!g_probe_met.load(std::memory_order_acquire) && Clock::now() < until) {
+    std::this_thread::sleep_for(Ms{1});
+  }
+  g_probe_inside.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+bool libc_runs_fork_handlers_one_fork_at_a_time() {
+  if (::pthread_atfork(&probe_prepare, nullptr, nullptr) != 0) {
+    return true;  // Cannot tell: take the careful branch.
+  }
+  g_probe_on.store(true, std::memory_order_release);
+  std::thread first([] { (void)fork_and_reap(); });
+  std::thread second([] { (void)fork_and_reap(); });
+  first.join();
+  second.join();
+  g_probe_on.store(false, std::memory_order_release);
+  return !g_probe_met.load(std::memory_order_acquire);
+}
+
+// Two threads that fork from inside a pass, a thread that forks outside any
+// pass, and a thread that runs ordinary passes, all at once.
+int scenario_forks_from_inside_passes(int iterations) {
+  if (!install_fork_handlers()) {
+    return kScenarioWrong;
+  }
+  const bool serialized = libc_runs_fork_handlers_one_fork_at_a_time();
+
+  std::atomic<bool> keep_running{true};
+  std::atomic<long> progress{0};
+  std::atomic<long> plain_passes{0};
+  std::atomic<long> failed{0};
+  std::atomic<bool> done{false};
+  std::thread watchdog(
+      [&] { watch_progress(progress, done, Ms{5000} * kSanitizerSlowdown); });
+
+  const auto in_pass_forker = [&] {
+    for (int i = 0; i < iterations; ++i) {
+      ForkGatedPass pass(keep_running);
+      if (!pass || !fork_and_reap()) {
+        failed.fetch_add(1);
+      }
+      progress.fetch_add(1);
+    }
+  };
+  const auto outside_forker = [&] {
+    for (int i = 0; i < iterations; ++i) {
+      if (!fork_and_reap()) {
+        failed.fetch_add(1);
+      }
+      progress.fetch_add(1);
+    }
+  };
+  std::atomic<bool> forkers_done{false};
+  const auto plain_passer = [&] {
+    while (!forkers_done.load(std::memory_order_acquire)) {
+      {
+        ForkGatedPass pass(keep_running);
+        if (!pass) {
+          failed.fetch_add(1);
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(30));
+      }
+      plain_passes.fetch_add(1);
+      std::this_thread::sleep_for(std::chrono::microseconds(30));
+    }
+  };
+
+  // Phase 1: the forks from inside passes.  Where two forks can be inside
+  // the C library at once, the outside forker runs right along with them.
+  // Where they cannot, it must not: an outside fork that waits for a pass
+  // holds the C library's fork lock, and the pass it waits for blocks on
+  // that lock the moment it forks.  No handler can undo that (see
+  // fork_gate.hpp), so there the outside forker gets a phase of its own.
+  {
+    std::thread passer(plain_passer);
+    std::thread a(in_pass_forker);
+    std::thread b(in_pass_forker);
+    std::thread c;
+    if (!serialized) {
+      c = std::thread(outside_forker);
+    }
+    a.join();
+    b.join();
+    if (c.joinable()) {
+      c.join();
+    }
+    forkers_done.store(true, std::memory_order_release);
+    passer.join();
+  }
+  const long passes_phase1 = plain_passes.load();
+
+  // Phase 2 (serialized libraries only): the outside forker against
+  // ordinary passes.
+  if (serialized) {
+    forkers_done.store(false, std::memory_order_release);
+    std::thread passer(plain_passer);
+    std::thread c(outside_forker);
+    c.join();
+    forkers_done.store(true, std::memory_order_release);
+    passer.join();
+  }
+
+  done.store(true, std::memory_order_release);
+  watchdog.join();
+  // Nothing is left pending, every fork worked, and ordinary passes got
+  // through while the forks were going on.
+  if (failed.load() != 0 || forks_pending_for_test() != 0 ||
+      passes_phase1 == 0) {
+    return kScenarioWrong;
+  }
+  ForkGatedPass after(keep_running);
+  if (!after) {
+    return kScenarioWrong;
+  }
+  return serialized ? kScenarioOkSerialized : kScenarioOk;
+}
+
+// A plugin whose transform() starts a helper process with fork().
+class ForkingPlugin : public OptimizationPlugin {
+ public:
+  [[nodiscard]] PluginInfo info() const override {
+    return {"forking-plugin", "1.0.0", 4242};
+  }
+
+  OptimizationPlan plan_optimization(const CacheKey& /*key*/,
+                                     std::span<const std::byte> /*header*/,
+                                     uint64_t content_length,
+                                     AlternateId written_alternate,
+                                     uint32_t /*hit_count*/) override {
+    OptimizationPlan plan;
+    if (written_alternate == AlternateId::Original) {
+      plan.add(AlternateId::Gzip, 5, true, content_length * 2);
+    }
+    return plan;
+  }
+
+  std::expected<TransformResult, CacheError> transform(
+      AlternateId target_alternate, const OptimizationContext& ctx) override {
+    if (!fork_and_reap()) {
+      failed_forks.fetch_add(1);
+    }
+    TransformResult result;
+    result.alternate_id = target_alternate;
+    result.header = std::vector<std::byte>(ctx.source_header().begin(),
+                                           ctx.source_header().end());
+    result.content = std::vector<std::byte>(ctx.source_content().begin(),
+                                            ctx.source_content().end());
+    transforms.fetch_add(1);
+    if (progress != nullptr) {
+      progress->fetch_add(1);
+    }
+    return result;
+  }
+
+  std::atomic<long> transforms{0};
+  std::atomic<long> failed_forks{0};
+  std::atomic<long>* progress = nullptr;
+};
+
+// The optimization engine with two workers and a plugin that forks in
+// transform(), while an application thread forks as well and the hit-count
+// flush and directory sync run at 1 ms.
+int scenario_plugin_forks(int transforms_wanted) {
+  TempCacheDir dir("fork_plugin");
+  CacheConfig cache_config;
+  cache_config.set_ram_cache_size(0);
+  cache_config.enable_hit_tracking = true;
+  cache_config.hit_flush_interval = Ms{1};
+  cache_config.set_multi_process(0, 1);
+  cache_config.set_directory_sync_interval(Ms{1});
+  cache_config.optimization_config.enabled = true;
+  cache_config.optimization_config.min_threads = 2;
+  cache_config.optimization_config.max_threads = 2;
+  cache_config.optimization_config.min_hits_before_optimize = 0;
+  // Keep load shedding out of it: a paused pool would look like a hang.
+  cache_config.optimization_config.load_high_watermark = 1e12;
+
+  auto created = Cache::create(cache_config);
+  if (!created.has_value()) {
+    return kScenarioWrong;
+  }
+  std::unique_ptr<Cache> cache = std::move(*created);
+  if (!cache->add_volume(dir.path(), size_t{64} << 20).has_value() ||
+      !cache->start().has_value() || cache->optimization_engine() == nullptr) {
+    return kScenarioWrong;
+  }
+  auto plugin = std::make_shared<ForkingPlugin>();
+  std::atomic<long> progress{0};
+  plugin->progress = &progress;
+  cache->optimization_engine()->register_plugin(plugin);
+
+  std::atomic<bool> done{false};
+  std::thread watchdog(
+      [&] { watch_progress(progress, done, Ms{5000} * kSanitizerSlowdown); });
+
+  std::atomic<bool> stop_forking{false};
+  std::atomic<long> outside_forks{0};
+  std::atomic<long> failed{0};
+  std::thread outside_forker([&] {
+    while (!stop_forking.load(std::memory_order_acquire)) {
+      if (!fork_and_reap()) {
+        failed.fetch_add(1);
+      }
+      outside_forks.fetch_add(1);
+    }
+  });
+
+  // Feed the engine until the plugin has forked often enough.
+  const std::string body(2048, 'x');
+  const std::vector<std::byte> header(16, std::byte{1});
+  for (long n = 0; plugin->transforms.load() < transforms_wanted; ++n) {
+    const CacheKey key("fork-plugin-" + std::to_string(n % 512));
+    if (write_document(*cache, key, body)) {
+      cache->optimization_engine()->on_write_complete(
+          key, header, body.size(), AlternateId::Original, 10);
+    }
+    if (cache->optimization_engine()->queue_depth() > 64) {
+      std::this_thread::sleep_for(Ms{1});
+    }
+  }
+  stop_forking.store(true, std::memory_order_release);
+  outside_forker.join();
+
+  const CacheStats stats = cache->stats();
+  cache->stop();
+  done.store(true, std::memory_order_release);
+  watchdog.join();
+
+  if (failed.load() != 0 || plugin->failed_forks.load() != 0 ||
+      outside_forks.load() == 0 || stats.directory_syncs == 0 ||
+      forks_pending_for_test() != 0) {
+    return kScenarioWrong;
+  }
+  return kScenarioOk;
+}
+
+}  // namespace
+
+TEST_CASE(
+    "Fork gate: forks from inside passes never hold up each other, "
+    "other forks or other passes",
+    "[fork][forkgate]") {
+  // No code of the library forks from inside a pass, and a pass runs no
+  // application code, so this only happens through the gate's own interface
+  // (here) or through a future mistake.  It must still never hang the
+  // process: such a fork bypasses the gate.  1500 rounds per thread; the
+  // earlier form of the gate, in which such a fork waited for the other
+  // passes, stopped within a few hundred.
+  const int code =
+      run_in_subprocess([] { return scenario_forks_from_inside_passes(1500); },
+                        Ms{120'000} * kSanitizerSlowdown);
+  INFO("scenario exit code "
+       << code << " (0 ok; 40 ok, the C library runs fork handlers one fork "
+       << "at a time, so the outside forker ran in a phase of its own; 50 "
+       << "hung; 51 finished wrong; -1 killed at the deadline)");
+  CHECK((code == kScenarioOk || code == kScenarioOkSerialized));
+#if defined(__linux__) && defined(__GLIBC__) && defined(__GLIBC_PREREQ)
+#if __GLIBC_PREREQ(2, 36)
+  // glibc from 2.36 on lets two forks run their handlers side by side, so
+  // the full scenario must have run there (CI's Linux is one of those).
+  CHECK(code == kScenarioOk);
+#endif
+#endif
+}
+
+TEST_CASE(
+    "Fork: a plugin that forks in transform() and an application "
+    "thread that forks do not block each other",
+    "[fork][forkgate][optimization]") {
+  // transform() runs between two passes, not inside one, so a helper
+  // process started there is an ordinary fork from outside a pass: it
+  // waits for the passes in flight like any other, on every platform,
+  // including those whose C library runs fork handlers one fork at a time.
+  const int code = run_in_subprocess([] { return scenario_plugin_forks(300); },
+                                     Ms{120'000} * kSanitizerSlowdown);
+  INFO("scenario exit code " << code
+                             << " (0 ok; 50 hung; 51 finished wrong; -1 "
+                             << "killed at the deadline)");
+  CHECK(code == kScenarioOk);
+}
+#endif  // !CYCLONE_FORK_STORM_TSAN
 
 TEST_CASE(
     "Fork gate: a pass that waits for a fork gives up when its owner "
@@ -650,7 +1027,7 @@ TEST_CASE(
   // `waiter` cannot enter its pass until the fork finishes.  An owner that
   // stops `waiter` meanwhile must get it back without waiting for either:
   // a stop() that joins a background thread is never held up by a fork.
-  install_fork_handlers();
+  REQUIRE(install_fork_handlers());
   std::atomic<bool> blocker_running{true};
   std::atomic<bool> release_blocker{false};
   std::atomic<bool> blocker_in_pass{false};

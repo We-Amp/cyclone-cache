@@ -15,14 +15,18 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   held by a thread it does not have. Such a child blocked on its first read
   of a key that hashed to that stripe, or, at exit, in the destructor after
   an explicit `stop()`. This affects forking servers that open the cache in
-  the parent; a blocked worker did not go away on a graceful restart. Now `fork()` waits (in the library's `pthread_atfork`
-  handler) for a background pass in flight and holds new ones off until it
-  returns, and `stop()` in a forked child marks the inherited `Cache`
-  finished, so a later `stop()` or the destructor returns without taking a
-  lock. Update recommended for forking servers.
+  the parent; a blocked worker did not go away on a graceful restart. Now
+  `fork()` waits (in the library's `pthread_atfork` handler) for a
+  background pass in flight and holds new ones off until it returns, and
+  `stop()` in a forked child marks the inherited `Cache` finished, so a
+  later `stop()` or the destructor returns without taking a lock. Update
+  recommended for forking servers.
   - Behaviour: `fork()` can now wait for one background pass, normally
-    microseconds and at most as long as an fsync of the volume (or a
-    plugin's transform when the optimization engine is working). No timeout.
+    microseconds and at most as long as an fsync of the volume. No timeout.
+    It never waits for application code: the optimization engine runs a
+    plugin's `transform()` between two passes (read the source, write the
+    result), not inside one. A plugin that starts a helper process should
+    use `posix_spawn()`; a `fork()` in `transform()` also works.
   - Behaviour: in a forked child that inherited a running cache,
     `optimization_engine()` returns `nullptr` from the fork on (it used to
     return a pointer to an engine whose threads were not there, until
