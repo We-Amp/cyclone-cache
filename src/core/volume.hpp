@@ -1369,6 +1369,18 @@ class Volume : public std::enable_shared_from_this<Volume> {
   using ReaderSeamHook = std::function<void(ReaderSeam seam)>;
   static inline ReaderSeamHook s_reader_seam_for_test{};
 
+  // Test clock for the lease protocol.  0 (the default) means the real
+  // steady clock.  Any other value is what the library reads as "now", in
+  // steady-clock nanoseconds, wherever the lease protocol asks the time:
+  // the lease stamp, the wrap gate's lapse and ceiling checks, the
+  // published force-wrap deadline and the wrap-age statistics.  A test sets
+  // it to freeze time (a lease then holds however slowly the test runs)
+  // and moves it forward to let a lease lapse or a ceiling pass without
+  // sleeping.  See tests/support/lease_test_clock.hpp.  Per process: a
+  // second process sharing the volume keeps the real clock, so tests that
+  // compare lease stamps across processes must not use it.
+  static inline std::atomic<uint64_t> s_steady_clock_ns_for_test{0};
+
   // Park a writer inside its odd window on `key`'s directory bucket: take the
   // stripe mutex exclusively (the writer serialization every production
   // mutator holds) and publish "writer active" on the bucket, then hold both
