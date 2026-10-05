@@ -7,15 +7,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- Builds that hash keys with OpenSSL (the CMake default; not
-  `CYCLONE_USE_BUNDLED_SHA256`): a process that exited, by `exit()` or by
+- Builds that hash keys with OpenSSL (`CYCLONE_USE_BUNDLED_SHA256=OFF`, the
+  CMake default until the change below): a process that exited, by `exit()` or by
   returning from `main`, while its own threads were still inside cache calls
   could crash in those threads (SIGSEGV, or an abort from the allocator) in
   about half of such exits. Each cache call starts by hashing its key, and
   the hash went through OpenSSL's EVP interface, which with OpenSSL 3 looks
   the digest up in the library's default context on every call. OpenSSL
-  frees that context in an exit handler of its own, under the threads still
-  hashing. A thread that hashed after that handler had finished did not
+  (1.1.x as well as 3) frees its global state in an exit handler of its own,
+  under the threads still hashing. A thread that hashed after that handler had finished did not
   crash: the hash failed and the key came back all zero, so in the last
   moments of such a process every write went to, and every read came from,
   one key. The key hash now uses OpenSSL's `SHA256_Init` / `SHA256_Update` /
@@ -23,19 +23,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   that OpenSSL tears down and cannot fail. Digests are unchanged, so
   existing cache files stay valid. Builds with the bundled SHA-256, or with
   a crypto library that has no such exit handler (BoringSSL), were not
-  affected. Update recommended for OpenSSL 3 builds whose host process
+  affected. Update recommended for OpenSSL builds whose host process
   can exit without first stopping its own cache users.
   - Build: the OpenSSL backend now includes `<openssl/sha.h>` in place of
     `<openssl/evp.h>`. Against an OpenSSL built without its deprecated
     functions (`no-deprecated`) the bundled implementation is compiled
     instead; no option needs to change.
-  - The regression is the existing case "exit while embedder threads are
-    still writing to open caches" in
-    `tests/integration/test_exit_with_open_cache.cpp`, made deterministic:
-    the writers now outlive every other exit handler by 300 ms and the
-    helper then checks the key hash against a known answer. CI gains a job
-    that builds and runs the suite with the OpenSSL backend; all jobs so far
-    used the bundled one, which is why this was never seen there.
 
 - A process that forked while a cache was running could leave the child
   blocked for good. The parent's background threads take in-process locks
@@ -259,6 +252,45 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   lockstep rule as the earlier tail appends).
 
 ### Changed
+
+- **The bundled SHA-256 is now the default key hash; OpenSSL is opt-in.**
+  `CYCLONE_USE_BUNDLED_SHA256` defaults to `ON` (it was `OFF`). A build that
+  does not pass the option no longer calls `find_package(OpenSSL)` and no
+  longer links libcrypto; the library then has no dependency beyond the C++
+  standard library and threads. The option keeps its name: pass
+  `-DCYCLONE_USE_BUNDLED_SHA256=OFF` to hash with OpenSSL's libcrypto as
+  before, which is faster where libcrypto has hardware SHA (about 0.3 µs per
+  key on a 61-byte key on an Apple M-series core) and is meant for
+  applications that link a crypto library anyway.
+  - **Cache files stay valid.** Both backends compute the same SHA-256, so
+    keys, on-disk volumes and caches shared between processes are unaffected,
+    whichever backend each process was built with.
+  - **Who has to act.** An application that relied on the old default to get
+    the OpenSSL hash now gets the bundled one: nothing breaks, each key hash
+    costs a little more, and libcrypto drops out of the link line. If the
+    application took libcrypto for its own code only through this library's
+    link interface, it has to link it itself now. An existing build directory
+    keeps the cached value until it is reconfigured with the option.
+  - Builds that set the option explicitly are unaffected, as are embedders
+    that compile the sources with their own build system and define (or do
+    not define) `CYCLONE_USE_BUNDLED_SHA256` themselves: the source-level
+    switch is unchanged.
+  - The `windows-*` CMake presets, which take OpenSSL from vcpkg, now set
+    `CYCLONE_USE_BUNDLED_SHA256=OFF` and build what they built before. The
+    native `linux-*` and `macos-*` presets follow the new default.
+  - Why: the bundled hash is the configuration that has no process-wide
+    crypto-library state to meet (initialisation, exit handlers, `fork()`),
+    and the previous default was the one build flavour that carried the
+    exit-time defect listed under Fixed.
+
+- **The installed CMake package finds its own dependencies.**
+  `find_package(cyclone-cache)` against an installed tree failed unless the
+  application had already called `find_package(Threads)` (and, for a static
+  library with the OpenSSL key hash, `find_package(OpenSSL)`): the exported
+  target names `Threads::Threads` and `OpenSSL::Crypto`, and nothing defined
+  them. The package now ships a `cyclone-cache-config.cmake` that finds them
+  and then loads the exported target from `cyclone-cache-targets.cmake`
+  (the export file's new name). `cyclone::cyclone-cache` is unchanged.
 
 - **The background optimization engine is off by default and
   embedder-driven** (issue #52). `OptimizationConfig::enabled` now defaults

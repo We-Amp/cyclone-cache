@@ -11,7 +11,9 @@ Thank you for your interest in contributing to Cyclone Cache!
   - GCC 13 or later
   - Clang 16 or later
   - MSVC 2022 or later
-- OpenSSL development headers (or build with `-DCYCLONE_USE_BUNDLED_SHA256=ON`)
+- No crypto library by default (bundled SHA-256). OpenSSL development
+  headers only for the opt-in OpenSSL key hash
+  (`-DCYCLONE_USE_BUNDLED_SHA256=OFF`)
 
 The lint gate pins LLVM 20 (`clang++-20`, `clang-tidy-20`, `clang-format-20`).
 To reproduce it locally you need LLVM 20 specifically — see CLAUDE.md's

@@ -7,20 +7,31 @@
 #include <iomanip>
 #include <sstream>
 
-// The OpenSSL backend hashes with the one-context SHA256_Init / _Update /
-// _Final functions, not EVP.  They work on a caller-owned context and reach
-// no state of the crypto library that it tears down at exit.  EVP does:
-// OpenSSL 3 resolves the digest through its default library context on every
-// EVP_DigestInit_ex, and frees that context in an exit handler
-// (OPENSSL_cleanup) it registers on first use.  A process that exits while
-// its own threads are still in cache calls (which Cyclone permits, see
-// "Process exit with open caches" in doc/architecture.md) then faulted in
-// the digest lookup, or, once the cleanup had finished, got a failed hash
-// back for every key.  The functions are deprecated in OpenSSL 3 in favour
-// of EVP, for reasons (provider selection) that do not apply to a cache key;
-// OPENSSL_SUPPRESS_DEPRECATED keeps the declarations quiet.  A crypto library
-// built without them falls back to the bundled implementation: the digest is
-// the same either way.
+// The bundled SHA-256 is the default key hash.  The OpenSSL backend
+// (CMake: -DCYCLONE_USE_BUNDLED_SHA256=OFF) hashes with the one-context
+// SHA256_Init / _Update / _Final functions, not EVP.  They work on a
+// caller-owned context and reach no state of the crypto library that it
+// tears down at exit.  EVP does: OpenSSL 3 resolves the digest through its
+// default library context on every EVP_DigestInit_ex, and OpenSSL (1.1.x as
+// well as 3) frees its global state in an exit handler (OPENSSL_cleanup) it
+// registers on first use.  A process that exits while its own threads are
+// still in cache calls (which Cyclone permits, see "Process exit with open
+// caches" in doc/architecture.md) then faulted in the digest lookup, or,
+// once the cleanup had finished, got a failed hash back for every key.
+//
+// The functions are deprecated in OpenSSL 3 in favour of EVP, for a reason
+// that does not apply to a cache key: EVP selects the implementation
+// through a provider, the low-level functions always run OpenSSL's built-in
+// code.  In particular they bypass a FIPS provider, so in a process
+// configured for FIPS this hash is not computed by the validated module.
+// That is acceptable here because the hash protects nothing: it only names
+// a cache entry and spreads keys over buckets, and no signature, MAC, key
+// or integrity check is derived from it.  A deployment whose policy still
+// rules out any non-validated SHA-256 should check that policy against the
+// bundled implementation as well, which is not a validated module either.
+// OPENSSL_SUPPRESS_DEPRECATED keeps the declarations quiet.  A crypto
+// library built without them falls back to the bundled implementation: the
+// digest is the same either way.
 #ifndef CYCLONE_USE_BUNDLED_SHA256
 #ifndef OPENSSL_SUPPRESS_DEPRECATED
 #define OPENSSL_SUPPRESS_DEPRECATED
