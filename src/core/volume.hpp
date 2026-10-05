@@ -1579,12 +1579,20 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // Called by WriteHandle to commit data (internal use)
   std::expected<void, CacheError> commit_write(
       Stripe *stripe, const CacheKey &key, std::span<const std::byte> header,
-      std::span<const std::byte> content);
+      std::span<const std::byte> content, uint64_t handle_generation);
 
   // Called by WriteHandle for alternates (internal use)
   std::expected<void, CacheError> commit_alternate_write(
       Stripe *stripe, const CacheKey &key, AlternateId alternate_id,
-      std::span<const std::byte> header, std::span<const std::byte> content);
+      std::span<const std::byte> header, std::span<const std::byte> content,
+      uint64_t handle_generation);
+
+  // The stripe generation a write handle created now belongs to.  A write
+  // handle records it when it is created and hands it back on every commit
+  // (see the handle_generation parameter above, and _stripe_generation).
+  [[nodiscard]] uint64_t stripe_generation() const noexcept {
+    return _stripe_generation.load(std::memory_order_seq_cst);
+  }
 
   // Re-stamp the read lease on a stripe (CAS-max now + T with the
   // write-avoidance guard).  Called by ReadHandle::renew_lease() for
@@ -1673,25 +1681,38 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // close() on another are ordered by the HandleCall handshake below.
   std::atomic<bool> _teardown{false};
 
+  // Counts the times the stripes were freed: close() moves it on, nothing
+  // moves it back.  Identifies the stripe generation a write handle was
+  // created in (see HandleCall::admitted(uint64_t)).
+  std::atomic<uint64_t> _stripe_generation{1};
+
   // Handle calls in flight, and the handshake that keeps close() from
   // freeing a stripe under one of them.
   //
   // A ReadHandle is closed, renewed and polled outside the Cache's gate, on
   // whatever thread the embedder serves from, while another thread may
-  // stop the cache (shutdown, reload).  Each such call dereferences the
-  // handle's raw Stripe*.  Checking a teardown flag first is not enough:
-  // the call could load "not torn down", close() could then publish
-  // teardown and free the stripes, and the call would go on into freed
-  // memory (seen under ThreadSanitizer as Volume::close against
-  // release_borrow).
+  // stop the cache (shutdown, reload).  A WriteHandle is committed there
+  // too.  Each such call dereferences the handle's raw Stripe*.  Checking a
+  // teardown flag first is not enough: the call could load "not torn down",
+  // close() could then publish teardown and free the stripes, and the call
+  // would go on into freed memory (seen under ThreadSanitizer as Volume::close
+  // against release_borrow).
   //
   // So a call counts itself in BEFORE it loads the flags, and close()
   // publishes _teardown BEFORE it loads the counts -- all seq_cst, the same
   // Dekker handshake as the wrap gate (invariant 3).  Either the call sees
   // teardown and touches no stripe, or close() sees the call and waits
-  // until it has left.  The wait is short and bounded by the call: a
-  // handle call takes no lock, runs no application code and does a handful
-  // of atomic operations.
+  // until it has left.
+  //
+  // How long close() can wait is the length of one call.  A read-handle
+  // call takes no lock, runs no application code and does a handful of
+  // atomic operations.  A write commit is longer: it takes its stripe's
+  // mutex, may wait for a cross-process lock (by time, capped, see
+  // LockHolderWait) and writes the document to the file; close() waits
+  // for it to finish, exactly as it would for a commit that was already
+  // running when stop() was called.  Neither kind of call takes the cache
+  // gate or anything else Cache::stop() holds while it waits here, and
+  // neither may ever do so: that would be a deadlock.
   //
   // The counts are per-thread shards (kShardPad apart) so that the two
   // RMWs a read handle's close adds stay on a line only its own thread
@@ -1752,6 +1773,27 @@ class Volume : public std::enable_shared_from_this<Volume> {
         return false;
       }
       if (_volume._teardown.load(std::memory_order_seq_cst)) {
+        return false;
+      }
+#ifdef CYCLONE_TEST_SEAMS
+      teardown_seam(TeardownSeam::kHandleCallAdmitted);
+#endif
+      return true;
+    }
+
+    // The same for a write handle's commit.  A write handle has no anchor;
+    // its generation is the value of _stripe_generation when it was
+    // created.  close() moves that counter on (after publishing teardown,
+    // before it looks for calls in flight) and it never moves back, so a
+    // handle from before a close() is refused for good -- also after the
+    // volume was opened again, when _teardown reads false once more and
+    // the handle's Stripe* points at freed memory.
+    [[nodiscard]] bool admitted(uint64_t handle_generation) const noexcept {
+      if (_volume._teardown.load(std::memory_order_seq_cst)) {
+        return false;
+      }
+      if (_volume._stripe_generation.load(std::memory_order_seq_cst) !=
+          handle_generation) {
         return false;
       }
 #ifdef CYCLONE_TEST_SEAMS
