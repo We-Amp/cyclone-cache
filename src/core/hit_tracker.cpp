@@ -7,6 +7,8 @@
 #include <chrono>
 #include <mutex>
 
+#include "fork_gate.hpp"
+
 namespace cyclone {
 
 HitTracker::HitTracker(const Config& config) : _config(config) {}
@@ -21,6 +23,9 @@ void HitTracker::start(HitFlushCallback callback) {
   _flush_callback = std::move(callback);
 
   if (_config.enable_background_flush) {
+    // Before the thread exists: its passes are fork-gated (see
+    // flush_thread_func), which needs the handlers in place.
+    install_fork_handlers();
     _flush_thread = std::thread(&HitTracker::flush_thread_func, this);
   }
 }
@@ -232,6 +237,18 @@ void HitTracker::flush_thread_func() {
     }
 
     if (!_running.load()) {
+      break;
+    }
+
+    // The whole sweep is ONE fork-gated pass: it locks each of the stripe
+    // mutexes in turn and its callbacks take volume stripe locks, and a
+    // child forked while this thread held any of them would inherit it
+    // locked for good (this thread does not exist there) and block on the
+    // first read that hashes to that stripe.  fork() waits for the sweep
+    // instead.  A false pass means stop() was called while a fork was
+    // pending: skip the sweep, stop() runs the final flush itself.
+    ForkGatedPass pass(_running);
+    if (!pass) {
       break;
     }
 

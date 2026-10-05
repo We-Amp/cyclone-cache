@@ -362,6 +362,23 @@ The read hot path is lock-free (the read-path scaling series). Before refactorin
    Guard: `tests/integration/test_wrap_phase_aba.cpp` (the forward-fill cases,
    `[!mayfail]` until the guard fixed them).
 
+10. **Library threads touch cache state only inside a `ForkGatedPass`**
+    (`src/core/fork_gate.hpp`). A forking server opens the cache in its
+    parent, so the parent runs the background threads; a lock one of them
+    holds at the instant of `fork()` is locked for good in the child. The
+    `pthread_atfork` prepare handler waits for passes in flight and holds
+    new ones off, THEN takes the liveness mutex (a flush pass may need it:
+    the other order deadlocks). The gate is two `seq_cst` atomic counters
+    (a Dekker handshake, don't weaken it) with no mutex or condition
+    variable of its own, and the child handler only stores. A new
+    background thread wraps each unit of work in a pass and passes its stop
+    flag, so a `stop()` that joins it is never held up by a pending fork.
+    A forked child never joins, destroys or locks what it inherited:
+    `Cache::stop()` abandons the thread-owning components there and every
+    later call returns before the cache gate.
+    Guard: `tests/integration/test_fork_storm.cpp`,
+    `tests/integration/test_lifecycle.cpp` (`[fork]`).
+
 ### Error Handling
 
 All fallible operations return `std::expected<T, CacheError>`. Never use exceptions.

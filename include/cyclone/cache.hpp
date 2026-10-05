@@ -329,6 +329,50 @@ class Cache {
                                              size_t size);
   std::expected<void, CacheError> add_volume(const VolumeConfig &config);
 
+  // start() opens the volumes and starts the background threads (hit-count
+  // flush, periodic directory sync, the optimization engine when enabled);
+  // stop() joins them and closes the volumes.  The destructor calls stop().
+  //
+  // FORK CONTRACT (POSIX; Windows has no fork).  A process may fork() while
+  // a Cache is running, which is what a forking server does: the parent
+  // opens the cache, the workers it forks use the inherited object.
+  //
+  // What the library guarantees:
+  //   - None of ITS threads is in the middle of a pass at the instant of a
+  //     fork: fork() waits (in a pthread_atfork handler) for a background
+  //     pass in flight and holds new ones off until it returns.  So a child
+  //     never inherits a lock held by a thread that does not exist in it.
+  //     The wait is one pass long at most -- normally microseconds, as long
+  //     as an fsync of the volume when a directory sync is in flight, and
+  //     as long as a plugin's transform when the optimization engine is
+  //     working.  It has no timeout.
+  //   - The parent is unaffected by the fork: its threads carry on.
+  //   - In the child, the inherited Cache reads and writes as before
+  //     (read_sync, write_sync, exists, remove, stats, ...).  In
+  //     multi-process mode the child shares the parent's process_index and
+  //     the same volume file.
+  //   - The child has NO background threads, and none are started for it:
+  //     pending hit counts are written when a per-key or total threshold is
+  //     reached (CacheConfig::hit_flush_threshold) instead of on a timer,
+  //     and the periodic directory sync is the parent's (it covers the
+  //     shared mapping).  optimization_engine() returns nullptr.
+  //   - stop() in the child joins nothing and takes no lock: it marks the
+  //     inherited Cache finished and leaves the thread-owning parts to the
+  //     parent.  Calling it again, destroying the Cache, or exiting without
+  //     either is safe.  After it, start() returns CacheError::Closed and
+  //     every operation NotInitialized; a child that wants a cache with
+  //     background threads of its own creates a new Cache.
+  //
+  // What stays the application's responsibility:
+  //   - Its own threads.  If another application thread is inside a Cache
+  //     call at the instant of the fork, the child may inherit a lock that
+  //     thread held, as with any library.  Fork from a process whose other
+  //     threads are not using the cache (a server parent has none).
+  //   - Only fork() runs the handlers.  A child made with vfork(), or with
+  //     clone() directly, must not touch the Cache; posix_spawn() and
+  //     fork()+exec() are fine.
+  //   - ReadHandles and WriteHandles open at the fork belong to the
+  //     parent; the child must not use or close its copies.
   std::expected<void, CacheError> start();
   void stop();
 
@@ -440,10 +484,12 @@ class Cache {
   // OptimizationPlugins here and calls
   // optimization_engine()->on_write_complete(...) after its own writes.
   // Valid for the Cache's lifetime once created; stop() stops the engine
-  // but keeps the pointer valid until the Cache is destroyed, except in a
-  // forked child, where stop() abandons the engine and the accessor
-  // returns nullptr afterwards (see the fork-safety handling in
-  // Cache::stop()).
+  // but keeps the pointer valid until the Cache is destroyed.  The exception
+  // is a forked child that inherited a running Cache: the engine's threads
+  // do not exist there, so the accessor returns nullptr from the fork on
+  // (see the fork contract at start()/stop()).  Do not carry an engine
+  // pointer obtained before a fork into the child; on_write_complete() is
+  // a no-op there, the engine's other methods are not safe to call.
   OptimizationEngine *optimization_engine();
   [[nodiscard]] const OptimizationEngine *optimization_engine() const;
 

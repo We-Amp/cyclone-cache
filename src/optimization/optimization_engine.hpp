@@ -109,6 +109,9 @@ class OptimizationEngine : public TaskProvider {
 
   // State
   std::atomic<bool> _running{false};
+  // fork_epoch() at start(): on_write_complete() is a no-op in a forked
+  // child that inherited the running engine (its workers are not there).
+  std::atomic<uint32_t> _start_epoch{0};
   std::atomic<bool> _paused{false};
   std::atomic<bool> _load_shedding{false};
 

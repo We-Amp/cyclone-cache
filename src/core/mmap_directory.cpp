@@ -9,6 +9,8 @@
 #include <thread>
 #include <vector>
 
+#include "fork_gate.hpp"
+
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
 #include <immintrin.h>
 #endif
@@ -21,6 +23,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -377,8 +380,33 @@ static_assert(sizeof(off_t) == 8,
 
 // Bumped in every forked child (pthread_atfork), so a WriterLiveness can
 // tell that it runs in a new process whatever PIDs say.  Windows has no
-// fork: it stays 0 there.
+// fork: it stays 0 there.  Read through fork_epoch() (fork_gate.hpp).
 std::atomic<uint32_t> g_fork_epoch{0};
+
+#if !defined(_WIN32)
+// The fork gate (see fork_gate.hpp).  Two counters and a Dekker handshake:
+// a pass announces itself (g_passes_active) and THEN looks for a pending
+// fork; fork's prepare handler announces itself (g_forks_pending) and THEN
+// looks for active passes.  Both sides use seq_cst, so at least one of them
+// sees the other: either the pass backs out and waits, or the fork waits
+// for the pass to end.  Don't weaken the memory order.
+//
+// g_forks_pending is a count, not a flag: two threads may fork at once.
+std::atomic<uint32_t> g_forks_pending{0};
+// Threads inside a pass (a thread counts once however deep it nests), plus
+// threads that are announcing themselves and about to back out.
+std::atomic<uint32_t> g_passes_active{0};
+// This thread's pass nesting depth.  A thread inside a pass may itself call
+// fork() (an optimization plugin that spawns a helper process): prepare
+// must then not wait for the caller's own pass.
+thread_local uint32_t t_pass_depth = 0;
+
+void fork_gate_sleep(long nanoseconds) {
+  struct timespec ts{};
+  ts.tv_nsec = nanoseconds;
+  (void)::nanosleep(&ts, nullptr);
+}
+#endif
 
 // ONE mutex for every WriterLiveness of the process: claim, probe and detach
 // run under it.  It is fork-safe by construction: the pthread_atfork
@@ -410,15 +438,59 @@ std::mutex &liveness_mutex() {
 }
 
 #if !defined(_WIN32)
-void on_fork_prepare() { liveness_mutex().lock(); }
-void on_fork_parent() { liveness_mutex().unlock(); }
+// ONE set of handlers for the whole library, so the order between the fork
+// gate and the liveness mutex is fixed here and does not depend on which
+// component registered first.
+//
+// PREPARE: quiesce the background passes FIRST, take the liveness mutex
+// SECOND.  A pass may itself need the liveness mutex (a hit-count flush
+// takes the cross-process write lock, whose slot claim and probe run under
+// it); taking the mutex first and then waiting for that pass would deadlock.
+// Once no pass is in flight, the mutex is only ever held for a few
+// non-blocking syscalls.
+//
+// The wait is unbounded on purpose.  A pass is one finite sweep, but it can
+// take as long as its slowest fsync; returning early would hand the child
+// the very locks this exists to keep out of it, and a child blocked for good
+// is worse than a fork that is late.
+void on_fork_prepare() {
+  g_forks_pending.fetch_add(1, std::memory_order_seq_cst);
+  const uint32_t own = t_pass_depth != 0 ? 1U : 0U;
+  for (unsigned round = 0;
+       g_passes_active.load(std::memory_order_seq_cst) > own; ++round) {
+    if (round < 64) {
+      std::this_thread::yield();
+    } else {
+      fork_gate_sleep(50'000);  // 50 us
+    }
+  }
+  liveness_mutex().lock();
+}
+
+void on_fork_parent() {
+  liveness_mutex().unlock();
+  g_forks_pending.fetch_sub(1, std::memory_order_seq_cst);
+}
+
+// Runs in the child, where only the forking thread exists.  Everything here
+// is a store to an atomic or the unlock of a mutex this very thread locked
+// in on_fork_prepare: no allocation, no lock acquisition, nothing that can
+// wait.  (t_pass_depth is this thread's own, and on_fork_prepare already
+// read it, so its storage exists.)  The counters are reset rather than
+// decremented: they may still include a thread that was announcing itself
+// at the instant of the fork, or a second thread that was forking at the
+// same time, and neither exists here.
 void on_fork_child() {
   g_fork_epoch.fetch_add(1, std::memory_order_relaxed);
   liveness_mutex().unlock();  // Taken by this thread in on_fork_prepare
+  g_passes_active.store(t_pass_depth != 0 ? 1U : 0U, std::memory_order_seq_cst);
+  g_forks_pending.store(0, std::memory_order_seq_cst);
 }
 #endif
 
-void install_fork_hook() {
+}  // namespace
+
+void install_fork_handlers() noexcept {
 #if !defined(_WIN32)
   static const bool installed = [] {
     return ::pthread_atfork(&on_fork_prepare, &on_fork_parent,
@@ -428,7 +500,59 @@ void install_fork_hook() {
 #endif
 }
 
-}  // namespace
+uint32_t fork_epoch() noexcept {
+  return g_fork_epoch.load(std::memory_order_relaxed);
+}
+
+#ifdef CYCLONE_TEST_SEAMS
+uint32_t forks_pending_for_test() noexcept {
+#if defined(_WIN32)
+  return 0;
+#else
+  return g_forks_pending.load(std::memory_order_seq_cst);
+#endif
+}
+#endif
+
+#if defined(_WIN32)
+ForkGatedPass::ForkGatedPass(
+    const std::atomic<bool> & /*keep_running*/) noexcept
+    : _entered(true) {}
+
+ForkGatedPass::~ForkGatedPass() = default;
+#else
+ForkGatedPass::ForkGatedPass(const std::atomic<bool> &keep_running) noexcept {
+  if (t_pass_depth != 0) {
+    // Nested on a thread that is already counted: a pending fork is waiting
+    // for the outer pass, so waiting for that fork here would never end.
+    ++t_pass_depth;
+    _entered = true;
+    return;
+  }
+  for (;;) {
+    g_passes_active.fetch_add(1, std::memory_order_seq_cst);
+    if (g_forks_pending.load(std::memory_order_seq_cst) == 0) {
+      t_pass_depth = 1;
+      _entered = true;
+      return;
+    }
+    // A fork is in progress: back out (holding nothing) and wait for it.
+    g_passes_active.fetch_sub(1, std::memory_order_seq_cst);
+    while (g_forks_pending.load(std::memory_order_seq_cst) != 0) {
+      if (!keep_running.load(std::memory_order_acquire)) {
+        return;  // The owner is stopping: skip the pass.
+      }
+      fork_gate_sleep(200'000);  // 200 us
+    }
+  }
+}
+
+ForkGatedPass::~ForkGatedPass() {
+  if (_entered && --t_pass_depth == 0) {
+    g_passes_active.fetch_sub(1, std::memory_order_seq_cst);
+  }
+}
+#endif
 
 uint32_t WriterLiveness::current_pid() {
 #ifdef CYCLONE_TEST_SEAMS
@@ -445,7 +569,7 @@ uint32_t WriterLiveness::current_pid() {
 }
 
 void WriterLiveness::attach(int probe_fd, const std::string &path) {
-  install_fork_hook();
+  install_fork_handlers();
   detach();
   std::lock_guard<std::mutex> lock(liveness_mutex());
   _probe_fd = probe_fd;

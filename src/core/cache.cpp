@@ -21,6 +21,7 @@
 #include "../ram_cache/ram_cache.hpp"
 #include "cyclone/detail/expected_compat.hpp"
 #include "cyclone/plugin/plugin.hpp"
+#include "fork_gate.hpp"
 #include "hit_tracker.hpp"
 #include "thread_util.hpp"
 #include "volume.hpp"
@@ -47,6 +48,8 @@ class DirectorySyncer {
     if (_running.exchange(true)) {
       return;  // Already running
     }
+    // Before the thread exists: its passes are fork-gated (see thread_func).
+    install_fork_handlers();
     _thread = std::thread(&DirectorySyncer::thread_func, this);
   }
 
@@ -88,6 +91,18 @@ class DirectorySyncer {
       }
 
       if (!_running.load()) {
+        break;
+      }
+
+      // One fork-gated pass per sync: the pass holds a shard of the cache
+      // gate (shared) for the whole msync/fsync sweep, and a child forked
+      // meanwhile would inherit that shard locked by a thread it does not
+      // have, then block for good the first time it takes the gate
+      // exclusively.  fork() waits for the sweep instead.  A false pass
+      // means stop() was called while a fork was pending: skip the sweep,
+      // stop() runs the final sync itself.
+      ForkGatedPass pass(_running);
+      if (!pass) {
         break;
       }
 
@@ -225,6 +240,16 @@ struct Cache::Impl {
   // deadlocking in their destructors. 0 = never started / not applicable (e.g.
   // Windows).
   long owner_pid{0};
+  // fork_epoch() of the process that start()ed the background threads.
+  // While `running`, it differs from the current epoch exactly in a forked
+  // child that inherited them (see engine_inherited_across_fork()).  The
+  // cheap counterpart of owner_pid, for a path that runs per write.
+  std::atomic<uint32_t> owner_epoch{0};
+  // Set by stop() in a forked child once it has abandoned the thread-owning
+  // components.  From then on this Cache is finished in this process: a
+  // later stop() (the destructor's) returns at once, without touching a
+  // lock, and start() refuses.
+  std::atomic<bool> abandoned_after_fork{false};
   // Sharded cache-level gate (see GateShard above).  Readers:
   // std::shared_lock on reader_gate(); exclusive: GateExclusive over all
   // shards.
@@ -243,12 +268,25 @@ struct Cache::Impl {
     return gate[shard_idx].m;
   }
 
+  // True in a forked child that inherited a STARTED engine: its threads do
+  // not exist here, and its queue and counters are guarded by locks this
+  // process cannot trust (the engine's cache work is fork-gated, its own
+  // bookkeeping is not).  False once the cache was stopped before the fork
+  // (the engine is then merely stopped) or was started by this process.
+  [[nodiscard]] bool engine_inherited_across_fork() const noexcept {
+    return running.load(std::memory_order_acquire) &&
+           owner_epoch.load(std::memory_order_acquire) != fork_epoch();
+  }
+
   CacheStats stats;
   AtomicFlushStats
       flush_stats;  // Thread-safe counters for hit tracker callbacks
 };
 
 Cache::Cache() : _impl(std::make_unique<Impl>()) {
+  // From the first Cache on, a fork() is visible to the library (fork_epoch)
+  // and waits for the background passes (see fork_gate.hpp).
+  install_fork_handlers();
   _impl->plugin_manager = std::make_unique<PluginManager>();
 }
 
@@ -509,6 +547,14 @@ std::expected<void, CacheError> Cache::add_volume_locked(
 }
 
 std::expected<void, CacheError> Cache::start() {
+  // A forked child that already stop()ped this inherited Cache: the
+  // components it abandoned cannot be brought back (see stop()), and the
+  // gate may not be touched.  A child that wants background threads of its
+  // own creates a new Cache.
+  if (_impl->abandoned_after_fork.load(std::memory_order_acquire)) {
+    return make_unexpected(CacheError::Closed);
+  }
+
   GateExclusive lock(_impl->gate);
 
   if (_impl->running) {
@@ -658,6 +704,7 @@ std::expected<void, CacheError> Cache::start() {
   // forked child can detect in stop() that it does not own them (see stop()).
   _impl->owner_pid = static_cast<long>(::getpid());
 #endif
+  _impl->owner_epoch.store(fork_epoch(), std::memory_order_release);
 
   _impl->running = true;
   return {};
@@ -665,21 +712,37 @@ std::expected<void, CacheError> Cache::start() {
 
 void Cache::stop() {
 #ifndef _WIN32
-  // Fork-safety (regression test "Cache teardown is fork-safe in a forked
-  // child"): if this is not the process that start()ed the background threads,
-  // we were inherited across fork(). The threads do not exist in this process,
-  // and the condition variables/mutexes inside the thread-owning components
-  // (OptimizationEngine + its WorkQueue, HitTracker) were fork-copied while
-  // threads in the owning process held them. Running their destructors here
-  // calls pthread_cond_destroy on such a condvar, which blocks forever (this is
-  // what wedged mod_pagespeed 1.1 Apache children on graceful recycle). Abandon
-  // (leak) those components so their destructors never run; the OS reclaims the
-  // memory on process exit, and the owning process performs the real teardown.
-  // We intentionally do NOT take the cache gate on this path: it too may be in
-  // a fork-copied locked state. owner_pid is written once (under the lock) in
-  // start() and never mutated, so reading it without the lock is safe here.
+  // Fork-safety (regression tests "Cache teardown is fork-safe in a forked
+  // child" and tests/integration/test_fork_storm.cpp): if this is not the
+  // process that start()ed the background threads, we were inherited across
+  // fork(). The threads do not exist in this process, and the condition
+  // variables inside the thread-owning components (OptimizationEngine + its
+  // WorkQueue) were fork-copied while threads in the owning process waited
+  // on them. Running their destructors here calls pthread_cond_destroy on
+  // such a condvar, which blocks forever; joining a thread that does not
+  // exist never returns either. Abandon (leak) those components so their
+  // destructors never run; the OS reclaims the memory on process exit, and
+  // the owning process performs the real teardown.
+  //
+  // We intentionally do NOT take the cache gate on this path, or on any
+  // later call: nothing here needs it, and a child must never depend on the
+  // state of a lock it inherited. (The fork gate keeps the library's own
+  // threads from holding it across a fork; an application thread still
+  // could.) That is why the "already abandoned" check comes FIRST: the
+  // destructor calls stop() again after an explicit stop(), by then
+  // `running` is false, and falling through to the ordinary path below
+  // would take the gate exclusively.
+  //
+  // owner_pid is written under the gate in start() and not changed while
+  // the cache runs, so reading it without the gate is safe here.
+  if (_impl->abandoned_after_fork.load(std::memory_order_acquire)) {
+    return;
+  }
   if (_impl->running && _impl->owner_pid != 0 &&
       _impl->owner_pid != static_cast<long>(::getpid())) {
+    if (_impl->abandoned_after_fork.exchange(true, std::memory_order_acq_rel)) {
+      return;  // Another thread of this child got here first.
+    }
     // unique_ptr::release() abandons the OptimizationEngine without destroying
     // it (skips ~OptimizationEngine -> ~WorkQueue -> pthread_cond_destroy).
     (void)_impl->optimization_engine.release();
@@ -1160,11 +1223,20 @@ const PluginManager &Cache::plugin_manager() const {
   return *_impl->plugin_manager;
 }
 
+// In a forked child that inherited a started engine the accessors return
+// nullptr from the first call on, not only after stop(): see
+// Impl::engine_inherited_across_fork().
 OptimizationEngine *Cache::optimization_engine() {
+  if (_impl->engine_inherited_across_fork()) {
+    return nullptr;
+  }
   return _impl->optimization_engine.get();
 }
 
 const OptimizationEngine *Cache::optimization_engine() const {
+  if (_impl->engine_inherited_across_fork()) {
+    return nullptr;
+  }
   return _impl->optimization_engine.get();
 }
 

@@ -443,6 +443,26 @@ typedef struct {
  * - Do not call cyclone_cache_destroy() while other operations are in progress
  *   on other threads; call cyclone_cache_drain_pending() first to ensure
  *   graceful shutdown.
+ *
+ * fork() (POSIX)
+ *
+ * A process may fork() while a cache is started; a forking server's parent
+ * opens the cache and its workers use the inherited handle.
+ * - fork() waits for a background pass of the library that is in flight (at
+ *   most one pass: normally microseconds, an fsync of the volume at worst),
+ *   so the child never inherits a lock held by a library thread.
+ * - In the child the handle reads and writes as before, without background
+ *   threads: pending hit counts are written when a threshold is reached
+ *   instead of on a timer, and the periodic directory sync is the parent's.
+ * - cyclone_cache_destroy() in the child joins no thread and never blocks
+ *   on a lock inherited from the parent; the child may also exit without
+ *   calling it.  It ends the child's use of the handle only: the parent's
+ *   cache keeps running.  A child that wants background threads of its own
+ *   creates a cache of its own with cyclone_cache_create().
+ * - Not covered: other threads of the application that are inside a cache
+ *   call at the instant of the fork, and children made with vfork() or a
+ *   direct clone().  Read and write handles open at the fork stay the
+ *   parent's.
  */
 
 /* --------------------------------------------------------------------------

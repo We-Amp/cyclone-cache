@@ -122,6 +122,10 @@ class HitTracker {
 
   const Config& config() const { return _config; }
 
+  // Stripe geometry, exposed so a test can pick one key per stripe.
+  static constexpr size_t stripe_count() noexcept { return kNumStripes; }
+  static size_t stripe_of(const CacheKey& key) { return stripe_index(key); }
+
  private:
   void flush_thread_func();
 
