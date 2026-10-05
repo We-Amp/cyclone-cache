@@ -33,9 +33,9 @@
 // scaled for the slower build.  Three cases do NOT run under
 // ThreadSanitizer and are compiled out there, each with its reason at the
 // case: the two that run a scenario in a forked subprocess which starts
-// threads, and, on macOS only, the one whose child exits while a thread of
-// the parent is still alive (the sanitizer reports that thread as leaked
-// in the child and turns the child's exit code into its own).
+// threads, and the one whose child exits after a fork made while a test
+// thread of the parent was alive (the sanitizer reports that thread as
+// leaked in the child and turns the child's exit code into its own).
 
 #ifndef _WIN32
 
@@ -592,11 +592,11 @@ int exit_code_within_deadline(pid_t pid) {
 
 }  // namespace
 
-// Not under ThreadSanitizer on macOS: the child below exits while the
-// parent's worker thread is still alive, and the sanitizer's exit hook in
-// the child reports that thread (which the child does not have) as leaked
-// and replaces the exit code this test reads.  On Linux it runs.
-#if !(defined(CYCLONE_FORK_STORM_TSAN) && defined(__APPLE__))
+// Not under ThreadSanitizer: the parent has a worker thread at the fork,
+// and the sanitizer's exit hook in the child reports that thread (which the
+// child does not have and cannot join) as leaked and replaces the exit code
+// this test reads.  Seen on macOS always and on Linux depending on timing.
+#if !defined(CYCLONE_FORK_STORM_TSAN)
 TEST_CASE("Fork gate: fork() waits for a background pass in flight",
           "[fork][forkgate]") {
   REQUIRE(install_fork_handlers());
