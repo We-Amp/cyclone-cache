@@ -66,6 +66,7 @@
 #include "cyclone/key.hpp"
 #include "cyclone/plugin/optimization.hpp"
 #include "optimization/optimization_engine.hpp"
+#include "support/signal_child.hpp"
 #include "support/temp_cache.hpp"
 
 #if defined(__SANITIZE_THREAD__)
@@ -255,7 +256,7 @@ bool reap_children(std::vector<LiveChild>& live, StormResult& result) {
     } else if (Clock::now() >= live[i].deadline) {
       gone = true;
       ++result.hung;
-      ::kill(live[i].pid, SIGKILL);
+      signal_child(live[i].pid, SIGKILL);
       ::waitpid(live[i].pid, &status, 0);
     }
     if (gone) {
@@ -555,7 +556,7 @@ TEST_CASE("Fork: a forked child's inherited cache is finished after stop()",
     std::this_thread::sleep_for(Ms{1});
   }
   if (done != pid) {
-    ::kill(pid, SIGKILL);
+    signal_child(pid, SIGKILL);
     ::waitpid(pid, &status, 0);
   }
   REQUIRE(done == pid);
@@ -575,6 +576,9 @@ namespace {
 // Waits for `pid` up to the child deadline; kills it when it is late.
 // Returns its exit code, or -1 when it was killed or died of a signal.
 int exit_code_within_deadline(pid_t pid) {
+  if (!is_child_pid(pid)) {
+    return -1;  // Not a child: never wait for, or signal, anything else
+  }
   int status = 0;
   const auto deadline = Clock::now() + kChildDeadline;
   pid_t done = 0;
@@ -583,7 +587,7 @@ int exit_code_within_deadline(pid_t pid) {
     std::this_thread::sleep_for(Ms{1});
   }
   if (done != pid) {
-    ::kill(pid, SIGKILL);
+    signal_child(pid, SIGKILL);
     ::waitpid(pid, &status, 0);
     return -1;
   }
@@ -681,7 +685,7 @@ int run_in_subprocess(const std::function<int()>& scenario, Ms budget) {
     std::this_thread::sleep_for(Ms{5});
   }
   if (done != pid) {
-    ::kill(pid, SIGKILL);
+    signal_child(pid, SIGKILL);
     ::waitpid(pid, &status, 0);
     return -1;
   }

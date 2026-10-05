@@ -117,6 +117,7 @@
 #include "cyclone/config.hpp"
 #include "cyclone/error.hpp"
 #include "cyclone/key.hpp"
+#include "support/signal_child.hpp"
 
 using namespace cyclone;
 
@@ -663,7 +664,7 @@ ReapResult reap_all(const std::vector<pid_t> &pids,
     }
     if (!exited) {
       if (!gone) {
-        ::kill(pids[i], SIGKILL);
+        signal_child(pids[i], SIGKILL);
         ::waitpid(pids[i], &status, 0);
       }
       result.all_exited = false;
@@ -1335,7 +1336,7 @@ TEST_CASE("A borrow held in one process defers another process's wrap",
       wait_for_byte(ready_fds[0], std::chrono::seconds(60));
   bool reader_killed = false;
   if (!reader_ready) {
-    ::kill(reader_pid, SIGKILL);
+    signal_child(reader_pid, SIGKILL);
     int st = 0;
     ::waitpid(reader_pid, &st, 0);
     reader_killed = true;

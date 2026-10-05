@@ -183,6 +183,7 @@ TEST_CASE(
 
 #include "cyclone/key.hpp"
 #include "support/liveness_file.hpp"
+#include "support/signal_child.hpp"
 
 #if defined(__linux__)
 #include <sched.h>
@@ -209,7 +210,7 @@ constexpr Ms kLiveWindow{400};
 constexpr Ms kPromptRecovery{1000};
 
 bool kill_reports_dead(uint32_t pid) {
-  return ::kill(static_cast<pid_t>(pid), 0) != 0 && errno == ESRCH;
+  return signal_child(static_cast<pid_t>(pid), 0) != 0 && errno == ESRCH;
 }
 
 // Limit the claimable slots for one test.
@@ -308,7 +309,8 @@ pid_t fork_holder(SharedDir &d, Then then, Report &report,
 }
 
 void kill_and_reap(pid_t pid) {
-  ::kill(pid, SIGKILL);
+  REQUIRE(is_child_pid(pid));
+  signal_child(pid, SIGKILL);
   int status = 0;
   ::waitpid(pid, &status, 0);
 }
@@ -699,7 +701,7 @@ TEST_CASE(
   CHECK(d.dir.get_shared_write_pos() == kBase);
 
   const auto killed_at = Clock::now();
-  ::kill(static_cast<pid_t>(real_pid), SIGKILL);
+  signal_child(static_cast<pid_t>(real_pid), SIGKILL);
   int status = 0;
   ::waitpid(middle, &status, 0);  // the middle reaps the holder first
   waiter.thread.join();

@@ -41,6 +41,7 @@
 #include "cyclone/cache.hpp"
 #include "cyclone/config.hpp"
 #include "cyclone/key.hpp"
+#include "support/signal_child.hpp"
 #include "support/temp_cache.hpp"
 
 using namespace cyclone;
@@ -186,7 +187,7 @@ TEST_CASE("Persistent directory reopens intact after a hard process kill",
     std::this_thread::sleep_for(std::chrono::milliseconds(25));
   }
   if (!exited) {
-    ::kill(pid, SIGKILL);
+    signal_child(pid, SIGKILL);
     ::waitpid(pid, &status, 0);
   }
   REQUIRE(exited);

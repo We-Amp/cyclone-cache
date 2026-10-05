@@ -21,6 +21,7 @@
 #include "cyclone/cache.hpp"
 #include "cyclone/config.hpp"
 #include "cyclone/key.hpp"
+#include "support/signal_child.hpp"
 
 #ifdef _WIN32
 #include <process.h>
@@ -562,7 +563,7 @@ TEST_CASE("reset() never runs while a live peer holds the volume open",
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
   if (!child_opened) {
-    ::kill(pid, SIGKILL);
+    signal_child(pid, SIGKILL);
   }
   int status = 0;
   REQUIRE(::waitpid(pid, &status, 0) == pid);
