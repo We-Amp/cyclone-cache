@@ -7,6 +7,25 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Stopping a cache while another thread closed or renewed a read handle
+  could touch freed memory.** Closing a disk-hit `ReadHandle`, renewing its
+  lease (`renew_lease()`, `renew_lease_strict()`) and polling
+  `ns_until_forced_wrap()` use per-stripe state that `Cache::stop()` frees,
+  and nothing ordered such a call against a `stop()` running at the same
+  moment on another thread. It needs two threads, one releasing or renewing
+  a handle and one stopping the cache, which is what a multi-threaded server
+  does at shutdown or reload while requests are still served from borrowed
+  regions; a process that uses the cache from one thread is not affected.
+  The window is a few instructions wide and the outcome was usually
+  invisible, otherwise a crash at shutdown. Cache files and the shared
+  mapping were never at risk. `stop()` now waits for a handle call that is
+  already in flight; a call that starts later finds the cache torn down and
+  does nothing, as before, and handles may still outlive `stop()`. No API,
+  on-disk or shared-mapping change. Found by ThreadSanitizer in the existing
+  case "Concurrent stop with in-flight reads must not crash". Update
+  recommended for multi-threaded embedders that stop or restart a cache
+  while requests are in flight.
+
 - Builds that hash keys with OpenSSL (the CMake default; not
   `CYCLONE_USE_BUNDLED_SHA256`): a process that exited, by `exit()` or by
   returning from `main`, while its own threads were still inside cache calls
