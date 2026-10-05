@@ -3390,6 +3390,16 @@ namespace {
 // Monotonic timestamp for wrap-cadence telemetry. Never returns 0 so that
 // 0 can serve as the "never wrapped" sentinel.
 uint64_t steady_now_ns() noexcept {
+#ifdef CYCLONE_TEST_SEAMS
+  // Test-seam builds only: a test may own the clock (see
+  // Volume::s_steady_clock_ns_for_test).  The release library has no load
+  // and no branch here.
+  if (const uint64_t test_now_ns =
+          Volume::s_steady_clock_ns_for_test.load(std::memory_order_acquire);
+      test_now_ns != 0) {
+    return test_now_ns;
+  }
+#endif
   auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now().time_since_epoch())
                     .count();

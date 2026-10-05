@@ -33,6 +33,7 @@
 #include "cyclone/config.hpp"
 #include "cyclone/key.hpp"
 #include "io/mapped_file.hpp"
+#include "support/lease_test_clock.hpp"
 #include "support/spawned_peer.hpp"
 #include "support/temp_cache.hpp"
 
@@ -1135,6 +1136,8 @@ TEST_CASE(
     "Retention 6: per-chunk gating -- a forced advance exposes only its "
     "chunk, and every borrow it uncounted learns kTorn",
     "[retention][lease]") {
+  // Time passes only where this case says so (clock.advance).
+  LeaseTestClock clock;
   RetentionVolume v("ret6", true, std::chrono::milliseconds(600000),
                     std::chrono::milliseconds(300));
   v.fill_pass0();
@@ -1156,7 +1159,7 @@ TEST_CASE(
   REQUIRE(h2->renew_lease_strict() == LeaseRenewal::kOk);
 
   // Past the ceiling the next mandatory advance is forced over chunk 3.
-  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+  clock.advance(std::chrono::milliseconds(400));
   REQUIRE(v.put(1, i));
   REQUIRE(v.cache->stats().wraps_forced_past_lease == 1);
   REQUIRE(h1->renew_lease_strict() == LeaseRenewal::kTorn);
@@ -1188,6 +1191,8 @@ TEST_CASE(
     "Retention 8: an early advance blocked by a borrow never starts the "
     "deferral clock, publishes no deadline and never forces",
     "[retention][lease]") {
+  // Time passes only where this case says so (clock.advance).
+  LeaseTestClock clock;
   RetentionVolume v("ret8", true, std::chrono::milliseconds(600000),
                     std::chrono::milliseconds(100));
   v.fill_pass0();
@@ -1200,7 +1205,7 @@ TEST_CASE(
   // Sleep past the ceiling half way: still no force, no deadline.
   for (uint64_t i = 1; i < v.per_chunk; ++i) {
     if (i == v.per_chunk / 2) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      clock.advance(std::chrono::milliseconds(200));
     }
     REQUIRE(v.put(1, i));
     REQUIRE(h->ns_until_forced_wrap() == UINT64_MAX);
@@ -1690,6 +1695,8 @@ TEST_CASE(
     "carries the chain forward, updates the head in place and forms no "
     "self-loop",
     "[retention][uniqueness][alternate]") {
+  // Time passes only where this case says so (clock.advance).
+  LeaseTestClock clock;
   SECTION("retained head, the carried copy lands on the old head's offset") {
     RetentionVolume v("ret9c", true, std::chrono::milliseconds(600000),
                       std::chrono::milliseconds(300));
@@ -1719,7 +1726,7 @@ TEST_CASE(
     const auto newer = doc_content(9, h);
     const auto refusals0 = v.cache->stats().alternate_wrap_refusals;
     REQUIRE_FALSE(put_alternate(*v.cache, key, AlternateId::Brotli, newer));
-    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    clock.advance(std::chrono::milliseconds(400));
     REQUIRE(put_alternate(*v.cache, key, AlternateId::Brotli, newer));
     REQUIRE(v.cache->stats().wraps_forced_past_lease == 1);
     // Nothing was refused (D5 holds without it); one node was carried.
@@ -1811,6 +1818,8 @@ TEST_CASE(
     "Retention 9: an alternate write whose own allocation moves the frontier "
     "over its retained head still carries the whole chain forward",
     "[retention][uniqueness][alternate]") {
+  // Time passes only where this case says so (clock.advance).
+  LeaseTestClock clock;
   // The write resolves a retained head, copies the retained chain for its
   // carry, and only then allocates -- and that allocation is what advances
   // the frontier over the head's chunk.  From then on a directory probe no
@@ -1842,7 +1851,7 @@ TEST_CASE(
   // the slot is [Original copy][Brotli copy][Gzip].
   const auto newer = doc_content(11, h);
   REQUIRE_FALSE(put_alternate(*v.cache, key, AlternateId::Gzip, newer));
-  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+  clock.advance(std::chrono::milliseconds(400));
   REQUIRE(put_alternate(*v.cache, key, AlternateId::Gzip, newer));
   const auto st = v.cache->stats();
   REQUIRE(st.wraps_forced_past_lease == 1);
@@ -2601,6 +2610,8 @@ TEST_CASE(
     "Retention review R3: a stale deferral episode does not force-tear a "
     "fresh borrow",
     "[retention][review][lease][episode]") {
+  // Time passes only where this case says so (clock.advance).
+  LeaseTestClock clock;
   if (!CacheConfig{}.wrap_retention) {
     SKIP("retention mode only");
   }
@@ -2638,7 +2649,7 @@ TEST_CASE(
   const auto adv_before = c->stats().frontier_advances;
   REQUIRE(rv_put(*c, "tiny", rv_fill(1, 100)));
   CAPTURE(c->stats().frontier_advances - adv_before);
-  std::this_thread::sleep_for(std::chrono::milliseconds(600));
+  clock.advance(std::chrono::milliseconds(600));
   auto b2 = c->read_sync(CacheKey(p0[b2_idx]));
   REQUIRE(b2.has_value());
   REQUIRE(b2->renew_lease_strict() == LeaseRenewal::kOk);
@@ -2677,6 +2688,8 @@ TEST_CASE(
     "Retention review R2: after a ceiling-forced advance a far borrow is "
     "either torn at once or still counted",
     "[retention][review][lease][forced]") {
+  // Time passes only where this case says so (clock.advance).
+  LeaseTestClock clock;
   if (!CacheConfig{}.wrap_retention) {
     SKIP("retention mode only");
   }
@@ -2713,13 +2726,13 @@ TEST_CASE(
         break;
     }
     REQUIRE(c->stats().advances_deferred_by_lease >= 1);
-    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    clock.advance(std::chrono::milliseconds(400));
     const auto forced0 = c->stats().wraps_forced_past_lease;
     // Retry until the ceiling forces the advance over chunk 2.
     for (int k = 0; k < 50 && c->stats().wraps_forced_past_lease == forced0;
          ++k) {
       (void)rv_put(*c, "x1-" + std::to_string(j), rv_fill(7000 + j, kContent));
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      clock.advance(std::chrono::milliseconds(50));
     }
     REQUIRE(c->stats().wraps_forced_past_lease == forced0 + 1);
     ++j;
@@ -2754,6 +2767,8 @@ TEST_CASE(
     "Retention review R3 (flush): a stale wrap-deferral episode does not "
     "force-tear a fresh borrow",
     "[retention][review][lease][episode]") {
+  // Time passes only where this case says so (clock.advance).
+  LeaseTestClock clock;
   if (CacheConfig{}.wrap_retention) {
     SKIP("flush mode only");
   }
@@ -2776,7 +2791,7 @@ TEST_CASE(
   REQUIRE(c->stats().wraps_deferred_by_lease == 1);
   b1 = make_unexpected(CacheError::NotFound);
   REQUIRE(rv_put(*c, "tiny", rv_fill(2, 100)));  // fits the tail, no wrap
-  std::this_thread::sleep_for(std::chrono::milliseconds(600));
+  clock.advance(std::chrono::milliseconds(600));
   auto b2 = c->read_sync(CacheKey(p0[5]));
   REQUIRE(b2.has_value());
   const auto forced0 = c->stats().wraps_forced_past_lease;
