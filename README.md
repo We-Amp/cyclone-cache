@@ -164,7 +164,7 @@ int main() {
     // ... use content before r goes out of scope
   }
 
-  cache.stop();                            // close all handles first
+  cache.stop();                            // finish every write first
 }
 ```
 
@@ -514,9 +514,12 @@ class WriteHandle {                        // RAII: an unclosed handle aborts
 };
 ```
 
-Destroy every handle before `Cache::stop()`, and do not hold a disk-hit
-`ReadHandle` across writes to the same cache — it pins its stripe against
-wraps.
+Commit or abandon every `WriteHandle` before `Cache::stop()`, and let no
+thread be inside a commit while another stops the cache: a write handle
+committed during or after `stop()` is undefined behavior. A `ReadHandle` may
+be held across `stop()` and closed afterwards, also from another thread while
+`stop()` runs. Do not hold a disk-hit `ReadHandle` across writes to the same
+cache — it pins its stripe against wraps.
 
 ### Errors
 

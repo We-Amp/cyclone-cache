@@ -18,13 +18,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   regions; a process that uses the cache from one thread is not affected.
   The window is a few instructions wide and the outcome was usually
   invisible, otherwise a crash at shutdown. Cache files and the shared
-  mapping were never at risk. `stop()` now waits for a handle call that is
-  already in flight; a call that starts later finds the cache torn down and
-  does nothing, as before, and handles may still outlive `stop()`. No API,
-  on-disk or shared-mapping change. Found by ThreadSanitizer in the existing
-  case "Concurrent stop with in-flight reads must not crash". Update
-  recommended for multi-threaded embedders that stop or restart a cache
-  while requests are in flight.
+  mapping were never at risk. `stop()` now waits for a read-handle call
+  that is already in flight; a call that starts later finds the cache torn
+  down and does nothing, as before, and read handles may still outlive
+  `stop()`. No API, on-disk or shared-mapping change. Update recommended
+  for multi-threaded embedders that stop or restart a cache while requests
+  are in flight.
+  - This covers read handles. A `WriteHandle` must still be committed or
+    abandoned before `stop()`, with no commit in flight on another thread
+    while the cache is stopped; `include/cyclone/handle.hpp` now says so
+    for both kinds of handle.
 
 - Builds that hash keys with OpenSSL (the CMake default; not
   `CYCLONE_USE_BUNDLED_SHA256`): a process that exited, by `exit()` or by

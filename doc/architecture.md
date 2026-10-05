@@ -766,8 +766,11 @@ So every handle call counts itself into a per-thread-shard in-flight counter
 gate). Either the call sees teardown and touches no stripe, or `close()` sees
 the call and waits for it to leave. The wait is bounded by one handle call, which
 takes no lock and runs no application code. The embedder therefore needs no
-lock of its own between releasing handles and stopping the cache; what stays its
-job is not to *use* one `ReadHandle` object from two threads at once. Pinned by
+lock of its own between releasing read handles and stopping the cache; what stays
+its job is not to *use* one `ReadHandle` object from two threads at once.
+Write handles are not covered: a `WriteHandle` commit also dereferences its
+stripe outside the gate and has no such handshake yet, so every write must be
+committed or abandoned before `stop()`. Pinned by
 `tests/integration/test_lifecycle.cpp` ("stop() waits for a handle call that is
 already using its stripe").
 
