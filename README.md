@@ -202,7 +202,8 @@ examples, and benchmarks.
 - CMake 3.20+ and a C++23 compiler (CI builds with each GitHub runner's
   default toolchain: GCC on Ubuntu, Apple Clang on macOS, MSVC on Windows;
   LLVM 20 is the formatting/lint toolchain, see [CONTRIBUTING.md](CONTRIBUTING.md))
-- OpenSSL **or** `-DCYCLONE_USE_BUNDLED_SHA256=ON` (hermetic, what CI uses)
+- OpenSSL **or** `-DCYCLONE_USE_BUNDLED_SHA256=ON` (hermetic, what CI uses
+  except for one job that builds the OpenSSL backend)
 - Catch2 3 for tests (found via `find_package`, else fetched at configure)
 
 ### Build options
@@ -216,7 +217,7 @@ examples, and benchmarks.
 | `CYCLONE_BUILD_CUDA_BENCHMARKS` | OFF | Also build `kv_gpu_cuda` (needs the CUDA toolkit; not on Windows) |
 | `CYCLONE_BUILD_FUZZERS` | OFF | Build the libFuzzer harnesses in `fuzz/` (Clang only) |
 | `CYCLONE_ENABLE_ASAN` | OFF | AddressSanitizer for a quick local check |
-| `CYCLONE_USE_BUNDLED_SHA256` | OFF | Bundled SHA-256 instead of OpenSSL; ON in CI, required where OpenSSL headers are absent |
+| `CYCLONE_USE_BUNDLED_SHA256` | OFF | Bundled SHA-256 instead of OpenSSL; ON in CI except for the OpenSSL-backend job, required where OpenSSL headers are absent |
 
 ### Consuming
 

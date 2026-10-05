@@ -7,6 +7,36 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Builds that hash keys with OpenSSL (the CMake default; not
+  `CYCLONE_USE_BUNDLED_SHA256`): a process that exited, by `exit()` or by
+  returning from `main`, while its own threads were still inside cache calls
+  could crash in those threads (SIGSEGV, or an abort from the allocator) in
+  about half of such exits. Each cache call starts by hashing its key, and
+  the hash went through OpenSSL's EVP interface, which with OpenSSL 3 looks
+  the digest up in the library's default context on every call. OpenSSL
+  frees that context in an exit handler of its own, under the threads still
+  hashing. A thread that hashed after that handler had finished did not
+  crash: the hash failed and the key came back all zero, so in the last
+  moments of such a process every write went to, and every read came from,
+  one key. The key hash now uses OpenSSL's `SHA256_Init` / `SHA256_Update` /
+  `SHA256_Final` on a context on the caller's stack, which reach no state
+  that OpenSSL tears down and cannot fail. Digests are unchanged, so
+  existing cache files stay valid. Builds with the bundled SHA-256, or with
+  a crypto library that has no such exit handler (BoringSSL), were not
+  affected. Update recommended for OpenSSL 3 builds whose host process
+  can exit without first stopping its own cache users.
+  - Build: the OpenSSL backend now includes `<openssl/sha.h>` in place of
+    `<openssl/evp.h>`. Against an OpenSSL built without its deprecated
+    functions (`no-deprecated`) the bundled implementation is compiled
+    instead; no option needs to change.
+  - The regression is the existing case "exit while embedder threads are
+    still writing to open caches" in
+    `tests/integration/test_exit_with_open_cache.cpp`, made deterministic:
+    the writers now outlive every other exit handler by 300 ms and the
+    helper then checks the key hash against a known answer. CI gains a job
+    that builds and runs the suite with the OpenSSL backend; all jobs so far
+    used the bundled one, which is why this was never seen there.
+
 - A process that forked while a cache was running could leave the child
   blocked for good. The parent's background threads take in-process locks
   while they work (the hit-count flush sweeps the hit-tracker stripe

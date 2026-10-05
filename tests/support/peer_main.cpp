@@ -737,6 +737,37 @@ int run_exitopen(const char* raw_path, unsigned long long size,
     return 0;
   }
 
+  if (shape == "capi2live") {
+    // Registered before the first cache call, so it runs LAST at exit:
+    // every exit handler registered after it has run, and every static
+    // constructed after it is destroyed, while the writers below keep
+    // calling into the caches for the length of the sleep.  That covers
+    // handlers a dependency registers on first use (a crypto library's
+    // cleanup), not only Cyclone's own statics.  Without the sleep the
+    // writers had only the instant between the last handler and the OS
+    // reaping them, and a fault in that teardown showed in about half the
+    // runs.
+    //
+    // After the sleep, a known-answer check of the key hash: the writers are
+    // still deriving a key for every call, and a hash that can no longer be
+    // computed must not pass as a clean exit.  (A backend that fails after
+    // its library's cleanup hands back an all-zero key instead of faulting,
+    // so every write lands on one key: silent, and worse than the crash.)
+    std::atexit([] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(300));
+      // SHA-256("abc"), FIPS 180-4 appendix B.1.  Compared as bytes: no
+      // stream or locale machinery this late in the exit.
+      static constexpr unsigned char kAbc[cyclone::CacheKey::kDigestSize] = {
+          0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40,
+          0xde, 0x5d, 0xae, 0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17,
+          0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad};
+      const cyclone::CacheKey key(std::string_view("abc"));
+      if (std::memcmp(key.digest().data(), kAbc, sizeof kAbc) != 0) {
+        std::fputs("exitopen: key hash wrong after exit handlers\n", stderr);
+        std::_Exit(3);
+      }
+    });
+  }
   CycloneCacheHandle* a = exit_open_capi(path_a, size);
   if (a == nullptr) {
     say("ERR create a");

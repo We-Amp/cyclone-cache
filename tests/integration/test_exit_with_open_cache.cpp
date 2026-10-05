@@ -52,6 +52,29 @@
 //   thread_local of trivially destructible slots (HighResolutionTimer owns a
 //   Win32 handle and is destroyed per thread, never from another thread).
 //
+//   State of a dependency that its own exit handler tears down:
+//     the key hash                      (key.cpp) -- every cache call of an
+//                                        embedder thread starts by hashing
+//                                        its key.  With the OpenSSL backend
+//                                        that went through EVP, which looks
+//                                        the digest up in OpenSSL 3's default
+//                                        library context; OPENSSL_cleanup, an
+//                                        exit handler, frees that context.  A
+//                                        thread still writing at exit then
+//                                        faulted inside the lookup (SIGSEGV,
+//                                        or an abort from the allocator), or,
+//                                        once the cleanup was over, got a
+//                                        failed hash and an all-zero key.
+//                                        The backend now uses the SHA256_*
+//                                        functions on a stack context, which
+//                                        reach none of that state.  The
+//                                        bundled backend never did.  Only the
+//                                        capi2live case below has embedder
+//                                        threads in cache calls at exit, and
+//                                        only a build with the OpenSSL
+//                                        backend can show this; CI has a job
+//                                        for it.
+//
 // Each case spawns the helper in a shape of that scenario and requires exit
 // code 0 before a deadline.  The spawn transport is the same anonymous-pipe
 // protocol as test_reset_gate_spawn.cpp; the helper says READY when its
@@ -196,6 +219,14 @@ TEST_CASE("exit with two in-process opens of the same volume file",
 
 TEST_CASE("exit while embedder threads are still writing to open caches",
           "[lifecycle][exit][spawn]") {
+  // The writers keep going for 300 ms after every other exit handler has run
+  // and every later static is destroyed (the helper registers a sleeping
+  // handler first, as lockwait does), and the handler then checks the key
+  // hash against a known answer: exit code 3 if it is wrong.  With the
+  // EVP-based OpenSSL key hash this failed every run, as a fault in the
+  // digest lookup or as the wrong hash; without the sleep and the check it
+  // failed about one run in two, whether the case ran alone or in the whole
+  // binary.
   TempCacheDir dir("exit2l");
   for (const char* how : {"return", "exit"}) {
     require_clean_exit(dir, "capi2live", how);
