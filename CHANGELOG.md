@@ -21,13 +21,43 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   mapping were never at risk. `stop()` now waits for a read-handle call
   that is already in flight; a call that starts later finds the cache torn
   down and does nothing, as before, and read handles may still outlive
-  `stop()`. No API, on-disk or shared-mapping change. Update recommended
+  `stop()` (write handles: see the next entry). No API, on-disk or shared-mapping change. Update recommended
   for multi-threaded embedders that stop or restart a cache while requests
   are in flight.
-  - This covers read handles. A `WriteHandle` must still be committed or
-    abandoned before `stop()`, with no commit in flight on another thread
-    while the cache is stopped; `include/cyclone/handle.hpp` now says so
-    for both kinds of handle.
+
+- **A write handle committed during or after `Cache::stop()` could touch
+  freed memory.** A `WriteHandle` buffers its content and writes it at
+  `close()` / `close_sync()`, using per-stripe state that `stop()` frees.
+  A commit that ran while another thread stopped the cache, or after the
+  cache had been stopped (or stopped and started again), was not ordered
+  against that. This is the write-side counterpart of the previous entry,
+  with a wider window: everything between obtaining the handle and
+  committing it. Typical shape: a multi-threaded server that stops,
+  restarts or resets a cache while other threads are still writing to it.
+  The outcome ranged from nothing visible to a crash. No effect on cache
+  files is known; an entry damaged this way would be rejected by the read
+  checksum. Now:
+  - A commit that runs while another thread is in `stop()` either
+    completes, and `stop()` waits for it (not for handles that are merely
+    open), or is refused.
+  - A commit that begins after `stop()` returned is always refused. Refused
+    means `CacheError::Closed`; the content is dropped and nothing is
+    written.
+    That stays so after `start()`: write the entry again through a new
+    handle. `write_sync()` and `reserve()` on such a handle return `Closed`
+    too. `abort()` and destruction were and are safe.
+  - `stop()` waits for at most one commit per writing thread. A commit is
+    short, except behind another process that holds the cross-process
+    write lock while it is stopped (a debugger, `SIGSTOP`): then about
+    5 seconds, until the lock is taken over.
+  - No new error code, no API, on-disk or shared-mapping change. Callers
+    already had to handle `Closed` from a commit (a handle whose cache had
+    been destroyed returned it).
+  With this, read and write handles may both outlive `stop()`, and an
+  application needs no lock of its own between the threads that use handles
+  and the thread that stops the cache. Update recommended for
+  multi-threaded embedders that stop, restart or reset a cache while writes
+  are in flight.
 
 - Builds that hash keys with OpenSSL (`CYCLONE_USE_BUNDLED_SHA256=OFF`, the
   CMake default until the change below): a process that exited, by `exit()` or by

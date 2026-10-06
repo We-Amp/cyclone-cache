@@ -402,12 +402,18 @@ The read hot path is lock-free (the read-path scaling series). Before refactorin
     handle call free of locks and application code so the wait stays short.
     Counts carry the fork epoch they were made in, so a forked child never
     waits for a thread of its parent. A new handle-facing path that touches
-    a stripe needs its own `HandleCall`. NOT yet covered: the `WriteHandle`
-    commit (`commit_write` / `commit_alternate_write`), which dereferences
-    its stripe outside the gate with no teardown check; until it is, a write
-    handle must be committed or abandoned before `stop()`.
+    a stripe needs its own `HandleCall`. The `WriteHandle` commit
+    (`commit_write` / `commit_alternate_write`) is one: counted for its
+    whole length, and admitted only if `Volume::_stripe_generation` still
+    equals the value the handle recorded when it was created (`close()`
+    moves the counter on between publishing teardown and waiting, and never
+    back, so a handle from before a `stop()`/`start()` cycle is refused
+    with `Closed` and writes nothing). Because `stop()` waits for a counted
+    commit while it holds every gate shard, NOTHING on a handle-call path
+    may take the cache gate.
     Guard: `tests/integration/test_lifecycle.cpp` ("stop() waits for a
-    handle call that is already using its stripe").
+    handle call that is already using its stripe", "A write handle
+    committed after stop() is refused, not written").
 
 ### Error Handling
 

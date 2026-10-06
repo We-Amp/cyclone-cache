@@ -942,7 +942,15 @@ class VolumeWriteHandleBase : public WriteHandleImpl {
   std::weak_ptr<Volume> volume_weak;
   Volume* volume_raw = nullptr;
   bool guarded = false;
+  // `stripe` is valid only while the stripe generation this handle was
+  // created in is alive.  Pinning the Volume object is not enough for
+  // that: Cache::stop() frees the stripes (Volume::close) and keeps the
+  // Volume, and a later start() builds new stripes in the same object.
+  // So the handle never dereferences `stripe` itself; the commit hands it
+  // to the Volume together with `generation`, and the Volume refuses it
+  // (CacheError::Closed, nothing written) once that generation is gone.
   Stripe* stripe = nullptr;
+  uint64_t generation = 0;
   CacheKey key;
   std::vector<std::byte> header;
   std::vector<std::byte, DefaultInitAllocator<std::byte>> content;
@@ -1049,6 +1057,12 @@ class VolumeWriteHandleBase : public WriteHandleImpl {
     if (!vol) {
       return make_unexpected(CacheError::Closed);
     }
+    // The cache was stopped (and perhaps started again) since this handle
+    // was created: its commit would be refused, so do not buffer for it.
+    // An early answer only; the commit makes the check that counts.
+    if (vol->stripe_generation() != generation) {
+      return make_unexpected(CacheError::Closed);
+    }
     // Configured per-object bound, checked on the running total
     // BEFORE anything is buffered, so a streamed write fails at the first
     // chunk that would cross the bound.  Covers both the plain and the
@@ -1086,7 +1100,7 @@ class VolumeWriteHandleImpl : public VolumeWriteHandleBase {
  protected:
   std::expected<void, CacheError> do_commit(Volume& vol) override {
     return vol.commit_write(stripe, key, std::span<const std::byte>(header),
-                            std::span<const std::byte>(content));
+                            std::span<const std::byte>(content), generation);
   }
 };
 
@@ -1096,9 +1110,9 @@ class VolumeAlternateWriteHandleImpl : public VolumeWriteHandleBase {
 
  protected:
   std::expected<void, CacheError> do_commit(Volume& vol) override {
-    return vol.commit_alternate_write(stripe, key, alternate_id,
-                                      std::span<const std::byte>(header),
-                                      std::span<const std::byte>(content));
+    return vol.commit_alternate_write(
+        stripe, key, alternate_id, std::span<const std::byte>(header),
+        std::span<const std::byte>(content), generation);
   }
 };
 
@@ -2095,6 +2109,10 @@ void Volume::close() {
   // on a new call bails; the wait covers the ones in flight (see
   // _handle_calls in volume.hpp).
   _teardown.store(true, std::memory_order_seq_cst);
+  // Retire the stripe generation: write handles created before this point
+  // are refused from here on, for good (a later open() re-arms _teardown
+  // but never this).
+  _stripe_generation.fetch_add(1, std::memory_order_seq_cst);
   wait_for_handle_calls();
   _stripes.clear();
   _mapped_file.reset();
@@ -3144,6 +3162,12 @@ std::expected<ReadHandle, CacheError> Volume::read_sync(const CacheKey& key) {
 
 std::expected<WriteHandle, CacheError> Volume::write_sync(
     const CacheKey& key, uint64_t content_length) {
+  // The generation BEFORE the stripe: if a close() runs in between, the
+  // handle carries the older generation and its commit is refused, never
+  // the other way round (a stripe of the old generation paired with the
+  // new value).  Under a Cache the gate already rules that out; a bare
+  // Volume relies on this order.
+  const uint64_t generation = stripe_generation();
   Stripe* stripe = select_stripe(key);
   if (stripe == nullptr) {
     return make_unexpected(CacheError::NotInitialized);
@@ -3168,6 +3192,7 @@ std::expected<WriteHandle, CacheError> Volume::write_sync(
   // pointer stands.
   impl->guarded = (impl->volume_weak.use_count() > 0);
   impl->stripe = stripe;
+  impl->generation = generation;
   impl->key = key;
   impl->expected_length = content_length;
 
@@ -4667,7 +4692,14 @@ void Volume::start_write_behind(const WrittenRange& range) {
 
 std::expected<void, CacheError> Volume::commit_write(
     Stripe* stripe, const CacheKey& key, std::span<const std::byte> header,
-    std::span<const std::byte> content) {
+    std::span<const std::byte> content, uint64_t handle_generation) {
+  // The handle's Stripe* is only good while the stripe generation the
+  // handle was created in is alive: count this call in, then check (see
+  // _handle_calls in volume.hpp).  A refused commit writes nothing.
+  const HandleCall call(*this);
+  if (!call.admitted(handle_generation)) {
+    return make_unexpected(CacheError::Closed);
+  }
   WrittenRange written;
   auto result = commit_write_impl(stripe, key, header, content, &written);
   start_write_behind(written);  // stripe mutex released by now
@@ -5220,6 +5252,12 @@ uint16_t Volume::expected_retain_chunks() const {
 
 std::expected<WriteHandle, CacheError> Volume::write_alternate_sync(
     const CacheKey& key, AlternateId alternate_id, uint64_t content_length) {
+  // The generation BEFORE the stripe: if a close() runs in between, the
+  // handle carries the older generation and its commit is refused, never
+  // the other way round (a stripe of the old generation paired with the
+  // new value).  Under a Cache the gate already rules that out; a bare
+  // Volume relies on this order.
+  const uint64_t generation = stripe_generation();
   Stripe* stripe = select_stripe(key);
   if (stripe == nullptr) {
     return make_unexpected(CacheError::NotInitialized);
@@ -5243,6 +5281,7 @@ std::expected<WriteHandle, CacheError> Volume::write_alternate_sync(
   // pointer stands.
   impl->guarded = (impl->volume_weak.use_count() > 0);
   impl->stripe = stripe;
+  impl->generation = generation;
   impl->key = key;
   impl->alternate_id = alternate_id;
   impl->expected_length = content_length;
@@ -5252,7 +5291,14 @@ std::expected<WriteHandle, CacheError> Volume::write_alternate_sync(
 
 std::expected<void, CacheError> Volume::commit_alternate_write(
     Stripe* stripe, const CacheKey& key, AlternateId alternate_id,
-    std::span<const std::byte> header, std::span<const std::byte> content) {
+    std::span<const std::byte> header, std::span<const std::byte> content,
+    uint64_t handle_generation) {
+  // As in commit_write: counted, then checked against the handle's stripe
+  // generation, for the whole commit including its retries.
+  const HandleCall call(*this);
+  if (!call.admitted(handle_generation)) {
+    return make_unexpected(CacheError::Closed);
+  }
   // Two reasons to run an attempt again, and they are independent.
   //
   // (1) At most one WRAP restart: a wrap-raced write whose live chain became

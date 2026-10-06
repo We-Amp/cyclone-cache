@@ -960,6 +960,8 @@ enum class HandleCallKind : uint8_t {
   kRenew,
   kRenewStrict,
   kForcedWrapPoll,
+  kCommit,           // WriteHandle::close_sync()
+  kCommitAlternate,  // the same, for a handle from write_alternate_sync()
 };
 
 const char *to_string(HandleCallKind kind) {
@@ -972,6 +974,10 @@ const char *to_string(HandleCallKind kind) {
       return "renew_lease_strict";
     case HandleCallKind::kForcedWrapPoll:
       return "ns_until_forced_wrap";
+    case HandleCallKind::kCommit:
+      return "write commit";
+    case HandleCallKind::kCommitAlternate:
+      return "alternate write commit";
   }
   return "?";
 }
@@ -1057,14 +1063,39 @@ void run_handle_call_against_stop(HandleCallKind kind, bool mmap_directory) {
   REQUIRE(read.has_value());
   REQUIRE_FALSE(read->is_ram_cache_hit());
   std::optional<ReadHandle> handle(std::move(*read));
+  const bool is_commit = kind == HandleCallKind::kCommit ||
+                         kind == HandleCallKind::kCommitAlternate;
+  if (is_commit) {
+    handle.reset();  // Only the write handle below is in play
+  }
+
+  // The write handle for the commit kinds: filled, not yet committed.
+  const CacheKey committed_key("committed-against-stop");
+  const std::vector<std::byte> committed_body(8192, std::byte{0xC3});
+  std::optional<WriteHandle> write_handle;
+  if (is_commit) {
+    auto wh = kind == HandleCallKind::kCommit
+                  ? cache->write_sync(committed_key, committed_body.size())
+                  : cache->write_alternate_sync(key, AlternateId::Gzip,
+                                                committed_body.size());
+    REQUIRE(wh.has_value());
+    REQUIRE(
+        wh->write_sync(std::span<const std::byte>(committed_body)).has_value());
+    write_handle.emplace(std::move(*wh));
+  }
 
   TeardownWindow window;
   bool renewed = false;
   LeaseRenewal strict = LeaseRenewal::kTorn;
   uint64_t forced_wrap_ns = 0;
+  std::optional<std::expected<void, CacheError>> committed;
   std::thread caller([&] {
     window.caller.store(std::this_thread::get_id(), std::memory_order_release);
     switch (kind) {
+      case HandleCallKind::kCommit:
+      case HandleCallKind::kCommitAlternate:
+        committed = write_handle->close_sync();
+        break;
       case HandleCallKind::kClose:
         handle.reset();
         break;
@@ -1106,7 +1137,13 @@ void run_handle_call_against_stop(HandleCallKind kind, bool mmap_directory) {
     case HandleCallKind::kForcedWrapPoll:
       CHECK(forced_wrap_ns == UINT64_MAX);  // No wrap is being deferred
       break;
+    case HandleCallKind::kCommit:
+    case HandleCallKind::kCommitAlternate:
+      REQUIRE(committed.has_value());
+      CHECK(committed->has_value());  // It ran to its end, on live stripes
+      break;
   }
+  write_handle.reset();
 
   // A handle that outlives stop() stays safe to use and to close: its calls
   // find the generation torn down and touch no stripe.
@@ -1118,6 +1155,23 @@ void run_handle_call_against_stop(HandleCallKind kind, bool mmap_directory) {
     handle.reset();
   }
   CHECK_FALSE(window.let_go_by_stop_returned.load());
+
+  // A commit that stop() waited for is a commit: the document is there
+  // when the cache is started again.  (Only the mmap directory is kept
+  // across a restart; the in-memory one starts empty.)
+  if (is_commit && mmap_directory) {
+    REQUIRE(cache->start().has_value());
+    if (kind == HandleCallKind::kCommit) {
+      auto back = cache->read_sync(committed_key);
+      REQUIRE(back.has_value());
+      CHECK(back->content().size() == committed_body.size());
+    } else {
+      auto alternates = cache->list_alternates_sync(key);
+      REQUIRE(alternates.has_value());
+      CHECK(alternates->size() == 2);
+    }
+    cache->stop();
+  }
 }
 
 }  // namespace
@@ -1126,7 +1180,8 @@ TEST_CASE("stop() waits for a handle call that is already using its stripe",
           "[lifecycle][concurrency][borrow]") {
   const HandleCallKind kind =
       GENERATE(HandleCallKind::kClose, HandleCallKind::kRenew,
-               HandleCallKind::kRenewStrict, HandleCallKind::kForcedWrapPoll);
+               HandleCallKind::kRenewStrict, HandleCallKind::kForcedWrapPoll,
+               HandleCallKind::kCommit, HandleCallKind::kCommitAlternate);
   const bool mmap_directory = GENERATE(false, true);
   run_handle_call_against_stop(kind, mmap_directory);
 }
@@ -1201,67 +1256,258 @@ TEST_CASE("A handle from before a stop()/start() cycle touches no stripe",
   cache->stop();
 }
 
-TEST_CASE("Concurrent stop with in-flight writes must not crash",
-          "[lifecycle][concurrency]") {
+// =============================================================================
+// Write handles and stop()
+// =============================================================================
+//
+// A WriteHandle buffers its content and writes it at close.  The commit
+// uses the stripe the handle was created for, and stop() frees the stripes
+// while the Volume object lives on (the Cache keeps it for the next
+// start()).  A handle committed after stop(), or after a stop()/start()
+// cycle, used to run its commit on freed memory.  Now the commit is refused
+// with CacheError::Closed and nothing is written.
+
+namespace {
+
+struct StaleWriteOutcome {
+  std::expected<size_t, CacheError> append{0};
+  std::expected<std::span<std::byte>, CacheError> reserved{
+      std::span<std::byte>{}};
+  std::expected<void, CacheError> commit{};
+  std::expected<void, CacheError> second_commit{};
+};
+
+// Uses a write handle that was created before the cache was stopped.
+StaleWriteOutcome use_stale_write_handle(WriteHandle &handle,
+                                         std::span<const std::byte> more) {
+  StaleWriteOutcome outcome;
+  outcome.append = handle.write_sync(more);
+  outcome.reserved = handle.reserve(16);
+  outcome.commit = handle.close_sync();
+  outcome.second_commit = handle.close_sync();
+  return outcome;
+}
+
+void check_refused(const StaleWriteOutcome &outcome) {
+  REQUIRE_FALSE(outcome.append.has_value());
+  CHECK(outcome.append.error() == CacheError::Closed);
+  REQUIRE_FALSE(outcome.reserved.has_value());
+  CHECK(outcome.reserved.error() == CacheError::Closed);
+  REQUIRE_FALSE(outcome.commit.has_value());
+  CHECK(outcome.commit.error() == CacheError::Closed);
+  // The handle is closed by the refused commit, like by any other.
+  CHECK(outcome.second_commit.has_value());
+}
+
+}  // namespace
+
+TEST_CASE("A write handle committed after stop() is refused, not written",
+          "[lifecycle][write][borrow]") {
+  const bool mmap_directory = GENERATE(false, true);
+  const bool alternate = GENERATE(false, true);
+  const bool restart = GENERATE(false, true);
+  CAPTURE(mmap_directory, alternate, restart);
   TempCacheDir tmp;
-  std::string cache_path = tmp.path();
-
   CacheConfig config;
-  auto cache_result = Cache::create(config);
-  REQUIRE(cache_result.has_value());
-  auto &cache = *cache_result;
-
+  config.set_ram_cache_size(0);
+  if (mmap_directory) {
+    config.set_multi_process(0, 1);
+  }
+  auto created = Cache::create(config);
+  REQUIRE(created.has_value());
+  auto &cache = *created;
   VolumeConfig vol_config;
-  vol_config.path = cache_path;
-  vol_config.size = static_cast<size_t>(20 * 1024 * 1024);
-
+  vol_config.path = tmp.path();
+  vol_config.size = static_cast<size_t>(10 * 1024 * 1024);
   REQUIRE(cache->add_volume(vol_config).has_value());
   REQUIRE(cache->start().has_value());
 
-  std::atomic<bool> keep_going{true};
-  std::atomic<int> operations_completed{0};
-
-  constexpr int kWriterThreads = 4;
-  std::vector<std::thread> writers;
-
-  writers.reserve(kWriterThreads);
-  for (int t = 0; t < kWriterThreads; ++t) {
-    writers.emplace_back([&, t]() {
-      int i = 0;
-      while (keep_going.load(std::memory_order_relaxed)) {
-        CacheKey key("stop-write-" + std::to_string(t * 1000 + i));
-        std::string content = "payload-" + std::to_string(i);
-        std::vector<std::byte> data(content.size());
-        std::memcpy(data.data(), content.data(), content.size());
-
-        auto wh = cache->write_sync(key, data.size());
-        if (wh.has_value()) {
-          wh->write_sync(std::span<const std::byte>(data));
-          wh->close_sync();
-        }
-        // write_sync returning NotInitialized is expected after stop()
-
-        operations_completed.fetch_add(1, std::memory_order_relaxed);
-        ++i;
-      }
-    });
+  const CacheKey base_key("stale-write-base");
+  const CacheKey stale_key("stale-write-target");
+  const std::vector<std::byte> body(4096, std::byte{0x42});
+  {
+    auto wh = cache->write_sync(base_key, body.size());
+    REQUIRE(wh.has_value());
+    REQUIRE(wh->write_sync(std::span<const std::byte>(body)).has_value());
+    REQUIRE(wh->close_sync().has_value());
   }
+  auto wh = alternate ? cache->write_alternate_sync(base_key, AlternateId::Gzip,
+                                                    2 * body.size())
+                      : cache->write_sync(stale_key, 2 * body.size());
+  REQUIRE(wh.has_value());
+  REQUIRE(wh->write_sync(std::span<const std::byte>(body)).has_value());
 
-  // Let writers warm up
-  while (operations_completed.load(std::memory_order_relaxed) <
-         kWriterThreads * 5) {
-    std::this_thread::yield();
-  }
-
-  // Now stop the cache while writers are active
   cache->stop();
-  keep_going = false;
-
-  for (auto &t : writers) {
-    t.join();
+  if (restart) {
+    REQUIRE(cache->start().has_value());
   }
 
-  REQUIRE_FALSE(cache->is_running());
+  // The handle's stripe was freed by stop().  With `restart` the volume is
+  // open again, on new stripes: the stale handle must not write into them.
+  const StaleWriteOutcome outcome =
+      use_stale_write_handle(*wh, std::span<const std::byte>(body));
+  check_refused(outcome);
+  wh = make_unexpected(CacheError::Closed);  // Destroying it is safe too
+
+  if (!restart) {
+    REQUIRE(cache->start().has_value());
+  }
+  // Nothing of the refused write reached the volume.
+  if (alternate) {
+    // The base document alone, or (in-memory directory: not kept across
+    // the restart) nothing at all; never the refused alternate.
+    auto alternates = cache->list_alternates_sync(base_key);
+    if (mmap_directory) {
+      REQUIRE(alternates.has_value());
+      CHECK(alternates->size() == 1);
+    } else {
+      CHECK((!alternates.has_value() || alternates->empty()));
+    }
+  } else {
+    CHECK_FALSE(cache->exists_sync(stale_key).value_or(true));
+  }
+  // The restarted cache takes writes as usual.
+  {
+    auto fresh = cache->write_sync(stale_key, body.size());
+    REQUIRE(fresh.has_value());
+    REQUIRE(fresh->write_sync(std::span<const std::byte>(body)).has_value());
+    REQUIRE(fresh->close_sync().has_value());
+    CHECK(cache->exists_sync(stale_key).value_or(false));
+  }
+  cache->stop();
+}
+
+TEST_CASE("A stale write handle on a bare Volume is refused after reopen",
+          "[lifecycle][write][borrow]") {
+  // The same without a Cache: close() retires the stripe generation, and a
+  // later open() does not bring it back.
+  TempCacheDir tmp;
+  VolumeConfig vol_config;
+  vol_config.path = tmp.path();
+  vol_config.size = static_cast<size_t>(8 * 1024 * 1024);
+  auto volume = std::make_shared<Volume>(vol_config);
+  REQUIRE(volume->open().has_value());
+  const CacheKey key("stale-on-a-bare-volume");
+  const std::vector<std::byte> body(4096, std::byte{0x24});
+  auto wh = volume->write_sync(key, 2 * body.size());
+  REQUIRE(wh.has_value());
+  REQUIRE(wh->write_sync(std::span<const std::byte>(body)).has_value());
+  volume->close();
+  REQUIRE(volume->open().has_value());
+  check_refused(use_stale_write_handle(*wh, std::span<const std::byte>(body)));
+  CHECK_FALSE(volume->exists_sync(key).value_or(true));
+
+  // The coroutine close() of a stale handle: refused once; the handle is
+  // then released, so close() reports success and close_sync()
+  // InvalidArgument (as documented on WriteHandle).
+  auto stale = volume->write_sync(key, body.size());
+  REQUIRE(stale.has_value());
+  REQUIRE(stale->write_sync(std::span<const std::byte>(body)).has_value());
+  volume->close();
+  REQUIRE(volume->open().has_value());
+  const auto first = stale->close().sync_wait();
+  REQUIRE_FALSE(first.has_value());
+  CHECK(first.error() == CacheError::Closed);
+  CHECK(stale->close().sync_wait().has_value());
+  const auto after_release = stale->close_sync();
+  REQUIRE_FALSE(after_release.has_value());
+  CHECK(after_release.error() == CacheError::InvalidArgument);
+  CHECK_FALSE(volume->exists_sync(key).value_or(true));
+  volume->close();
+}
+
+TEST_CASE("Concurrent stop with in-flight writes must not crash",
+          "[lifecycle][concurrency]") {
+  // Writers hold a filled write handle and commit it around the moment the
+  // main thread stops the cache: some just before, some while stop() runs,
+  // some after it returned.  Every commit must either succeed (it began
+  // before the stripes were retired, and stop() waited for it) or be
+  // refused with Closed; and no commit may touch a freed stripe, which is
+  // what a sanitizer build of this case checks.
+  //
+  // An earlier form of this case looped write_sync / close_sync back to
+  // back.  Its window between the two calls was a few instructions wide,
+  // so it essentially never committed across stop().
+  constexpr int kRounds = 6;
+  constexpr int kWriterThreads = 8;
+  std::atomic<uint64_t> committed{0};
+  std::atomic<uint64_t> refused{0};
+  std::atomic<uint64_t> wrong{0};
+  for (int round = 0; round < kRounds; ++round) {
+    TempCacheDir tmp;
+    CacheConfig config;
+    if ((round % 2) == 1) {
+      config.set_multi_process(0, 1);
+    }
+    auto cache_result = Cache::create(config);
+    REQUIRE(cache_result.has_value());
+    auto &cache = *cache_result;
+    VolumeConfig vol_config;
+    vol_config.path = tmp.path();
+    vol_config.size = static_cast<size_t>(20 * 1024 * 1024);
+    REQUIRE(cache->add_volume(vol_config).has_value());
+    REQUIRE(cache->start().has_value());
+
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    std::atomic<bool> stop_returned{false};
+    std::vector<std::thread> writers;
+    writers.reserve(kWriterThreads);
+    for (int t = 0; t < kWriterThreads; ++t) {
+      writers.emplace_back([&, t]() {
+        const std::vector<std::byte> data(2048 + 512 * t, std::byte{0x11});
+        CacheKey key("stop-write-" + std::to_string(round * 100 + t));
+        auto wh = cache->write_sync(key, data.size());
+        const bool have =
+            wh.has_value() &&
+            wh->write_sync(std::span<const std::byte>(data)).has_value();
+        ready.fetch_add(1, std::memory_order_release);
+        while (!go.load(std::memory_order_acquire)) {
+          std::this_thread::yield();
+        }
+        // Spread the commits over the stop: writer 0 at once, the others
+        // after a growing number of yields, the last two only after stop()
+        // returned.
+        if (t >= kWriterThreads - 2) {
+          while (!stop_returned.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+          }
+        } else {
+          for (int spin = 0; spin < t * (round + 1) * 4; ++spin) {
+            std::this_thread::yield();
+          }
+        }
+        if (!have) {
+          wrong.fetch_add(1, std::memory_order_relaxed);
+          return;
+        }
+        const auto result = wh->close_sync();
+        if (result.has_value()) {
+          committed.fetch_add(1, std::memory_order_relaxed);
+        } else if (result.error() == CacheError::Closed) {
+          refused.fetch_add(1, std::memory_order_relaxed);
+        } else {
+          wrong.fetch_add(1, std::memory_order_relaxed);
+        }
+      });
+    }
+    while (ready.load(std::memory_order_acquire) < kWriterThreads) {
+      std::this_thread::yield();
+    }
+    go.store(true, std::memory_order_release);
+    cache->stop();
+    stop_returned.store(true, std::memory_order_release);
+    for (auto &t : writers) {
+      t.join();
+    }
+    REQUIRE_FALSE(cache->is_running());
+  }
+  CAPTURE(committed.load(), refused.load());
+  CHECK(wrong.load() == 0);
+  CHECK(committed.load() + refused.load() ==
+        static_cast<uint64_t>(kRounds) * kWriterThreads);
+  // The writers that waited for stop() to return were all refused.
+  CHECK(refused.load() >= static_cast<uint64_t>(kRounds) * 2);
 }
 
 // =============================================================================
@@ -1448,7 +1694,10 @@ TEST_CASE(
   // volume, and not when it then reopens the volume and closes it again
   // (the count is still there; only its fork epoch says whose it is).
   const bool reopen = GENERATE(false, true);
-  CAPTURE(reopen);
+  // The parent's call in flight: a read handle's release, or a write
+  // handle's commit (parked before it takes any lock).
+  const bool commit_in_flight = GENERATE(false, true);
+  CAPTURE(reopen, commit_in_flight);
   REQUIRE(install_fork_handlers());
   TempCacheDir tmp;
   VolumeConfig vol_config;
@@ -1469,10 +1718,26 @@ TEST_CASE(
   REQUIRE_FALSE(read->is_ram_cache_hit());
   std::optional<ReadHandle> handle(std::move(*read));
 
+  const CacheKey parked_key("commit-parked-across-fork");
+  std::optional<WriteHandle> write_handle;
+  if (commit_in_flight) {
+    handle.reset();
+    auto wh = volume->write_sync(parked_key, body.size());
+    REQUIRE(wh.has_value());
+    REQUIRE(wh->write_sync(std::span<const std::byte>(body)).has_value());
+    write_handle.emplace(std::move(*wh));
+  }
+
   TeardownWindow window;
+  std::optional<std::expected<void, CacheError>> committed;
   std::thread caller([&] {
     window.caller.store(std::this_thread::get_id(), std::memory_order_release);
-    handle.reset();  // Parks inside the release, counted as in flight
+    // Parks inside the call, counted as in flight
+    if (commit_in_flight) {
+      committed = write_handle->close_sync();
+    } else {
+      handle.reset();
+    }
   });
   const bool admitted = window.wait_admitted();
 
@@ -1525,6 +1790,13 @@ TEST_CASE(
   // Let the parked call go and finish in the parent.
   window.stop_returned.store(true, std::memory_order_release);
   caller.join();
+  if (commit_in_flight) {
+    // The parent's commit was not disturbed by the child.
+    REQUIRE(committed.has_value());
+    CHECK(committed->has_value());
+    CHECK(volume->exists_sync(parked_key).value_or(false));
+  }
+  write_handle.reset();
   volume->close();
 
   REQUIRE(admitted);

@@ -116,8 +116,6 @@ struct UpdateHandleImpl {
 /// any more: renew_lease() returns false, renew_lease_strict() returns
 /// LeaseRenewal::kTorn and ns_until_forced_wrap() returns UINT64_MAX.
 /// One ReadHandle object must not be used from two threads at once.
-/// This holds for read handles only; see WriteHandle for the stricter
-/// rule there.
 ///
 /// Releasing handles promptly is still the rule: each one pins mapped
 /// memory.
@@ -258,16 +256,40 @@ class ReadHandle {
 
 /// Handle for writing one cache entry.
 ///
-/// **Lifetime: finish every write before Cache::stop().**
-/// A WriteHandle must be committed (close() / close_sync()) or abandoned
-/// (abort(), or destroyed) BEFORE Cache::stop() is called, and no thread
-/// may be inside one of those calls while another thread stops the cache.
-/// Unlike a ReadHandle, a WriteHandle that is committed during or after
-/// stop() is not protected by the library: the commit uses per-stripe
-/// state that stop() frees, and the behavior is undefined.  This also
-/// rules out carrying a WriteHandle across a stop()/start() cycle.  An
-/// application that stops or restarts a cache while other threads write
-/// must wait for those writes itself.
+/// The content is buffered in the handle and written when the handle is
+/// committed (close() / close_sync()); nothing is visible before that.
+///
+/// **Lifetime**
+/// A WriteHandle belongs to the run of the cache it was created in, from
+/// Cache::start() to Cache::stop().  It may be held past stop() and used
+/// or destroyed afterwards, from any thread; the application needs no lock
+/// of its own between its writers and the thread that stops the cache.
+///  - A commit that runs while another thread is in stop() either
+///    completes, and stop() waits for it, or is refused; which of the two
+///    depends on who came first.  stop() does not wait for handles that
+///    are merely open.
+///  - A commit that starts after stop() returned is always refused.
+///  - Refused means: close() / close_sync() return CacheError::Closed, the
+///    buffered content is dropped and nothing is written.  That stays so
+///    after the cache is started again; the entry has to be written again
+///    through a new handle.
+///  - write_sync() and reserve() on such a handle return
+///    CacheError::Closed as well.  abort() and the destructor are always
+///    safe.
+///  - The first close() / close_sync() closes the handle, whatever its
+///    result.  A later call writes nothing and does not repeat the error:
+///    close_sync() after close_sync() returns success, and after the
+///    coroutine close() (which also releases the handle) close() returns
+///    success and close_sync() returns CacheError::InvalidArgument.  Only
+///    the result of the first call says whether the entry was written.
+///  - How long stop() can wait: for the commits already in flight, at most
+///    one commit per writing thread.  A commit is short (a lock and a
+///    write to the file), except behind another process that holds the
+///    cross-process write lock: if that process is alive but stopped (for
+///    example by a debugger or SIGSTOP), the commit waits about 5 seconds
+///    before the lock is taken over.  Slow storage delays it as it delays
+///    every write.
+/// One WriteHandle object must not be used from two threads at once.
 class WriteHandle {
  public:
   WriteHandle() = default;
