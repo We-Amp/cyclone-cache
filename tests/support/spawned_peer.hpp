@@ -46,6 +46,8 @@
 #include <cerrno>
 #include <csignal>
 
+#include "signal_child.hpp"
+
 extern char** environ;
 #endif
 
@@ -517,7 +519,7 @@ inline std::optional<int> SpawnedPeer::wait_exit(
 
 inline void SpawnedPeer::kill() {
   if (pid_ > 0 && !reaped_) {
-    ::kill(pid_, SIGKILL);
+    signal_child(pid_, SIGKILL);
     int status = 0;
     while (::waitpid(pid_, &status, 0) < 0 && errno == EINTR) {
     }

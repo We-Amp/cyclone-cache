@@ -19,6 +19,7 @@
 #include "core/volume.hpp"  // Volume::TeardownSeam (test-seam builds)
 #include "cyclone/cache.hpp"
 #include "cyclone/key.hpp"
+#include "support/signal_child.hpp"
 #include "support/temp_cache.hpp"
 
 #ifndef _WIN32
@@ -1657,7 +1658,7 @@ TEST_CASE("Cache teardown is fork-safe in a forked child",
     std::this_thread::sleep_for(std::chrono::milliseconds(25));
   }
   if (!exited) {
-    ::kill(pid, SIGKILL);
+    signal_child(pid, SIGKILL);
     ::waitpid(pid, &status, 0);
   }
 
@@ -1783,7 +1784,7 @@ TEST_CASE(
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     if (pid > 0 && !exited) {
-      ::kill(pid, SIGKILL);
+      signal_child(pid, SIGKILL);
       ::waitpid(pid, &status, 0);
     }
   }

@@ -109,6 +109,7 @@
 #include <unistd.h>
 
 #include "support/liveness_file.hpp"
+#include "support/signal_child.hpp"
 #endif
 
 #ifdef _WIN32
@@ -2528,7 +2529,7 @@ TEST_CASE(
           static_cast<ssize_t>(sizeof(child_base)));
   REQUIRE(child_base == kBase);
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  REQUIRE(::kill(pid, 0) == 0);  // holder alive (stopped)
+  REQUIRE(signal_child(pid, 0) == 0);  // holder alive (stopped)
 
   // Shrink the escalation budget so the last-resort takeover fires in test
   // time instead of after the multi-second production deadline.
@@ -2538,7 +2539,7 @@ TEST_CASE(
   CHECK(tok2.acquired);
   CHECK(tok2.escalated_takeover);    // the ALERTABLE event...
   CHECK_FALSE(tok2.forced_release);  // ...not routine crash recovery
-  CHECK(::kill(pid, 0) == 0);        // holder STILL alive at usurpation
+  CHECK(signal_child(pid, 0) == 0);  // holder STILL alive at usurpation
 
   // B reserves off the un-advanced cursor: the SAME base A is mid-filling --
   // the overlap is by construction, not by accident.
@@ -2550,7 +2551,7 @@ TEST_CASE(
   dir.release_write_lock(tok2);
 
   // Resume A: its stalled tail lands OVER B's published record.
-  REQUIRE(::kill(pid, SIGCONT) == 0);
+  REQUIRE(signal_child(pid, SIGCONT) == 0);
   int status = 0;
   REQUIRE(::waitpid(pid, &status, 0) == pid);
   REQUIRE(WIFEXITED(status));

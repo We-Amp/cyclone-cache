@@ -35,6 +35,7 @@
 
 #include "../../src/core/mmap_directory.hpp"
 #include "support/liveness_file.hpp"
+#include "support/signal_child.hpp"
 #endif
 
 #ifdef _WIN32
@@ -1103,7 +1104,7 @@ TEST_CASE("Volume::open waits for a concurrent creator's initialization",
   }
 
   if (!completed) {
-    ::kill(pid, SIGKILL);
+    signal_child(pid, SIGKILL);
   }
   int status = 0;
   ::waitpid(pid, &status, 0);
@@ -1203,7 +1204,7 @@ TEST_CASE("Write lock waits on a live holder and recovers a dead one",
           static_cast<ssize_t>(sizeof(child_base)));
   REQUIRE(child_base == kWlReservationBase);
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  REQUIRE(::kill(pid, 0) == 0);  // holder alive (stopped)
+  REQUIRE(signal_child(pid, 0) == 0);  // holder alive (stopped)
 
   std::atomic<bool> done{false};
   MmapDirectory::WriteLockToken parent_token;
@@ -1221,7 +1222,7 @@ TEST_CASE("Write lock waits on a live holder and recovers a dead one",
 
   // Now CRASH the holder mid-critical-section.  Its liveness lock dies with
   // it; the waiter must then recover the lock.
-  REQUIRE(::kill(pid, SIGKILL) == 0);
+  REQUIRE(signal_child(pid, SIGKILL) == 0);
   int status = 0;
   ::waitpid(pid, &status, 0);
 
@@ -1275,7 +1276,7 @@ TEST_CASE(
           static_cast<ssize_t>(sizeof(child_base)));
   REQUIRE(child_base == kWlReservationBase);
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  REQUIRE(::kill(pid, 0) == 0);  // holder alive (stopped)
+  REQUIRE(signal_child(pid, 0) == 0);  // holder alive (stopped)
 
   // Pre-fix: the parent presumes the holder dead after the spin budget and
   // force-releases it — usurping a LIVE holder.
@@ -1286,12 +1287,12 @@ TEST_CASE(
   // alive, and would reserve the SAME base — an overlapping reservation that
   // both processes then pwrite into with no wrap event and no epoch bump.
   CHECK(parent_token.forced_release);
-  CHECK(::kill(pid, 0) == 0);        // holder STILL alive at usurpation
+  CHECK(signal_child(pid, 0) == 0);  // holder STILL alive at usurpation
   CHECK(parent_base == child_base);  // overlapping reservation base
 
   // Cleanup.
   MmapDirectory::s_write_lock_presume_dead_for_test.store(false);
-  REQUIRE(::kill(pid, SIGKILL) == 0);
+  REQUIRE(signal_child(pid, SIGKILL) == 0);
   int status = 0;
   ::waitpid(pid, &status, 0);
   dir.release_write_lock(parent_token);
