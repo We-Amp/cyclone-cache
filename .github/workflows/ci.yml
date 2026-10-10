@@ -42,7 +42,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       # Compiler cache: ccache on all three platforms, persisted with
       # actions/cache.  CMake reads the CMAKE_<LANG>_COMPILER_LAUNCHER and
       # CMAKE_GENERATOR environment variables set below, so the Configure
@@ -133,7 +133,7 @@ jobs:
           } >> "$GITHUB_ENV"
       - name: Restore compiler cache
         id: ccache-restore
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ runner.temp }}/ccache
           key: ccache-${{ runner.os }}-${{ runner.arch }}-${{ steps.ccache.outputs.compiler-id }}-Release-${{ hashFiles('CMakeLists.txt') }}-${{ github.sha }}
@@ -157,7 +157,7 @@ jobs:
         if: >-
           !cancelled() && steps.ccache-restore.outcome == 'success' &&
           steps.ccache-restore.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ runner.temp }}/ccache
           key: ${{ steps.ccache-restore.outputs.cache-primary-key }}
@@ -221,7 +221,7 @@ jobs:
             StartTime = (Get-Date).AddHours(-1) } | Format-List TimeCreated, ProviderName, Message
       - name: Upload crash dumps (Windows, on failure)
         if: failure() && runner.os == 'Windows'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: crashdumps-attempt-${{ github.run_attempt }}
           path: crashdumps/
@@ -242,7 +242,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Install OpenSSL headers
         run: |
           sudo apt-get update -qq
@@ -279,8 +279,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-java@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6
         with:
           distribution: temurin
           java-version: "21"
@@ -290,7 +290,7 @@ jobs:
         run: bash tools/ci/rat.sh
       - name: Upload RAT report
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: rat-report
           path: ${{ runner.temp }}/rat/rat-report.txt
@@ -301,6 +301,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Scan the tracked tree for non-public vocabulary
         run: bash tools/ci/check-public-hygiene.sh

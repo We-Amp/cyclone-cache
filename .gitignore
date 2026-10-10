@@ -23,3 +23,7 @@ Thumbs.db
 
 # local scratch artifacts (never committed)
 .artifacts-nobump/
+
+# Python bytecode
+__pycache__/
+*.pyc
