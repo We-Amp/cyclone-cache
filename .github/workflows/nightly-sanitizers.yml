@@ -1,0 +1,143 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2024-2026 We-Amp B.V.
+
+name: Nightly sanitizers
+
+# Scheduled deep-checking lanes, kept out of the per-PR CI for cost:
+#   - ASan + UBSan: library + tests, test binary run under both sanitizers.
+#   - TSan: library + tests, test binary run under ThreadSanitizer with the
+#     suppressions file carried in tools/.
+#   - Fuzz: libFuzzer harnesses (fuzz/), each run for a bounded time on top of
+#     the checked-in seed corpus; crashers are uploaded as artifacts.
+# Tests run as a single process (the binary directly): the Catch2 cases share
+# a fixed on-disk temp path, so parallel test processes race.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-sanitizers-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CLANG_VERSION: "20"
+
+jobs:
+  asan-ubsan:
+    name: ASan + UBSan (clang-20)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Install clang
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-${CLANG_VERSION} main" \
+            | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends "clang-${CLANG_VERSION}"
+      - name: Configure (ASan + UBSan)
+        run: |
+          cmake -B build-asan -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER="clang++-${CLANG_VERSION}" \
+            -DCYCLONE_USE_BUNDLED_SHA256=ON \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize=vptr -g" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+      - name: Build
+        run: cmake --build build-asan -j"$(nproc)"
+      - name: Test
+        run: |
+          cd build-asan
+          LSAN_OPTIONS="suppressions=${GITHUB_WORKSPACE}/tools/lsan_suppressions.txt" \
+            ./cyclone-tests
+
+  tsan:
+    name: TSan (clang-20)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Install clang
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-${CLANG_VERSION} main" \
+            | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends "clang-${CLANG_VERSION}"
+      - name: Configure (TSan)
+        run: |
+          cmake -B build-tsan -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER="clang++-${CLANG_VERSION}" \
+            -DCYCLONE_USE_BUNDLED_SHA256=ON \
+            -DCMAKE_CXX_FLAGS="-fsanitize=thread -g" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+      - name: Build
+        run: cmake --build build-tsan -j"$(nproc)"
+      - name: Test
+        run: |
+          cd build-tsan
+          TSAN_OPTIONS="suppressions=${GITHUB_WORKSPACE}/tools/tsan_suppressions.txt" \
+            ./cyclone-tests
+
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [fuzz_document_parse, fuzz_volume_open, fuzz_c_api]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Install clang
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-${CLANG_VERSION} main" \
+            | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            "clang-${CLANG_VERSION}" "libclang-rt-${CLANG_VERSION}-dev"
+      - name: Configure
+        run: |
+          cmake -B build-fuzz -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_COMPILER="clang++-${CLANG_VERSION}" \
+            -DCYCLONE_USE_BUNDLED_SHA256=ON \
+            -DCYCLONE_BUILD_FUZZERS=ON \
+            -DCYCLONE_BUILD_TESTS=OFF \
+            -DCYCLONE_BUILD_EXAMPLES=OFF \
+            -DCYCLONE_BUILD_BENCHMARKS=OFF
+      - name: Build ${{ matrix.target }}
+        run: cmake --build build-fuzz -j"$(nproc)" --target ${{ matrix.target }}
+      - name: Run ${{ matrix.target }} (120 s)
+        # TMPDIR on tmpfs: the harnesses write a fresh multi-MiB volume file
+        # on every exec; tmpfs keeps fsync from tripping -timeout spuriously.
+        env:
+          TMPDIR: /dev/shm
+        run: |
+          mkdir -p run_corpus artifacts
+          cp -f fuzz/corpus/${{ matrix.target }}/* run_corpus/ 2>/dev/null || true
+          ASAN_OPTIONS=abort_on_error=1 \
+          LSAN_OPTIONS=suppressions=tools/lsan_suppressions.txt \
+            ./build-fuzz/fuzz/${{ matrix.target }} \
+              -max_total_time=120 \
+              -timeout=25 -rss_limit_mb=4096 -error_exitcode=77 \
+              -print_final_stats=1 \
+              -artifact_prefix=artifacts/ \
+              run_corpus
+      - name: Upload crashers and corpus
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-failure-${{ matrix.target }}
+          path: |
+            artifacts/
+            run_corpus/
+          if-no-files-found: ignore

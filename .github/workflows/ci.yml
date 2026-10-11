@@ -6,9 +6,10 @@ name: CI
 # Minimal public CI: build + test on the three GitHub-hosted
 # platforms, plus the license-header gate and the public-tree hygiene gate
 # (tools/ci/check-public-hygiene.sh — keeps private-infrastructure and
-# private-process vocabulary out of the public tree). The exhaustive lanes
-# (sanitizers, TSan, lint, fuzzing, CVE scanning, nightly stress) stay on
-# the private fleet and are deliberately not part of this workflow.
+# private-process vocabulary out of the public tree). The sanitizer, TSan
+# and fuzz lanes run nightly in nightly-sanitizers.yml; the remaining
+# exhaustive lanes (lint, CVE scanning, nightly stress) are deliberately not
+# part of this workflow.
 #
 # The build mirrors the private lanes: bundled SHA-256 (no OpenSSL/vcpkg
 # dependency) and Catch2 via FetchContent.  One extra Linux job builds the
