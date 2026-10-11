@@ -42,7 +42,8 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/llvm.list
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends \
-            "clang-${CLANG_VERSION}" "libclang-rt-${CLANG_VERSION}-dev"
+            "clang-${CLANG_VERSION}" "libclang-rt-${CLANG_VERSION}-dev" \
+            "llvm-${CLANG_VERSION}"
       - name: Configure (ASan + UBSan)
         # The sanitizer flags go in the Debug-only variables: flags in plain
         # CMAKE_CXX_FLAGS reach CMake's compiler probe, which then records
@@ -59,6 +60,8 @@ jobs:
       - name: Test
         run: |
           cd build-asan
+          ASAN_SYMBOLIZER_PATH="/usr/bin/llvm-symbolizer-${CLANG_VERSION}" \
+          UBSAN_OPTIONS=print_stacktrace=1 \
           LSAN_OPTIONS="suppressions=${GITHUB_WORKSPACE}/tools/lsan_suppressions.txt" \
             ./cyclone-tests
 
@@ -76,7 +79,8 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/llvm.list
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends \
-            "clang-${CLANG_VERSION}" "libclang-rt-${CLANG_VERSION}-dev"
+            "clang-${CLANG_VERSION}" "libclang-rt-${CLANG_VERSION}-dev" \
+            "llvm-${CLANG_VERSION}"
       - name: Configure (TSan)
         # Debug-only flag variables; see the ASan configure step.
         run: |
@@ -90,7 +94,8 @@ jobs:
       - name: Test
         run: |
           cd build-tsan
-          TSAN_OPTIONS="suppressions=${GITHUB_WORKSPACE}/tools/tsan_suppressions.txt" \
+          # Symbolized frames are required: suppressions match function names.
+          TSAN_OPTIONS="suppressions=${GITHUB_WORKSPACE}/tools/tsan_suppressions.txt:external_symbolizer_path=/usr/bin/llvm-symbolizer-${CLANG_VERSION}" \
             ./cyclone-tests
 
   fuzz:
