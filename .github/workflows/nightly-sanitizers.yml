@@ -41,19 +41,27 @@ jobs:
           echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-${CLANG_VERSION} main" \
             | sudo tee /etc/apt/sources.list.d/llvm.list
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends "clang-${CLANG_VERSION}"
+          sudo apt-get install -y -qq --no-install-recommends \
+            "clang-${CLANG_VERSION}" "libclang-rt-${CLANG_VERSION}-dev" \
+            "llvm-${CLANG_VERSION}"
       - name: Configure (ASan + UBSan)
+        # The sanitizer flags go in the Debug-only variables: flags in plain
+        # CMAKE_CXX_FLAGS reach CMake's compiler probe, which then records
+        # the toolchain's own libasan/libubsan as implicit link libraries and
+        # links a second, incompatible runtime into every executable.
         run: |
           cmake -B build-asan -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_CXX_COMPILER="clang++-${CLANG_VERSION}" \
             -DCYCLONE_USE_BUNDLED_SHA256=ON \
-            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize=vptr -g" \
-            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+            -DCMAKE_CXX_FLAGS_DEBUG="-fsanitize=address,undefined -fno-sanitize=vptr -g" \
+            -DCMAKE_EXE_LINKER_FLAGS_DEBUG="-fsanitize=address,undefined"
       - name: Build
         run: cmake --build build-asan -j"$(nproc)"
       - name: Test
         run: |
           cd build-asan
+          ASAN_SYMBOLIZER_PATH="/usr/bin/llvm-symbolizer-${CLANG_VERSION}" \
+          UBSAN_OPTIONS=print_stacktrace=1 \
           LSAN_OPTIONS="suppressions=${GITHUB_WORKSPACE}/tools/lsan_suppressions.txt" \
             ./cyclone-tests
 
@@ -70,20 +78,24 @@ jobs:
           echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-${CLANG_VERSION} main" \
             | sudo tee /etc/apt/sources.list.d/llvm.list
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends "clang-${CLANG_VERSION}"
+          sudo apt-get install -y -qq --no-install-recommends \
+            "clang-${CLANG_VERSION}" "libclang-rt-${CLANG_VERSION}-dev" \
+            "llvm-${CLANG_VERSION}"
       - name: Configure (TSan)
+        # Debug-only flag variables; see the ASan configure step.
         run: |
           cmake -B build-tsan -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_CXX_COMPILER="clang++-${CLANG_VERSION}" \
             -DCYCLONE_USE_BUNDLED_SHA256=ON \
-            -DCMAKE_CXX_FLAGS="-fsanitize=thread -g" \
-            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+            -DCMAKE_CXX_FLAGS_DEBUG="-fsanitize=thread -g" \
+            -DCMAKE_EXE_LINKER_FLAGS_DEBUG="-fsanitize=thread"
       - name: Build
         run: cmake --build build-tsan -j"$(nproc)"
       - name: Test
         run: |
           cd build-tsan
-          TSAN_OPTIONS="suppressions=${GITHUB_WORKSPACE}/tools/tsan_suppressions.txt" \
+          # Symbolized frames are required: suppressions match function names.
+          TSAN_OPTIONS="suppressions=${GITHUB_WORKSPACE}/tools/tsan_suppressions.txt:external_symbolizer_path=/usr/bin/llvm-symbolizer-${CLANG_VERSION}" \
             ./cyclone-tests
 
   fuzz:
