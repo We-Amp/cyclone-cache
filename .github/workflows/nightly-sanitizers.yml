@@ -44,12 +44,16 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends \
             "clang-${CLANG_VERSION}" "libclang-rt-${CLANG_VERSION}-dev"
       - name: Configure (ASan + UBSan)
+        # The sanitizer flags go in the Debug-only variables: flags in plain
+        # CMAKE_CXX_FLAGS reach CMake's compiler probe, which then records
+        # the toolchain's own libasan/libubsan as implicit link libraries and
+        # links a second, incompatible runtime into every executable.
         run: |
           cmake -B build-asan -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_CXX_COMPILER="clang++-${CLANG_VERSION}" \
             -DCYCLONE_USE_BUNDLED_SHA256=ON \
-            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize=vptr -g" \
-            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+            -DCMAKE_CXX_FLAGS_DEBUG="-fsanitize=address,undefined -fno-sanitize=vptr -g" \
+            -DCMAKE_EXE_LINKER_FLAGS_DEBUG="-fsanitize=address,undefined"
       - name: Build
         run: cmake --build build-asan -j"$(nproc)"
       - name: Test
@@ -74,12 +78,13 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends \
             "clang-${CLANG_VERSION}" "libclang-rt-${CLANG_VERSION}-dev"
       - name: Configure (TSan)
+        # Debug-only flag variables; see the ASan configure step.
         run: |
           cmake -B build-tsan -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_CXX_COMPILER="clang++-${CLANG_VERSION}" \
             -DCYCLONE_USE_BUNDLED_SHA256=ON \
-            -DCMAKE_CXX_FLAGS="-fsanitize=thread -g" \
-            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+            -DCMAKE_CXX_FLAGS_DEBUG="-fsanitize=thread -g" \
+            -DCMAKE_EXE_LINKER_FLAGS_DEBUG="-fsanitize=thread"
       - name: Build
         run: cmake --build build-tsan -j"$(nproc)"
       - name: Test

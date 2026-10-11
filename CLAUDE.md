@@ -508,8 +508,8 @@ not something to suppress.
 cmake -B build-asan -DCMAKE_BUILD_TYPE=Debug \
   -DCMAKE_CXX_COMPILER=clang++-20 \
   -DCYCLONE_USE_BUNDLED_SHA256=ON \
-  -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize=vptr -g" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+  -DCMAKE_CXX_FLAGS_DEBUG="-fsanitize=address,undefined -fno-sanitize=vptr -g" \
+  -DCMAKE_EXE_LINKER_FLAGS_DEBUG="-fsanitize=address,undefined"
 cmake --build build-asan -j$(nproc)
 (cd build-asan && LSAN_OPTIONS="suppressions=$PWD/../tools/lsan_suppressions.txt" ./cyclone-tests)
 
@@ -517,8 +517,8 @@ cmake --build build-asan -j$(nproc)
 cmake -B build-tsan -DCMAKE_BUILD_TYPE=Debug \
   -DCMAKE_CXX_COMPILER=clang++-20 \
   -DCYCLONE_USE_BUNDLED_SHA256=ON \
-  -DCMAKE_CXX_FLAGS="-fsanitize=thread -g" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+  -DCMAKE_CXX_FLAGS_DEBUG="-fsanitize=thread -g" \
+  -DCMAKE_EXE_LINKER_FLAGS_DEBUG="-fsanitize=thread"
 cmake --build build-tsan -j$(nproc)
 (cd build-tsan && TSAN_OPTIONS="suppressions=$PWD/../tools/tsan_suppressions.txt" ./cyclone-tests)
 ```
