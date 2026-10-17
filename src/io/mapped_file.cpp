@@ -63,9 +63,9 @@ bool pages_resident(uintptr_t addr, size_t length, size_t page_size) {
 class PosixMappedFile : public MappedFile {
  public:
   PosixMappedFile() = default;
-  // Qualified call: a virtual call from a destructor resolves to this class
-  // anyway, and the qualified form says so and keeps static analysers quiet.
-  ~PosixMappedFile() override { PosixMappedFile::close(); }
+  // The destructor releases through a non-virtual helper: no virtual
+  // dispatch during destruction, and the same code path as close().
+  ~PosixMappedFile() override { release_resources(); }
 
   std::expected<void, std::error_code> open(const std::string &path,
                                             OpenMode mode) override {
@@ -110,7 +110,9 @@ class PosixMappedFile : public MappedFile {
     return {};
   }
 
-  void close() override {
+  void close() override { release_resources(); }
+
+  void release_resources() {
     if (_persistent_base != nullptr) {
       munmap(_persistent_base, _persistent_size);
       _persistent_base = nullptr;
@@ -452,9 +454,9 @@ static DWORD win32_allocation_granularity() {
 class Win32MappedFile : public MappedFile {
  public:
   Win32MappedFile() = default;
-  // Qualified call: a virtual call from a destructor resolves to this class
-  // anyway, and the qualified form says so and keeps static analysers quiet.
-  ~Win32MappedFile() override { Win32MappedFile::close(); }
+  // The destructor releases through a non-virtual helper: no virtual
+  // dispatch during destruction, and the same code path as close().
+  ~Win32MappedFile() override { release_resources(); }
 
   std::expected<void, std::error_code> open(const std::string &path,
                                             OpenMode mode) override {
@@ -506,7 +508,9 @@ class Win32MappedFile : public MappedFile {
     return {};
   }
 
-  void close() override {
+  void close() override { release_resources(); }
+
+  void release_resources() {
     if (_persistent_base != nullptr) {
       UnmapViewOfFile(_persistent_base);
       _persistent_base = nullptr;
