@@ -231,14 +231,15 @@ FreshnessResult HttpAlternatePlugin::check_freshness(
 double HttpAlternatePlugin::eviction_priority(const CacheVariant &variant) {
   double priority = 1.0;
 
+  // A last-access time ahead of the clock counts as just accessed.
   auto age_seconds =
       std::chrono::duration_cast<std::chrono::seconds>(
           std::chrono::system_clock::now() - variant.last_accessed)
           .count();
-  priority += age_seconds / 3600.0;
+  priority += std::max<int64_t>(age_seconds, 0) / 3600.0;
 
   if (variant.hit_count > 0) {
-    priority /= (1.0 + std::log(variant.hit_count + 1));
+    priority /= (1.0 + std::log(static_cast<double>(variant.hit_count) + 1.0));
   }
 
   return priority;

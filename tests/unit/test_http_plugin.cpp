@@ -3,6 +3,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -862,6 +864,32 @@ TEST_CASE("HttpAlternatePlugin eviction_priority", "[http]") {
   double cold_priority = plugin->eviction_priority(cold_variant);
 
   REQUIRE(cold_priority > hot_priority);
+}
+
+TEST_CASE("HttpAlternatePlugin eviction_priority stays finite and positive",
+          "[http]") {
+  auto plugin = create_http_alternate_plugin();
+
+  CacheVariant saturated;
+  saturated.key = CacheKey("saturated-key");
+  saturated.last_accessed = std::chrono::system_clock::now();
+  saturated.hit_count = UINT32_MAX;
+  double saturated_priority = plugin->eviction_priority(saturated);
+  REQUIRE(std::isfinite(saturated_priority));
+  REQUIRE(saturated_priority > 0.0);
+
+  // A last-access time ahead of the clock must not lower the priority below
+  // that of a variant accessed right now.
+  CacheVariant future;
+  future.key = CacheKey("future-key");
+  future.last_accessed =
+      std::chrono::system_clock::now() + std::chrono::hours(24 * 365);
+  future.hit_count = 1;
+  CacheVariant now_variant = future;
+  now_variant.last_accessed = std::chrono::system_clock::now();
+  REQUIRE(plugin->eviction_priority(future) >=
+          plugin->eviction_priority(now_variant) - 1e-3);
+  REQUIRE(plugin->eviction_priority(future) > 0.0);
 }
 
 TEST_CASE("HTTP alternate Accept with multiple ranges and q-values",
