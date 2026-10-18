@@ -99,12 +99,114 @@ TEST_CASE("HttpCacheAlt stale entry", "[http]") {
   REQUIRE_FALSE(alt.is_fresh());
 }
 
-TEST_CASE("HttpCacheAlt no Cache-Control defaults to fresh", "[http]") {
+TEST_CASE("HttpCacheAlt no freshness lifetime is stale", "[http]") {
   HttpCacheAlt alt;
   alt.set_response_time(std::time(nullptr));
 
-  REQUIRE(alt.is_fresh());
+  REQUIRE_FALSE(alt.is_fresh());
   REQUIRE_FALSE(alt.max_age().has_value());
+
+  // Cache-Control without max-age gives no lifetime either.
+  alt.set_response_header("Cache-Control", "public");
+  REQUIRE_FALSE(alt.is_fresh());
+}
+
+namespace {
+std::string http_date(std::time_t t) {
+  std::tm *tm = std::gmtime(&t);
+  char buf[64];
+  std::strftime(buf, sizeof(buf), "%a, %d %b %Y %H:%M:%S GMT", tm);
+  return buf;
+}
+}  // namespace
+
+TEST_CASE("HttpCacheAlt max-age directive parsing", "[http]") {
+  auto now = std::time(nullptr);
+  HttpCacheAlt alt;
+  alt.set_response_time(now);
+
+  SECTION("directive name is case-insensitive") {
+    alt.set_response_header("Cache-Control", "public, MAX-AGE=60");
+    REQUIRE(alt.max_age().has_value());
+    REQUIRE(alt.max_age()->count() == 60);
+    REQUIRE(alt.is_fresh());
+  }
+  SECTION("directive is matched as a whole token") {
+    alt.set_response_header("Cache-Control", "x-max-age=60");
+    REQUIRE_FALSE(alt.max_age().has_value());
+    REQUIRE_FALSE(alt.is_fresh());
+  }
+  SECTION("s-maxage alone is not max-age") {
+    alt.set_response_header("Cache-Control", "s-maxage=60");
+    REQUIRE_FALSE(alt.max_age().has_value());
+  }
+  SECTION("max-age=0 is stale") {
+    alt.set_response_header("Cache-Control", "max-age=0");
+    REQUIRE_FALSE(alt.is_fresh());
+  }
+}
+
+TEST_CASE("HttpCacheAlt honours Expires", "[http]") {
+  auto now = std::time(nullptr);
+
+  SECTION("future Expires is fresh") {
+    HttpCacheAlt alt;
+    alt.set_response_time(now);
+    alt.set_response_header("Expires", http_date(now + 3600));
+    REQUIRE(alt.is_fresh());
+  }
+  SECTION("past Expires is stale") {
+    HttpCacheAlt alt;
+    alt.set_response_time(now - 7200);
+    alt.set_response_header("Expires", http_date(now - 3600));
+    REQUIRE_FALSE(alt.is_fresh());
+  }
+  SECTION("invalid Expires is stale") {
+    HttpCacheAlt alt;
+    alt.set_response_time(now);
+    alt.set_response_header("Expires", "0");
+    REQUIRE_FALSE(alt.is_fresh());
+  }
+  SECTION("max-age wins over Expires") {
+    HttpCacheAlt alt;
+    alt.set_response_time(now);
+    alt.set_response_header("Expires", http_date(now - 3600));
+    alt.set_response_header("Cache-Control", "max-age=600");
+    REQUIRE(alt.is_fresh());
+  }
+  SECTION("Expires is measured from the Date header") {
+    HttpCacheAlt alt;
+    // Response stored now but generated two hours ago with a one hour life.
+    alt.set_response_time(now);
+    alt.set_response_header("Date", http_date(now - 7200));
+    alt.set_response_header("Expires", http_date(now - 3600));
+    REQUIRE_FALSE(alt.is_fresh());
+  }
+}
+
+TEST_CASE("HttpCacheAlt heuristic freshness needs Last-Modified", "[http]") {
+  auto now = std::time(nullptr);
+  constexpr std::time_t kDay = 86400;
+
+  SECTION("recent response of an old resource is fresh") {
+    HttpCacheAlt alt;
+    alt.set_response_time(now);
+    alt.set_response_header("Last-Modified", http_date(now - 100 * kDay));
+    REQUIRE(alt.is_fresh());
+  }
+  SECTION("response older than a tenth of the resource age is stale") {
+    HttpCacheAlt alt;
+    alt.set_response_time(now - 20 * kDay);
+    alt.set_response_header("Date", http_date(now - 20 * kDay));
+    alt.set_response_header("Last-Modified", http_date(now - 120 * kDay));
+    // Resource was 100 days old at response time: heuristic life is 10 days.
+    REQUIRE_FALSE(alt.is_fresh());
+  }
+  SECTION("no Last-Modified gives no heuristic") {
+    HttpCacheAlt alt;
+    alt.set_response_time(now);
+    REQUIRE_FALSE(alt.is_fresh());
+  }
 }
 
 TEST_CASE("HttpCacheAlt header names are case-insensitive", "[http]") {

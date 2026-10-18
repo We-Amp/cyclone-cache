@@ -48,6 +48,9 @@ class HttpCacheAlt {
 
   [[nodiscard]] std::chrono::seconds age() const;
   [[nodiscard]] std::optional<std::chrono::seconds> max_age() const;
+  // Lifetime from max-age, else Expires, else a heuristic (only with
+  // Last-Modified); nullopt when none applies.
+  [[nodiscard]] std::optional<std::chrono::seconds> freshness_lifetime() const;
   [[nodiscard]] bool is_fresh() const;
 
   [[nodiscard]] std::vector<std::byte> serialize() const;

@@ -198,8 +198,12 @@ FreshnessResult HttpAlternatePlugin::check_freshness(
 
   auto cc = alt.get_response_header("Cache-Control");
   if (cc) {
-    if (cc->find("must-revalidate") != std::string_view::npos ||
-        cc->find("no-cache") != std::string_view::npos) {
+    std::string lowered(*cc);
+    for (char &c : lowered) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (lowered.find("must-revalidate") != std::string::npos ||
+        lowered.find("no-cache") != std::string::npos) {
       return FreshnessResult::MustRevalidate;
     }
   }
