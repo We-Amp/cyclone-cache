@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2024-2026 We-Amp B.V.
 
+#include <algorithm>
 #include <catch2/catch_test_macros.hpp>
 #include <cstddef>
 #include <cstdio>
@@ -290,6 +291,92 @@ TEST_CASE("Cache async remove", "[async][integration]") {
     auto rh_result = rh_task.sync_wait();
     REQUIRE_FALSE(rh_result.has_value());
     REQUIRE(rh_result.error() == CacheError::NotFound);
+  }
+
+  cache->stop();
+}
+
+TEST_CASE("ReadHandle read() and read_all() copy the content out",
+          "[async][integration]") {
+  TempCacheDir tmp;
+  CacheConfig config;
+  auto cache_result = Cache::create(config);
+  REQUIRE(cache_result.has_value());
+  auto &cache = *cache_result;
+  VolumeConfig vol_config;
+  vol_config.path = tmp.path();
+  vol_config.size = static_cast<size_t>(10 * 1024 * 1024);
+  REQUIRE(cache->add_volume(vol_config).has_value());
+  REQUIRE(cache->start().has_value());
+
+  const CacheKey key("read-handle-stream-key");
+  std::vector<std::byte> content(10000);
+  for (size_t i = 0; i < content.size(); ++i) {
+    content[i] = static_cast<std::byte>((i * 31) & 0xFF);
+  }
+  {
+    auto wh = cache->write_sync(key, content.size());
+    REQUIRE(wh.has_value());
+    REQUIRE(wh->write_sync(content).has_value());
+    REQUIRE(wh->close_sync().has_value());
+  }
+
+  SECTION("read_all returns the whole content") {
+    auto rh = cache->read_sync(key);
+    REQUIRE(rh.has_value());
+    auto all = rh->read_all().sync_wait();
+    REQUIRE(all.has_value());
+    REQUIRE(*all == content);
+    // Everything was consumed: nothing is left for a later call.
+    auto rest = rh->read_all().sync_wait();
+    REQUIRE(rest.has_value());
+    REQUIRE(rest->empty());
+  }
+
+  SECTION("read fills buffers in order and returns 0 at the end") {
+    auto rh = cache->read_sync(key);
+    REQUIRE(rh.has_value());
+    std::vector<std::byte> got;
+    std::vector<std::byte> buffer(4096);
+    std::vector<size_t> sizes;
+    for (;;) {
+      auto n = rh->read(buffer).sync_wait();
+      REQUIRE(n.has_value());
+      sizes.push_back(*n);
+      if (*n == 0) {
+        break;
+      }
+      got.insert(got.end(), buffer.begin(), buffer.begin() + *n);
+    }
+    REQUIRE(sizes == std::vector<size_t>{4096, 4096, 1808, 0});
+    REQUIRE(got == content);
+  }
+
+  SECTION("read_all after read returns the remainder") {
+    auto rh = cache->read_sync(key);
+    REQUIRE(rh.has_value());
+    std::vector<std::byte> head(100);
+    auto n = rh->read(head).sync_wait();
+    REQUIRE(n.has_value());
+    REQUIRE(*n == head.size());
+    auto rest = rh->read_all().sync_wait();
+    REQUIRE(rest.has_value());
+    REQUIRE(rest->size() == content.size() - head.size());
+    REQUIRE(std::equal(rest->begin(), rest->end(), content.begin() + 100));
+  }
+
+  SECTION("an empty or closed handle reports NotInitialized") {
+    ReadHandle empty;
+    std::vector<std::byte> buffer(16);
+    auto n = empty.read(buffer).sync_wait();
+    REQUIRE_FALSE(n.has_value());
+    REQUIRE(n.error() == CacheError::NotInitialized);
+    auto rh = cache->read_sync(key);
+    REQUIRE(rh.has_value());
+    rh->close();
+    auto all = rh->read_all().sync_wait();
+    REQUIRE_FALSE(all.has_value());
+    REQUIRE(all.error() == CacheError::NotInitialized);
   }
 
   cache->stop();

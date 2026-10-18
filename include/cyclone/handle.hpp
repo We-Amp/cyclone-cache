@@ -148,6 +148,12 @@ class ReadHandle {
   ReadHandle &operator=(const ReadHandle &) = delete;
   ~ReadHandle() = default;
 
+  // Copy the content out, for a caller that wants owned bytes rather than
+  // the content() view.  read() fills `buffer` from the handle's read
+  // position and advances it, returning the byte count (0 at the end);
+  // read_all() returns everything from the read position to the end and
+  // moves the position there.  Both complete synchronously and report
+  // CacheError::NotInitialized on an empty or closed handle.
   Task<std::expected<size_t, CacheError>> read(std::span<std::byte> buffer);
   Task<std::expected<std::vector<std::byte>, CacheError>> read_all();
 
@@ -249,6 +255,7 @@ class ReadHandle {
   friend class Volume;
 
   std::shared_ptr<ReadHandleImpl> _impl;
+  size_t _read_offset = 0;  // read() / read_all() position in content()
 
   explicit ReadHandle(std::shared_ptr<ReadHandleImpl> impl)
       : _impl(std::move(impl)) {}

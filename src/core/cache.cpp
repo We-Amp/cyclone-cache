@@ -185,12 +185,30 @@ class GateExclusive {
 
 Task<std::expected<size_t, CacheError>> ReadHandle::read(
     std::span<std::byte> buffer) {
-  (void)buffer;
-  co_return make_unexpected(CacheError::NotInitialized);
+  if (!_impl) {
+    co_return make_unexpected(CacheError::NotInitialized);
+  }
+  const std::span<const std::byte> content = _impl->content();
+  if (_read_offset >= content.size()) {
+    co_return size_t{0};
+  }
+  const size_t n = std::min(buffer.size(), content.size() - _read_offset);
+  std::copy_n(content.begin() + static_cast<std::ptrdiff_t>(_read_offset), n,
+              buffer.begin());
+  _read_offset += n;
+  co_return n;
 }
 
 Task<std::expected<std::vector<std::byte>, CacheError>> ReadHandle::read_all() {
-  co_return make_unexpected(CacheError::NotInitialized);
+  if (!_impl) {
+    co_return make_unexpected(CacheError::NotInitialized);
+  }
+  const std::span<const std::byte> content = _impl->content();
+  const size_t start = std::min(_read_offset, content.size());
+  std::vector<std::byte> rest(
+      content.begin() + static_cast<std::ptrdiff_t>(start), content.end());
+  _read_offset = content.size();
+  co_return rest;
 }
 
 Task<std::expected<size_t, CacheError>> WriteHandle::write(
