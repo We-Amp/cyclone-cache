@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2024-2026 We-Amp B.V.
 
+#include <array>
 #include <catch2/catch_test_macros.hpp>
+#include <span>
+#include <string>
+
+#include "../../src/core/sha256.hpp"
 
 #include "cyclone/key.hpp"
 
@@ -70,4 +75,26 @@ TEST_CASE("CacheKey std::hash", "[key]") {
 
   REQUIRE(hasher(key1) == hasher(key2));
   REQUIRE(hasher(key1) != hasher(key3));
+}
+
+TEST_CASE("SHA256 finalize leaves the context reusable and in bounds",
+          "[key][sha256]") {
+  auto hex = [](const std::array<std::byte, 32> &d) {
+    static const char *digits = "0123456789abcdef";
+    std::string out;
+    for (auto b : d) {
+      out.push_back(digits[static_cast<unsigned>(b) >> 4]);
+      out.push_back(digits[static_cast<unsigned>(b) & 0xf]);
+    }
+    return out;
+  };
+  const char abc[] = {'a', 'b', 'c'};
+  cyclone::crypto::SHA256 ctx;
+  ctx.update(std::as_bytes(std::span(abc)));
+  CHECK(hex(ctx.finalize()) ==
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+  // A second finalize without new input must not write past the block buffer;
+  // the context is back in its initial state, so it yields the empty digest.
+  CHECK(hex(ctx.finalize()) ==
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
 }

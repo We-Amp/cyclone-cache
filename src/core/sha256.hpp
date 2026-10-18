@@ -95,6 +95,9 @@ class SHA256 {
       result[i * 4 + 2] = static_cast<std::byte>(state_[i] >> 8);
       result[i * 4 + 3] = static_cast<std::byte>(state_[i]);
     }
+    // Leave the context in its initial state: a further finalize() or update()
+    // starts a new message instead of running past the block buffer.
+    reset();
     return result;
   }
 
