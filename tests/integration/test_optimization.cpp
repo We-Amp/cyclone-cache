@@ -14,6 +14,7 @@
 #include "cyclone/config.hpp"
 #include "cyclone/plugin/optimization.hpp"
 #include "optimization/optimization_engine.hpp"
+#include "support/temp_cache.hpp"
 
 #if defined(__GLIBCXX__) && defined(__linux__)
 #include <pthread.h>
@@ -24,7 +25,6 @@
 #endif
 
 using namespace cyclone;
-namespace fs = std::filesystem;
 
 namespace {
 
@@ -243,17 +243,6 @@ class PlanThrowingPlugin : public OptimizationPlugin {
   std::atomic<int> attempts{0};
 };
 
-std::string temp_cache_path() {
-  auto path = fs::temp_directory_path() / "cyclone_opt_test";
-  fs::create_directories(path);
-  return path.string();
-}
-
-void cleanup_temp(const std::string &path) {
-  std::error_code ec;
-  fs::remove_all(path, ec);
-}
-
 // Plugin that throws an exception during transform (for testing exception
 // handling)
 class ThrowingOptimizationPlugin : public OptimizationPlugin {
@@ -288,7 +277,8 @@ class ThrowingOptimizationPlugin : public OptimizationPlugin {
 }  // namespace
 
 TEST_CASE("OptimizationEngine basic lifecycle", "[optimization][integration]") {
-  auto cache_path = temp_cache_path();
+  TempCacheDir temp_dir("opt");
+  const std::string cache_path = temp_dir.dir().string();
 
   CacheConfig config;
   config.optimization_config.set_enabled(true)
@@ -309,8 +299,6 @@ TEST_CASE("OptimizationEngine basic lifecycle", "[optimization][integration]") {
 
   cache->stop();
   REQUIRE_FALSE(engine->is_running());
-
-  cleanup_temp(cache_path);
 }
 
 // Issue #52: the engine is opt-in.  A default CacheConfig must not construct
@@ -318,7 +306,8 @@ TEST_CASE("OptimizationEngine basic lifecycle", "[optimization][integration]") {
 // workers; the accessor reports that as nullptr before and after start().
 TEST_CASE("OptimizationEngine absent with a default CacheConfig",
           "[optimization][integration]") {
-  auto cache_path = temp_cache_path();
+  TempCacheDir temp_dir("opt");
+  const std::string cache_path = temp_dir.dir().string();
 
   CacheConfig config;
   REQUIRE_FALSE(config.optimization_config.enabled);
@@ -346,12 +335,12 @@ TEST_CASE("OptimizationEngine absent with a default CacheConfig",
 
   cache->stop();
   REQUIRE(cache->optimization_engine() == nullptr);
-  cleanup_temp(cache_path);
 }
 
 TEST_CASE("OptimizationEngine disabled when not enabled",
           "[optimization][integration]") {
-  auto cache_path = temp_cache_path();
+  TempCacheDir temp_dir("opt");
+  const std::string cache_path = temp_dir.dir().string();
 
   CacheConfig config;
   config.optimization_config.set_enabled(false);
@@ -366,12 +355,12 @@ TEST_CASE("OptimizationEngine disabled when not enabled",
   REQUIRE(cache->optimization_engine() == nullptr);
 
   cache->stop();
-  cleanup_temp(cache_path);
 }
 
 TEST_CASE("OptimizationEngine plugin registration",
           "[optimization][integration]") {
-  auto cache_path = temp_cache_path();
+  TempCacheDir temp_dir("opt");
+  const std::string cache_path = temp_dir.dir().string();
 
   CacheConfig config;
   config.optimization_config.set_enabled(true).set_min_threads(1);
@@ -400,12 +389,12 @@ TEST_CASE("OptimizationEngine plugin registration",
   REQUIRE(plugins.empty());
 
   cache->stop();
-  cleanup_temp(cache_path);
 }
 
 TEST_CASE("OptimizationEngine min_hits_before_optimize threshold",
           "[optimization][integration]") {
-  auto cache_path = temp_cache_path();
+  TempCacheDir temp_dir("opt");
+  const std::string cache_path = temp_dir.dir().string();
 
   CacheConfig config;
   config.optimization_config.set_enabled(true)
@@ -448,12 +437,12 @@ TEST_CASE("OptimizationEngine min_hits_before_optimize threshold",
   REQUIRE(stats.queued > 0);
 
   cache->stop();
-  cleanup_temp(cache_path);
 }
 
 TEST_CASE("OptimizationEngine pause and resume",
           "[optimization][integration]") {
-  auto cache_path = temp_cache_path();
+  TempCacheDir temp_dir("opt");
+  const std::string cache_path = temp_dir.dir().string();
 
   CacheConfig config;
   config.optimization_config.set_enabled(true)
@@ -479,11 +468,11 @@ TEST_CASE("OptimizationEngine pause and resume",
   REQUIRE_FALSE(engine->is_paused());
 
   cache->stop();
-  cleanup_temp(cache_path);
 }
 
 TEST_CASE("OptimizationEngine statistics", "[optimization][integration]") {
-  auto cache_path = temp_cache_path();
+  TempCacheDir temp_dir("opt");
+  const std::string cache_path = temp_dir.dir().string();
 
   CacheConfig config;
   config.optimization_config.set_enabled(true)
@@ -505,12 +494,12 @@ TEST_CASE("OptimizationEngine statistics", "[optimization][integration]") {
   REQUIRE(initial_stats.queued == 0);
 
   cache->stop();
-  cleanup_temp(cache_path);
 }
 
 TEST_CASE("OptimizationEngine load monitor integration",
           "[optimization][integration]") {
-  auto cache_path = temp_cache_path();
+  TempCacheDir temp_dir("opt");
+  const std::string cache_path = temp_dir.dir().string();
 
   CacheConfig config;
   config.optimization_config.set_enabled(true)
@@ -541,12 +530,12 @@ TEST_CASE("OptimizationEngine load monitor integration",
   REQUIRE(metrics.write_ops == 1);
 
   cache->stop();
-  cleanup_temp(cache_path);
 }
 
 TEST_CASE("OptimizationEngine work queue integration",
           "[optimization][integration]") {
-  auto cache_path = temp_cache_path();
+  TempCacheDir temp_dir("opt");
+  const std::string cache_path = temp_dir.dir().string();
 
   CacheConfig config;
   config.optimization_config.set_enabled(true)
@@ -572,12 +561,12 @@ TEST_CASE("OptimizationEngine work queue integration",
   REQUIRE(queue_stats.total_enqueued == 0);
 
   cache->stop();
-  cleanup_temp(cache_path);
 }
 
 TEST_CASE("OptimizationEngine handles transform failures",
           "[optimization][integration]") {
-  auto cache_path = temp_cache_path();
+  TempCacheDir temp_dir("opt");
+  const std::string cache_path = temp_dir.dir().string();
 
   CacheConfig config;
   config.optimization_config.set_enabled(true)
@@ -620,12 +609,12 @@ TEST_CASE("OptimizationEngine handles transform failures",
   REQUIRE(stats.failed > 0);
 
   cache->stop();
-  cleanup_temp(cache_path);
 }
 
 TEST_CASE("OptimizationEngine concurrent stress",
           "[optimization][integration][stress]") {
-  auto cache_path = temp_cache_path();
+  TempCacheDir temp_dir("opt");
+  const std::string cache_path = temp_dir.dir().string();
 
   CacheConfig config;
   config.optimization_config.set_enabled(true)
@@ -688,7 +677,6 @@ TEST_CASE("OptimizationEngine concurrent stress",
   REQUIRE(stats.queued >= 0);  // May be 0 if processing is fast
 
   cache->stop();
-  cleanup_temp(cache_path);
 }
 
 // Regression: the pool's start() resets its stop/pause flags, so stop -> start
@@ -698,7 +686,8 @@ TEST_CASE("OptimizationEngine concurrent stress",
 // silently dead.
 TEST_CASE("OptimizationEngine stop/start cycle resumes work",
           "[optimization][integration][regression]") {
-  auto cache_path = temp_cache_path();
+  TempCacheDir temp_dir("opt");
+  const std::string cache_path = temp_dir.dir().string();
 
   CacheConfig config;
   config.optimization_config.set_enabled(true)
@@ -746,7 +735,6 @@ TEST_CASE("OptimizationEngine stop/start cycle resumes work",
   REQUIRE(run_one("http://test.com/after-restart", 2));
 
   cache->stop();
-  cleanup_temp(cache_path);
 }
 
 // Regression: dequeue() erases an item's id from the queue's dedup set, so a
@@ -758,7 +746,8 @@ TEST_CASE("OptimizationEngine stop/start cycle resumes work",
 // later item for the same id must still run once the first completes.
 TEST_CASE("OptimizationEngine refuses duplicate in-flight work items",
           "[optimization][integration][regression]") {
-  auto cache_path = temp_cache_path();
+  TempCacheDir temp_dir("opt");
+  const std::string cache_path = temp_dir.dir().string();
 
   CacheConfig config;
   config.optimization_config.set_enabled(true)
@@ -827,7 +816,6 @@ TEST_CASE("OptimizationEngine refuses duplicate in-flight work items",
   const bool reran = wait_for_entries(entries_while_running + 1);
 
   cache->stop();
-  cleanup_temp(cache_path);
 
   REQUIRE(entries_while_running == 1);
   REQUIRE(duplicates_while_running == 1);
@@ -839,7 +827,8 @@ TEST_CASE("OptimizationEngine refuses duplicate in-flight work items",
 // the call, record the failure, and keep the worker alive for later work.
 TEST_CASE("OptimizationEngine survives a throwing plugin transform",
           "[optimization][integration][regression]") {
-  auto cache_path = temp_cache_path();
+  TempCacheDir temp_dir("opt");
+  const std::string cache_path = temp_dir.dir().string();
 
   CacheConfig config;
   config.optimization_config.set_enabled(true)
@@ -900,7 +889,6 @@ TEST_CASE("OptimizationEngine survives a throwing plugin transform",
   REQUIRE(plugin->attempts.load(std::memory_order_acquire) >= 2);
 
   cache->stop();
-  cleanup_temp(cache_path);
 }
 
 // Regression: plan_optimization() runs on the embedder's own thread inside
@@ -908,7 +896,8 @@ TEST_CASE("OptimizationEngine survives a throwing plugin transform",
 // path.  The engine must guard the call and record the failure.
 TEST_CASE("OptimizationEngine guards exceptions from plugin planning",
           "[optimization][integration][regression]") {
-  auto cache_path = temp_cache_path();
+  TempCacheDir temp_dir("opt");
+  const std::string cache_path = temp_dir.dir().string();
 
   CacheConfig config;
   config.optimization_config.set_enabled(true)
@@ -936,7 +925,6 @@ TEST_CASE("OptimizationEngine guards exceptions from plugin planning",
   REQUIRE(engine->is_running());
 
   cache->stop();
-  cleanup_temp(cache_path);
 }
 
 // Regression: record_read_complete()/record_write_complete() had no callers
@@ -946,7 +934,8 @@ TEST_CASE("OptimizationEngine guards exceptions from plugin planning",
 // feed the monitor.
 TEST_CASE("OptimizationEngine load monitor observes cache traffic",
           "[optimization][integration][regression]") {
-  auto cache_path = temp_cache_path();
+  TempCacheDir temp_dir("opt");
+  const std::string cache_path = temp_dir.dir().string();
 
   CacheConfig config;
   config.optimization_config.set_enabled(true)
@@ -993,7 +982,6 @@ TEST_CASE("OptimizationEngine load monitor observes cache traffic",
   }
 
   cache->stop();
-  cleanup_temp(cache_path);
 
   REQUIRE(metrics.write_ops >= kWrites);
   REQUIRE(metrics.write_bytes >= kWrites * kContentSize);
@@ -1051,12 +1039,13 @@ class ThreadExitingPlugin : public OptimizationPlugin {
 // Runs one engine scenario in a child process: a swallowed forced unwind
 // aborts the process, which the parent observes as a signal exit.
 int run_thread_exit_scenario(bool exit_in_plan) {
+  TempCacheDir temp_dir("opt");
+  const std::string cache_path = temp_dir.dir().string();
   const pid_t child = fork();
   if (child < 0) {
     return -1;
   }
   if (child == 0) {
-    auto cache_path = temp_cache_path();
     CacheConfig config;
     config.optimization_config.set_enabled(true)
         .set_min_threads(1)
@@ -1099,7 +1088,6 @@ int run_thread_exit_scenario(bool exit_in_plan) {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     const bool reached = plugin->reached.load();
     cache->stop();
-    cleanup_temp(cache_path);
     std::_Exit(reached ? 0 : 2);
   }
   int status = 0;
@@ -1141,7 +1129,8 @@ TEST_CASE("OptimizationEngine load shedding is opt-in",
   for (const bool shedding : {false, true}) {
     INFO("enable_load_shedding=" << shedding);
     {
-      auto cache_path = temp_cache_path();
+      TempCacheDir temp_dir("opt");
+      const std::string cache_path = temp_dir.dir().string();
       CacheConfig config;
       // Baselines of one op and one byte per second: any traffic saturates
       // the load estimate.
@@ -1177,7 +1166,6 @@ TEST_CASE("OptimizationEngine load shedding is opt-in",
       }
 
       cache->stop();
-      cleanup_temp(cache_path);
 
       // Shedding stays inert even though the estimate is past the
       // watermark; when enabled it engages.
@@ -1194,7 +1182,8 @@ TEST_CASE("OptimizationEngine load shedding is opt-in",
 // the estimate up and shed itself.  Only the embedder's operations count.
 TEST_CASE("OptimizationEngine does not record its own cache operations as load",
           "[optimization][integration][regression]") {
-  auto cache_path = temp_cache_path();
+  TempCacheDir temp_dir("opt");
+  const std::string cache_path = temp_dir.dir().string();
 
   CacheConfig config;
   config.optimization_config.set_enabled(true)
@@ -1236,7 +1225,6 @@ TEST_CASE("OptimizationEngine does not record its own cache operations as load",
   const auto metrics = engine->stats().load_metrics;
 
   cache->stop();
-  cleanup_temp(cache_path);
 
   REQUIRE(completed == 1);
   REQUIRE(metrics.write_ops == 1);
