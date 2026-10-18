@@ -10,7 +10,9 @@
 //
 // The global allocation functions are replaced for this test binary.  The
 // replacement forwards to malloc/free and fails only on a thread that armed
-// it, so every other test is unaffected.
+// it, so every other test is unaffected.  ThreadSanitizer and
+// MemorySanitizer runtimes define the allocation functions themselves, so
+// under them nothing is replaced and these tests are skipped.
 
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
@@ -24,6 +26,19 @@
 #include "cyclone/cyclone_c.h"
 #include "support/temp_cache.hpp"
 
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer) || __has_feature(memory_sanitizer)
+#define CYCLONE_TEST_REPLACE_NEW 0
+#endif
+#endif
+#if !defined(CYCLONE_TEST_REPLACE_NEW) && defined(__SANITIZE_THREAD__)
+#define CYCLONE_TEST_REPLACE_NEW 0
+#endif
+#ifndef CYCLONE_TEST_REPLACE_NEW
+#define CYCLONE_TEST_REPLACE_NEW 1
+#endif
+
+#if CYCLONE_TEST_REPLACE_NEW
 namespace {
 thread_local bool g_fail_allocations = false;
 
@@ -67,6 +82,17 @@ void operator delete[](void *p, const std::nothrow_t &) noexcept {
   std::free(p);
 }
 // NOLINTEND(misc-new-delete-overloads,cert-dcl54-cpp)
+#else
+namespace {
+class FailAllocations {};
+}  // namespace
+#endif
+
+#define SKIP_WITHOUT_ALLOCATION_FAILURE()                              \
+  do {                                                                 \
+    if (!CYCLONE_TEST_REPLACE_NEW)                                     \
+      SKIP("allocation functions are owned by the sanitizer runtime"); \
+  } while (false)
 
 namespace {
 CycloneCacheHandle *make_cache(const TempCacheDir &tmp, std::string &path) {
@@ -98,6 +124,7 @@ bool escapes(Fn &&fn) {
 
 TEST_CASE("C API: allocation failure in a synchronous call returns an error",
           "[c_api][alloc_failure]") {
+  SKIP_WITHOUT_ALLOCATION_FAILURE();
   TempCacheDir tmp;
   std::string path;
   CycloneCacheHandle *cache = make_cache(tmp, path);
@@ -172,6 +199,7 @@ void on_read(void *ud, const char *, size_t len, CycloneError err) {
 
 TEST_CASE("C API: allocation failure in read_async leaves no stuck state",
           "[c_api][alloc_failure][miss_callback]") {
+  SKIP_WITHOUT_ALLOCATION_FAILURE();
   TempCacheDir tmp;
   std::string path;
   CycloneCacheHandle *cache = make_cache(tmp, path);
@@ -198,6 +226,7 @@ TEST_CASE("C API: allocation failure in read_async leaves no stuck state",
 
 TEST_CASE("C API: allocation failure in the miss done callback is contained",
           "[c_api][alloc_failure][miss_callback]") {
+  SKIP_WITHOUT_ALLOCATION_FAILURE();
   TempCacheDir tmp;
   std::string path;
   CycloneCacheHandle *cache = make_cache(tmp, path);
