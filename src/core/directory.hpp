@@ -242,10 +242,11 @@ class SleepBackoff {
 // reader that then gave up would report a key that is present as absent.
 //
 // So the wait has two phases:
-//   1. Fast: kFastAttempts retries exactly as before, with no clock read, so
-//      an uncontended or briefly contended probe costs what it always did.
-//      An attempt that finds the bucket odd spins up to kSpinsPerAttempt
-//      pauses for it to turn even, then yields.
+//   1. Fast: kFastAttempts retries exactly as before, with no clock read
+//      until an attempt has actually spun and yielded, so an uncontended or
+//      briefly contended probe costs what it always did.  An attempt that
+//      finds the bucket odd spins up to kSpinsPerAttempt pauses for it to
+//      turn even, then yields.
 //   2. Timed: past them the writer is presumed descheduled.  Spinning or
 //      sched_yield cannot help a writer waiting on ANOTHER CPU's runqueue,
 //      and would burn this thread's CPU (on an event-loop thread, every
@@ -253,6 +254,14 @@ class SleepBackoff {
 //      exponential backoff from kFirstSleep to kMaxSleep, and makes one
 //      version check per attempt, until kBudget of steady-clock time has
 //      passed.
+// The fast phase is itself bounded by wall time (kFastPhaseCap): a yield is
+// the one step with no bound of its own -- under CPU oversubscription it
+// costs a scheduling quantum (1-4 ms), so 100 clock-free attempts could
+// park a reader for hundreds of milliseconds BEFORE the budget even
+// started.  Past the cap the reader escalates to the sleeping phase, which
+// is the designed response to a merely descheduled writer anyway.  The
+// clock is read only after a spin AND a yield have both failed, so the
+// uncontended probe still never pays for it.
 // Only when the budget is spent does the probe give up, and it reports that
 // as "unknown" (probe_each returns false, which the Volume turns into
 // CacheError::Busy) -- never as a miss.
@@ -281,6 +290,10 @@ class SeqlockReadWait {
   static constexpr size_t kFastAttempts = 100;
   static constexpr size_t kSpinsPerAttempt = 1000;
   static constexpr std::chrono::microseconds kBudget{5000};
+  // Wall-clock bound of the clock-free fast phase (see the class comment):
+  // far above any live writer's odd window (sub-microsecond), far below the
+  // budget it would otherwise delay.
+  static constexpr std::chrono::microseconds kFastPhaseCap{500};
   static constexpr std::chrono::microseconds kFirstSleep{10};
   static constexpr std::chrono::microseconds kMaxSleep{1000};
 
@@ -337,7 +350,28 @@ class SeqlockReadWait {
       }
     }
     std::this_thread::yield();
+    if (fast_phase_past_cap()) {
+      // A yield has no bound of its own (a scheduling quantum under
+      // oversubscription): past the cap, leave the clock-free fast phase;
+      // the next retry() arms the timed phase's deadline.  The current
+      // attempt still completes normally -- an even version it observes is
+      // as valid as any other.
+      _attempts = kFastAttempts;
+    }
     return version;
+  }
+
+  // True once kFastPhaseCap of wall time has passed since this wait's first
+  // completed spin+yield.  Out of line with wait_for_even: it runs only on
+  // the genuinely contended path, never on the inline uncontended one.
+  CYCLONE_SEQLOCK_COLD bool fast_phase_past_cap() {
+    const auto now = std::chrono::steady_clock::now();
+    if (!_fast_started) {
+      _fast_started = true;
+      _fast_start = now;
+      return false;
+    }
+    return now - _fast_start > kFastPhaseCap;
   }
 
   CYCLONE_SEQLOCK_COLD bool timed_retry() {
@@ -372,6 +406,8 @@ class SeqlockReadWait {
   static void cpu_pause() { wait_detail::cpu_pause(); }
 
   size_t _attempts = 0;
+  bool _fast_started = false;
+  std::chrono::steady_clock::time_point _fast_start{};
   std::chrono::steady_clock::time_point _deadline{};
   wait_detail::SleepBackoff<kFirstSleep.count(), kMaxSleep.count()> _backoff;
 };

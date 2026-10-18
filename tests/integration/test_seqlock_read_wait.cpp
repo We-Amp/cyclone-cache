@@ -643,6 +643,82 @@ TEST_CASE(
 
 namespace {
 
+// Spins until released, one per slot: the CPU oversubscription under which
+// a sched_yield costs a scheduling quantum instead of returning at once.
+class CpuHogs {
+ public:
+  explicit CpuHogs(size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+      _hogs.emplace_back([this] {
+        while (!_stop.load(std::memory_order_relaxed)) {
+        }
+      });
+    }
+  }
+  ~CpuHogs() {
+    _stop.store(true, std::memory_order_relaxed);
+    for (auto &hog : _hogs) {
+      hog.join();
+    }
+  }
+  CpuHogs(const CpuHogs &) = delete;
+  CpuHogs &operator=(const CpuHogs &) = delete;
+
+ private:
+  std::atomic<bool> _stop{false};
+  std::vector<std::thread> _hogs;
+};
+
+}  // namespace
+
+template <typename Dir>
+void directory_fast_phase_bounded_under_oversubscription() {
+  // No budget override: the production 5 ms budget.  With the machine
+  // oversubscribed (each yield costs a scheduling quantum), the fast phase
+  // -- 100 attempts of 1000 pause hints plus a yield, never reading the
+  // clock -- could burn hundreds of milliseconds BEFORE the budget even
+  // started.  The fast phase must escalate to the sleeping phase by wall
+  // clock, keeping the whole probe within the budget and small slack.
+  Dir d;
+  const CacheKey key("oversubscribed-fast-phase");
+  REQUIRE(d.dir.insert(key, 4096, 512));
+
+  const unsigned cores = std::thread::hardware_concurrency();
+  const size_t hogs = cores == 0 ? 8 : 2 * cores;
+  CpuHogs busy(hogs);
+
+  d.begin(key);  // The bucket stays odd for the whole probe
+  const auto t0 = std::chrono::steady_clock::now();
+  size_t seen = 0;
+  const bool complete = d.dir.probe_each(key, [&](const DirEntry &) {
+    ++seen;
+    return false;
+  });
+  const auto waited = std::chrono::steady_clock::now() - t0;
+  d.end(key);
+
+  CAPTURE(cores, waited.count());
+  REQUIRE_FALSE(complete);
+  REQUIRE(seen == 0);
+  // The budget is 5 ms; the bound allows for one scheduling quantum of
+  // slack per phase.  The unbounded fast phase spent 100x that.
+  REQUIRE(waited < std::chrono::milliseconds(60));
+}
+
+TEST_CASE(
+    "Seqlock read wait: the clock-free fast phase is bounded by wall time "
+    "under CPU oversubscription",
+    "[directory][mmap_directory][concurrent][lockfree][regression]") {
+  SECTION("Directory") {
+    directory_fast_phase_bounded_under_oversubscription<InMemoryDir>();
+  }
+  SECTION("MmapDirectory") {
+    directory_fast_phase_bounded_under_oversubscription<MappedDir>();
+  }
+}
+
+namespace {
+
 struct AsyncResult {
   bool called = false;
   CycloneError err = CYCLONE_INTERNAL_ERROR;
