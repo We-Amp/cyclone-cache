@@ -275,6 +275,9 @@ bool RamCacheCLFUS::Segment::put(const RamCacheKey& rk,
     auto& entry = *existing->second;
 
     if (entry.in_cache) {
+      // Copy the new body first: if that allocation throws, nothing has
+      // moved and the accounting still matches the stored body.
+      std::vector<std::byte> body(data.begin(), data.end());
       _bytes_used -= entry.data.size();
 
       // A growing overwrite can push the segment past its budget; enforce
@@ -292,7 +295,7 @@ bool RamCacheCLFUS::Segment::put(const RamCacheKey& rk,
       _active_lru.splice(_active_lru.begin(), rescued, rescued.begin());
       _entry_map[entry.key] = _active_lru.begin();
 
-      entry.data.assign(data.begin(), data.end());
+      entry.data = std::move(body);
       entry.stamp = stamp;
       _bytes_used += entry.data.size();
       ++entry.hits;

@@ -111,7 +111,7 @@ std::optional<std::vector<std::byte>> RamCacheLRU::get(const CacheKey& key,
     refresh = it->second;
     // Sampled during the shared window: insertions and splices never
     // invalidate list iterators, only destroying the node does, and every
-    // destroyer bumps the generation counter first.
+    // destroyer also bumps the generation counter.
     generation = _generation.load(std::memory_order_relaxed);
     result.emplace(it->second->data);
   }
