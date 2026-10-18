@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <expected>
 #include <memory>
 #include <shared_mutex>
 #include <thread>
@@ -11,6 +12,7 @@
 
 #include "adaptive_pool.hpp"
 #include "cyclone/config.hpp"
+#include "cyclone/error.hpp"
 #include "cyclone/plugin/optimization.hpp"
 #include "load_monitor.hpp"
 #include "work_queue.hpp"
@@ -25,7 +27,8 @@ struct OptimizationStats {
   uint64_t completed = 0;
   uint64_t cancelled = 0;
   uint64_t failed = 0;
-  uint64_t skipped = 0;  // Skipped due to min_hits_before_optimize
+  uint64_t skipped = 0;     // Skipped due to min_hits_before_optimize
+  uint64_t duplicates = 0;  // Refused: the same item id was already running
 
   WorkQueueStats queue_stats;
   ThreadPoolStats pool_stats;
@@ -42,7 +45,9 @@ class OptimizationEngine : public TaskProvider {
   OptimizationEngine &operator=(const OptimizationEngine &) = delete;
 
   // Lifecycle
-  void start();
+  // start() refuses an invalid config (see OptimizationConfig::is_valid())
+  // with InvalidConfiguration instead of running degraded.
+  std::expected<void, CacheError> start();
   void stop();
 
   // Two-phase stop. request_stop() quiesces intake — stops the
@@ -71,8 +76,14 @@ class OptimizationEngine : public TaskProvider {
                          uint32_t hit_count);
 
   // Access to sub-components
-  LoadMonitor &load_monitor() { return _load_monitor; }
-  const LoadMonitor &load_monitor() const { return _load_monitor; }
+  LoadMonitor &load_monitor() { return *_load_monitor; }
+  const LoadMonitor &load_monitor() const { return *_load_monitor; }
+
+  // Shared handle for write-completion reporting (Cache write handles hold a
+  // weak reference and may outlive this engine).
+  const std::shared_ptr<LoadMonitor> &load_monitor_shared() const {
+    return _load_monitor;
+  }
 
   WorkQueue &work_queue() { return _work_queue; }
   const WorkQueue &work_queue() const { return _work_queue; }
@@ -82,7 +93,16 @@ class OptimizationEngine : public TaskProvider {
   void resume();
   bool is_paused() const noexcept;
 
-  // Get combined statistics
+  // True while load shedding holds the pool paused (only ever with
+  // OptimizationConfig::enable_load_shedding set).
+  bool is_load_shedding() const noexcept {
+    return _load_shedding.load(std::memory_order_acquire);
+  }
+
+  // Get combined statistics.
+  // Not a consistent snapshot: each counter is read on its own.  End counters
+  // (completed, failed) are read before start counters, so an
+  // end never appears to exceed its start.
   OptimizationStats stats() const;
 
   // TaskProvider interface
@@ -97,7 +117,9 @@ class OptimizationEngine : public TaskProvider {
   Cache *_cache;
 
   WorkQueue _work_queue;
-  LoadMonitor _load_monitor;
+  // Shared so Cache write handles can hold a weak reference for reporting
+  // completed writes; such a handle may outlive this engine.
+  std::shared_ptr<LoadMonitor> _load_monitor;
   std::unique_ptr<AdaptiveThreadPool> _thread_pool;
 
   // Plugin list
@@ -119,9 +141,19 @@ class OptimizationEngine : public TaskProvider {
   std::chrono::steady_clock::time_point _load_drop_time;
   bool _in_cooldown{false};
 
-  // Statistics
-  mutable std::mutex _stats_mutex;
-  OptimizationStats _stats;
+  // Statistics counters: incremented on the per-task hot path, so relaxed
+  // atomics read field by field in stats(), never under a mutex.
+  struct alignas(kShardPad) HotCounters {
+    std::atomic<uint64_t> queued{0};
+    std::atomic<uint64_t> completed{0};
+    std::atomic<uint64_t> cancelled{0};
+    std::atomic<uint64_t> failed{0};
+    std::atomic<uint64_t> skipped{0};
+    std::atomic<uint64_t> duplicates{0};
+  };
+  static_assert(alignof(HotCounters) == kShardPad &&
+                sizeof(HotCounters) % kShardPad == 0);
+  HotCounters _stat;
 
   // Cancellation tokens for in-progress work items
   mutable std::mutex _active_work_mutex;

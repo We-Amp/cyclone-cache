@@ -10,6 +10,16 @@
 #include "../core/fork_gate.hpp"
 #include "cyclone/cache.hpp"
 
+// Thread cancellation on glibc is a forced unwind (abi::__forced_unwind),
+// which must not be swallowed: the runtime aborts the process if it is.  The
+// catch-all guards below rethrow it.
+#if defined(__GLIBCXX__) && __has_include(<cxxabi.h>)
+#include <cxxabi.h>
+#define CYCLONE_OPT_FORCED_UNWIND 1
+#else
+#define CYCLONE_OPT_FORCED_UNWIND 0
+#endif
+
 namespace cyclone {
 
 // OptimizationContext implementation
@@ -30,19 +40,26 @@ OptimizationEngine::OptimizationEngine(const OptimizationConfig &config,
     : _config(config),
       _cache(cache),
       _work_queue(config),
-      _load_monitor(config) {
+      _load_monitor(std::make_shared<LoadMonitor>(config)) {
   _thread_pool = std::make_unique<AdaptiveThreadPool>(config, *this);
 }
 
 OptimizationEngine::~OptimizationEngine() { stop(); }
 
-void OptimizationEngine::start() {
+std::expected<void, CacheError> OptimizationEngine::start() {
   if (!_config.enabled) {
-    return;
+    return {};
+  }
+
+  // Refuse a config that would run degraded: a non-positive
+  // scale_check_interval spins the monitoring thread in a sleep_for(0)
+  // loop, and load shedding cannot measure against a missing baseline.
+  if (!_config.is_valid()) {
+    return std::unexpected(CacheError::InvalidConfiguration);
   }
 
   if (_running.exchange(true, std::memory_order_acq_rel)) {
-    return;  // Already running
+    return {};  // Already running
   }
 
   // Before any worker exists: their cache work is fork-gated (see
@@ -50,11 +67,18 @@ void OptimizationEngine::start() {
   install_fork_handlers();
   _start_epoch.store(fork_epoch(), std::memory_order_release);
 
+  // Restart the queue before the pool: the pool's start() resets its own
+  // stop/pause flags, so a stop -> start cycle must clear the queue's stopped
+  // flag too, else restarted workers exit at once on the stopped queue and
+  // every enqueue is refused with Closed.
+  _work_queue.start();
+
   // Start thread pool
   _thread_pool->start();
 
   // Start background monitoring thread
   _monitoring_thread = std::thread([this] { monitoring_loop(); });
+  return {};
 }
 
 void OptimizationEngine::stop() {
@@ -99,8 +123,8 @@ void OptimizationEngine::join_threads() {
   // join_workers() is genuinely terminal and reaps any worker the monitor just
   // spawned (teardown review).
   //
-  // UNBOUNDED joins — not the bounded-join + leak pattern (see
-  // thread_util.hpp). A leaked worker would dereference cache state freed by
+  // UNBOUNDED joins: not a bounded-join-then-leak pattern. A leaked worker
+  // would dereference cache state freed by
   // teardown; a leaked monitor would dereference this engine's own members
   // after ~OptimizationEngine frees them.  The monitor loop re-checks
   // _running frequently and does no blocking I/O, so its join is prompt.  The
@@ -157,8 +181,7 @@ void OptimizationEngine::on_write_complete(const CacheKey &key,
 
   // Check minimum hits threshold
   if (hit_count < _config.min_hits_before_optimize) {
-    std::lock_guard stats_lock(_stats_mutex);
-    ++_stats.skipped;
+    _stat.skipped.fetch_add(1, std::memory_order_relaxed);
     return;
   }
 
@@ -171,33 +194,44 @@ void OptimizationEngine::on_write_complete(const CacheKey &key,
 
   // Ask each plugin what optimizations to queue
   for (const auto &plugin : current_plugins) {
-    auto plan = plugin->plan_optimization(key, header, content_length,
-                                          written_alternate, hit_count);
+    // plan_optimization()/estimate_memory() are embedder-supplied code running
+    // on the caller's own thread: an exception must not escape into the
+    // caller's write path.  Record the failure and move to the next plugin.
+    try {
+      auto plan = plugin->plan_optimization(key, header, content_length,
+                                            written_alternate, hit_count);
 
-    for (const auto &target : plan.targets) {
-      WorkItem item;
-      item.id.key = key;
-      item.id.target_alternate = target.target_alternate;
-      item.plugin_id = plugin->info().plugin_id;
-      item.priority = target.priority;
-      item.hit_count = hit_count;
-      item.content_length = content_length;
-      // Get memory estimate and clamp to reasonable bounds (1KB - 1GB)
-      constexpr size_t kMinMemoryEstimate = 1024;
-      constexpr size_t kMaxMemoryEstimate = 1024ULL * 1024 * 1024;
-      size_t mem_estimate = target.estimated_memory > 0
-                                ? target.estimated_memory
-                                : plugin->estimate_memory(
-                                      content_length, target.target_alternate);
-      item.estimated_memory =
-          std::clamp(mem_estimate, kMinMemoryEstimate, kMaxMemoryEstimate);
-      item.deferrable = target.deferrable;
+      for (const auto &target : plan.targets) {
+        WorkItem item;
+        item.id.key = key;
+        item.id.target_alternate = target.target_alternate;
+        item.plugin_id = plugin->info().plugin_id;
+        item.priority = target.priority;
+        item.hit_count = hit_count;
+        item.content_length = content_length;
+        // Get memory estimate and clamp to reasonable bounds (1KB - 1GB)
+        constexpr size_t kMinMemoryEstimate = 1024;
+        constexpr size_t kMaxMemoryEstimate = 1024ULL * 1024 * 1024;
+        size_t mem_estimate =
+            target.estimated_memory > 0
+                ? target.estimated_memory
+                : plugin->estimate_memory(content_length,
+                                          target.target_alternate);
+        item.estimated_memory =
+            std::clamp(mem_estimate, kMinMemoryEstimate, kMaxMemoryEstimate);
+        item.deferrable = target.deferrable;
 
-      auto result = _work_queue.enqueue(item);
-      if (result.has_value()) {
-        std::lock_guard stats_lock(_stats_mutex);
-        ++_stats.queued;
+        auto result = _work_queue.enqueue(item);
+        if (result.has_value()) {
+          _stat.queued.fetch_add(1, std::memory_order_relaxed);
+        }
       }
+#if CYCLONE_OPT_FORCED_UNWIND
+    } catch (abi::__forced_unwind &) {
+      throw;
+#endif
+    } catch (...) {
+      _stat.failed.fetch_add(1, std::memory_order_relaxed);
     }
   }
 }
@@ -218,11 +252,17 @@ bool OptimizationEngine::is_paused() const noexcept {
 }
 
 OptimizationStats OptimizationEngine::stats() const {
-  std::lock_guard lock(_stats_mutex);
-  OptimizationStats result = _stats;
+  OptimizationStats result;
+  // End counters first (acquire keeps the later loads after them).
+  result.completed = _stat.completed.load(std::memory_order_acquire);
+  result.cancelled = _stat.cancelled.load(std::memory_order_acquire);
+  result.failed = _stat.failed.load(std::memory_order_acquire);
+  result.queued = _stat.queued.load(std::memory_order_relaxed);
+  result.skipped = _stat.skipped.load(std::memory_order_relaxed);
+  result.duplicates = _stat.duplicates.load(std::memory_order_relaxed);
   result.queue_stats = _work_queue.stats();
   result.pool_stats = _thread_pool->stats();
-  result.load_metrics = _load_monitor.metrics();
+  result.load_metrics = _load_monitor->metrics();
   return result;
 }
 
@@ -260,137 +300,177 @@ void OptimizationEngine::process_work_item(WorkItem item) {
 
   // Create cancellation token
   auto cancelled = std::make_shared<std::atomic<bool>>(false);
+  bool refused = false;
   {
     std::lock_guard lock(_active_work_mutex);
-    _active_work[item.id] = cancelled;
-  }
-
-  // Find the plugin that queued this work item
-  std::shared_ptr<OptimizationPlugin> plugin;
-  {
-    std::shared_lock lock(_plugins_mutex);
-    for (const auto &p : _plugins) {
-      if (p->info().plugin_id == item.plugin_id) {
-        plugin = p;
-        break;
-      }
+    // dequeue() erased this id from the queue's dedup set, so the same id can
+    // be re-enqueued and picked up by another worker while this instance is
+    // still running.  Refuse the duplicate: overwriting the existing entry
+    // would evict the running instance's token (request_stop() could no
+    // longer signal it) and both instances would race the same alternate
+    // write.  The next on_write_complete() re-queues the id once this
+    // instance has finished.
+    if (!_active_work.try_emplace(item.id, cancelled).second) {
+      refused = true;
     }
   }
-
-  if (!plugin) {
-    std::lock_guard lock(_active_work_mutex);
-    _active_work.erase(item.id);
+  if (refused) {
+    _stat.duplicates.fetch_add(1, std::memory_order_relaxed);
     return;
   }
 
-  // Read source content from cache.
-  // Note: If the original content was evicted while this work item was queued,
-  // the read will fail. This is expected behavior - we simply increment the
-  // 'failed' stat and move on. The optimization can be re-queued on next
-  // access.
-  //
-  // The handle stays open across transform() (its spans are the plugin's
-  // input) and is closed after the write, as before.  Holding or closing it
-  // outside a pass is fine: a read handle is a lease, not a lock.
-  std::optional<ReadHandle> source;
-  bool read_pass_entered = false;
-  {
-    ForkGatedPass pass(_running);
-    if (pass) {
-      read_pass_entered = true;
-      auto read_result = _cache->read_sync(item.id.key);
-      if (read_result) {
-        source.emplace(std::move(*read_result));
+  // Erase this instance's in-flight token on every way out, including the
+  // forced unwind a thread cancellation raises (which must propagate): a
+  // token left behind would refuse every later item for this id.  Only the
+  // entry that is still this instance's goes: the token is erased early,
+  // after the transform, and a later same-id instance may hold a fresh one.
+  struct TokenGuard {
+    OptimizationEngine &engine;
+    const WorkItemId &id;
+    const std::shared_ptr<std::atomic<bool>> &token;
+    ~TokenGuard() {
+      std::lock_guard lock(engine._active_work_mutex);
+      auto it = engine._active_work.find(id);
+      if (it != engine._active_work.end() && it->second == token) {
+        engine._active_work.erase(it);
       }
     }
-  }
-  if (!source) {
-    if (read_pass_entered) {
-      std::lock_guard stats_lock(_stats_mutex);
-      ++_stats.failed;
+  } token_guard{*this, item.id, cancelled};
+
+  // Everything below runs embedder-supplied plugin code (transform,
+  // on_cancelled) and cache operations that may throw (allocation failure).
+  // An exception escaping the worker would terminate the host process, and an
+  // unwind without the token erase would refuse every later item for this
+  // id, so the whole body is guarded and the failure is recorded.
+  try {
+    // Find the plugin that queued this work item
+    std::shared_ptr<OptimizationPlugin> plugin;
+    {
+      std::shared_lock lock(_plugins_mutex);
+      for (const auto &p : _plugins) {
+        if (p->info().plugin_id == item.plugin_id) {
+          plugin = p;
+          break;
+        }
+      }
     }
-    std::lock_guard lock(_active_work_mutex);
-    _active_work.erase(item.id);
-    return;
-  }
 
-  auto &handle = *source;
+    if (!plugin) {
+      std::lock_guard lock(_active_work_mutex);
+      _active_work.erase(item.id);
+      return;
+    }
 
-  // Get header and content
-  auto header_data = handle.header();
-  auto content_data = handle.content();
+    // Read source content from cache.
+    // Note: If the original content was evicted while this work item was
+    // queued, the read will fail. This is expected behavior - we simply
+    // increment the 'failed' stat and move on. The optimization can be
+    // re-queued on next access.
+    //
+    // The handle stays open across transform() (its spans are the plugin's
+    // input) and is closed after the write, as before.  Holding or closing it
+    // outside a pass is fine: a read handle is a lease, not a lock.
+    std::optional<ReadHandle> source;
+    bool read_pass_entered = false;
+    {
+      ForkGatedPass pass(_running);
+      if (pass) {
+        read_pass_entered = true;
+        // Not reported as load: this is the engine's own work.
+        auto read_result = _cache->read_sync_unrecorded(item.id.key);
+        if (read_result) {
+          source.emplace(std::move(*read_result));
+        }
+      }
+    }
+    if (!source) {
+      if (read_pass_entered) {
+        _stat.failed.fetch_add(1, std::memory_order_relaxed);
+      }
+      std::lock_guard lock(_active_work_mutex);
+      _active_work.erase(item.id);
+      return;
+    }
 
-  // Create optimization context
-  OptimizationContext ctx(item.id.key, header_data, content_data,
-                          item.hit_count, _cache, *cancelled);
+    auto &handle = *source;
 
-  // Perform transformation
-  auto transform_result = plugin->transform(item.id.target_alternate, ctx);
+    // Get header and content
+    auto header_data = handle.header();
+    auto content_data = handle.content();
 
-  // Remove from active work
-  {
-    std::lock_guard lock(_active_work_mutex);
-    _active_work.erase(item.id);
-  }
+    // Create optimization context
+    OptimizationContext ctx(item.id.key, header_data, content_data,
+                            item.hit_count, _cache, *cancelled);
 
-  if (!transform_result) {
-    if (transform_result.error() == CacheError::OptimizationCancelled) {
+    // Perform transformation
+    auto transform_result = plugin->transform(item.id.target_alternate, ctx);
+
+    // Remove from active work
+    {
+      std::lock_guard lock(_active_work_mutex);
+      _active_work.erase(item.id);
+    }
+
+    if (!transform_result) {
+      if (transform_result.error() == CacheError::OptimizationCancelled) {
+        plugin->on_cancelled(item.id.key, item.id.target_alternate);
+        _stat.cancelled.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        _stat.failed.fetch_add(1, std::memory_order_relaxed);
+      }
+      return;
+    }
+
+    // Write the new alternate to cache: the second pass, to the end of the
+    // function.
+    ForkGatedPass write_pass(_running);
+    if (!write_pass) {
+      // No pass is open here, so calling the plugin is allowed.
       plugin->on_cancelled(item.id.key, item.id.target_alternate);
-      std::lock_guard stats_lock(_stats_mutex);
-      ++_stats.cancelled;
-    } else {
-      std::lock_guard stats_lock(_stats_mutex);
-      ++_stats.failed;
+      _stat.cancelled.fetch_add(1, std::memory_order_relaxed);
+      return;
     }
-    return;
+
+    auto write_result = _cache->write_alternate_sync_unrecorded(
+        item.id.key, transform_result->alternate_id,
+        transform_result->content.size());
+
+    if (!write_result) {
+      _stat.failed.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    auto &write_handle = *write_result;
+
+    // Write header
+    write_handle.set_header(transform_result->header);
+
+    // Write content
+    auto write_content_result =
+        write_handle.write_sync(transform_result->content);
+    if (!write_content_result) {
+      write_handle.abort();
+      _stat.failed.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    // Close/commit
+    auto close_result = write_handle.close_sync();
+    if (!close_result) {
+      _stat.failed.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    _stat.completed.fetch_add(1, std::memory_order_relaxed);
+#if CYCLONE_OPT_FORCED_UNWIND
+  } catch (abi::__forced_unwind &) {
+    throw;
+#endif
+  } catch (...) {
+    // Count the item as failed and drop it like any failed transform; the
+    // token guard releases the in-flight token.
+    _stat.failed.fetch_add(1, std::memory_order_relaxed);
   }
-
-  // Write the new alternate to cache: the second pass, to the end of the
-  // function.
-  ForkGatedPass write_pass(_running);
-  if (!write_pass) {
-    // No pass is open here, so calling the plugin is allowed.
-    plugin->on_cancelled(item.id.key, item.id.target_alternate);
-    std::lock_guard stats_lock(_stats_mutex);
-    ++_stats.cancelled;
-    return;
-  }
-
-  auto write_result =
-      _cache->write_alternate_sync(item.id.key, transform_result->alternate_id,
-                                   transform_result->content.size());
-
-  if (!write_result) {
-    std::lock_guard stats_lock(_stats_mutex);
-    ++_stats.failed;
-    return;
-  }
-
-  auto &write_handle = *write_result;
-
-  // Write header
-  write_handle.set_header(transform_result->header);
-
-  // Write content
-  auto write_content_result =
-      write_handle.write_sync(transform_result->content);
-  if (!write_content_result) {
-    write_handle.abort();
-    std::lock_guard stats_lock(_stats_mutex);
-    ++_stats.failed;
-    return;
-  }
-
-  // Close/commit
-  auto close_result = write_handle.close_sync();
-  if (!close_result) {
-    std::lock_guard stats_lock(_stats_mutex);
-    ++_stats.failed;
-    return;
-  }
-
-  std::lock_guard stats_lock(_stats_mutex);
-  ++_stats.completed;
 }
 
 void OptimizationEngine::monitoring_loop() {
@@ -410,10 +490,12 @@ void OptimizationEngine::monitoring_loop() {
     }
 
     // Update load metrics
-    _load_monitor.update_metrics();
+    _load_monitor->update_metrics();
 
-    // Check for load shedding
-    if (_load_monitor.is_above_high_watermark()) {
+    // Check for load shedding (opt-in: see
+    // OptimizationConfig::enable_load_shedding)
+    if (_config.enable_load_shedding &&
+        _load_monitor->is_above_high_watermark()) {
       _in_cooldown = false;  // Reset cooldown if load goes back up
       if (!_load_shedding.exchange(true, std::memory_order_acq_rel)) {
         // Just crossed above high watermark
@@ -422,12 +504,11 @@ void OptimizationEngine::monitoring_loop() {
         // Cancel deferrable work
         size_t cancelled = _work_queue.cancel_deferrable();
         if (cancelled > 0) {
-          std::lock_guard lock(_stats_mutex);
-          _stats.cancelled += cancelled;
+          _stat.cancelled.fetch_add(cancelled, std::memory_order_relaxed);
         }
       }
     } else if (_load_shedding.load(std::memory_order_acquire) &&
-               _load_monitor.is_below_low_watermark()) {
+               _load_monitor->is_below_low_watermark()) {
       // Crossed below low watermark, start cooldown if not already started
       auto now = std::chrono::steady_clock::now();
       if (!_in_cooldown) {

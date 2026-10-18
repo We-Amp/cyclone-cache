@@ -2,6 +2,7 @@
 // Copyright (c) 2024-2026 We-Amp B.V.
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -100,6 +101,43 @@ TEST_CASE("MmapDirectory init fails with insufficient region",
   auto dir = MmapDirectory::init(std::span<std::byte>(region), kBuckets);
 
   REQUIRE_FALSE(dir.has_value());
+}
+
+namespace {
+
+// What an open() of the region found while init() was still writing it.
+bool g_opened_mid_init = false;
+
+void open_mid_init(std::span<std::byte> region) {
+  g_opened_mid_init = MmapDirectory::open(region).has_value();
+}
+
+}  // namespace
+
+TEST_CASE("MmapDirectory init publishes the header magic last",
+          "[mmap_directory]") {
+  // An open() that lands while init() is still writing (a peer, or the
+  // next opener after a crash in init) must not accept the region: its
+  // bucket versions and entries are not all written yet.  That holds over
+  // recycled memory too, which starts with an old directory's valid magic.
+  constexpr size_t kBuckets = 256;
+  std::vector<std::byte> region(MmapDirectory::required_size(kBuckets),
+                                std::byte{0});
+  const bool recycled = GENERATE(false, true);
+  CAPTURE(recycled);
+  if (recycled) {
+    REQUIRE(MmapDirectory::init(std::span<std::byte>(region), kBuckets));
+  }
+
+  g_opened_mid_init = true;
+  MmapDirectory::s_init_before_publish_for_test = &open_mid_init;
+  auto dir = MmapDirectory::init(std::span<std::byte>(region), kBuckets);
+  MmapDirectory::s_init_before_publish_for_test = nullptr;
+
+  REQUIRE(dir.has_value());
+  CHECK_FALSE(g_opened_mid_init);
+  // Published once init() returned.
+  CHECK(MmapDirectory::open(std::span<std::byte>(region)).has_value());
 }
 
 TEST_CASE("MmapDirectory open existing directory", "[mmap_directory]") {
@@ -361,6 +399,27 @@ TEST_CASE("MmapDirectory bucket overflow handled gracefully",
   // an empty one, so the evictions above make it trail the insert count.
   REQUIRE(dir.count() < static_cast<size_t>(successful_inserts));
   REQUIRE(dir.count() <= kBuckets * MmapDirectory::kEntriesPerBucket);
+}
+
+TEST_CASE("MmapDirectory entry count stops at zero instead of wrapping",
+          "[mmap_directory]") {
+  // The count is updated after the bucket is released, so a process that
+  // died in between left it one short.  The next removal of that entry must
+  // leave the count at zero, not wrap it to about four billion.
+  constexpr size_t kBuckets = 256;
+  std::vector<std::byte> region(MmapDirectory::required_size(kBuckets));
+  auto dir = MmapDirectory::init(std::span<std::byte>(region), kBuckets);
+  REQUIRE(dir.has_value());
+  const CacheKey key("count-one-short");
+  REQUIRE(dir->insert(key, 4096, 512));
+  REQUIRE(dir->count() == 1);
+
+  // The entry is there, the count says it is not.
+  const uint32_t zero = 0;
+  std::memcpy(region.data() + offsetof(MmapDirectory::Header, entry_count),
+              &zero, sizeof(zero));
+  REQUIRE(dir->remove(key));
+  CHECK(dir->count() == 0);
 }
 
 TEST_CASE("MmapDirectory GC phase toggle", "[mmap_directory]") {

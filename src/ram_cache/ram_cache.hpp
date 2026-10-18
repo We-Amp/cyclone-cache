@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -16,6 +18,16 @@
 #include "cyclone/key.hpp"
 
 namespace cyclone {
+
+// Increment a per-entry hit counter without wrapping: at the maximum it stays
+// there, so a very hot entry is never mistaken for a cold one.
+inline void saturating_increment(std::atomic<uint32_t>& counter) noexcept {
+  uint32_t current = counter.load(std::memory_order_relaxed);
+  while (current != UINT32_MAX &&
+         !counter.compare_exchange_weak(current, current + 1,
+                                        std::memory_order_relaxed)) {
+  }
+}
 
 // Composite key for alternate-aware RAM cache.
 // Each (CacheKey, AlternateId) pair is a distinct cache entry, so

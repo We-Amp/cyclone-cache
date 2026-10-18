@@ -167,6 +167,10 @@ const char *seam_name(Seam s) {
       return "after-epoch-store";
     case Seam::kAfterPublish:
       return "after-publish";
+    case Seam::kBeforeAlternatePublish:
+      return "before-alternate-publish";
+    case Seam::kBeforePlainPublish:
+      return "before-plain-publish";
   }
   return "?";
 }
@@ -3061,6 +3065,95 @@ TEST_CASE(
       REQUIRE_FALSE(closed.has_value());
       REQUIRE(closed.error() == CacheError::TooManyAlternates);
     }
+    c->stop();
+  }
+}
+
+TEST_CASE(
+    "Retention R4: a carry does not take a retained node whose bytes were "
+    "replaced by another fill since the walk",
+    "[retention][carry][alternate][usurp]") {
+  // A taken-over writer's late fill can land on a node of a retained chain
+  // between the write's walk, which bound the node by its serial, and the
+  // copy.  The bytes there are then a complete, valid document of the key
+  // carrying another fill's serial.  Carrying them would re-stamp them with
+  // the new slot's serial and publish them as the key's: the copy must be
+  // dropped instead.  Simulated at the seam between choosing the sources
+  // and copying them, by writing such a document over the Gzip node.
+  for (const bool mp : {false, true}) {
+    CAPTURE(mp);
+    TempCacheDir tmp(mp ? "r4-late-src-mp" : "r4-late-src");
+    auto c = carry_open(tmp.path(), mp);
+    const std::string file = c->volume_files().at(0).file_path;
+    const auto filler = rv_fill(99, 60000);
+    size_t fi = 0;
+    const CarryChain ch;
+    ch.build(*c, fi, filler);
+    REQUIRE(ch.old_complete(*c));
+    auto listed = c->list_alternates_sync(CacheKey(ch.key));
+    REQUIRE(listed.has_value());
+    uint64_t gz_doc = 0;
+    for (const AlternateInfo &a : *listed) {
+      if (a.id == AlternateId::Gzip) {
+        gz_doc = a.disk_offset;
+      }
+    }
+    REQUIRE(gz_doc != 0);
+
+    // The replacement: the same key, id and length, other content, a valid
+    // checksum, the node's pass stamp and link, and another fill serial.
+    std::vector<std::byte> on_disk(Document::kHeaderSize);
+    {
+      std::ifstream in(file, std::ios::binary);
+      in.seekg(static_cast<std::streamoff>(gz_doc));
+      in.read(reinterpret_cast<char *>(on_disk.data()),
+              static_cast<std::streamsize>(on_disk.size()));
+      REQUIRE(in.good());
+    }
+    const Document node = Document::deserialize(on_disk);
+    const auto late_content = rv_fill(77, ch.gz.size());
+    auto late = DocumentBuilder()
+                    .set_key(CacheKey(ch.key))
+                    .set_content(late_content)
+                    .set_type(Document::Type::SingleFrag)
+                    .set_alternate_id(static_cast<uint8_t>(AlternateId::Gzip))
+                    .set_next_alternate_offset(node.next_alternate_offset)
+                    .set_hit_count(0)
+                    .set_last_access(node.last_access)
+                    .enable_checksum(true)
+                    .build();
+    REQUIRE(late.size() == node.len);
+    const uint32_t other_serial = node.fill_serial + 1;
+    std::memcpy(late.data() + Document::kWriteSerialOffset, &node.write_serial,
+                sizeof(node.write_serial));
+    std::memcpy(late.data() + Document::kFillSerialOffset, &other_serial,
+                sizeof(other_serial));
+
+    std::atomic<int> landed{0};
+    Volume::s_carry_seam_for_test = [&](Volume::CarrySeam at) {
+      if (at != Volume::CarrySeam::kSourcesChosen || landed.fetch_add(1) != 0) {
+        return;
+      }
+      std::fstream out(file, std::ios::binary | std::ios::in | std::ios::out);
+      out.seekp(static_cast<std::streamoff>(gz_doc));
+      out.write(reinterpret_cast<const char *>(late.data()),
+                static_cast<std::streamsize>(late.size()));
+    };
+    const auto st0 = c->stats();
+    const bool wrote = rv_put_alt(*c, ch.key, AlternateId::AVIF, ch.avif);
+    Volume::s_carry_seam_for_test = nullptr;
+    const auto st1 = c->stats();
+    REQUIRE(wrote);
+    REQUIRE(landed.load() >= 1);
+
+    // The Gzip node was not carried; the others were.
+    CHECK(rv_ids(*c, ch.key) == std::set<int>{0, 16, 17});
+    CHECK(st1.alternates_carried_forward - st0.alternates_carried_forward == 2);
+    CHECK(st1.alternates_carry_dropped - st0.alternates_carry_dropped == 1);
+    CHECK_FALSE(rv_serves_alt(*c, ch.key, AlternateId::Gzip, late_content));
+    CHECK(rv_serves_alt(*c, ch.key, AlternateId::Original, ch.orig));
+    CHECK(rv_serves_alt(*c, ch.key, AlternateId::WebP, ch.webp));
+    CHECK(rv_serves_alt(*c, ch.key, AlternateId::AVIF, ch.avif));
     c->stop();
   }
 }

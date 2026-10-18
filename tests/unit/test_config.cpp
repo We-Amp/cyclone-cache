@@ -3,6 +3,7 @@
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <limits>
 #include <thread>
 
 #include "cyclone/config.hpp"
@@ -164,6 +165,69 @@ TEST_CASE("OptimizationConfig watermark invariant", "[config]") {
     REQUIRE(opt.load_low_watermark == 0.6);
     REQUIRE(opt.load_high_watermark > 0.6);
     REQUIRE(opt.load_high_watermark == Catch::Approx(0.6 / 0.6));
+  }
+}
+
+// The monitoring loop sleeps scale_check_interval between passes; a
+// non-positive interval would spin it in a sleep_for(0) loop.  The setter
+// clamps to a positive minimum.
+TEST_CASE("OptimizationConfig clamps a zero scale check interval",
+          "[config][regression]") {
+  OptimizationConfig opt;
+  opt.set_scale_check_interval(std::chrono::milliseconds{0});
+  REQUIRE(opt.scale_check_interval >= std::chrono::milliseconds{1});
+  opt.set_scale_check_interval(std::chrono::milliseconds{-5});
+  REQUIRE(opt.scale_check_interval >= std::chrono::milliseconds{1});
+  opt.set_scale_check_interval(std::chrono::milliseconds{250});
+  REQUIRE(opt.scale_check_interval == std::chrono::milliseconds{250});
+}
+
+TEST_CASE("OptimizationConfig validation", "[config]") {
+  SECTION("defaults are valid") { REQUIRE(OptimizationConfig{}.is_valid()); }
+
+  SECTION("a non-positive scale check interval is invalid") {
+    OptimizationConfig opt;
+    opt.scale_check_interval = std::chrono::milliseconds{0};
+    REQUIRE_FALSE(opt.is_valid());
+    opt.scale_check_interval = std::chrono::milliseconds{-1};
+    REQUIRE_FALSE(opt.is_valid());
+  }
+
+  SECTION("an automatic maximum never falls below min_threads") {
+    OptimizationConfig opt;
+    opt.max_threads = 0;
+    opt.min_threads = 4096;
+    REQUIRE(opt.effective_max_threads() >= opt.min_threads);
+    REQUIRE(opt.is_valid());
+  }
+
+  SECTION("an explicit maximum below min_threads is invalid") {
+    OptimizationConfig opt;
+    opt.min_threads = 4;
+    opt.max_threads = 2;
+    REQUIRE_FALSE(opt.is_valid());
+    opt.max_threads = 4;
+    REQUIRE(opt.is_valid());
+  }
+
+  SECTION("load shedding requires measurable baselines") {
+    OptimizationConfig opt;
+    opt.enable_load_shedding = true;
+    opt.baseline_ops_per_sec = 0.0;
+    REQUIRE_FALSE(opt.is_valid());
+    opt.baseline_ops_per_sec = 1000.0;
+    opt.baseline_bytes_per_sec = std::numeric_limits<double>::quiet_NaN();
+    REQUIRE_FALSE(opt.is_valid());
+    opt.baseline_bytes_per_sec = 1000.0;
+    REQUIRE(opt.is_valid());
+  }
+
+  SECTION("non-positive baselines are allowed without load shedding") {
+    // LoadMonitor treats them as "no contribution" (fail open).
+    OptimizationConfig opt;
+    opt.baseline_ops_per_sec = 0.0;
+    opt.baseline_bytes_per_sec = 0.0;
+    REQUIRE(opt.is_valid());
   }
 }
 

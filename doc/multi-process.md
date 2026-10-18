@@ -221,7 +221,7 @@ holder's budget plus the 2 ms confirmation:
 | Lock | Longest capped wait |
 |------|---------------------|
 | Bucket seqlock | About 0.5 s. |
-| Phase lock | About 1.25 s. An insert takes the phase lock, then a bucket, so an insert can wait about 1.75 s. |
+| Phase lock | About 1.25 s. An insert takes the bucket and only tries the phase lock while it holds it; when the phase lock is busy it releases the bucket, waits for the phase lock holding nothing (this wait, up to about 1.25 s), and retries a bounded number of times. A wedged bucket or phase lock therefore never keeps another bucket, or readers of this one, waiting behind a held bucket. One insert as a whole: about one recovery plus short waits, under 2 s (a bucket wait of up to about 0.5 s, then at most one phase-lock wait that runs to its budget, about 1.25 s, since that wait recovers a wedged holder and later holders keep the lock only for a bracket). Its hard ceiling, if every one of its waits ran to its cap, is about 7.5 s: 5 bucket waits and 4 phase-lock waits (`kInsertPhaseAttempts`). It then reports Busy and publishes nothing. |
 | Write lock | About 0.3 s behind a dead holder. About 5.25 s behind a live holder it cannot prove dead, the pathological case the escalation exists for. |
 
 Three waits stay uncapped, because giving up there would leave work half
@@ -800,7 +800,7 @@ switch (result.error()) {
 
 ## On-Disk Format Versions
 
-The current on-disk format major version is **v8**
+The current on-disk format major version is **v9**
 (`VolumeHeader::kFormatVersionMajor` and `Document::kVersionMajor`, kept in
 lockstep). Version history:
 
@@ -812,10 +812,11 @@ lockstep). Version history:
 | v6 | `hit_count` / `next_alternate_offset` / `last_access` laid out naturally aligned, so the in-place header RMW sites can store them atomically |
 | v7 | alternate chains are depth-bounded at write time; the bump leaves pre-bound (over-deep, possibly cyclic) chains behind rather than repairing them |
 | v8 | the document checksum is CRC-32C (Castagnoli) instead of CRC-32/ISO-HDLC, so it has hardware instructions on x86-64 as well as ARMv8; pre-v8 checksums were computed over a different polynomial and the bump leaves those rings behind |
+| v9 | the document checksum also covers the fixed document header (every field that never changes after the write); no byte of the layout moved, but every pre-v9 checksum covers less and would fail verification, so the bump leaves those rings behind. The document's `sync_serial` became `fill_serial` and the directory entry's unused `next` word its 16-bit twin, and `next_alternate_offset` carries the successor's serial in bits 48-63 above its 40-bit offset: all carry the serial of the write that filled the document, and a read uses a document only when the serial of the entry or link it was reached through agrees |
 
 ### Automatic Migration
 
-Migration is automatic: opening a volume whose major version predates v8
+Migration is automatic: opening a volume whose major version predates v9
 resets (reinitializes) it with the current format, losing the cached data —
 entries are cache data, so the cost is a one-time miss spike while the cache
 re-populates. With `auto_reset_on_incompatible = false`, the open fails with

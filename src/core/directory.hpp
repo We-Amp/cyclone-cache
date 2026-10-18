@@ -74,8 +74,12 @@ struct alignas(2) DirEntry {
   [[nodiscard]] bool pinned() const;
   void set_pinned(bool pinned);
 
-  [[nodiscard]] uint16_t next() const;
-  void set_next(uint16_t next);
+  // The serial of the fill that wrote the document this entry publishes
+  // (Document::fill_serial).  A read serves the document only when its own
+  // fill_serial matches.  Was the ATS-style bucket-chain `next` word, which
+  // nothing ever linked.
+  [[nodiscard]] uint16_t fill_serial() const;
+  void set_fill_serial(uint16_t serial);
 
   [[nodiscard]] bool is_empty() const;
   void clear();
@@ -150,8 +154,11 @@ struct InsertChoice {
 // then land beside the key's real entry (the entry it meant to update in
 // place is gone), giving the key two heads -- and the next write of the key
 // elects one and clears the other, silently dropping every alternate only
-// the cleared chain held.  The insert therefore publishes only when the
-// bucket still holds what the writer saw; see publish_view_is_current.
+// the cleared chain held.  A plain write has the same window between its
+// election of the entry to update in place and its insert, and without the
+// check leaves two live entries for the key, the later write shadowed by the
+// earlier one.  The insert therefore publishes only when the bucket still
+// holds what the writer saw; see publish_view_is_current.
 struct PublishView {
   std::span<const uint64_t> seen_offsets;
 };
@@ -235,10 +242,11 @@ class SleepBackoff {
 // reader that then gave up would report a key that is present as absent.
 //
 // So the wait has two phases:
-//   1. Fast: kFastAttempts retries exactly as before, with no clock read, so
-//      an uncontended or briefly contended probe costs what it always did.
-//      An attempt that finds the bucket odd spins up to kSpinsPerAttempt
-//      pauses for it to turn even, then yields.
+//   1. Fast: kFastAttempts retries exactly as before, with no clock read
+//      until an attempt has actually spun and yielded, so an uncontended or
+//      briefly contended probe costs what it always did.  An attempt that
+//      finds the bucket odd spins up to kSpinsPerAttempt pauses for it to
+//      turn even, then yields.
 //   2. Timed: past them the writer is presumed descheduled.  Spinning or
 //      sched_yield cannot help a writer waiting on ANOTHER CPU's runqueue,
 //      and would burn this thread's CPU (on an event-loop thread, every
@@ -246,6 +254,14 @@ class SleepBackoff {
 //      exponential backoff from kFirstSleep to kMaxSleep, and makes one
 //      version check per attempt, until kBudget of steady-clock time has
 //      passed.
+// The fast phase is itself bounded by wall time (kFastPhaseCap): a yield is
+// the one step with no bound of its own -- under CPU oversubscription it
+// costs a scheduling quantum (1-4 ms), so 100 clock-free attempts could
+// park a reader for hundreds of milliseconds BEFORE the budget even
+// started.  Past the cap the reader escalates to the sleeping phase, which
+// is the designed response to a merely descheduled writer anyway.  The
+// clock is read only after a spin AND a yield have both failed, so the
+// uncontended probe still never pays for it.
 // Only when the budget is spent does the probe give up, and it reports that
 // as "unknown" (probe_each returns false, which the Volume turns into
 // CacheError::Busy) -- never as a miss.
@@ -261,7 +277,9 @@ class SleepBackoff {
 // nanoseconds of its own work, so the budget is only spent while a writer
 // waits to be scheduled again, or on a bucket whose holder is stuck (a
 // process that died mid-update); the next write to the bucket by its owner
-// releases that one (Volume::writer_probe).
+// releases that one (Volume::writer_probe), and so does a reader that keeps
+// finding the same holder there for the writers' bucket budget, 250 ms
+// (MmapDirectory::reader_recover_stuck_bucket).
 #if defined(_MSC_VER)
 #define CYCLONE_SEQLOCK_COLD __declspec(noinline)
 #else
@@ -272,6 +290,10 @@ class SeqlockReadWait {
   static constexpr size_t kFastAttempts = 100;
   static constexpr size_t kSpinsPerAttempt = 1000;
   static constexpr std::chrono::microseconds kBudget{5000};
+  // Wall-clock bound of the clock-free fast phase (see the class comment):
+  // far above any live writer's odd window (sub-microsecond), far below the
+  // budget it would otherwise delay.
+  static constexpr std::chrono::microseconds kFastPhaseCap{500};
   static constexpr std::chrono::microseconds kFirstSleep{10};
   static constexpr std::chrono::microseconds kMaxSleep{1000};
 
@@ -328,7 +350,28 @@ class SeqlockReadWait {
       }
     }
     std::this_thread::yield();
+    if (fast_phase_past_cap()) {
+      // A yield has no bound of its own (a scheduling quantum under
+      // oversubscription): past the cap, leave the clock-free fast phase;
+      // the next retry() arms the timed phase's deadline.  The current
+      // attempt still completes normally -- an even version it observes is
+      // as valid as any other.
+      _attempts = kFastAttempts;
+    }
     return version;
+  }
+
+  // True once kFastPhaseCap of wall time has passed since this wait's first
+  // completed spin+yield.  Out of line with wait_for_even: it runs only on
+  // the genuinely contended path, never on the inline uncontended one.
+  CYCLONE_SEQLOCK_COLD bool fast_phase_past_cap() {
+    const auto now = std::chrono::steady_clock::now();
+    if (!_fast_started) {
+      _fast_started = true;
+      _fast_start = now;
+      return false;
+    }
+    return now - _fast_start > kFastPhaseCap;
   }
 
   CYCLONE_SEQLOCK_COLD bool timed_retry() {
@@ -363,6 +406,8 @@ class SeqlockReadWait {
   static void cpu_pause() { wait_detail::cpu_pause(); }
 
   size_t _attempts = 0;
+  bool _fast_started = false;
+  std::chrono::steady_clock::time_point _fast_start{};
   std::chrono::steady_clock::time_point _deadline{};
   wait_detail::SleepBackoff<kFirstSleep.count(), kMaxSleep.count()> _backoff;
 };
@@ -698,14 +743,16 @@ class Directory {
   // `clear_offsets` is cleared in the same seqlock bracket (the uniqueness
   // rule: one resolvable entry per key; the caller verified those offsets
   // hold a stale or duplicate copy of this key).  Without it: the legacy
-  // current-phase-only behaviour described above.
+  // current-phase-only behaviour described above.  The published entry
+  // carries `fill_serial` (see DirEntry::fill_serial), in place or new.
   bool insert(const CacheKey &key, uint64_t offset, uint64_t size,
               uint64_t verified_offset = kMatchAnyTag,
               bool *collision_evicted = nullptr,
               bool *bucket_full_evicted = nullptr,
               InsertAdmission *admission = nullptr,
               std::span<const uint64_t> clear_offsets = {},
-              const PublishView *view = nullptr, bool *stale = nullptr);
+              const PublishView *view = nullptr, bool *stale = nullptr,
+              uint16_t fill_serial = 0);
 
   // WARNING: matches on the 12-bit tag only (a DirEntry holds no key
   // material), so a colliding foreign key's entry can be removed.

@@ -38,6 +38,13 @@ option(CYCLONE_ENABLE_ASAN "Enable AddressSanitizer" OFF)
 # valid across both.
 option(CYCLONE_USE_BUNDLED_SHA256 "Hash keys with the bundled SHA-256 (no crypto library); OFF uses OpenSSL's libcrypto" ON)
 
+# MSVC's default /EHsc assumes extern "C" functions never throw, which would
+# let an exception from an application callback pass through the C API's
+# exception barrier. /EHs keeps the barrier effective.
+if(MSVC)
+  string(REPLACE "/EHsc" "/EHs" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+endif()
+
 if(CYCLONE_ENABLE_ASAN AND NOT MSVC)
   add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
   add_link_options(-fsanitize=address)
@@ -88,7 +95,6 @@ set(CYCLONE_LIBRARY_SOURCES
   src/ram_cache/clfus.cpp
   src/ram_cache/lru.cpp
   src/io/mapped_file.cpp
-  src/io/executor.cpp
   src/plugin/plugin_manager.cpp
   src/optimization/work_queue.cpp
   src/optimization/adaptive_pool.cpp
@@ -188,6 +194,7 @@ if(CYCLONE_BUILD_TESTS)
     tests/integration/test_lifecycle.cpp
     tests/integration/test_optimization.cpp
     tests/unit/test_c_api.cpp
+    tests/unit/test_c_api_alloc_failure.cpp
     tests/unit/multi_process_test.cpp
     tests/unit/test_mmap_directory.cpp
     tests/integration/test_handle.cpp
@@ -205,6 +212,7 @@ if(CYCLONE_BUILD_TESTS)
     tests/integration/test_lease_pinning.cpp
     tests/integration/test_tag_collision.cpp
     tests/integration/test_wrap_phase_aba.cpp
+    tests/integration/test_read_integrity.cpp
     tests/integration/test_alternate_chain_bound.cpp
     tests/integration/test_ram_alternate_invalidation.cpp
     tests/integration/test_ram_coherence_cross_process.cpp
@@ -220,7 +228,11 @@ if(CYCLONE_BUILD_TESTS)
     tests/integration/test_wrap_retention.cpp
     tests/integration/test_publish_after_snapshot.cpp
     tests/integration/test_alternate_publish_race.cpp
+    tests/integration/test_plain_publish_race.cpp
+    tests/integration/test_usurped_fill.cpp
     tests/integration/test_seqlock_read_wait.cpp
+    tests/integration/test_sync_on_write_overlap.cpp
+    tests/integration/test_phase_lock_scope.cpp
     tests/integration/test_write_reserve.cpp
     tests/integration/test_tail_fill.cpp
     tests/integration/test_write_behind.cpp
@@ -260,7 +272,13 @@ if(CYCLONE_BUILD_TESTS)
                                               cyclone-c-header-check)
   target_include_directories(cyclone-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
                                                    ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-  catch_discover_tests(cyclone-tests)
+  # A test case that skips itself (SKIP(), e.g. the allocation-failure tests
+  # under ThreadSanitizer) reports "1 skipped" in its summary: report that to
+  # ctest as skipped by matching the summary, not the exit code, which also
+  # equals the number of failed assertions. The separator is matched as [^ ]
+  # because a literal pipe breaks the post-build command on Windows.
+  catch_discover_tests(cyclone-tests PROPERTIES SKIP_REGULAR_EXPRESSION
+                     "test cases: +1 [^ ] +1 skipped")
 
   # Helper peer for the spawn-based reset-gate tests.  A separate image (never
   # a re-exec of cyclone-tests): Catch2WithMain owns that binary's main(),

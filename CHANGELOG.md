@@ -5,7 +5,63 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- **Embedding processes could crash, hang or use freed memory through the C
+  API.** **Update recommended.**
+- **Memory-safety fault in the CLFUS RAM cache.** **Update recommended.**
+- **A damaged cache file could terminate the process when the volume could
+  not be mapped as a whole.** **Update recommended.**
+- **Damaged or stale cache contents could be served, including in
+  multi-process mode.** **Update recommended.**
+- **Stale entries could be served after a crash and restart.** **Update
+  recommended.**
+- **Resource exhaustion under load.** Memory and wait time are now bounded on
+  the affected paths. **Update recommended.**
+
 ### Fixed
+
+- C API: library errors map to distinct codes (new, appended:
+  `CYCLONE_TIMEOUT`, `CYCLONE_NOT_OWNED`, `CYCLONE_INCOMPATIBLE_VERSION`;
+  existing values are unchanged). Without a miss handler, `read_async` reports
+  I/O errors and corruption instead of a miss. A fetched value is stored before
+  coalesced readers are notified. A C read handle no longer pins the disk
+  region it was read from.
+- `read_alternate_sync` reads an alternate whose header bytes exceed 64 KiB in
+  full instead of failing or truncating it.
+- A read handle from a `Volume` that no `Cache` owns keeps its mapping alive
+  after the volume closes, and refuses stale calls after a reopen.
+- `open()` refuses a volume too small for its stripe directories with
+  `InvalidArgument` instead of accepting it and failing every write.
+- A read-only peer recovers a shared directory bucket left held by a process
+  that died mid-update after the same 250 ms a writer waits, instead of
+  reporting `Busy` for that bucket's keys until a write came. Opening a
+  directory that another process is still initialising, or one left by a crash
+  during initialisation, is rejected.
+- Hit counts are recorded only on stripes the process owns. `Cache::stop()` in
+  a forked child is detected by fork epoch as well as process id. Without fork
+  handlers a process no longer claims a liveness slot a child would share.
+- The optimization engine: the adaptive pool scales back up after a scale-down
+  and no longer hangs across stop and start, the engine can be stopped and
+  started again, a work item whose target is already in flight is refused and
+  counted, an exception from an optimization plugin no longer ends the
+  process, pausing or stopping takes effect immediately, and a cancelled
+  optimization thread no longer leaves counts or in-flight records wrong.
+- HTTP plugin: header names are matched case-insensitively; entries without a
+  freshness lifetime are stale instead of fresh forever (`max-age`,
+  `s-maxage`, `Expires`, the `Age` header and heuristic freshness for
+  cacheable statuses are honoured, `no-cache` always revalidates, and a stale
+  shared-cache entry with `s-maxage` or `proxy-revalidate` revalidates);
+  truncated or malformed metadata is rejected as a whole; variants the client
+  marks unacceptable are not selected and the most specific negotiation range
+  wins; Vary matching on the four negotiation headers ignores order, case and
+  optional whitespace; out-of-range stored times no longer overflow.
+- `ReadHandle::read()` and `read_all()` copy the content out instead of always
+  returning `NotInitialized`.
+- Smaller fixes: a reused SHA-256 context hashes correctly, error codes from a
+  failed cache-file open are accurate, a failed flush to stable storage is
+  reported on Windows, RAM-cache hit counters saturate, and a misaligned
+  document in a corrupt cache file reads as invalid.
 
 - **Stopping a cache while another thread closed or renewed a read handle
   could touch freed memory.** Closing a disk-hit `ReadHandle`, renewing its
@@ -117,352 +173,6 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     now written down on `Cache::start()` / `Cache::stop()`, in
     `cyclone_c.h` and in the README ("Forking with an open cache").
     Windows is unaffected (no fork).
-
-### Added
-
-- `CacheConfig::for_kv_tier()`: a static factory returning the recommended
-  configuration for an LLM KV-cache tier, as round 7 of the KV benchmark
-  recommends. It is a default `CacheConfig` with exactly
-  `fill_large_document_tail` and `write_behind` turned on; wrap retention,
-  the readahead settings and every other field keep their defaults, and
-  sizing stays the caller's. Measured in round 7 (Linux, 2 MiB churn, four
-  threads, same-day LMDB): hit p99 about 0.19× LMDB's on both patterns,
-  served 1.55–1.66× LMDB's. Costs: hit p50 +6–22 %, bulk-load PUT
-  throughput −18–31 %, `write_behind` Linux-only (a no-op elsewhere), and
-  the write-back call can block the writer under device congestion. Not for
-  event-loop callers such as nginx. Library defaults are unchanged,
-  PageSpeed is unaffected, and there is no C API equivalent (neither option
-  is in the C API). `kv_bench` and `kv_churn` gained `--preset default|kv`
-  (the explicit `--fill-tail` / `--write-behind` flags still override it),
-  and record the preset in their JSON output (`preset` / `cy_preset`). See
-  doc/api-reference.md, "KV-Tier Preset".
-- `CacheConfig::write_behind` (and `VolumeConfig::write_behind`, fluent
-  `set_write_behind()`), opt-in, default off (issue #43). When on, after a
-  document above 64 KiB is committed, the writing thread starts the
-  kernel's write-back of the document up to its last whole page (Linux
-  `sync_file_range(SYNC_FILE_RANGE_WRITE)`; no wait, not a durability
-  point), after the stripe mutex and the cross-process write lock are
-  released; both commit paths. Elsewhere it does nothing. Not persisted and
-  not in the C API. New `CacheStats::write_behind_ranges` /
-  `write_behind_us`. Measured with `fill_large_document_tail` on the Linux
-  benchmark machine (2 MiB churn, saturated NVMe, four threads): cgroup
-  dirty data 300 → 8 MiB, miss+insert p99 20.8 → 11.0 ms (`zipf`) and
-  21.9 → 12.5 ms (`zipf+scan`) against the fill alone, hit p99 24.8 → 8.4
-  and 29.6 → 10.5 ms, and the churn latency clause is met on both patterns
-  (0.22× and 0.25× LMDB). Hit p50 rises 10–21 %. Can block while the
-  device queue is full, so not for event-loop callers. See
-  doc/design/writer-admission-control.md and doc/kv-cache-benchmark.md,
-  "Writer admission". `kv_churn` gained `--fill-tail on|off` and
-  `--write-behind on|off`.
-- `CacheConfig::fill_large_document_tail` (and
-  `VolumeConfig::fill_large_document_tail`, fluent
-  `set_fill_large_document_tail()`), opt-in, default off (issue #35). When
-  on, a document above 64 KiB is written together with zeros up to the next
-  4 KiB boundary of the file, clamped to the data area and, with wrap
-  retention, to the clean frontier, all in one `pwritev`. Its write then
-  never covers part of a page, so ext4 and XFS no longer read that page
-  from the device inside the write. Documents stay packed and the cursor,
-  capacity and on-disk format are unchanged; the alternate write path fills
-  its tail the same way. Not persisted and not in the C API. With it off,
-  writes are byte-for-byte and syscall-for-syscall as before. Measured on
-  the Linux benchmark machine (2 MiB churn, saturated NVMe): the insert
-  p99 roughly halves (26 → 15 ms at one thread, 57 → 30 ms at four), but
-  the hit p99 at four threads rises 25 % (`zipf`) and 68 % (`zipf+scan`).
-  The removed read was acting as writer admission control under device
-  saturation. For write-latency-sensitive, insert-heavy workloads; see
-  doc/kv-cache-benchmark.md, "Insert tail". Follow-up: #43.
-- `kv_churn --ops-per-second R`: paces each thread's measured phase as a
-  Poisson process of R operations per second, so two trees can be compared
-  at the same offered load.
-
-- Cold-read readahead below the large-document threshold, and a
-  sequential window (issue #29). `CacheConfig::cold_readahead_min_bytes`
-  (default 16 KiB, `0` = off) and `CacheConfig::sequential_readahead_bytes`
-  (default 1 MiB, `0` = off), mirrored on `VolumeConfig`, with fluent
-  setters. On a read that is about to run the CRC pass (the first read of
-  a document incarnation in this process), a document of at least 16 KiB
-  and below `readahead_min_bytes` gets a readahead hint over its own range,
-  and a per-thread, per-stripe detector extends the hint by up to 1 MiB past
-  the document when the read continues where that stripe's previous read
-  ended (a KV prefix read back in insertion order). Validated warm re-reads
-  never reach either hint. An existing mmap directory also gets one
-  readahead hint per stripe at open, so a restart with a cold page cache no
-  longer faults it in page by page. A first read of a document written
-  within the stripe's last 4 MiB of puts (write, then serve on the next
-  request) skips the hint with no syscall, as does a sequential run that
-  catches up with a writer still appending. Cold 64 KiB reads on the Linux benchmark
-  machine: 0.04 → 2.6 GB/s (2.0× a same-day LMDB); 512 KiB 1.6 → 2.9 GB/s.
-  `CacheStats::cold_readahead_hints`, `sequential_readahead_hints` and
-  `recent_write_hint_skips` count the hints and the skips (C++ only, appended at the tail). Internal:
-  `MappedFile::range_resident()` and `advise_willneed_unchecked()`, and
-  `Stripe::index`. Not in the C API.
-- `WriteHandle::reserve(length)`: appends `length` bytes to the object and
-  returns them as a writable span, so a producer generates the content in
-  the handle's buffer instead of in its own buffer that `write_sync()` then
-  copies. Mixes with `write_sync()`; the checksum is taken at close; an
-  abort after a partial fill publishes nothing; the `write_sync()` limits
-  apply. Additive: `WriteHandleImpl` gains a virtual with a default body,
-  appended after its existing members. Not in the C API, which has no
-  streaming write handle.
-- `insert_bench` benchmark target: one put split into key / open / write /
-  commit, over a first lap and steady-state laps, with page faults per
-  insert (`--reserve` for the `reserve()` path). `kv_churn --reserve`
-  inserts through `reserve()`.
-
-- `CacheConfig::readahead_min_bytes` (and `VolumeConfig::readahead_min_bytes`,
-  fluent `set_readahead_min_bytes()`): a readahead hint over exactly a
-  document's byte range on the disk read path (`read_sync` and the
-  selected-alternate path) for documents of at least this many bytes,
-  issued before the CRC pass first touches the content. Default 256 KiB;
-  `0` disables it. Not exposed in the C API. Per platform:
-  - Linux: `madvise(MADV_WILLNEED)`, page-aligned, in 64 KiB chunks over
-    the first 4 MiB of the document and 512 KiB chunks after that (a cold
-    512 KiB read is about 2x faster than with uniform 512 KiB chunks), and
-    skipped when `mincore()` reports every page of the range resident.
-  - macOS: `fcntl(F_RDADVISE)` over the file range (Darwin's
-    `MADV_WILLNEED` is synchronous and serialises across processes).
-  - Windows: `PrefetchVirtualMemory` (previously a no-op).
-  A placement is re-advised at most once per 2 s, so warm re-reads do not
-  pay for the hint.
-- `CacheStats::readahead_hints_issued` (also on `VolumeStats`): readahead
-  hints issued, appended at the end of `CacheStats`. C++ only; not mirrored
-  in `CycloneCacheStats`.
-- The Windows build now imports `PrefetchVirtualMemory` from `kernel32`, so
-  the library requires Windows 8 / Windows Server 2012 or later when built
-  with `_WIN32_WINNT >= 0x0602`.
-- `crc32c_bench` benchmark target: times every CRC-32C implementation
-  (byte-wise reference, portable slice-by-16, hardware single-stream and
-  3-way interleaved, and whatever runtime dispatch selected) over 4 KiB,
-  64 KiB and 2 MiB buffers, and prints the selected path.
-- KV-cache storage-tier benchmarks, built with `CYCLONE_BUILD_BENCHMARKS`
-  (results and method in `doc/kv-cache-benchmark.md`):
-  - `kv_bench`: the workload in `doc/kv-cache-benchmark/kv-workload-spec.md`
-    (put, first-touch get, warm Zipf get in `view` / `copy` mode, restart,
-    multi-process read) over 512 KiB-32 MiB blocks; `--drop-caches-cmd`,
-    `--readahead-min-bytes` and `--pause-before-warm` for cold-cache and
-    readahead runs, and `readahead_hints_issued` printed per cold phase.
-  - `kv_churn`: a bounded-capacity tier under churn
-    (`doc/kv-cache-benchmark/kv-churn-spec.md`), get-or-insert against a full
-    volume, reporting hit ratio, served bandwidth, latency and Linux
-    device/cgroup counters.
-  - `kv_churn_policy`: replays the churn key streams through LRU, FIFO and
-    Cyclone's wrap eviction without I/O, to attribute hit-ratio differences.
-  - `kv_gpu_metal` (Apple only): host-to-GPU transfer of stored blocks on
-    Metal, including a single wrap of the whole volume mapping.
-  - `kv_gpu_cuda`, behind the new `CYCLONE_BUILD_CUDA_BENCHMARKS` option
-    (default `OFF`, not supported on Windows): the same experiment over
-    PCIe with `cudaHostRegister`.
-- **Wrap retention** (`CacheConfig::wrap_retention`, default `true` since
-  the change below; C API `disable_wrap_retention`). In flush mode a
-  stripe's wrap drops its whole previous pass at once. With retention on,
-  the previous pass stays readable
-  until its bytes are needed: a clean frontier moves ahead of the write
-  cursor one chunk at a time. A frontier advance waits only for live borrows
-  in the chunks it crosses, and each document is stamped with its pass, so a
-  stale entry from two or more wraps back can never resolve. In a Linux
-  KV-churn run (2 MiB blocks, 4 GiB tier, 4 threads) the hit ratio rose from
-  0.726 to 0.788 on Zipf and from 0.614 to 0.660 on Zipf with scans. The
-  mode is persisted per volume (`VolumeHeader::retain_chunks`), and an open
-  in the other mode resets through the live-peer gate, so every process
-  sharing a cache must use the same setting. New counters in `CacheStats`
-  and at the tail of `CycloneCacheStats`: `frontier_advances`,
-  `advances_deferred_by_lease`, `early_advances_skipped`, `retained_hits`,
-  `stamp_rejections`. See `doc/api-reference.md#wrap-retention` and
-  `doc/design/wrap-retention.md`.
-  It first shipped off by default. The one gap that kept it off, the
-  PageSpeed `cache_burst_test`, is resolved (see "Wrap retention is the
-  default" under Changed).
-- **Wrap retention: alternate carry-forward.** An alternate write whose
-  chain head is retained no longer drops the key's other alternates (review
-  R4). A chain may still not link across a pass. Instead the write rewrites
-  the surviving alternates as current-pass documents in its own slot, below
-  the new head, and publishes all of them with one directory insert. A
-  crash at any step leaves either the old retained chain or the new complete
-  chain. For PageSpeed that means the Original, Gzip and WebP keep resolving
-  when the optimization engine adds an AVIF after a wrap. A carry happens at
-  most once per key per pass. It keeps at most `kMaxAlternatesPerKey - 1`
-  alternates and `min(A / 8, max_object_size)` bytes, the Original first,
-  then the newest. A write whose allocation wraps while it links a live
-  chain retries once and carries that chain, where it used to refuse the
-  link. Flush mode is unchanged. New counters in `CacheStats` and at the
-  tail of `CycloneCacheStats`: `alternates_carried_forward`,
-  `alternate_carry_bytes`, `alternates_carry_dropped` (appended, so C
-  consumers must be rebuilt against the new header, as for the earlier
-  tail fields). `alternate_wrap_refusals` no longer moves in retention
-  mode. See
-  `doc/design/wrap-retention.md` sections 4.5 and 14.
-- `performance_baseline --wrap-retention on|off`, a `retain|flush` argument
-  for `concurrent_read_bench`, and `kv_churn --wrap-retention on|off`, which
-  adds the retention counters to its JSON. `kv_churn_policy` gains
-  `retain/16`, `retain/32`, `retain/64` and `retain/256` columns, the
-  retention policy replayed without I/O.
-- `CYCLONE_BUSY` C API error code, appended after `CYCLONE_OBJECT_TOO_LARGE`
-  (existing codes keep their values). It maps `CacheError::Busy`, which the
-  C API used to report as `CYCLONE_INTERNAL_ERROR`, so a C caller that got
-  `CYCLONE_INTERNAL_ERROR` from a contended write, delete or hit-count update
-  now gets `CYCLONE_BUSY`.
-- `CacheStats::directory_read_timeouts` (also on `VolumeStats`, and appended
-  to `CycloneCacheStats`): directory probes that spent the whole seqlock wait
-  budget because a writer held the key's bucket. Expected near 0. Appending
-  it grows `CycloneCacheStats`, and `cyclone_cache_stats()` writes the whole
-  struct, so a C caller built against an older `cyclone_c.h` passes a
-  smaller buffer: rebuild every consumer against this header (the same
-  lockstep rule as the earlier tail appends).
-
-### Changed
-
-- **The bundled SHA-256 is now the default key hash; OpenSSL is opt-in.**
-  `CYCLONE_USE_BUNDLED_SHA256` defaults to `ON` (it was `OFF`). A build that
-  does not pass the option no longer calls `find_package(OpenSSL)` and no
-  longer links libcrypto; the library then has no dependency beyond the C++
-  standard library and threads. The option keeps its name: pass
-  `-DCYCLONE_USE_BUNDLED_SHA256=OFF` to hash with OpenSSL's libcrypto as
-  before, which is faster where libcrypto has hardware SHA (about 0.3 µs per
-  key on a 61-byte key on an Apple M-series core) and is meant for
-  applications that link a crypto library anyway.
-  - **Cache files stay valid.** Both backends compute the same SHA-256, so
-    keys, on-disk volumes and caches shared between processes are unaffected,
-    whichever backend each process was built with.
-  - **Who has to act.** An application that relied on the old default to get
-    the OpenSSL hash now gets the bundled one: nothing breaks, each key hash
-    costs a little more, and libcrypto drops out of the link line. If the
-    application took libcrypto for its own code only through this library's
-    link interface, it has to link it itself now. An existing build directory
-    keeps the cached value until it is reconfigured with the option.
-  - Builds that set the option explicitly are unaffected, as are embedders
-    that compile the sources with their own build system and define (or do
-    not define) `CYCLONE_USE_BUNDLED_SHA256` themselves: the source-level
-    switch is unchanged.
-  - The `windows-*` CMake presets, which take OpenSSL from vcpkg, now set
-    `CYCLONE_USE_BUNDLED_SHA256=OFF` and build what they built before. The
-    native `linux-*` and `macos-*` presets follow the new default.
-  - Why: the bundled hash is the configuration that has no process-wide
-    crypto-library state to meet (initialisation, exit handlers, `fork()`),
-    and the previous default was the one build flavour that carried the
-    exit-time defect listed under Fixed.
-
-- **The installed CMake package finds its own dependencies.**
-  `find_package(cyclone-cache)` against an installed tree failed unless the
-  application had already called `find_package(Threads)` (and, for a static
-  library with the OpenSSL key hash, `find_package(OpenSSL)`): the exported
-  target names `Threads::Threads` and `OpenSSL::Crypto`, and nothing defined
-  them. The package now ships a `cyclone-cache-config.cmake` that finds them
-  and then loads the exported target from `cyclone-cache-targets.cmake`
-  (the export file's new name). `cyclone::cyclone-cache` is unchanged.
-
-- **The background optimization engine is off by default and
-  embedder-driven** (issue #52). `OptimizationConfig::enabled` now defaults
-  to `false`. `OptimizationEngine::on_write_complete()` has no caller in
-  Cyclone (`Volume::commit_write` / `Cache` never invoke it) nor in any known
-  embedder, so with the old default every `Cache::start()` spun up a
-  `LoadMonitor` thread and `min_threads` `AdaptiveThreadPool` workers per
-  cache instance that idled forever, and any registered `OptimizationPlugin`
-  was unreachable. With the engine off, `Cache::optimization_engine()`
-  returns `nullptr` and `start()` starts no engine threads; the fork-safety
-  and two-phase-stop paths already handle the absent engine. Migration for
-  an embedder that wants background optimization: set
-  `optimization_config.enabled = true`, register plugins on
-  `cache->optimization_engine()`, and call
-  `cache->optimization_engine()->on_write_complete(...)` after each of your
-  own writes; nothing in Cyclone calls that hook. Code that already
-  called `cache->optimization_engine()->...` (for example
-  `register_plugin`) without setting `optimization_config.enabled = true`
-  now dereferences a null pointer: set `enabled` first, or null-check the
-  accessor. The `OptimizationConfig` layout is unchanged, and the C API
-  has no optimization settings.
-- **Plain writes no longer assemble the document in a second and third
-  buffer** (issue #16). `commit_write` used to copy the content into the
-  document builder and again into one contiguous document, two fresh heap
-  buffers per put whose page faults and frees cost more than the copies:
-  at 2 MiB on the Linux benchmark machine they were about 1.9 of the
-  2.5 ms a put took. It now builds only the 132-byte header plus the
-  caller's header bytes, with the CRC-32C chained over header bytes and
-  content, and writes the content from the handle's buffer right behind
-  it. Objects up to 64 KiB are still joined behind the head and written
-  with one `pwrite`, where the copy is cheaper than a second syscall. The
-  bytes on disk are unchanged, and so is the commit order (the whole fill,
-  then `sync_on_write`'s fsync, then the directory insert). The alternate
-  write path is unchanged.
-- **Wrap retention is the default** (`kDefaultWrapRetention = true`, so
-  `CacheConfig::wrap_retention` and `VolumeConfig::wrap_retention` default
-  to `true`, and a zero-initialised `CycloneCacheConfig` retains). Flush is
-  the opt-out: `wrap_retention = false`, or `disable_wrap_retention = 1` in
-  the C API. Every gate of design decision D1 passed first: the design and
-  review tests, the full suite and TSan in both modes on macOS and Linux,
-  and the PageSpeed `cache_burst_test` 200/200 with retention forced on
-  (40/40 under TSan), with review item R4 resolved by the alternate
-  carry-forward and the read-miss regression by the same-key publish retry.
-  **Upgrade impact.** A volume created with the default config by any
-  earlier build records flush (`VolumeHeader::retain_chunks = 0`). The mode
-  is not part of the fingerprinted filename, so this build opens the same
-  file and finds a mode mismatch:
-  - single process, or every old process stopped first: the volume is reset
-    cold in place on the first open. All entries are lost once; no second
-    file is created.
-  - a process of the other mode still holds the file (an overlapping
-    multi-process upgrade, or a peer that opts out): `Cache::start()` fails
-    with `ResetRefusedLivePeer` (`CYCLONE_RESET_REFUSED_LIVE_PEER` from
-    `cyclone_cache_create`) until that process exits. Stop every old
-    process before starting new ones.
-  - `auto_reset_on_incompatible = false`: `IncompatibleVersion`.
-  To keep an existing cache warm, set `wrap_retention = false` on every
-  process. Volumes configured with `wrap_retention = true` before this change
-  are unaffected. The filename, the format version and the C ABI do not
-  change. See `doc/api-reference.md#wrap-retention`.
-- **Mmap directory version 2** (`MmapDirectory::kVersion`). A retention
-  region after the directory entries holds the stripe's exposure generation
-  and 64 per-chunk borrow slots. It replaces the stripe-wide borrow slot and
-  the `{wrap count, phase}` reader epoch. The version is mixed into the
-  fingerprinted filename of mmap volumes, so **multi-process caches start
-  cold** after the upgrade. The old file is left on disk. The data offset
-  does not move (177 pages at the default 16384 buckets).
-- Borrows are counted per frontier chunk: 64 `u32` slots per thread shard
-  locally (two 128-byte lines), 64 `u32` slots in the mmap directory. In flush mode the stripe is
-  one chunk, so the lease gate behaves as before.
-- The GC phase is derived from the pass (`P & 1`) rather than toggled. The
-  writer stamps every document with its pass in both modes
-  (`Document::write_serial`, outside the CRC). Flush mode ignores the stamp.
-- `CycloneCacheConfig` gains a trailing `int disable_wrap_retention`. As with
-  earlier trailing fields, callers must be recompiled against the new
-  header.
-- **On-disk format v8 (was v7): the document checksum is CRC-32C
-  (Castagnoli, reflected poly `0x82F63B78`) instead of CRC-32/ISO-HDLC.**
-  The checksum used to be a byte-at-a-time ISO-HDLC table inside
-  `document.cpp`, at about 0.5-0.6 GB/s, and it is re-verified on every cold
-  read, so it capped cold-read bandwidth. It now lives in
-  `src/core/crc32c.{hpp,cpp}` (`crc32c()` / `crc32c_update()`), and CRC-32C
-  has a hardware path on x86-64 (SSE4.2 `crc32q`) as well as on ARMv8
-  (`crc32cx`). Both hardware paths run a 3-way interleave: 34.9 GB/s over
-  2 MiB on an Apple M5 (12.2 GB/s single-stream), 26.5 GB/s on an
-  i7-8750H (10.4 GB/s single-stream); every other target runs a portable
-  slice-by-16 table path at 3.4 GB/s (M5) / 2.8 GB/s (i7), against 0.61 /
-  0.50 GB/s for the old byte-wise table. End to end on Linux (i7-8750H),
-  the 2 MiB cold read goes from 1.6 GB/s, measured against an interim
-  slice-by-16 CRC-32, to 2.2 GB/s, level with LMDB
-  (`doc/kv-cache-benchmark.md`). The path is picked by a runtime CPU probe,
-  resolved once, on first use.
-  **Existing cache files are abandoned (not deleted) on open.** The format
-  major is mixed into the fingerprinted volume filename, so a v8 binary
-  resolves to a different file and starts cold rather than failing to verify
-  v7 documents; the superseded v7 file stays on disk until
-  `gc_superseded_on_start` (POSIX only) or a manual delete reclaims it.
-- **Bazel and vendored consumers:** add the new sources
-  `src/core/crc32c.cpp` and `src/core/crc32c.hpp` to any downstream BUILD
-  file that lists srcs explicitly. No new copts or defines are needed: the
-  hardware paths use per-function target attributes and runtime dispatch,
-  so the stock compiler flags still build every path.
-- C API: `cyclone_c.h` now compiles as C11 as well as C++. `CycloneError`
-  and `CycloneTier` are `typedef uint8_t` plus an anonymous enum of their
-  constants (previously C++ `using X = enum : uint8_t`), so the ABI is
-  unchanged. From C++ this is observable: they are no longer distinct
-  types, so overloads on them collide with `uint8_t`, and streaming one
-  with `<<` prints a character rather than a number.
-- License: Apache License 2.0 (was BUSL-1.1). See `LICENSE` and `NOTICE`.
-- License: every file carries an Apache-2.0 SPDX header or is a documented
-  exception, verified with Apache RAT.
-
-### Fixed
-
 - Two processes writing alternates of one key at the same moment could lose
   one of them. An alternate write resolves the key's chain before it writes
   and publishes afterwards; when another process published or removed the
@@ -477,12 +187,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   once every process sharing the volume runs this version (a process on an
   older build still publishes unconditionally; newer writers clear the
   second entry at their next write of the key, as before), and apart from
-  the wrap-retention limit named below. A write resolves again until it is published, for any number of concurrent
-  writers: each round it loses is another writer's completed operation, so
-  the writers always make progress together, and the delay a write can see
-  is bounded by the other writers' completions, not by a time limit. A
-  write with a current head that notices the change before writing (the
-  usual case under contention) only walks the chain again; one that notices
+  the wrap-retention limit named below. A write resolves again, backing off
+  with a short jittered sleep from its second retry on, until it is
+  published: each round it loses is another writer's completed operation,
+  so the writers always make progress together. A round lost at the publish
+  leaves its written document behind as dead space, so after 32 lost rounds
+  in a row a write reports `Busy` and publishes nothing, far above what a
+  burst of sixteen writers of one key takes. A write with a current head
+  that notices the change before writing (the usual case under contention)
+  only walks the chain again; one that notices
   it at the publish writes its document a second time. A head removal
   resolves again within its existing bound of eight attempts and then
   reports `Busy`, having removed nothing. `VolumeStats` gains
@@ -692,3 +405,408 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `CacheConfig::hit_flush_interval` below 100 ms flushed late (a 50 ms
   interval flushed after at least 100 ms). It now sleeps
   `min(100 ms, remaining)`.
+
+### Removed
+
+- The unused internal I/O executor (`src/io/executor.cpp`,
+  `src/core/thread_util.hpp`); nothing public changes.
+
+### Added
+
+- Fuzz targets for the asynchronous C API, HTTP metadata decoding and HTTP
+  variant selection, run by the nightly fuzz job.
+- `CacheConfig::for_kv_tier()`: a static factory returning the recommended
+  configuration for an LLM KV-cache tier, as round 7 of the KV benchmark
+  recommends. It is a default `CacheConfig` with exactly
+  `fill_large_document_tail` and `write_behind` turned on; wrap retention,
+  the readahead settings and every other field keep their defaults, and
+  sizing stays the caller's. Measured in round 7 (Linux, 2 MiB churn, four
+  threads, same-day LMDB): hit p99 about 0.19× LMDB's on both patterns,
+  served 1.55–1.66× LMDB's. Costs: hit p50 +6–22 %, bulk-load PUT
+  throughput −18–31 %, `write_behind` Linux-only (a no-op elsewhere), and
+  the write-back call can block the writer under device congestion. Not for
+  event-loop callers such as nginx. Library defaults are unchanged,
+  PageSpeed is unaffected, and there is no C API equivalent (neither option
+  is in the C API). `kv_bench` and `kv_churn` gained `--preset default|kv`
+  (the explicit `--fill-tail` / `--write-behind` flags still override it),
+  and record the preset in their JSON output (`preset` / `cy_preset`). See
+  doc/api-reference.md, "KV-Tier Preset".
+- `CacheConfig::write_behind` (and `VolumeConfig::write_behind`, fluent
+  `set_write_behind()`), opt-in, default off (issue #43). When on, after a
+  document above 64 KiB is committed, the writing thread starts the
+  kernel's write-back of the document up to its last whole page (Linux
+  `sync_file_range(SYNC_FILE_RANGE_WRITE)`; no wait, not a durability
+  point), after the stripe mutex and the cross-process write lock are
+  released; both commit paths. Elsewhere it does nothing. Not persisted and
+  not in the C API. New `CacheStats::write_behind_ranges` /
+  `write_behind_us`. Measured with `fill_large_document_tail` on the Linux
+  benchmark machine (2 MiB churn, saturated NVMe, four threads): cgroup
+  dirty data 300 → 8 MiB, miss+insert p99 20.8 → 11.0 ms (`zipf`) and
+  21.9 → 12.5 ms (`zipf+scan`) against the fill alone, hit p99 24.8 → 8.4
+  and 29.6 → 10.5 ms, and the churn latency clause is met on both patterns
+  (0.22× and 0.25× LMDB). Hit p50 rises 10–21 %. Can block while the
+  device queue is full, so not for event-loop callers. See
+  doc/design/writer-admission-control.md and doc/kv-cache-benchmark.md,
+  "Writer admission". `kv_churn` gained `--fill-tail on|off` and
+  `--write-behind on|off`.
+- `CacheConfig::fill_large_document_tail` (and
+  `VolumeConfig::fill_large_document_tail`, fluent
+  `set_fill_large_document_tail()`), opt-in, default off (issue #35). When
+  on, a document above 64 KiB is written together with zeros up to the next
+  4 KiB boundary of the file, clamped to the data area and, with wrap
+  retention, to the clean frontier, all in one `pwritev`. Its write then
+  never covers part of a page, so ext4 and XFS no longer read that page
+  from the device inside the write. Documents stay packed and the cursor,
+  capacity and on-disk format are unchanged; the alternate write path fills
+  its tail the same way. Not persisted and not in the C API. With it off,
+  writes are byte-for-byte and syscall-for-syscall as before. Measured on
+  the Linux benchmark machine (2 MiB churn, saturated NVMe): the insert
+  p99 roughly halves (26 → 15 ms at one thread, 57 → 30 ms at four), but
+  the hit p99 at four threads rises 25 % (`zipf`) and 68 % (`zipf+scan`).
+  The removed read was acting as writer admission control under device
+  saturation. For write-latency-sensitive, insert-heavy workloads; see
+  doc/kv-cache-benchmark.md, "Insert tail". Follow-up: #43.
+- `kv_churn --ops-per-second R`: paces each thread's measured phase as a
+  Poisson process of R operations per second, so two trees can be compared
+  at the same offered load.
+
+- Cold-read readahead below the large-document threshold, and a
+  sequential window (issue #29). `CacheConfig::cold_readahead_min_bytes`
+  (default 16 KiB, `0` = off) and `CacheConfig::sequential_readahead_bytes`
+  (default 1 MiB, `0` = off), mirrored on `VolumeConfig`, with fluent
+  setters. On a read that is about to run the CRC pass (the first read of
+  a document incarnation in this process), a document of at least 16 KiB
+  and below `readahead_min_bytes` gets a readahead hint over its own range,
+  and a per-thread, per-stripe detector extends the hint by up to 1 MiB past
+  the document when the read continues where that stripe's previous read
+  ended (a KV prefix read back in insertion order). Validated warm re-reads
+  never reach either hint. An existing mmap directory also gets one
+  readahead hint per stripe at open, so a restart with a cold page cache no
+  longer faults it in page by page. A first read of a document written
+  within the stripe's last 4 MiB of puts (write, then serve on the next
+  request) skips the hint with no syscall, as does a sequential run that
+  catches up with a writer still appending. Cold 64 KiB reads on the Linux benchmark
+  machine: 0.04 → 2.6 GB/s (2.0× a same-day LMDB); 512 KiB 1.6 → 2.9 GB/s.
+  `CacheStats::cold_readahead_hints`, `sequential_readahead_hints` and
+  `recent_write_hint_skips` count the hints and the skips (C++ only, appended at the tail). Internal:
+  `MappedFile::range_resident()` and `advise_willneed_unchecked()`, and
+  `Stripe::index`. Not in the C API.
+- `WriteHandle::reserve(length)`: appends `length` bytes to the object and
+  returns them as a writable span, so a producer generates the content in
+  the handle's buffer instead of in its own buffer that `write_sync()` then
+  copies. Mixes with `write_sync()`; the checksum is taken at close; an
+  abort after a partial fill publishes nothing; the `write_sync()` limits
+  apply. Additive: `WriteHandleImpl` gains a virtual with a default body,
+  appended after its existing members. Not in the C API, which has no
+  streaming write handle.
+- `insert_bench` benchmark target: one put split into key / open / write /
+  commit, over a first lap and steady-state laps, with page faults per
+  insert (`--reserve` for the `reserve()` path). `kv_churn --reserve`
+  inserts through `reserve()`.
+
+- `CacheConfig::readahead_min_bytes` (and `VolumeConfig::readahead_min_bytes`,
+  fluent `set_readahead_min_bytes()`): a readahead hint over exactly a
+  document's byte range on the disk read path (`read_sync` and the
+  selected-alternate path) for documents of at least this many bytes,
+  issued before the CRC pass first touches the content. Default 256 KiB;
+  `0` disables it. Not exposed in the C API. Per platform:
+  - Linux: `madvise(MADV_WILLNEED)`, page-aligned, in 64 KiB chunks over
+    the first 4 MiB of the document and 512 KiB chunks after that (a cold
+    512 KiB read is about 2x faster than with uniform 512 KiB chunks), and
+    skipped when `mincore()` reports every page of the range resident.
+  - macOS: `fcntl(F_RDADVISE)` over the file range (Darwin's
+    `MADV_WILLNEED` is synchronous and serialises across processes).
+  - Windows: `PrefetchVirtualMemory` (previously a no-op).
+  A placement is re-advised at most once per 2 s, so warm re-reads do not
+  pay for the hint.
+- `CacheStats::readahead_hints_issued` (also on `VolumeStats`): readahead
+  hints issued, appended at the end of `CacheStats`. C++ only; not mirrored
+  in `CycloneCacheStats`.
+- The Windows build now imports `PrefetchVirtualMemory` from `kernel32`, so
+  the library requires Windows 8 / Windows Server 2012 or later when built
+  with `_WIN32_WINNT >= 0x0602`.
+- `crc32c_bench` benchmark target: times every CRC-32C implementation
+  (byte-wise reference, portable slice-by-16, hardware single-stream and
+  3-way interleaved, and whatever runtime dispatch selected) over 4 KiB,
+  64 KiB and 2 MiB buffers, and prints the selected path.
+- KV-cache storage-tier benchmarks, built with `CYCLONE_BUILD_BENCHMARKS`
+  (results and method in `doc/kv-cache-benchmark.md`):
+  - `kv_bench`: the workload in `doc/kv-cache-benchmark/kv-workload-spec.md`
+    (put, first-touch get, warm Zipf get in `view` / `copy` mode, restart,
+    multi-process read) over 512 KiB-32 MiB blocks; `--drop-caches-cmd`,
+    `--readahead-min-bytes` and `--pause-before-warm` for cold-cache and
+    readahead runs, and `readahead_hints_issued` printed per cold phase.
+  - `kv_churn`: a bounded-capacity tier under churn
+    (`doc/kv-cache-benchmark/kv-churn-spec.md`), get-or-insert against a full
+    volume, reporting hit ratio, served bandwidth, latency and Linux
+    device/cgroup counters.
+  - `kv_churn_policy`: replays the churn key streams through LRU, FIFO and
+    Cyclone's wrap eviction without I/O, to attribute hit-ratio differences.
+  - `kv_gpu_metal` (Apple only): host-to-GPU transfer of stored blocks on
+    Metal, including a single wrap of the whole volume mapping.
+  - `kv_gpu_cuda`, behind the new `CYCLONE_BUILD_CUDA_BENCHMARKS` option
+    (default `OFF`, not supported on Windows): the same experiment over
+    PCIe with `cudaHostRegister`.
+- **Wrap retention** (`CacheConfig::wrap_retention`, default `true` since
+  the change below; C API `disable_wrap_retention`). In flush mode a
+  stripe's wrap drops its whole previous pass at once. With retention on,
+  the previous pass stays readable
+  until its bytes are needed: a clean frontier moves ahead of the write
+  cursor one chunk at a time. A frontier advance waits only for live borrows
+  in the chunks it crosses, and each document is stamped with its pass, so a
+  stale entry from two or more wraps back can never resolve. In a Linux
+  KV-churn run (2 MiB blocks, 4 GiB tier, 4 threads) the hit ratio rose from
+  0.726 to 0.788 on Zipf and from 0.614 to 0.660 on Zipf with scans. The
+  mode is persisted per volume (`VolumeHeader::retain_chunks`), and an open
+  in the other mode resets through the live-peer gate, so every process
+  sharing a cache must use the same setting. New counters in `CacheStats`
+  and at the tail of `CycloneCacheStats`: `frontier_advances`,
+  `advances_deferred_by_lease`, `early_advances_skipped`, `retained_hits`,
+  `stamp_rejections`. See `doc/api-reference.md#wrap-retention` and
+  `doc/design/wrap-retention.md`.
+  It first shipped off by default. The one gap that kept it off, the
+  PageSpeed `cache_burst_test`, is resolved (see "Wrap retention is the
+  default" under Changed).
+- **Wrap retention: alternate carry-forward.** An alternate write whose
+  chain head is retained no longer drops the key's other alternates (review
+  R4). A chain may still not link across a pass. Instead the write rewrites
+  the surviving alternates as current-pass documents in its own slot, below
+  the new head, and publishes all of them with one directory insert. A
+  crash at any step leaves either the old retained chain or the new complete
+  chain. For PageSpeed that means the Original, Gzip and WebP keep resolving
+  when the optimization engine adds an AVIF after a wrap. A carry happens at
+  most once per key per pass. It keeps at most `kMaxAlternatesPerKey - 1`
+  alternates and `min(A / 8, max_object_size)` bytes, the Original first,
+  then the newest. A write whose allocation wraps while it links a live
+  chain retries once and carries that chain, where it used to refuse the
+  link. Flush mode is unchanged. New counters in `CacheStats` and at the
+  tail of `CycloneCacheStats`: `alternates_carried_forward`,
+  `alternate_carry_bytes`, `alternates_carry_dropped` (appended, so C
+  consumers must be rebuilt against the new header, as for the earlier
+  tail fields). `alternate_wrap_refusals` no longer moves in retention
+  mode. See
+  `doc/design/wrap-retention.md` sections 4.5 and 14.
+- `performance_baseline --wrap-retention on|off`, a `retain|flush` argument
+  for `concurrent_read_bench`, and `kv_churn --wrap-retention on|off`, which
+  adds the retention counters to its JSON. `kv_churn_policy` gains
+  `retain/16`, `retain/32`, `retain/64` and `retain/256` columns, the
+  retention policy replayed without I/O.
+- `CYCLONE_BUSY` C API error code, appended after `CYCLONE_OBJECT_TOO_LARGE`
+  (existing codes keep their values). It maps `CacheError::Busy`, which the
+  C API used to report as `CYCLONE_INTERNAL_ERROR`, so a C caller that got
+  `CYCLONE_INTERNAL_ERROR` from a contended write, delete or hit-count update
+  now gets `CYCLONE_BUSY`.
+- `CacheStats::directory_read_timeouts` (also on `VolumeStats`, and appended
+  to `CycloneCacheStats`): directory probes that spent the whole seqlock wait
+  budget because a writer held the key's bucket. Expected near 0. Appending
+  it grows `CycloneCacheStats`, and `cyclone_cache_stats()` writes the whole
+  struct, so a C caller built against an older `cyclone_c.h` passes a
+  smaller buffer: rebuild every consumer against this header (the same
+  lockstep rule as the earlier tail appends).
+
+### Changed
+
+- C API error mapping: `InvalidConfiguration` now maps to
+  `CYCLONE_INVALID_ARGUMENT`, `Closed` to `CYCLONE_NOT_INITIALIZED`,
+  `AlternateNotFound` to `CYCLONE_NOT_FOUND` and `ChainCorrupted` to
+  `CYCLONE_CORRUPTED` (each was `CYCLONE_INTERNAL_ERROR`).
+- `remove_sync` returns `NotFound` for an entry that no longer binds its
+  document, and a malformed selected alternate reads as `NotFound` instead of
+  `Corrupted`.
+- `set_scale_check_interval` clamps to at least 1 ms, and an automatic
+  `max_threads` never falls below `min_threads`.
+- HTTP plugin: `age()` and `is_fresh()` gain overloads that take the current
+  time, and HTTP dates also parse in the RFC 850 and asctime forms.
+- **HTTP plugin metadata** uses a versioned, platform-independent layout;
+  entries stored by earlier versions miss once and are replaced. Metadata
+  written by this version is not read correctly by earlier versions.
+- **Load shedding is opt-in** (`OptimizationConfig::enable_load_shedding`,
+  default off). Its inputs are now fed from real cache traffic.
+- `OptimizationConfig::priority_aging_interval` (default 10 s, 0 disables):
+  queued optimization work gains priority while it waits, so low-priority work
+  is not starved. `Cache::start()` returns `InvalidConfiguration` for an
+  invalid optimization configuration.
+- Plain writes with `sync_on_write` no longer serialize every writer of a
+  stripe behind the device flush (alternate writes still flush under the
+  stripe mutex); a directory insert no longer holds the stripe-wide
+  phase lock while it waits on a busy bucket; directory reads under CPU
+  oversubscription stop spinning after 0.5 ms; hit recording past
+  `max_pending_entries` hands the sweep to the flush thread, dropping and
+  counting (`CacheStats::hit_overload_drops`) hits beyond twice the limit; a
+  volume whose whole-file mapping fails reports
+  `volumes_without_whole_file_map` and warns once per open; optimization
+  statistics no longer take locks on the per-task path; LRU RAM-cache hits no
+  longer serialize on the write lock.
+- A plain write, like an alternate write, gives up with `Busy` after 32 lost
+  publish rounds.
+- `ReadHandle`, `CacheStats`, `OptimizationConfig` and `CacheConfig` change
+  layout: code using the C++ API must be rebuilt.
+  The C ABI is unchanged apart from the appended error codes.
+
+- **The bundled SHA-256 is now the default key hash; OpenSSL is opt-in.**
+  `CYCLONE_USE_BUNDLED_SHA256` defaults to `ON` (it was `OFF`). A build that
+  does not pass the option no longer calls `find_package(OpenSSL)` and no
+  longer links libcrypto; the library then has no dependency beyond the C++
+  standard library and threads. The option keeps its name: pass
+  `-DCYCLONE_USE_BUNDLED_SHA256=OFF` to hash with OpenSSL's libcrypto as
+  before, which is faster where libcrypto has hardware SHA (about 0.3 µs per
+  key on a 61-byte key on an Apple M-series core) and is meant for
+  applications that link a crypto library anyway.
+  - **Cache files stay valid.** Both backends compute the same SHA-256, so
+    keys, on-disk volumes and caches shared between processes are unaffected,
+    whichever backend each process was built with.
+  - **Who has to act.** An application that relied on the old default to get
+    the OpenSSL hash now gets the bundled one: nothing breaks, each key hash
+    costs a little more, and libcrypto drops out of the link line. If the
+    application took libcrypto for its own code only through this library's
+    link interface, it has to link it itself now. An existing build directory
+    keeps the cached value until it is reconfigured with the option.
+  - Builds that set the option explicitly are unaffected, as are embedders
+    that compile the sources with their own build system and define (or do
+    not define) `CYCLONE_USE_BUNDLED_SHA256` themselves: the source-level
+    switch is unchanged.
+  - The `windows-*` CMake presets, which take OpenSSL from vcpkg, now set
+    `CYCLONE_USE_BUNDLED_SHA256=OFF` and build what they built before. The
+    native `linux-*` and `macos-*` presets follow the new default.
+  - Why: the bundled hash is the configuration that has no process-wide
+    crypto-library state to meet (initialisation, exit handlers, `fork()`),
+    and the previous default was the one build flavour that carried the
+    exit-time defect listed under Fixed.
+
+- **The installed CMake package finds its own dependencies.**
+  `find_package(cyclone-cache)` against an installed tree failed unless the
+  application had already called `find_package(Threads)` (and, for a static
+  library with the OpenSSL key hash, `find_package(OpenSSL)`): the exported
+  target names `Threads::Threads` and `OpenSSL::Crypto`, and nothing defined
+  them. The package now ships a `cyclone-cache-config.cmake` that finds them
+  and then loads the exported target from `cyclone-cache-targets.cmake`
+  (the export file's new name). `cyclone::cyclone-cache` is unchanged.
+
+- **The background optimization engine is off by default and
+  embedder-driven** (issue #52). `OptimizationConfig::enabled` now defaults
+  to `false`. `OptimizationEngine::on_write_complete()` has no caller in
+  Cyclone (`Volume::commit_write` / `Cache` never invoke it) nor in any known
+  embedder, so with the old default every `Cache::start()` spun up a
+  `LoadMonitor` thread and `min_threads` `AdaptiveThreadPool` workers per
+  cache instance that idled forever, and any registered `OptimizationPlugin`
+  was unreachable. With the engine off, `Cache::optimization_engine()`
+  returns `nullptr` and `start()` starts no engine threads; the fork-safety
+  and two-phase-stop paths already handle the absent engine. Migration for
+  an embedder that wants background optimization: set
+  `optimization_config.enabled = true`, register plugins on
+  `cache->optimization_engine()`, and call
+  `cache->optimization_engine()->on_write_complete(...)` after each of your
+  own writes; nothing in Cyclone calls that hook. Code that already
+  called `cache->optimization_engine()->...` (for example
+  `register_plugin`) without setting `optimization_config.enabled = true`
+  now dereferences a null pointer: set `enabled` first, or null-check the
+  accessor. The `OptimizationConfig` layout is unchanged, and the C API
+  has no optimization settings.
+- **Plain writes no longer assemble the document in a second and third
+  buffer** (issue #16). `commit_write` used to copy the content into the
+  document builder and again into one contiguous document, two fresh heap
+  buffers per put whose page faults and frees cost more than the copies:
+  at 2 MiB on the Linux benchmark machine they were about 1.9 of the
+  2.5 ms a put took. It now builds only the 132-byte header plus the
+  caller's header bytes, with the CRC-32C chained over header bytes and
+  content, and writes the content from the handle's buffer right behind
+  it. Objects up to 64 KiB are still joined behind the head and written
+  with one `pwrite`, where the copy is cheaper than a second syscall. The
+  bytes on disk are unchanged, and so is the commit order (the whole fill,
+  then `sync_on_write`'s fsync, then the directory insert). The alternate
+  write path is unchanged.
+- **Wrap retention is the default** (`kDefaultWrapRetention = true`, so
+  `CacheConfig::wrap_retention` and `VolumeConfig::wrap_retention` default
+  to `true`, and a zero-initialised `CycloneCacheConfig` retains). Flush is
+  the opt-out: `wrap_retention = false`, or `disable_wrap_retention = 1` in
+  the C API. Every gate of design decision D1 passed first: the design and
+  review tests, the full suite and TSan in both modes on macOS and Linux,
+  and the PageSpeed `cache_burst_test` 200/200 with retention forced on
+  (40/40 under TSan), with review item R4 resolved by the alternate
+  carry-forward and the read-miss regression by the same-key publish retry.
+  **Upgrade impact.** A volume created with the default config by any
+  earlier build records flush (`VolumeHeader::retain_chunks = 0`). The mode
+  is not part of the fingerprinted filename, so this build opens the same
+  file and finds a mode mismatch:
+  - single process, or every old process stopped first: the volume is reset
+    cold in place on the first open. All entries are lost once; no second
+    file is created.
+  - a process of the other mode still holds the file (an overlapping
+    multi-process upgrade, or a peer that opts out): `Cache::start()` fails
+    with `ResetRefusedLivePeer` (`CYCLONE_RESET_REFUSED_LIVE_PEER` from
+    `cyclone_cache_create`) until that process exits. Stop every old
+    process before starting new ones.
+  - `auto_reset_on_incompatible = false`: `IncompatibleVersion`.
+  To keep an existing cache warm, set `wrap_retention = false` on every
+  process. Volumes configured with `wrap_retention = true` before this change
+  are unaffected. The filename, the format version and the C ABI do not
+  change. See `doc/api-reference.md#wrap-retention`.
+- **Mmap directory version 2** (`MmapDirectory::kVersion`). A retention
+  region after the directory entries holds the stripe's exposure generation
+  and 64 per-chunk borrow slots. It replaces the stripe-wide borrow slot and
+  the `{wrap count, phase}` reader epoch. The version is mixed into the
+  fingerprinted filename of mmap volumes, so **multi-process caches start
+  cold** after the upgrade. The old file is left on disk. The data offset
+  does not move (177 pages at the default 16384 buckets).
+- Borrows are counted per frontier chunk: 64 `u32` slots per thread shard
+  locally (two 128-byte lines), 64 `u32` slots in the mmap directory. In flush mode the stripe is
+  one chunk, so the lease gate behaves as before.
+- The GC phase is derived from the pass (`P & 1`) rather than toggled. The
+  writer stamps every document with its pass in both modes
+  (`Document::write_serial`, outside the CRC). Flush mode ignores the stamp.
+- `CycloneCacheConfig` gains a trailing `int disable_wrap_retention`. As with
+  earlier trailing fields, callers must be recompiled against the new
+  header.
+- **On-disk format v8 (was v7): the document checksum is CRC-32C
+  (Castagnoli, reflected poly `0x82F63B78`) instead of CRC-32/ISO-HDLC.**
+  The checksum used to be a byte-at-a-time ISO-HDLC table inside
+  `document.cpp`, at about 0.5-0.6 GB/s, and it is re-verified on every cold
+  read, so it capped cold-read bandwidth. It now lives in
+  `src/core/crc32c.{hpp,cpp}` (`crc32c()` / `crc32c_update()`), and CRC-32C
+  has a hardware path on x86-64 (SSE4.2 `crc32q`) as well as on ARMv8
+  (`crc32cx`). Both hardware paths run a 3-way interleave: 34.9 GB/s over
+  2 MiB on an Apple M5 (12.2 GB/s single-stream), 26.5 GB/s on an
+  i7-8750H (10.4 GB/s single-stream); every other target runs a portable
+  slice-by-16 table path at 3.4 GB/s (M5) / 2.8 GB/s (i7), against 0.61 /
+  0.50 GB/s for the old byte-wise table. End to end on Linux (i7-8750H),
+  the 2 MiB cold read goes from 1.6 GB/s, measured against an interim
+  slice-by-16 CRC-32, to 2.2 GB/s, level with LMDB
+  (`doc/kv-cache-benchmark.md`). The path is picked by a runtime CPU probe,
+  resolved once, on first use.
+  **Existing cache files are abandoned (not deleted) on open.** The format
+  major is mixed into the fingerprinted volume filename, so a v8 binary
+  resolves to a different file and starts cold rather than failing to verify
+  v7 documents; the superseded v7 file stays on disk until
+  `gc_superseded_on_start` (POSIX only) or a manual delete reclaims it.
+- **On-disk format v9 (was v8): the document checksum covers the fixed
+  document header.** The checksum now also covers the fixed document
+  header, except the fields the cache stamps or updates itself, so damage
+  to a header field reads as a miss instead of being served. The added
+  cost is small (one checksum over the 132-byte header per write and per
+  verified read). Each document also carries the serial of the write
+  that filled it, as do the directory entry that publishes it and the
+  alternate chain links made to it.
+  **Existing cache files are abandoned (not deleted) on open**, exactly as
+  for v8: a v9 binary resolves to a different fingerprinted file and
+  starts cold; the superseded v8 file stays on disk until
+  `gc_superseded_on_start` (POSIX only) or a manual delete reclaims it.
+  During a rolling restart the old and new versions use separate files,
+  so disk use temporarily doubles, and in multi-process mode each file
+  is written only by the processes on its version, so the hit rate stays
+  low until every process runs the new version.
+- **Bazel and vendored consumers:** add the new sources
+  `src/core/crc32c.cpp`, `src/core/crc32c.hpp`, `src/c_api/c_error_map.hpp`
+  and `src/core/write_commit_observer.hpp`, and remove `src/io/executor.cpp`
+  and `src/core/thread_util.hpp`, in any downstream BUILD file that lists
+  srcs explicitly. No new copts or defines are needed: the
+  hardware paths use per-function target attributes and runtime dispatch,
+  so the stock compiler flags still build every path.
+- C API: `cyclone_c.h` now compiles as C11 as well as C++. `CycloneError`
+  and `CycloneTier` are `typedef uint8_t` plus an anonymous enum of their
+  constants (previously C++ `using X = enum : uint8_t`), so the ABI is
+  unchanged. From C++ this is observable: they are no longer distinct
+  types, so overloads on them collide with `uint8_t`, and streaming one
+  with `<<` prints a character rather than a number.
+- License: Apache License 2.0 (was BUSL-1.1). See `LICENSE` and `NOTICE`.
+- License: every file carries an Apache-2.0 SPDX header or is a documented
+  exception, verified with Apache RAT.

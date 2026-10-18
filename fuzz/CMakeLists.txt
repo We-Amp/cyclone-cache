@@ -14,7 +14,12 @@ set(CYCLONE_FUZZ_TARGETS
   fuzz_document_parse
   fuzz_volume_open
   fuzz_c_api
+  fuzz_c_api_async
 )
+
+if(CYCLONE_BUILD_HTTP_PLUGIN)
+  list(APPEND CYCLONE_FUZZ_TARGETS fuzz_http_metadata fuzz_http_alternate)
+endif()
 
 foreach(target ${CYCLONE_FUZZ_TARGETS})
   add_executable(${target} ${target}.cpp)

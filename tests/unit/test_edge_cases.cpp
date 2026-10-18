@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -51,7 +52,7 @@ TEST_CASE("DirEntry offset preserves other fields", "[edge][directory]") {
   entry.set_phase(true);
   entry.set_head(true);
   entry.set_pinned(true);
-  entry.set_next(0x1234);
+  entry.set_fill_serial(0x1234);
 
   entry.set_offset(0x123456789AULL);
 
@@ -62,7 +63,7 @@ TEST_CASE("DirEntry offset preserves other fields", "[edge][directory]") {
   REQUIRE(entry.phase() == true);
   REQUIRE(entry.head() == true);
   REQUIRE(entry.pinned() == true);
-  REQUIRE(entry.next() == 0x1234);
+  REQUIRE(entry.fill_serial() == 0x1234);
 }
 
 TEST_CASE("DirEntry size encoding boundary values", "[edge][directory]") {
@@ -99,17 +100,17 @@ TEST_CASE("DirEntry all tag values", "[edge][directory]") {
   REQUIRE(entry.tag() == 0xFFF);
 }
 
-TEST_CASE("DirEntry next pointer full range", "[edge][directory]") {
+TEST_CASE("DirEntry fill serial full range", "[edge][directory]") {
   DirEntry entry;
 
-  entry.set_next(0);
-  REQUIRE(entry.next() == 0);
+  entry.set_fill_serial(0);
+  REQUIRE(entry.fill_serial() == 0);
 
-  entry.set_next(0xFFFF);
-  REQUIRE(entry.next() == 0xFFFF);
+  entry.set_fill_serial(0xFFFF);
+  REQUIRE(entry.fill_serial() == 0xFFFF);
 
-  entry.set_next(0x8000);
-  REQUIRE(entry.next() == 0x8000);
+  entry.set_fill_serial(0x8000);
+  REQUIRE(entry.fill_serial() == 0x8000);
 }
 
 // =============================================================================
@@ -585,6 +586,42 @@ TEST_CASE("Volume reset rejects size equal to header", "[edge][volume]") {
 
   auto start_result = cache->start();
   REQUIRE_FALSE(start_result.has_value());
+}
+
+TEST_CASE("Volume whose stripe cannot hold its directory is rejected",
+          "[edge][volume]") {
+  // A stripe starts with its directory (~640 KiB in memory, ~720 KiB as an
+  // mmap directory).  A volume too small to hold it would seat the data area
+  // past the end of the stripe: every write then extends the file and
+  // fails.  It must be refused at start() instead, without growing a file.
+  const bool multi_process = GENERATE(false, true);
+  const size_t size = multi_process ? static_cast<size_t>(512 * 1024)
+                                    : static_cast<size_t>(64 * 1024);
+  INFO("multi_process=" << multi_process << " size=" << size);
+
+  TempCacheDir tmp;
+  CacheConfig config;
+  config.set_enable_checksum(true);
+  if (multi_process) {
+    config.set_multi_process(0, 1);
+  }
+  auto cache_result = Cache::create(config);
+  REQUIRE(cache_result.has_value());
+  auto &cache = *cache_result;
+
+  VolumeConfig vol_config;
+  vol_config.path = tmp.path("edge_small.cache");
+  vol_config.size = size;
+  REQUIRE(cache->add_volume(vol_config).has_value());
+
+  auto start_result = cache->start();
+  REQUIRE_FALSE(start_result.has_value());
+  REQUIRE(start_result.error() == CacheError::InvalidArgument);
+
+  namespace fs = std::filesystem;
+  for (const auto &entry : fs::directory_iterator(tmp.dir())) {
+    REQUIRE(fs::file_size(entry.path()) <= size);
+  }
 }
 
 TEST_CASE("WriteBuffer has max size limit", "[edge][write_buffer][security]") {

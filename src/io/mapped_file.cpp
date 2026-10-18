@@ -3,6 +3,7 @@
 
 #include "mapped_file.hpp"
 
+#include <atomic>
 #include <cerrno>
 #include <climits>
 
@@ -20,6 +21,12 @@
 #endif
 
 namespace cyclone {
+
+#ifdef CYCLONE_TEST_SEAMS
+namespace {
+std::atomic<bool> g_fail_whole_file_map{false};
+}  // namespace
+#endif
 
 #ifdef CYCLONE_USE_POSIX_MMAP
 
@@ -99,10 +106,11 @@ class PosixMappedFile : public MappedFile {
 
     struct stat st;
     if (fstat(_fd, &st) < 0) {
+      const int saved_errno = errno;
       ::close(_fd);
       _fd = -1;
       return make_unexpected(
-          std::make_error_code(static_cast<std::errc>(errno)));
+          std::make_error_code(static_cast<std::errc>(saved_errno)));
     }
 
     _file_size = st.st_size;
@@ -128,6 +136,12 @@ class PosixMappedFile : public MappedFile {
   [[nodiscard]] bool is_open() const override { return _fd >= 0; }
 
   std::expected<void, std::error_code> map_whole_file(MapMode mode) override {
+#ifdef CYCLONE_TEST_SEAMS
+    if (g_fail_whole_file_map.load(std::memory_order_relaxed)) {
+      return make_unexpected(
+          std::make_error_code(std::errc::not_enough_memory));
+    }
+#endif
     if (_fd < 0) {
       return make_unexpected(
           std::make_error_code(std::errc::bad_file_descriptor));
@@ -176,6 +190,13 @@ class PosixMappedFile : public MappedFile {
             std::make_error_code(std::errc::invalid_argument));
       }
       return std::span<std::byte>(_persistent_base + offset, length);
+    }
+
+    // Slow path: the same bounds as the fast path, against the file size.
+    // Mapping a range past the end of the file succeeds, but the first touch
+    // of a page wholly beyond the end raises a bus error, so refuse it here.
+    if (offset > _file_size || length > _file_size - offset) {
+      return make_unexpected(std::make_error_code(std::errc::invalid_argument));
     }
 
     int prot = PROT_READ;
@@ -497,10 +518,11 @@ class Win32MappedFile : public MappedFile {
 
     LARGE_INTEGER size;
     if (!GetFileSizeEx(_file_handle, &size)) {
+      const DWORD saved_error = GetLastError();
       CloseHandle(_file_handle);
       _file_handle = INVALID_HANDLE_VALUE;
       return make_unexpected(
-          std::error_code(GetLastError(), std::system_category()));
+          std::error_code(saved_error, std::system_category()));
     }
 
     _file_size = size.QuadPart;
@@ -530,6 +552,12 @@ class Win32MappedFile : public MappedFile {
   bool is_open() const override { return _file_handle != INVALID_HANDLE_VALUE; }
 
   std::expected<void, std::error_code> map_whole_file(MapMode mode) override {
+#ifdef CYCLONE_TEST_SEAMS
+    if (g_fail_whole_file_map.load(std::memory_order_relaxed)) {
+      return make_unexpected(
+          std::make_error_code(std::errc::not_enough_memory));
+    }
+#endif
     if (_file_handle == INVALID_HANDLE_VALUE) {
       return make_unexpected(
           std::make_error_code(std::errc::bad_file_descriptor));
@@ -580,6 +608,12 @@ class Win32MappedFile : public MappedFile {
             std::make_error_code(std::errc::invalid_argument));
       }
       return std::span<std::byte>(_persistent_base + offset, length);
+    }
+
+    // Slow path: the same bounds as the fast path, against the file size.
+    // Keeps both platforms refusing the same ranges.
+    if (offset > _file_size || length > _file_size - offset) {
+      return make_unexpected(std::make_error_code(std::errc::invalid_argument));
     }
 
     DWORD protect =
@@ -644,7 +678,9 @@ class Win32MappedFile : public MappedFile {
     // For synchronous mode, also call FlushFileBuffers to ensure data
     // reaches stable storage.  Skip for async to avoid blocking.
     if (mode == SyncMode::Sync && _file_handle != INVALID_HANDLE_VALUE) {
-      FlushFileBuffers(_file_handle);
+      if (!FlushFileBuffers(_file_handle)) {
+        return std::error_code(GetLastError(), std::system_category());
+      }
     }
     return {};
   }
@@ -717,6 +753,12 @@ class Win32MappedFile : public MappedFile {
 };
 
 #endif  // CYCLONE_USE_WIN32_MMAP
+
+#ifdef CYCLONE_TEST_SEAMS
+void MappedFile::set_whole_file_map_failure_for_testing(bool fail) noexcept {
+  g_fail_whole_file_map.store(fail, std::memory_order_relaxed);
+}
+#endif
 
 std::unique_ptr<MappedFile> MappedFile::create() {
 #ifdef CYCLONE_USE_WIN32_MMAP

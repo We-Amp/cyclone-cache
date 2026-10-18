@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -238,8 +239,12 @@ class WriterLiveness {
   /// `path` names it.  On POSIX a claim opens its own descriptor of `path`
   /// (checked to be the same inode as `probe_fd`), so that a forked child,
   /// which shares the parent's descriptors, can claim a slot of its own
-  /// whose lock dies with the child.  Claims a slot for this process at once.
-  void attach(int probe_fd, const std::string &path);
+  /// whose lock dies with the child.  Claims a slot for this process at once,
+  /// unless the fork handlers (install_fork_handlers) could not be
+  /// registered: a forked child could not tell its parent's claim from its
+  /// own, so then no slot is claimed in this attachment.  Returns whether
+  /// this process now holds a slot.
+  bool attach(int probe_fd, const std::string &path);
 
   /// Release this process's slot and forget the file.  The caller must not
   /// use a directory whose liveness this is afterwards.
@@ -272,6 +277,8 @@ class WriterLiveness {
   static inline std::atomic<uint32_t> s_pid_override_for_test{0};
   /// When true, every claim fails (locking unavailable).
   static inline std::atomic<bool> s_claims_fail_for_test{false};
+  /// When true, attach() finds the fork handlers not registered.
+  static inline std::atomic<bool> s_fork_handlers_fail_for_test{false};
   /// Nonzero: only slots [0, n) are claimable, starting at slot 0.
   static inline std::atomic<unsigned> s_slots_for_test{0};
 #endif
@@ -632,6 +639,7 @@ class MmapDirectory {
   /// refreshed INSIDE the bracket, under phase_lock.
   /// A capped wait on the phase lock or the bucket that gave up (see
   /// kLockWaitCap) sets *busy and publishes nothing.
+  /// The published entry carries `fill_serial` (DirEntry::fill_serial).
   bool insert(const CacheKey &key, uint64_t offset, uint64_t size,
               uint64_t verified_offset = kMatchAnyTag,
               bool *collision_evicted = nullptr,
@@ -639,7 +647,7 @@ class MmapDirectory {
               InsertAdmission *admission = nullptr,
               std::span<const uint64_t> clear_offsets = {},
               bool *busy = nullptr, const PublishView *view = nullptr,
-              bool *stale = nullptr);
+              bool *stale = nullptr, uint16_t fill_serial = 0);
 
   /// Remove an entry
   /// Returns true if entry was found and removed
@@ -798,22 +806,25 @@ class MmapDirectory {
   // Measured on macOS (10 cores): two processes writing one volume as
   // process 0 of 1, 2 writer threads each, plus CPU hogs.  Live holders held
   // a bucket for at most 0.6 ms with 12 hogs, but up to 56 ms with 24-48
-  // hogs (2.8-5.2 runnable threads per core); the phase lock, whose holder
-  // also waits on a bucket, up to 112 ms.  The budgets sit well above
-  // that: recovering a live holder costs a spurious miss, while a larger
-  // budget only lengthens the one-time stall after a process died holding
-  // the lock.  The phase-lock budget must exceed the bucket budget plus a
-  // live phase hold, since the holder (insert) waits on a bucket inside it.
+  // hogs (2.8-5.2 runnable threads per core); the phase lock up to 112 ms
+  // (measured while its holder still waited on a bucket inside it).  The
+  // budgets sit well above that: recovering a live holder costs a spurious
+  // miss, while a larger budget only lengthens the one-time stall after a
+  // process died holding the lock.
   static constexpr std::chrono::milliseconds kBucketWriterBudget{250};
   static constexpr std::chrono::milliseconds kPhaseLockBudget{1000};
   // The write lock never presumes a live holder stuck: it recovers the lock
   // from a holder PROVEN dead, and takes over a holder it cannot prove dead
   // only after this last-resort escalation budget.
   static constexpr std::chrono::milliseconds kWriteLockEscalationBudget{5000};
-  // A phase-lock holder waits on a bucket; a write-lock holder (wrap) waits
-  // on the phase lock.  An inner wait must end well inside the outer budget.
-  static_assert(kPhaseLockBudget >= 2 * kBucketWriterBudget);
+  // A write-lock holder (wrap) waits on the phase lock, so that inner wait
+  // must end well inside the outer budget.  A phase-lock holder never waits
+  // on a bucket: insert() takes the bucket first and only TRIES the phase
+  // lock while it is held.
   static_assert(kWriteLockEscalationBudget >= 2 * kPhaseLockBudget);
+  // Times insert() retries its bucket bracket after finding the phase lock
+  // busy (each retry follows a capped wait holding nothing).
+  static constexpr int kInsertPhaseAttempts = 4;
   // The write lock consults the holder's liveness (WriterLiveness::probe,
   // one fcntl / LockFileEx) only once one holder has kept it this long, far
   // past any ordinary contention, so a waiter does not probe on every short
@@ -850,6 +861,11 @@ class MmapDirectory {
   static inline std::atomic<uint64_t> s_bucket_recoveries_for_test{0};
   static inline std::atomic<uint64_t> s_phase_lock_recoveries_for_test{0};
 
+  /// Called by init() with the region once everything but the publish of
+  /// the header's magic is written, so a test can open the region there.
+  /// Set and cleared while no init() runs.
+  static inline void (*s_init_before_publish_for_test)(
+      std::span<std::byte> region) = nullptr;
   /// Take / release the phase lock as insert() does, so a test can park a
   /// live holder inside it.
   [[nodiscard]] PhaseLockToken acquire_phase_lock_for_test() {
@@ -1064,6 +1080,15 @@ class MmapDirectory {
   /// acquire_writer's contended path, out of line.
   bool acquire_writer_slow(size_t bucket_idx, uint32_t &token, bool capped);
 
+  /// A reader's probe of `bucket_idx` spent its whole read budget with the
+  /// bucket odd at `version`.  Remembers when this process first saw that
+  /// holder; once the same odd version has been seen for
+  /// kBucketWriterBudget, recovers the bucket exactly as a waiting writer
+  /// does (CAS from that odd version to the next even one).  True when the
+  /// bucket is no longer held at `version` (recovered, or released
+  /// meanwhile): the probe may scan again.  Cold path, never blocks.
+  bool reader_recover_stuck_bucket(size_t bucket_idx, uint32_t version) const;
+
   /// Release writer lock: CAS token+1 (odd) -> token+2 (even).  A no-op if
   /// the bucket was force-released from under us (see acquire_writer), so a
   /// late release can never flip the parity back to odd.
@@ -1081,6 +1106,10 @@ class MmapDirectory {
 
   /// acquire_phase_lock's contended path, out of line.
   bool acquire_phase_lock_slow(PhaseLockToken &token, bool capped);
+
+  /// One attempt at the phase lock, never waiting (insert() calls it while
+  /// holding a bucket odd).
+  [[nodiscard]] bool try_acquire_phase_lock(PhaseLockToken &token);
 
   /// True iff the write-lock holder seen as {value, generation, pid} holds
   /// a WriterLiveness slot (its token encodes one) whose lock the OS reports
@@ -1101,6 +1130,24 @@ class MmapDirectory {
   RetentionRegion *_retention;  // after the entries (see RetentionRegion)
   size_t _num_buckets;
   WriterLiveness *_liveness = nullptr;  // see set_liveness
+
+  // Process-local (never in the shared region): the buckets readers found
+  // held past their whole read budget, with when this process first saw
+  // each holder (see reader_recover_stuck_bucket).  A holder is its odd
+  // version: versions only grow, so the same odd value seen twice is one
+  // unbroken hold.  Guarded by a try-only flag, so a reader never waits on
+  // it (and a forked child that inherited it set merely stops recording).
+  struct StuckBucketSighting {
+    size_t bucket = 0;
+    uint32_t version = 0;  // the odd version held; 0 (even) = slot unused
+    std::chrono::steady_clock::time_point first_seen{};
+  };
+  // Process-local and small: room for the buckets a writer that died in the
+  // middle of several stripes' updates can leave held, so eviction never
+  // drops a record that is about to reach the recovery budget.
+  static constexpr size_t kStuckBucketSightings = 32;
+  mutable std::atomic_flag _sightings_busy;
+  mutable std::array<StuckBucketSighting, kStuckBucketSightings> _sightings{};
 };
 
 // Template implementation
@@ -1117,7 +1164,22 @@ bool MmapDirectory::probe_each_impl(const CacheKey &key,
   // Retry loop for torn read detection, bounded by SeqlockReadWait.  Every
   // failed attempt, including each `continue` below, goes through
   // wait.retry() in the loop condition.
+  //
+  // A budget spent on a bucket that stayed odd may be a holder that died
+  // mid-update: past the writers' bucket budget for that same holder, the
+  // reader recovers the bucket and makes one more attempt (see
+  // reader_recover_stuck_bucket), instead of reporting Busy until a writer
+  // of this bucket happens along.
   SeqlockReadWait wait;
+  uint32_t last_version = 0;
+  bool recovery_tried = false;
+  const auto recover = [&] {
+    if (recovery_tried || (last_version & 1) == 0) {
+      return false;
+    }
+    recovery_tried = true;
+    return reader_recover_stuck_bucket(bucket_idx, last_version);
+  };
   do {
     // Capture the phase INSIDE the retry loop: a retry triggered by a
     // concurrent toggle_phase() must rescan with the new phase, or
@@ -1130,6 +1192,7 @@ bool MmapDirectory::probe_each_impl(const CacheKey &key,
     // wasting a full retry attempt on a guaranteed-inconsistent read.
     const uint32_t version_before =
         wait.even_version([&] { return load_version(bucket_idx); });
+    last_version = version_before;
     if ((version_before & 1) != 0) {
       continue;  // Writer still active: retry (wait.retry() paces it)
     }
@@ -1178,7 +1241,7 @@ bool MmapDirectory::probe_each_impl(const CacheKey &key,
       return true;  // Consistent read achieved
     }
     // Version changed - retry
-  } while (wait.retry());
+  } while (wait.retry() || recover());
   return false;  // A writer held the bucket past the budget: unknown
 }
 

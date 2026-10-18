@@ -3,28 +3,33 @@
 
 #include "document.hpp"
 
+#include <array>
 #include <atomic>
+#include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <utility>
 
 #include "crc32c.hpp"
 
 namespace cyclone {
 
-// The document checksum is the CRC-32C (Castagnoli) over header_data +
-// content (everything after the 132-byte on-disk header).  The polynomial,
-// init, reflection and xorout live in crc32c.hpp and are part of the on-disk
-// format -- see the convention block there before touching any of it, and
-// note that changing it requires a kVersionMajor bump (v8 is the CRC-32C
-// one; v7 and earlier carried CRC-32/ISO-HDLC).
+// The document checksum is the CRC-32C (Castagnoli) over the canonical fixed
+// header (see Document::checksum_header_seed) followed by header_data +
+// content.  The polynomial, init, reflection and xorout live in crc32c.hpp
+// and, like the coverage, are part of the on-disk format -- see the
+// convention block there before touching any of it, and note that changing
+// either requires a kVersionMajor bump (v9 covers the fixed header; v8
+// covered header_data + content only; v7 and earlier carried
+// CRC-32/ISO-HDLC).
 
 uint32_t Document::compute_checksum(std::span<const std::byte> data) {
   return crc32c(data);
 }
 
-bool Document::verify_checksum(std::span<const std::byte> content) const {
-  return checksum == crc32c(content);
+bool Document::verify_checksum(std::span<const std::byte> payload) const {
+  return checksum == crc32c_update(checksum_header_seed(), payload);
 }
 
 // Field descriptor for table-driven serialization.
@@ -50,7 +55,7 @@ constexpr FieldDesc kDocumentFields[] = {
     {offsetof(Document, version_major), sizeof(Document::version_major)},
     {offsetof(Document, version_minor), sizeof(Document::version_minor)},
     {offsetof(Document, flags), sizeof(Document::flags)},
-    {offsetof(Document, sync_serial), sizeof(Document::sync_serial)},
+    {offsetof(Document, fill_serial), sizeof(Document::fill_serial)},
     {offsetof(Document, write_serial), sizeof(Document::write_serial)},
     {offsetof(Document, pin_until), sizeof(Document::pin_until)},
     {offsetof(Document, checksum), sizeof(Document::checksum)},
@@ -83,6 +88,8 @@ consteval size_t wire_offset_of(size_t field_index) {
 // next_alternate_offset is 16, last_access is 17, alternate_id is 18 (v6)
 static_assert(wire_offset_of(7) == Document::kVersionMajorOffset,
               "kVersionMajorOffset out of sync with field table");
+static_assert(wire_offset_of(10) == Document::kFillSerialOffset,
+              "kFillSerialOffset out of sync with field table");
 static_assert(wire_offset_of(11) == Document::kWriteSerialOffset,
               "kWriteSerialOffset out of sync with field table");
 static_assert(wire_offset_of(13) == Document::kChecksumOffset,
@@ -110,16 +117,35 @@ static_assert(Document::kLastAccessOffset % 8 == 0,
 std::span<std::byte> Document::serialize(std::vector<std::byte> &buffer) const {
   size_t old_size = buffer.size();
   buffer.resize(old_size + kHeaderSize);
-
-  const auto *src = reinterpret_cast<const std::byte *>(this);
-  std::byte *dst = buffer.data() + old_size;
-
-  for (const auto &f : kDocumentFields) {
-    std::memcpy(dst, src + f.struct_offset, f.size);
-    dst += f.size;
-  }
-
+  serialize_to(buffer.data() + old_size);
   return {buffer.data() + old_size, kHeaderSize};
+}
+
+void Document::serialize_to(std::byte *out) const {
+  const auto *src = reinterpret_cast<const std::byte *>(this);
+  for (const auto &f : kDocumentFields) {
+    std::memcpy(out, src + f.struct_offset, f.size);
+    out += f.size;
+  }
+}
+
+uint32_t Document::checksum_header_seed() const {
+  std::array<std::byte, kHeaderSize> canonical;
+  serialize_to(canonical.data());
+  // The fields stamped after the checksum is computed (the fill and pass
+  // stamps) or updated in place, and the checksum itself.
+  constexpr std::pair<size_t, size_t> kInPlace[] = {
+      {kFillSerialOffset, sizeof(uint32_t)},
+      {kWriteSerialOffset, sizeof(uint32_t)},
+      {kChecksumOffset, sizeof(uint32_t)},
+      {kHitCountOffset, sizeof(uint32_t)},
+      {kNextAlternateOffsetPos, sizeof(uint64_t)},
+      {kLastAccessOffset, sizeof(int64_t)},
+  };
+  for (const auto &[off, size] : kInPlace) {
+    std::memset(canonical.data() + off, 0, size);
+  }
+  return crc32c_update(0, canonical);
 }
 
 Document Document::deserialize(std::span<const std::byte> data) {
@@ -285,10 +311,13 @@ std::vector<std::byte> DocumentBuilder::serialize_head(
   result.insert(result.end(), _header.begin(), _header.end());
 
   if (_enable_checksum) {
-    // Header bytes, then content: crc32c_update chains, so this is the CRC
-    // of the contiguous payload without the payload ever being contiguous.
+    // Canonical fixed header, then header bytes, then content:
+    // crc32c_update chains, so this is the CRC of the concatenation without
+    // it ever being contiguous.
     const uint32_t crc =
-        crc32c_update(crc32c(std::span<const std::byte>(_header)), content);
+        crc32c_update(crc32c_update(doc.checksum_header_seed(),
+                                    std::span<const std::byte>(_header)),
+                      content);
     std::byte *checksum_location = result.data() + Document::kChecksumOffset;
     std::memcpy(checksum_location, &crc, sizeof(crc));
   }
@@ -297,6 +326,19 @@ std::vector<std::byte> DocumentBuilder::serialize_head(
 }
 
 // DocumentReader
+
+DocumentReader::DocumentReader(SharedMappingTag,
+                               std::span<const std::byte> data)
+    : _data(data) {
+  // Documents start 8-aligned in a shared mapping, which the atomic loads of
+  // the live-mutated header fields require.  A misaligned base can only come
+  // from a corrupt offset: leave the reader invalid so the caller takes its
+  // normal invalid-document path.
+  if (reinterpret_cast<std::uintptr_t>(data.data()) % 8 != 0) {
+    return;
+  }
+  *this = DocumentReader(data);
+}
 
 DocumentReader::DocumentReader(std::span<const std::byte> data) : _data(data) {
   if (data.size() >= Document::kHeaderSize) {

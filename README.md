@@ -17,7 +17,7 @@ It is a general-purpose blob store for anything keyed by a hash — HTTP
 responses and their content-negotiated variants, rendered pages, transcoded
 images, or the [KV-cache tensors of an LLM prefix](#kv-cache-for-llm-inference).
 
-**Status:** v0.1.0, pre-release. On-disk format v8. The API is not yet frozen;
+**Status:** v0.1.0, pre-release. On-disk format v9. The API is not yet frozen;
 pin a commit when you depend on it. The numbers below are from one machine
 (Apple M5 / macOS 27) unless they name another; expect different absolutes
 on Linux/NVMe.
@@ -677,6 +677,14 @@ cache.optimization_engine()->on_write_complete(key, header_bytes, content.size()
                                                AlternateId::Original, hit_count);
 ```
 
+Load shedding (pause the pool and drop deferrable queued work while the cache
+is busy) is opt-in through `set_enable_load_shedding(true)`. The load estimate
+is `0.3 * ops/baseline_ops_per_sec + 0.7 * bytes/baseline_bytes_per_sec` (each
+term capped at 1) over the cache's completed reads and writes; with the default
+baselines (100k ops/s, 500 MiB/s) about 100k reads/s of 4 KiB objects already
+score 0.86, past the default high watermark of 0.8, so set both baselines to
+what the host sustains at full load before enabling it.
+
 See [doc/plugin-development.md](doc/plugin-development.md).
 
 ## C ABI
@@ -732,12 +740,12 @@ probes) is documented in [include/cyclone/cyclone_c.h](include/cyclone/cyclone_c
 
 ## On-disk format
 
-Format major **v8**. Each volume file starts with a 64-byte `VolumeHeader`
+Format major **v9**. Each volume file starts with a 64-byte `VolumeHeader`
 (magic `CYLN`, format version, creation time, size); a major-version mismatch
 resets the volume (or fails with `IncompatibleVersion` when
 `auto_reset_on_incompatible = false`), a minor mismatch is compatible. File
 names are fingerprinted with the format version and geometry
-(`cache-8-<hash>.dat`), so an upgrade starts a fresh file and leaves the old
+(`cache-9-<hash>.dat`), so an upgrade starts a fresh file and leaves the old
 one on disk until `gc_superseded_on_start` (POSIX only) or you delete it.
 
 Directory entry — 10 bytes, no key material:
@@ -746,7 +754,7 @@ Directory entry — 10 bytes, no key material:
 w0  offset[0:15]
 w1  offset[16:23] | big[2] | size[6]         approximate size = (size+1) × 512 << big
 w2  tag[12] | phase[1] | head[1] | pinned[1] | reserved[1]
-w3  next                                     bucket chain, 4 entries per bucket
+w3  fill_serial                              serial of the write that filled the document
 w4  offset[24:39]                            40-bit byte offset → 1 TiB per stripe
 ```
 
@@ -756,10 +764,17 @@ Document — 132-byte header, then header bytes, then content:
 magic · len · total_len
 first_key      (32 B, SHA-256 of the key)
 fragment_key   (32 B)
-header_len · type · version · flags · sync_serial · write_serial
+header_len · type · version · flags · fill_serial · write_serial
 pin_until · checksum (CRC-32C) · frag_offset · hit_count
-next_alternate_offset (8 B) · last_access · alternate_id · reserved
+next_alternate_offset (8 B: offset + the next node's fill_serial) · last_access · alternate_id · reserved
 ```
+
+The checksum covers the fixed header as well as the header bytes and
+content: every field except the ones stamped after the checksum is
+computed or updated in place (fill_serial, write_serial, hit_count,
+next_alternate_offset, last_access) and the
+checksum itself. A read serves a document only when its fill_serial
+matches the directory entry's.
 
 ## Performance
 

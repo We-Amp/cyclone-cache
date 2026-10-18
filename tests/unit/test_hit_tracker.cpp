@@ -659,12 +659,11 @@ TEST_CASE("HitTracker callback receives correct key and alternate",
   REQUIRE(found_key2_gzip);
 }
 
-// Regression for the staged-teardown fix (leak_thread_on_shutdown UAF
-// class).
+// Regression for the staged-teardown fix (the abandoned-thread UAF class).
 //
 // The old HitTracker::stop() joined the flush thread with a 5 s bounded wait
-// and, on timeout, abandoned the still-running thread via
-// leak_thread_on_shutdown().  When a flush callback stalled (I/O pressure),
+// and, on timeout, abandoned the still-running thread by leaking its
+// std::thread object.  When a flush callback stalled (I/O pressure),
 // stop() returned while the flush thread was still executing the callback,
 // which iterates the Cache's volume list — so the leaked thread went on to
 // dereference volumes the caller then destroyed (heap-use-after-free).
@@ -749,4 +748,209 @@ TEST_CASE("HitTracker::stop() joins an in-flight flush thread (no leak)",
   REQUIRE(stop_elapsed >= std::chrono::milliseconds(5500));
   // Exactly one callback ran, on the background thread, and it completed.
   REQUIRE(callback_invocations.load(std::memory_order_relaxed) == 1);
+}
+
+TEST_CASE("HitTracker batch-done callback follows real flush results",
+          "[hit_tracker]") {
+  HitTrackerConfig config;
+  config.enable_background_flush = false;
+  HitTracker tracker(config);
+
+  std::atomic<bool> store_ok{false};
+  int batch_done = 0;
+  tracker.set_batch_done_callback([&]() { ++batch_done; });
+  tracker.start([&](const CacheKey &, AlternateId, uint32_t, int64_t) {
+    return store_ok.load();
+  });
+
+  CacheKey key("failing-flush");
+  tracker.record_hit(key);
+  tracker.flush_now();
+  CHECK(batch_done == 0);
+  CHECK(tracker.flush_failures() == 1);
+
+  store_ok = true;
+  tracker.record_hit(key);
+  tracker.flush_now();
+  CHECK(batch_done == 1);
+}
+
+// Records past the configured pending-entry bound must not run a full
+// flush sweep on the reading thread (issue: record_hit -> flush_now on the
+// hot read path).  With a flush thread, the overflow is handed off to it;
+// the reader only pays a flag store.  Without one, at most one reader at a
+// time sweeps.  Past twice the bound the pending set is capped by dropping
+// and counting further records, so memory stays bounded even when the
+// flush thread cannot drain.
+TEST_CASE(
+    "HitTracker overflow: a flush thread drains the overflow off the "
+    "reading thread",
+    "[hit_tracker][regression]") {
+  HitTrackerConfig config;
+  config.enable_background_flush = true;
+  config.flush_interval = std::chrono::milliseconds(10000);
+  config.max_pending_entries = 8;
+  config.flush_threshold = 1000000;
+  HitTracker tracker(config);
+
+  std::atomic<int> flushed_delta{0};
+  std::atomic<int> main_thread_flushes{0};
+  const auto main_id = std::this_thread::get_id();
+  tracker.start([&](const CacheKey &, AlternateId, uint32_t delta, int64_t) {
+    flushed_delta.fetch_add(delta, std::memory_order_relaxed);
+    if (std::this_thread::get_id() == main_id) {
+      main_thread_flushes.fetch_add(1, std::memory_order_relaxed);
+    }
+    // A slow callback: an inline sweep on the reading thread is directly
+    // visible as read latency.
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    return true;
+  });
+
+  // Push past the bound with unique keys, all from the reading (main)
+  // thread, exactly as cache reads do.
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < 40; ++i) {
+    tracker.record_hit(CacheKey("overflow-handoff-" + std::to_string(i)));
+  }
+  const auto record_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - t0)
+                             .count();
+
+  // No sweep ever ran on the reading thread, and recording 40 hits (32 of
+  // them past the bound) stayed fast: one inline sweep per over-limit hit
+  // with a 20 ms callback would cost hundreds of milliseconds.
+  REQUIRE(main_thread_flushes.load() == 0);
+  REQUIRE(record_ms < 200);
+
+  // The hand-off drains everything within the flush thread's wake-up
+  // window, losing nothing.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  while (flushed_delta.load() < 40 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  REQUIRE(flushed_delta.load() == 40);
+  REQUIRE(tracker.pending_count() == 0);
+  REQUIRE(tracker.dropped_overflow_hits() == 0);
+
+  tracker.stop();
+}
+
+TEST_CASE(
+    "HitTracker overflow: without a flush thread at most one reader "
+    "sweeps at a time",
+    "[hit_tracker][concurrent][regression]") {
+  HitTrackerConfig config;
+  config.enable_background_flush = false;
+  config.max_pending_entries = 8;
+  config.flush_threshold = 1000000;
+  HitTracker tracker(config);
+
+  std::atomic<int> flushed_delta{0};
+  std::atomic<int> in_flight{0};
+  std::atomic<int> max_in_flight{0};
+  tracker.start([&](const CacheKey &, AlternateId, uint32_t delta, int64_t) {
+    const int now = in_flight.fetch_add(1, std::memory_order_acq_rel) + 1;
+    int prev = max_in_flight.load(std::memory_order_relaxed);
+    while (now > prev && !max_in_flight.compare_exchange_weak(
+                             prev, now, std::memory_order_relaxed)) {
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    flushed_delta.fetch_add(delta, std::memory_order_relaxed);
+    in_flight.fetch_sub(1, std::memory_order_acq_rel);
+    return true;
+  });
+
+  constexpr int kThreads = 8;
+  constexpr int kPerThread = 20;
+  std::vector<std::thread> readers;
+  for (int t = 0; t < kThreads; ++t) {
+    readers.emplace_back([&, t] {
+      for (int i = 0; i < kPerThread; ++i) {
+        tracker.record_hit(CacheKey("overflow-gate-" + std::to_string(t) + "-" +
+                                    std::to_string(i)));
+      }
+    });
+  }
+  for (auto &reader : readers) {
+    reader.join();
+  }
+
+  // Every over-limit record_hit used to enter flush_now itself; with the
+  // single-observer gate at most one sweep (and so one callback) runs at a
+  // time.
+  REQUIRE(max_in_flight.load() == 1);
+
+  tracker.stop();  // final flush drains the rest
+  const int recorded = kThreads * kPerThread;
+  REQUIRE(flushed_delta.load() + tracker.dropped_overflow_hits() == recorded);
+}
+
+TEST_CASE(
+    "HitTracker overflow: past the hard bound a hit on an already pending "
+    "key is still counted and only new keys are dropped",
+    "[hit_tracker][regression]") {
+  HitTrackerConfig config;
+  config.enable_background_flush = true;
+  config.flush_interval = std::chrono::milliseconds(10000);
+  config.max_pending_entries = 8;
+  config.flush_threshold = 1000000;
+  HitTracker tracker(config);
+
+  // A callback that never returns until released: the first sweep stalls on
+  // its first key, leaving every other stripe's entries pending and the set
+  // over the hard bound (16) for good.
+  std::atomic<bool> in_callback{false};
+  std::atomic<bool> release{false};
+  struct Releaser {
+    std::atomic<bool> &flag;
+    ~Releaser() { flag.store(true); }
+  } releaser{release};
+  tracker.start([&](const CacheKey &, AlternateId, uint32_t, int64_t) {
+    in_callback.store(true);
+    while (!release.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+  });
+
+  std::vector<CacheKey> keys;
+  for (int i = 0; i < 40; ++i) {
+    keys.emplace_back("overflow-existing-" + std::to_string(i));
+    tracker.record_hit(keys.back());
+  }
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!in_callback.load() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  REQUIRE(in_callback.load());
+  REQUIRE(tracker.pending_count() > 16);
+
+  // Arm the grace window with one more new key, let it lapse, then probe.
+  tracker.record_hit(CacheKey("overflow-arm"));
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+
+  // Pick a key that is still pending (the stalled sweep took one).
+  const CacheKey *pending = nullptr;
+  for (const auto &key : keys) {
+    if (tracker.pending_hits(key) == 1) {
+      pending = &key;
+      break;
+    }
+  }
+  REQUIRE(pending != nullptr);
+
+  tracker.record_hit(*pending);
+  REQUIRE(tracker.pending_hits(*pending) == 2);
+  REQUIRE(tracker.dropped_overflow_hits() == 0);
+
+  tracker.record_hit(CacheKey("overflow-new-key"));
+  REQUIRE(tracker.pending_hits(CacheKey("overflow-new-key")) == 0);
+  REQUIRE(tracker.dropped_overflow_hits() == 1);
+
+  release.store(true);
+  tracker.stop();
 }

@@ -105,7 +105,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [fuzz_document_parse, fuzz_volume_open, fuzz_c_api]
+        target:
+          [
+            fuzz_document_parse,
+            fuzz_volume_open,
+            fuzz_c_api,
+            fuzz_c_api_async,
+            fuzz_http_metadata,
+            fuzz_http_alternate,
+          ]
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Install clang
@@ -142,6 +150,7 @@ jobs:
               -max_total_time=120 \
               -timeout=25 -rss_limit_mb=4096 -error_exitcode=77 \
               -print_final_stats=1 \
+              ${{ matrix.target == 'fuzz_c_api_async' && '-max_len=64' || '' }} \
               -artifact_prefix=artifacts/ \
               run_corpus
       - name: Upload crashers and corpus

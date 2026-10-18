@@ -1735,3 +1735,95 @@ TEST_CASE("Full chain corruption returns error",
 
   cleanup_temp_file(path);
 }
+
+// =============================================================================
+// A persisted shared write cursor below the stripe is repaired at open
+// =============================================================================
+// After a crash the mmap'd directory pages reach the disk in any order, so
+// the directory header can carry a cursor older than the entries beside it
+// (0, the value of a freshly initialised header, in the worst case).  The
+// exclusive opener already seats its process-local write_pos at the data
+// start, but the readers' phase-ABA positional guard reads the SHARED cell:
+// left below the stripe offset, `cursor - stripe->offset` underflowed and the
+// guard admitted every same-phase entry, including the ones the next forward
+// fill overwrites in place.  The repaired cursor sits at the data start, so
+// every surviving entry is now ahead of it and reads as a miss.
+TEST_CASE("Reopen repairs a persisted shared write cursor below the stripe",
+          "[stabilization][multiprocess][powerloss]") {
+  constexpr size_t kVolumeSize = static_cast<size_t>(10) * 1024 * 1024;
+  // Stripe 0 starts right after the 64-byte volume header; the directory
+  // header's shared_write_pos sits 24 bytes into it.
+  constexpr std::streamoff kSharedWritePosOffset = 64 + 24;
+  const std::vector<std::byte> data(512, std::byte{0x5A});
+
+  // Below the data start, past the end of the volume, and far out of bounds:
+  // every refused value must be repaired, never trusted.
+  for (const uint64_t rewound :
+       {uint64_t{0}, uint64_t{32}, uint64_t{kVolumeSize + 8},
+        uint64_t{1} << 40}) {
+    INFO("persisted cursor rewound to " << rewound);
+    const std::string path = get_temp_path("cursor_rewind");
+    cleanup_temp_file(path);
+
+    auto open_cache = [&]() {
+      CacheConfig config;
+      config.set_multi_process(0, 1);
+      config.set_enable_checksum(true);
+      config.set_ram_cache_size(0);  // a RAM hit would mask the directory
+      auto cache = Cache::create(config);
+      REQUIRE(cache.has_value());
+      REQUIRE((*cache)->add_volume(path, kVolumeSize).has_value());
+      REQUIRE((*cache)->start().has_value());
+      return std::move(*cache);
+    };
+
+    {
+      auto cache = open_cache();
+      REQUIRE(cache->stats().stripe_count == 1);
+      for (int i = 0; i < 8; ++i) {
+        CacheKey k("cursor-rewind-" + std::to_string(i));
+        auto wh = cache->write_sync(k, data.size());
+        REQUIRE(wh.has_value());
+        REQUIRE(wh->write_sync(data).has_value());
+        REQUIRE(wh->close_sync().has_value());
+      }
+      cache->stop();
+    }
+
+    {
+      std::fstream file(fp(path, kVolumeSize),
+                        std::ios::in | std::ios::out | std::ios::binary);
+      REQUIRE(file.is_open());
+      uint64_t persisted = 0;
+      file.seekg(kSharedWritePosOffset);
+      file.read(reinterpret_cast<char *>(&persisted), sizeof(persisted));
+      REQUIRE(persisted > 64);  // the layout assumption above holds
+      file.seekp(kSharedWritePosOffset);
+      file.write(reinterpret_cast<const char *>(&rewound), sizeof(rewound));
+    }
+
+    {
+      auto cache = open_cache();
+      int admitted = 0;
+      for (int i = 0; i < 8; ++i) {
+        CacheKey k("cursor-rewind-" + std::to_string(i));
+        if (cache->read_sync(k).has_value()) {
+          ++admitted;
+        }
+      }
+      INFO("entries admitted ahead of the repaired cursor: " << admitted);
+      REQUIRE(admitted == 0);
+
+      // The repaired volume keeps working.
+      CacheKey fresh("cursor-rewind-fresh");
+      auto wh = cache->write_sync(fresh, data.size());
+      REQUIRE(wh.has_value());
+      REQUIRE(wh->write_sync(data).has_value());
+      REQUIRE(wh->close_sync().has_value());
+      REQUIRE(cache->read_sync(fresh).has_value());
+      cache->stop();
+    }
+
+    cleanup_temp_file(path);
+  }
+}

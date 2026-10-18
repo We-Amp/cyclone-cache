@@ -71,7 +71,7 @@ TEST_CASE("VolumeHeader constants are correct", "[version]") {
   // Deliberate tripwire (see the twin assertion on Document::kVersionMajor):
   // Version 8 switches the document checksum to CRC-32C, leaving every
   // pre-v8 ring behind, and the two constants move in lockstep.
-  REQUIRE(VolumeHeader::kFormatVersionMajor == 8);
+  REQUIRE(VolumeHeader::kFormatVersionMajor == 9);
   REQUIRE(VolumeHeader::kFormatVersionMinor == 0);
 }
 
@@ -513,10 +513,11 @@ TEST_CASE("Old-format documents miss instead of being misparsed",
   // Phase 2: age every document on disk to a FOREIGN major version, exactly as
   // a peer running an older format would have written them.  Scan for document
   // headers (magic + a current version_major at the named wire offset) and bump
-  // the version byte.  The document checksum covers only the bytes AFTER the
-  // 132-byte header, so this does not disturb it -- which is the whole point:
-  // the record stays perfectly well-formed and CRC-clean, and ONLY the version
-  // says it is not ours.  Nothing but a version check can reject it.
+  // the version byte.  From format v9 the document checksum covers the version
+  // byte too, so the CRC pass would reject the aged record as well; the
+  // version gate in DocumentReader still rejects it first, before any content
+  // is touched, and is what a foreign-format peer's (differently
+  // checksummed) records meet.
   size_t aged = 0;
   {
     std::fstream f(path, std::ios::in | std::ios::out | std::ios::binary);

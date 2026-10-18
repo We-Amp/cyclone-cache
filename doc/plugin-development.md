@@ -67,6 +67,13 @@ PluginInfo info() const override {
 - `version`: Version string
 - `plugin_id`: Unique uint32_t identifier (use values > 100 for custom plugins)
 
+The `version` string is informational only; the library does not compare it or
+check any binary interface tag when a plugin is registered. A plugin is C++
+code that shares class layouts and virtual tables with the library, so it must
+be built with the same compiler, standard library, build options and Cyclone
+library version as the program that loads it. Mixing builds is undefined
+behavior.
+
 ### generate_key()
 
 Optional. Customizes cache key generation.

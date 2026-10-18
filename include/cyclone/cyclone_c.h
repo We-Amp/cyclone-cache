@@ -51,12 +51,26 @@ enum {
                                       never renumber. */
   CYCLONE_OBJECT_TOO_LARGE,        /* Write content exceeds the configured
                                       max_object_size */
-  CYCLONE_BUSY /* Transient contention; retry.  From a read or exists: a
+  CYCLONE_BUSY, /* Transient contention; retry.  From a read or exists: a
                   writer held the key's directory bucket for the whole wait
                   budget (5 ms), so whether the key is present is UNKNOWN --
                   not a miss.  From a write, delete or hit-count update: a
                   contended or raced lock (previously reported as
                   CYCLONE_INTERNAL_ERROR). */
+
+  /* The codes below were previously reported as CYCLONE_INTERNAL_ERROR.  A
+     caller should treat a code it does not recognise as a failure. */
+
+  /* An operation gave up after its time budget.  From
+     cyclone_cache_drain_pending(): fetches were still outstanding at the
+     deadline. */
+  CYCLONE_TIMEOUT,
+  /* Multi-process mode: the write was refused because another process owns
+     the key's stripe.  Expected, not a failure: the owning process writes
+     the key. */
+  CYCLONE_NOT_OWNED,
+  /* The cache file was written in a format this library cannot open. */
+  CYCLONE_INCOMPATIBLE_VERSION
 };
 
 /* --------------------------------------------------------------------------
@@ -107,22 +121,15 @@ typedef struct {
                                     zero-byte cache is the natural reading of
                                     zero, and remapping it would silently
                                     change every config that passes 0 today. */
-  int enable_checksum;           /* Non-zero: store a CRC-32C with each
-                                    document (verified on read whenever the
-                                    stored CRC is non-zero).  Copied verbatim to
-                                    CacheConfig::enable_checksum, whose C++
-                                    default is TRUE -- so a zero-initialised
-                                    config runs with checksums DISABLED, the one
-                                    remaining field where C zero-init diverges
-                                    from the C++ default.  Set this to 1
-                                    explicitly for the C++ behaviour.  0 keeps
-                                    meaning "disabled": remapping it to the C++
-                                    default would silently change every config
-                                    that passes 0 today and, absent a new opt-out
-                                    sentinel, remove the only way a C caller can
-                                    turn checksums off.  (Multi-process mode --
-                                    enable_mmap_directory -- refuses to start
-                                    with checksums off either way.) */
+  int enable_checksum;           /* Copied verbatim to
+                                    CacheConfig::enable_checksum (C++
+                                    default TRUE).  Every document is
+                                    written with a CRC-32C and verified on
+                                    read whatever this says; 0 does not
+                                    turn either off.  Its only effect:
+                                    multi-process mode
+                                    (enable_mmap_directory) refuses to start
+                                    when it is 0, so set it to 1. */
   uint32_t num_segments;
   uint32_t max_in_flight_requests; /* Max concurrent miss handler calls.  0 is
                                       NOT unlimited: the bridge maps 0 to the
@@ -440,9 +447,18 @@ typedef struct {
  *   the new handler takes effect for subsequent misses only.
  * - Callbacks (CycloneReadCallback, CycloneMissDoneCallback) may be invoked
  *   from any thread, including the calling thread or internal worker threads.
+ * - Callbacks the application passes in (CycloneReadCallback,
+ *   CycloneMissHandler) must not throw a C++ exception.  The library
+ *   contains one so that it does not cross a C frame, but the operation that
+ *   called the callback is cut short: remaining waiters of that read may go
+ *   unanswered and the fetched value is not stored.
  * - Do not call cyclone_cache_destroy() while other operations are in progress
  *   on other threads; call cyclone_cache_drain_pending() first to ensure
  *   graceful shutdown.
+ * - No function declared here, and no done callback passed to a miss
+ *   handler, lets a C++ exception escape.  A failure inside the library that
+ *   raises one (memory exhaustion, in practice) is reported as
+ *   CYCLONE_INTERNAL_ERROR, or 0 from the functions returning int.
  *
  * fork() (POSIX)
  *
@@ -460,11 +476,17 @@ typedef struct {
  *   cyclone_cache_drain_pending()): if the application had asynchronous
  *   reads with a miss handler in flight at the fork, their entries were
  *   copied into the child, nothing completes them there, and the destroy
- *   waits out the drain's 30 seconds.  Fork when no such read is in flight
- *   (a server parent has none), or let such a child exit without
- *   destroying.  The destroy ends the child's use of the handle only: the
- *   parent's cache keeps running.  A child that wants background threads of
- *   its own creates a cache of its own with cyclone_cache_create().
+ *   waits out the drain's 30 seconds.  Worse, if a done callback of the
+ *   parent was storing a fetched value at the instant of the fork, the
+ *   child inherits that write-back as still under way; nothing ends it in
+ *   the child, and the child's destroy, which waits for every write-back
+ *   under way before closing the cache, never returns.  So fork only when
+ *   no asynchronous read with a miss handler is in flight and no done
+ *   callback is running (a server parent that forks before it serves has
+ *   neither), or let such a child exit without destroying.  The destroy
+ *   ends the child's use of the handle only: the parent's cache keeps
+ *   running.  A child that wants background threads of its own creates a
+ *   cache of its own with cyclone_cache_create().
  * - Not covered: other threads of the application that are inside a cache
  *   call at the instant of the fork, and children made with vfork() or a
  *   direct clone().  Read and write handles open at the fork stay the
@@ -570,7 +592,12 @@ typedef void (*CycloneMissDoneCallback)(void *, const char *, size_t,
  * fetch and call done_cb(done_user_data, ...) when complete.
  *   key/key_len:        the cache key that missed
  *   handler_user_data:  opaque pointer registered with set_miss_handler
- *   done_cb:            completion callback the handler MUST call exactly once
+ *   done_cb:            completion callback the handler MUST call exactly once.
+ *                       Calling it more than once is undefined behaviour,
+ *                       before and after cyclone_cache_destroy(); after
+ *                       destroy the single call is still safe (see
+ *                       cyclone_cache_drain_pending()). Do not call
+ *                       cyclone_cache_destroy() from inside a callback.
  *   done_user_data:     opaque pointer to pass back to done_cb
  */
 typedef void (*CycloneMissHandler)(const char *, size_t, void *,
@@ -605,9 +632,20 @@ typedef void (*CycloneReadCallback)(void *, const char *, size_t, CycloneError);
  *     - When fetch completes: stores result, invokes read_cb for ALL waiters
  * - Cache miss + no miss handler: invokes read_cb with CYCLONE_NOT_FOUND,
  *   or with CYCLONE_BUSY when the read could not tell whether the key is
- *   present (see CYCLONE_BUSY).  With a miss handler set, that case takes
- *   the miss path like any other non-hit.
+ *   present (see CYCLONE_BUSY), or with CYCLONE_IO_ERROR / CYCLONE_CORRUPTED
+ *   when the stored entry could not be read.  With a miss handler set, those
+ *   cases take the miss path like any other non-hit.
  * - Cache shutting down: invokes read_cb with CYCLONE_NOT_INITIALIZED.
+ * Returns CYCLONE_OK when read_cb has been or will be called.  Any other
+ * return (CYCLONE_INVALID_ARGUMENT, CYCLONE_INTERNAL_ERROR) means read_cb
+ * has not been called and will not be, with one exception: callbacks must
+ * not throw, and a read_cb that throws has already been called when
+ * CYCLONE_INTERNAL_ERROR is returned.  A miss handler that throws before
+ * it completes the fetch makes the call return CYCLONE_INTERNAL_ERROR
+ * without calling read_cb, and reads that coalesced onto its fetch
+ * meanwhile get CYCLONE_INTERNAL_ERROR; if the fetch was already completed
+ * (or a timed-out drain already answered the read), the call returns
+ * CYCLONE_OK and read_cb has been or will be called.
  */
 CycloneError cyclone_cache_read_async(CycloneCacheHandle *cache,
                                       const char *key, size_t key_len,
@@ -618,7 +656,15 @@ CycloneError cyclone_cache_read_async(CycloneCacheHandle *cache,
  * Drain all in-flight miss handler invocations. Blocks until all pending
  * fetches complete or timeout_ms elapses. After this call, new read_async
  * calls return CYCLONE_NOT_INITIALIZED.
- * Called automatically by cyclone_cache_destroy().
+ * Returns CYCLONE_OK when everything completed, or CYCLONE_TIMEOUT when the
+ * deadline passed first: the reads still waiting were then answered with
+ * CYCLONE_NOT_INITIALIZED, and the miss handler's fetches may still call
+ * their done callback later.  That late call is safe, also after
+ * cyclone_cache_destroy(): it answers no one again, and after a destroy it
+ * stores nothing.
+ * Called automatically by cyclone_cache_destroy(), which then waits for
+ * any write-back of a fetched value already under way before closing the
+ * cache.
  */
 CycloneError cyclone_cache_drain_pending(CycloneCacheHandle *cache,
                                          uint32_t timeout_ms);

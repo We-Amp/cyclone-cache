@@ -7,9 +7,7 @@
 #
 # Intentionally empty: the library has no known, accepted leak.  Every
 # Cache-owned thread is joined by Cache::stop(), so nothing is leaked at
-# shutdown.  The only remaining leak_thread_on_shutdown() caller is
-# Executor::stop() (src/io/executor.cpp), reached solely through the
-# process-lifetime Executor::global() singleton, which has no callers.
+# shutdown.
 #
 # The file is kept so the documented sanitizer invocation
 # (LSAN_OPTIONS=suppressions=tools/lsan_suppressions.txt, CLAUDE.md "Running

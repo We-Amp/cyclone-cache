@@ -243,7 +243,7 @@ std::optional<std::vector<std::byte>> RamCacheCLFUS::Segment::get(
     return std::nullopt;
   }
 
-  ++entry.hits;
+  saturating_increment(entry.hits);
   ++_hits;
 
   if (out_stamp != nullptr) {
@@ -275,15 +275,30 @@ bool RamCacheCLFUS::Segment::put(const RamCacheKey& rk,
     auto& entry = *existing->second;
 
     if (entry.in_cache) {
+      // Copy the new body first: if that allocation throws, nothing has
+      // moved and the accounting still matches the stored body.
+      std::vector<std::byte> body(data.begin(), data.end());
       _bytes_used -= entry.data.size();
-      entry.data.assign(data.begin(), data.end());
+
+      // A growing overwrite can push the segment past its budget; enforce
+      // it like insert and promotion do.  The entry must be off the list
+      // while that runs: eviction requeues hit-bearing victims to the
+      // FRONT, and enough requeues push the just-updated entry to the
+      // back where it is evicted by its own put().  Off both lists it
+      // cannot be picked (the size check at the top of put() means it
+      // alone never exceeds the budget).
+      EntryList rescued;
+      rescued.splice(rescued.begin(), _active_lru, existing->second);
+
+      evict_if_needed(data.size());
+
+      _active_lru.splice(_active_lru.begin(), rescued, rescued.begin());
+      _entry_map[entry.key] = _active_lru.begin();
+
+      entry.data = std::move(body);
       entry.stamp = stamp;
       _bytes_used += entry.data.size();
-      ++entry.hits;
-
-      if (existing->second != _active_lru.begin()) {
-        _active_lru.splice(_active_lru.begin(), _active_lru, existing->second);
-      }
+      saturating_increment(entry.hits);
       return true;
     } else {
       if (entry.value() > _average_value ||
@@ -291,7 +306,7 @@ bool RamCacheCLFUS::Segment::put(const RamCacheKey& rk,
         promote_from_history(existing->second, data, stamp);
         return true;
       }
-      ++entry.hits;
+      saturating_increment(entry.hits);
       return false;
     }
   }
@@ -406,16 +421,32 @@ void RamCacheCLFUS::Segment::evict_if_needed(size_t required_space) {
 
 void RamCacheCLFUS::Segment::promote_from_history(
     EntryIter it, std::span<const std::byte> data, uint32_t stamp) {
+  // Build the body before touching any bookkeeping: assigning it below
+  // used to happen with the node already spliced onto _active_lru while
+  // its bookkeeping still said history, and an allocation failure there
+  // left a node that remove() later erased from the wrong list.  With the
+  // body pre-built, the entry moves in through a noexcept vector move
+  // assignment after the splices.
+  std::vector<std::byte> body(data.begin(), data.end());
+
+  // Splice the node out of history before making room: evict_if_needed()
+  // trims _history_lru from the back, and `it` can name that back node, so
+  // the eviction triggered by this very promotion would otherwise free the
+  // node the caller still holds.
+  EntryList rescued;
+  rescued.splice(rescued.begin(), _history_lru, it);
+
   evict_if_needed(data.size());
 
-  auto& entry = *it;
-  entry.data.assign(data.begin(), data.end());
+  // Back on the segment's active list from here on.
+  _active_lru.splice(_active_lru.begin(), rescued, rescued.begin());
+  auto& entry = *_active_lru.begin();
+  _entry_map[entry.key] = _active_lru.begin();
+
+  entry.data = std::move(body);
   entry.stamp = stamp;
   entry.in_cache = true;
-  ++entry.hits;
-
-  _active_lru.splice(_active_lru.begin(), _history_lru, it);
-  _entry_map[entry.key] = _active_lru.begin();
+  saturating_increment(entry.hits);
   _bytes_used += data.size();
 }
 

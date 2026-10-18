@@ -23,10 +23,33 @@
 #include "cyclone/plugin/plugin.hpp"
 #include "fork_gate.hpp"
 #include "hit_tracker.hpp"
-#include "thread_util.hpp"
 #include "volume.hpp"
 
 namespace cyclone {
+
+#ifdef CYCLONE_TEST_SEAMS
+namespace {
+std::atomic<long> g_pid_for_test{0};
+}  // namespace
+
+void set_pid_for_test(long pid) noexcept {
+  g_pid_for_test.store(pid, std::memory_order_relaxed);
+}
+#endif
+
+#ifndef _WIN32
+namespace {
+long current_pid() noexcept {
+#ifdef CYCLONE_TEST_SEAMS
+  if (const long pid = g_pid_for_test.load(std::memory_order_relaxed);
+      pid != 0) {
+    return pid;
+  }
+#endif
+  return static_cast<long>(::getpid());
+}
+}  // namespace
+#endif
 
 // Background thread that periodically flushes persistent (mmap'd) cache
 // directories to disk.  Owns the bounded power-loss window documented on
@@ -58,9 +81,8 @@ class DirectorySyncer {
       return;  // Already stopped
     }
 
-    // UNBOUNDED join — deliberately not the bounded-join + leak pattern that
-    // now survives only in Executor::stop() (see thread_util.hpp).  A
-    // leaked-but-still-RUNNING sync thread dereferences the Cache's volume
+    // UNBOUNDED join: deliberately not a bounded-join-then-leak pattern.
+    // A leaked-but-still-RUNNING sync thread dereferences the Cache's volume
     // list and this object's members after teardown frees them: with the
     // previous 5-second deadline, a
     // sync pass stalled in msync/fsync past the deadline was abandoned
@@ -161,12 +183,30 @@ class GateExclusive {
 
 Task<std::expected<size_t, CacheError>> ReadHandle::read(
     std::span<std::byte> buffer) {
-  (void)buffer;
-  co_return make_unexpected(CacheError::NotInitialized);
+  if (!_impl) {
+    co_return make_unexpected(CacheError::NotInitialized);
+  }
+  const std::span<const std::byte> content = _impl->content();
+  if (_read_offset >= content.size()) {
+    co_return size_t{0};
+  }
+  const size_t n = std::min(buffer.size(), content.size() - _read_offset);
+  std::copy_n(content.begin() + static_cast<std::ptrdiff_t>(_read_offset), n,
+              buffer.begin());
+  _read_offset += n;
+  co_return n;
 }
 
 Task<std::expected<std::vector<std::byte>, CacheError>> ReadHandle::read_all() {
-  co_return make_unexpected(CacheError::NotInitialized);
+  if (!_impl) {
+    co_return make_unexpected(CacheError::NotInitialized);
+  }
+  const std::span<const std::byte> content = _impl->content();
+  const size_t start = std::min(_read_offset, content.size());
+  std::vector<std::byte> rest(
+      content.begin() + static_cast<std::ptrdiff_t>(start), content.end());
+  _read_offset = content.size();
+  co_return rest;
 }
 
 Task<std::expected<size_t, CacheError>> WriteHandle::write(
@@ -239,7 +279,7 @@ struct Cache::Impl {
   // threads) so it can abandon the thread-owning components instead of
   // deadlocking in their destructors. 0 = never started / not applicable (e.g.
   // Windows).
-  long owner_pid{0};
+  std::atomic<long> owner_pid{0};
   // fork_epoch() of the process that start()ed the background threads.
   // While `running`, it differs from the current epoch exactly in a forked
   // child that inherited them (see engine_inherited_across_fork()).  The
@@ -573,6 +613,14 @@ std::expected<void, CacheError> Cache::start() {
     }
   }
 
+  // Validate the optimization engine's config up front as well, before any
+  // volume is opened or background thread started (OptimizationEngine::
+  // start() re-checks it; see OptimizationConfig::is_valid()).
+  if (_impl->optimization_engine &&
+      !_impl->config.optimization_config.is_valid()) {
+    return make_unexpected(CacheError::InvalidConfiguration);
+  }
+
   for (auto &volume : _impl->volumes) {
     auto result = volume->open();
     if (!result) {
@@ -696,13 +744,19 @@ std::expected<void, CacheError> Cache::start() {
 
   // Start optimization engine
   if (_impl->optimization_engine) {
-    _impl->optimization_engine->start();
+    // The config was validated above, so this cannot fail; propagate anyway
+    // rather than leave the cache half-started if it ever does.
+    auto engine_started = _impl->optimization_engine->start();
+    if (!engine_started) {
+      return engine_started;
+    }
   }
 
 #ifndef _WIN32
   // Record the process that owns the just-started background threads, so a
   // forked child can detect in stop() that it does not own them (see stop()).
-  _impl->owner_pid = static_cast<long>(::getpid());
+  _impl->owner_pid.store(static_cast<long>(::getpid()),
+                         std::memory_order_relaxed);
 #endif
   _impl->owner_epoch.store(fork_epoch(), std::memory_order_release);
 
@@ -734,12 +788,19 @@ void Cache::stop() {
   // would take the gate exclusively.
   //
   // owner_pid is written under the gate in start() and not changed while
-  // the cache runs, so reading it without the gate is safe here.
+  // the cache runs; it is atomic so this gate-free read is race-free.
+  //
+  // A PID can be reused (a grandchild in a PID namespace may get its
+  // ancestor's), so the fork epoch decides as well: it moves in every forked
+  // child whatever the PIDs say.  The PID comparison stays for a process
+  // whose fork handlers could not be registered (the epoch then never moves).
   if (_impl->abandoned_after_fork.load(std::memory_order_acquire)) {
     return;
   }
-  if (_impl->running && _impl->owner_pid != 0 &&
-      _impl->owner_pid != static_cast<long>(::getpid())) {
+  const long owner_pid = _impl->owner_pid.load(std::memory_order_relaxed);
+  if (_impl->running &&
+      ((owner_pid != 0 && owner_pid != current_pid()) ||
+       _impl->owner_epoch.load(std::memory_order_acquire) != fork_epoch())) {
     if (_impl->abandoned_after_fork.exchange(true, std::memory_order_acq_rel)) {
       return;  // Another thread of this child got here first.
     }
@@ -972,11 +1033,34 @@ Task<std::expected<bool, CacheError>> Cache::exists(const CacheKey &key,
   co_return co_await volume->exists(key);
 }
 
+std::expected<ReadHandle, CacheError> Cache::read_sync_unrecorded(
+    const CacheKey &key, Tier tier) {
+  auto guard = lock_and_select(key, tier);
+  if (!guard) return make_unexpected(guard.error());
+  return guard->second->read_sync(key);
+}
+
+std::expected<WriteHandle, CacheError> Cache::write_alternate_sync_unrecorded(
+    const CacheKey &key, AlternateId alternate_id, uint64_t content_length,
+    Tier tier) {
+  auto guard = lock_and_select(key, tier);
+  if (!guard) return make_unexpected(guard.error());
+  return guard->second->write_alternate_sync(key, alternate_id, content_length);
+}
+
 std::expected<ReadHandle, CacheError> Cache::read_sync(const CacheKey &key,
                                                        Tier tier) {
   auto guard = lock_and_select(key, tier);
   if (!guard) return make_unexpected(guard.error());
-  return guard->second->read_sync(key);
+  auto result = guard->second->read_sync(key);
+  if (result && _impl->optimization_engine) {
+    // Feed the load monitor from the hot read path: two relaxed atomic
+    // increments on this thread's counter shard.  Without this its counters
+    // stay zero and load shedding can never engage.
+    _impl->optimization_engine->load_monitor().record_read_complete(
+        result->content_length());
+  }
+  return result;
 }
 
 std::expected<WriteHandle, CacheError> Cache::write_sync(const CacheKey &key,
@@ -988,7 +1072,16 @@ std::expected<WriteHandle, CacheError> Cache::write_sync(
     const CacheKey &key, uint64_t content_length, Tier tier) {
   auto guard = lock_and_select(key, tier);
   if (!guard) return make_unexpected(guard.error());
-  return guard->second->write_sync(key, content_length);
+  auto result = guard->second->write_sync(key, content_length);
+  if (result && _impl->optimization_engine) {
+    // The commit runs later, on close(): the handle reports a successful
+    // commit to the load monitor.  The reference is weak because a write
+    // handle may outlive the Cache and its engine; a commit that lands
+    // afterwards simply goes uncounted.
+    Volume::set_commit_observer(
+        *result, _impl->optimization_engine->load_monitor_shared());
+  }
+  return result;
 }
 
 std::expected<void, CacheError> Cache::remove_sync(const CacheKey &key,
@@ -1017,7 +1110,14 @@ std::expected<WriteHandle, CacheError> Cache::write_alternate_sync(
     Tier tier) {
   auto guard = lock_and_select(key, tier);
   if (!guard) return make_unexpected(guard.error());
-  return guard->second->write_alternate_sync(key, alternate_id, content_length);
+  auto result =
+      guard->second->write_alternate_sync(key, alternate_id, content_length);
+  if (result && _impl->optimization_engine) {
+    // Same load-monitor reporting as write_sync().
+    Volume::set_commit_observer(
+        *result, _impl->optimization_engine->load_monitor_shared());
+  }
+  return result;
 }
 
 std::expected<ReadHandle, CacheError> Cache::read_alternate_sync(
@@ -1025,7 +1125,13 @@ std::expected<ReadHandle, CacheError> Cache::read_alternate_sync(
     const AlternateSelectionContext &ctx, Tier tier) {
   auto guard = lock_and_select(key, tier);
   if (!guard) return make_unexpected(guard.error());
-  return guard->second->read_alternate_sync(key, selector, ctx);
+  auto result = guard->second->read_alternate_sync(key, selector, ctx);
+  if (result && _impl->optimization_engine) {
+    // Same load-monitor reporting as read_sync().
+    _impl->optimization_engine->load_monitor().record_read_complete(
+        result->content_length());
+  }
+  return result;
 }
 
 std::expected<void, CacheError> Cache::remove_alternate_sync(
@@ -1072,6 +1178,9 @@ CacheStats Cache::stats() const {
       _impl->flush_stats.hit_flush_total_delta.load(std::memory_order_relaxed);
   result.hit_flush_fsyncs =
       _impl->flush_stats.hit_flush_fsyncs.load(std::memory_order_relaxed);
+  if (_impl->hit_tracker) {
+    result.hit_overload_drops = _impl->hit_tracker->dropped_overflow_hits();
+  }
   result.hit_flush_lock_contended =
       _impl->flush_stats.hit_flush_lock_contended.load(
           std::memory_order_relaxed);
@@ -1124,6 +1233,7 @@ CacheStats Cache::stats() const {
 
     // Volumes whose reset gate degraded on a lock-less filesystem (gauge).
     result.volumes_with_degraded_reset_gate += vs.reset_gate_degraded;
+    result.volumes_without_whole_file_map += vs.whole_file_map_failed;
 
     // Reset provenance (monotonic counters, summed across volumes).
     result.resets_under_degraded_gate += vs.resets_under_degraded_gate;

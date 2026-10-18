@@ -66,6 +66,11 @@ bool install_fork_handlers() noexcept;
 // Test seam: the number of fork() calls that are between their prepare and
 // parent handlers right now (always 0 on Windows).
 [[nodiscard]] uint32_t forks_pending_for_test() noexcept;
+
+// Test seam: makes Cache::stop() see `pid` as the current process ID (0
+// restores getpid()), so a forked child can stand in for a process that
+// reuses its parent's PID.
+void set_pid_for_test(long pid) noexcept;
 #endif
 
 // One unit of background work that must not be cut in half by fork().

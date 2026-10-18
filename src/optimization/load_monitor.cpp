@@ -10,24 +10,20 @@ namespace cyclone {
 LoadMonitor::LoadMonitor(const OptimizationConfig &config)
     : _config(config), _last_update(std::chrono::steady_clock::now()) {}
 
-void LoadMonitor::record_read_complete(uint64_t bytes) {
-  _read_ops.fetch_add(1, std::memory_order_relaxed);
-  _read_bytes.fetch_add(bytes, std::memory_order_relaxed);
-}
-
-void LoadMonitor::record_write_complete(uint64_t bytes) {
-  _write_ops.fetch_add(1, std::memory_order_relaxed);
-  _write_bytes.fetch_add(bytes, std::memory_order_relaxed);
-}
-
 void LoadMonitor::update_metrics() {
   auto now = std::chrono::steady_clock::now();
 
   // Get current counter values
-  uint64_t read_ops = _read_ops.load(std::memory_order_relaxed);
-  uint64_t write_ops = _write_ops.load(std::memory_order_relaxed);
-  uint64_t read_bytes = _read_bytes.load(std::memory_order_relaxed);
-  uint64_t write_bytes = _write_bytes.load(std::memory_order_relaxed);
+  uint64_t read_ops = 0;
+  uint64_t write_ops = 0;
+  uint64_t read_bytes = 0;
+  uint64_t write_bytes = 0;
+  for (const auto &shard : _shards) {
+    read_ops += shard.read_ops.load(std::memory_order_relaxed);
+    write_ops += shard.write_ops.load(std::memory_order_relaxed);
+    read_bytes += shard.read_bytes.load(std::memory_order_relaxed);
+    write_bytes += shard.write_bytes.load(std::memory_order_relaxed);
+  }
 
   // Calculate elapsed time
   auto elapsed =
@@ -55,10 +51,17 @@ void LoadMonitor::update_metrics() {
   double total_ops_per_sec = read_ops_per_sec + write_ops_per_sec;
   double total_bytes_per_sec = read_bytes_per_sec + write_bytes_per_sec;
 
+  // Estimate load.  A non-positive baseline contributes nothing (fail open):
+  // dividing by it would pin the estimate at the maximum and keep load
+  // shedding engaged permanently.
   double cpu_usage =
-      std::min(1.0, total_ops_per_sec / _config.baseline_ops_per_sec);
+      _config.baseline_ops_per_sec > 0.0
+          ? std::min(1.0, total_ops_per_sec / _config.baseline_ops_per_sec)
+          : 0.0;
   double io_usage =
-      std::min(1.0, total_bytes_per_sec / _config.baseline_bytes_per_sec);
+      _config.baseline_bytes_per_sec > 0.0
+          ? std::min(1.0, total_bytes_per_sec / _config.baseline_bytes_per_sec)
+          : 0.0;
   double combined = kCpuWeight * cpu_usage + kIoWeight * io_usage;
 
   // Update metrics
@@ -106,10 +109,12 @@ bool LoadMonitor::is_below_low_watermark() const {
 }
 
 void LoadMonitor::reset() {
-  _read_ops.store(0, std::memory_order_relaxed);
-  _write_ops.store(0, std::memory_order_relaxed);
-  _read_bytes.store(0, std::memory_order_relaxed);
-  _write_bytes.store(0, std::memory_order_relaxed);
+  for (auto &shard : _shards) {
+    shard.read_ops.store(0, std::memory_order_relaxed);
+    shard.write_ops.store(0, std::memory_order_relaxed);
+    shard.read_bytes.store(0, std::memory_order_relaxed);
+    shard.write_bytes.store(0, std::memory_order_relaxed);
+  }
 
   _prev_read_ops = 0;
   _prev_write_ops = 0;

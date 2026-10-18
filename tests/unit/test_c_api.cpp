@@ -1,19 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2024-2026 We-Amp B.V.
 
+#include <algorithm>
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <latch>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
+#if defined(__linux__)
+#include <pthread.h>
+#endif
+
+#include "c_api/c_error_map.hpp"
 #include "cyclone/config.hpp"
 #include "cyclone/cyclone_c.h"
 #include "support/temp_cache.hpp"
@@ -235,6 +243,124 @@ TEST_CASE("C API: Basic miss handler invocation", "[c_api][miss_callback]") {
 
   // Verify data was stored in cache
   REQUIRE(cyclone_cache_exists(cache, key, strlen(key)) == CYCLONE_OK);
+
+  cyclone_cache_destroy(cache);
+}
+
+TEST_CASE("C API: A waiter observes the fetched value already stored",
+          "[c_api][miss_callback]") {
+  TempCacheDir tmp;
+  std::string cache_path = tmp.path();
+  CycloneCacheConfig config{};
+  config.cache_path = cache_path.c_str();
+  config.cache_size_bytes = static_cast<uint64_t>(10 * 1024 * 1024);
+  config.ram_cache_size_bytes = static_cast<uint64_t>(1 * 1024 * 1024);
+  config.enable_checksum = 1;
+  config.num_segments = 2;
+
+  CycloneCacheHandle *cache = nullptr;
+  REQUIRE(cyclone_cache_create(&config, &cache) == CYCLONE_OK);
+
+  auto miss_handler = [](const char *, size_t, void *,
+                         CycloneMissDoneCallback done_cb, void *done_ud) {
+    const char value[] = "fetched";
+    done_cb(done_ud, value, sizeof(value) - 1, CYCLONE_OK);
+  };
+  REQUIRE(cyclone_cache_set_miss_handler(cache, miss_handler, nullptr) ==
+          CYCLONE_OK);
+
+  const char *key = "store_before_notify";
+  struct Context {
+    CycloneCacheHandle *cache;
+    const char *key;
+    CycloneError exists_in_callback = CYCLONE_NOT_FOUND;
+    bool called = false;
+  } ctx{cache, key};
+
+  auto callback = [](void *ud, const char *, size_t, CycloneError) {
+    auto *c = static_cast<Context *>(ud);
+    c->exists_in_callback =
+        cyclone_cache_exists(c->cache, c->key, strlen(c->key));
+    c->called = true;
+  };
+
+  REQUIRE(cyclone_cache_read_async(cache, key, strlen(key), callback, &ctx) ==
+          CYCLONE_OK);
+  REQUIRE(ctx.called);
+  REQUIRE(ctx.exists_in_callback == CYCLONE_OK);
+
+  cyclone_cache_destroy(cache);
+}
+
+size_t cyclone_test_completed_context_count(CycloneCacheHandle *cache);
+
+TEST_CASE("C API: Completed miss contexts stay bounded and are reclaimed",
+          "[c_api][miss_callback]") {
+  TempCacheDir tmp;
+  std::string cache_path = tmp.path();
+  CycloneCacheConfig config{};
+  config.cache_path = cache_path.c_str();
+  config.cache_size_bytes = static_cast<uint64_t>(10 * 1024 * 1024);
+  config.ram_cache_size_bytes = static_cast<uint64_t>(1 * 1024 * 1024);
+  config.enable_checksum = 1;
+  config.num_segments = 2;
+
+  CycloneCacheHandle *cache = nullptr;
+  REQUIRE(cyclone_cache_create(&config, &cache) == CYCLONE_OK);
+
+  struct Saved {
+    CycloneMissDoneCallback first_cb = nullptr;
+    void *first_ud = nullptr;
+    CycloneMissDoneCallback held_cb = nullptr;
+    void *held_ud = nullptr;
+  } saved;
+
+  auto miss_handler = [](const char *key, size_t key_len, void *ud,
+                         CycloneMissDoneCallback done_cb, void *done_ud) {
+    auto *s = static_cast<Saved *>(ud);
+    std::string k(key, key_len);
+    if (k == "held") {
+      // Left outstanding on purpose.
+      s->held_cb = done_cb;
+      s->held_ud = done_ud;
+      return;
+    }
+    if (k == "stray") {
+      s->first_cb = done_cb;
+      s->first_ud = done_ud;
+    }
+    const char value[] = "v";
+    done_cb(done_ud, value, 1, CYCLONE_OK);
+  };
+  REQUIRE(cyclone_cache_set_miss_handler(cache, miss_handler, &saved) ==
+          CYCLONE_OK);
+
+  auto noop = [](void *, const char *, size_t, CycloneError) {};
+  auto miss = [&](const std::string &key) {
+    REQUIRE(cyclone_cache_read_async(cache, key.data(), key.size(), noop,
+                                     nullptr) == CYCLONE_OK);
+  };
+
+  // A completed miss is remembered, so a stray second completion of it
+  // lands on live memory and is ignored; the number remembered is capped.
+  miss("held");
+  miss("stray");
+  const char again[] = "again";
+  for (int i = 0; i < 3000; ++i) {
+    miss("many_misses_" + std::to_string(i));
+    REQUIRE(cyclone_test_completed_context_count(cache) <= 1024);
+    if (i == 100) {
+      // Still within the ring: ignored.
+      saved.first_cb(saved.first_ud, again, sizeof(again) - 1, CYCLONE_OK);
+    }
+  }
+  REQUIRE(cyclone_test_completed_context_count(cache) == 1024);
+
+  // The last outstanding fetch completes; draining releases the list.
+  const char value[] = "v";
+  saved.held_cb(saved.held_ud, value, 1, CYCLONE_OK);
+  REQUIRE(cyclone_cache_drain_pending(cache, 1000) == CYCLONE_OK);
+  REQUIRE(cyclone_test_completed_context_count(cache) == 0);
 
   cyclone_cache_destroy(cache);
 }
@@ -1583,3 +1709,455 @@ TEST_CASE("C API: RAM coherence needs the mmap directory and a RAM tier",
   full.enable_cross_process_ram_coherence = 1;
   REQUIRE(coherence_active_for(full) == 1);
 }
+
+// =============================================================================
+// Read handle lifetime
+// =============================================================================
+
+TEST_CASE("C API: an open read handle does not hold a disk borrow",
+          "[c_api][read]") {
+  // cyclone_cache_read() copies the entry into the handle, and the copy is
+  // what cyclone_cache_read_data() serves.  The handle must not also keep
+  // the disk borrow open: a borrow pins the stripe and defers wraps for as
+  // long as the application keeps the handle.
+  TempCacheDir tmp;
+  std::string cache_path = tmp.path();
+  CycloneCacheConfig config{};
+  config.cache_path = cache_path.c_str();
+  config.cache_size_bytes = static_cast<uint64_t>(10 * 1024 * 1024);
+  config.ram_cache_size_bytes = 0;  // disk only: every hit is a disk hit
+  config.enable_checksum = 1;
+  config.num_segments = 2;
+
+  CycloneCacheHandle *cache = nullptr;
+  REQUIRE(cyclone_cache_create(&config, &cache) == CYCLONE_OK);
+
+  const std::string key = "borrow_key";
+  const std::string data(4096, 'b');
+  REQUIRE(cyclone_cache_write(cache, key.data(), key.size(), data.data(),
+                              data.size()) == CYCLONE_OK);
+
+  CycloneReadHandle *rh = nullptr;
+  REQUIRE(cyclone_cache_read(cache, key.data(), key.size(), &rh) == CYCLONE_OK);
+  REQUIRE(rh != nullptr);
+
+  CycloneCacheStats stats{};
+  REQUIRE(cyclone_cache_stats(cache, &stats) == CYCLONE_OK);
+  REQUIRE(stats.disk_cache_hits >= 1);
+  CHECK(stats.borrows_outstanding == 0);
+
+  // The data stays readable for the life of the handle.
+  const char *read_data = nullptr;
+  size_t read_len = 0;
+  REQUIRE(cyclone_cache_read_data(rh, &read_data, &read_len) == CYCLONE_OK);
+  REQUIRE(std::string(read_data, read_len) == data);
+
+  cyclone_cache_read_close(rh);
+  REQUIRE(cyclone_cache_stats(cache, &stats) == CYCLONE_OK);
+  REQUIRE(stats.borrows_outstanding == 0);
+  cyclone_cache_destroy(cache);
+}
+
+// =============================================================================
+// Error mapping
+// =============================================================================
+
+TEST_CASE("C API: library errors map to distinct C codes", "[c_api][error]") {
+  using cyclone::CacheError;
+  using cyclone::c_api_detail::to_c_error;
+  // Routine outcomes must not surface as CYCLONE_INTERNAL_ERROR, which the
+  // header reserves for conditions that should not occur in normal use.
+  CHECK(to_c_error(CacheError::Success) == CYCLONE_OK);
+  CHECK(to_c_error(CacheError::NotFound) == CYCLONE_NOT_FOUND);
+  CHECK(to_c_error(CacheError::Exists) == CYCLONE_EXISTS);
+  CHECK(to_c_error(CacheError::NoSpace) == CYCLONE_NO_SPACE);
+  CHECK(to_c_error(CacheError::IoError) == CYCLONE_IO_ERROR);
+  CHECK(to_c_error(CacheError::Corrupted) == CYCLONE_CORRUPTED);
+  CHECK(to_c_error(CacheError::ChainCorrupted) == CYCLONE_CORRUPTED);
+  CHECK(to_c_error(CacheError::InvalidKey) == CYCLONE_INVALID_KEY);
+  CHECK(to_c_error(CacheError::InvalidArgument) == CYCLONE_INVALID_ARGUMENT);
+  CHECK(to_c_error(CacheError::InvalidConfiguration) ==
+        CYCLONE_INVALID_ARGUMENT);
+  CHECK(to_c_error(CacheError::NotInitialized) == CYCLONE_NOT_INITIALIZED);
+  CHECK(to_c_error(CacheError::Closed) == CYCLONE_NOT_INITIALIZED);
+  CHECK(to_c_error(CacheError::Busy) == CYCLONE_BUSY);
+  CHECK(to_c_error(CacheError::Timeout) == CYCLONE_TIMEOUT);
+  CHECK(to_c_error(CacheError::NotOwned) == CYCLONE_NOT_OWNED);
+  CHECK(to_c_error(CacheError::IncompatibleVersion) ==
+        CYCLONE_INCOMPATIBLE_VERSION);
+  CHECK(to_c_error(CacheError::AlternateNotFound) == CYCLONE_NOT_FOUND);
+  CHECK(to_c_error(CacheError::ResetRefusedLivePeer) ==
+        CYCLONE_RESET_REFUSED_LIVE_PEER);
+  CHECK(to_c_error(CacheError::ObjectTooLarge) == CYCLONE_OBJECT_TOO_LARGE);
+  CHECK(to_c_error(CacheError::InternalError) == CYCLONE_INTERNAL_ERROR);
+  // A value outside the enumeration still maps to the catch-all.
+  CHECK(to_c_error(static_cast<CacheError>(0xFF)) == CYCLONE_INTERNAL_ERROR);
+
+  // The appended codes keep the existing values and extend the tail.
+  STATIC_REQUIRE(CYCLONE_BUSY == 12);
+  STATIC_REQUIRE(CYCLONE_TIMEOUT == CYCLONE_BUSY + 1);
+  STATIC_REQUIRE(CYCLONE_NOT_OWNED == CYCLONE_TIMEOUT + 1);
+  STATIC_REQUIRE(CYCLONE_INCOMPATIBLE_VERSION == CYCLONE_NOT_OWNED + 1);
+}
+
+TEST_CASE("C API: read_async without a miss handler reports corruption",
+          "[c_api][miss_callback][error]") {
+  // A disk failure or a corrupted entry is not a clean miss: without a miss
+  // handler, read_async must report it as such, as the synchronous read
+  // does, rather than as CYCLONE_NOT_FOUND.
+  TempCacheDir tmp;
+  std::string cache_path = tmp.path();
+  CycloneCacheConfig config{};
+  config.cache_path = cache_path.c_str();
+  config.cache_size_bytes = static_cast<uint64_t>(10 * 1024 * 1024);
+  config.ram_cache_size_bytes = 0;  // disk only
+  config.enable_checksum = 1;
+  config.num_segments = 2;
+
+  CycloneCacheHandle *cache = nullptr;
+  REQUIRE(cyclone_cache_create(&config, &cache) == CYCLONE_OK);
+
+  const std::string key = "corrupt_me";
+  std::string data(8192, '\0');
+  for (size_t i = 0; i < data.size(); ++i) {
+    data[i] = static_cast<char>('a' + (i * 7 + i / 13) % 26);
+  }
+  REQUIRE(cyclone_cache_write(cache, key.data(), key.size(), data.data(),
+                              data.size()) == CYCLONE_OK);
+
+  // Flip one byte of the stored content in place.  The volume is a shared
+  // mapping of the file, so the change is visible to the next read.
+  bool flipped = false;
+  for (const auto &entry : std::filesystem::directory_iterator(tmp.dir())) {
+    if (!entry.is_regular_file()) continue;
+    std::FILE *f = std::fopen(entry.path().string().c_str(), "r+b");
+    REQUIRE(f != nullptr);
+    std::vector<char> file(static_cast<size_t>(entry.file_size()));
+    REQUIRE(std::fread(file.data(), 1, file.size(), f) == file.size());
+    auto it = std::search(file.begin(), file.end(), data.begin(), data.end());
+    if (it != file.end()) {
+      auto pos = static_cast<long>(it - file.begin()) + 100;
+      REQUIRE(std::fseek(f, pos, SEEK_SET) == 0);
+      char flipped_byte = static_cast<char>(data[100] ^ 0x5A);
+      REQUIRE(std::fwrite(&flipped_byte, 1, 1, f) == 1);
+      flipped = true;
+    }
+    std::fclose(f);
+    if (flipped) break;
+  }
+  REQUIRE(flipped);
+
+  CycloneReadHandle *rh = nullptr;
+  REQUIRE(cyclone_cache_read(cache, key.data(), key.size(), &rh) ==
+          CYCLONE_CORRUPTED);
+
+  struct Context {
+    std::atomic<bool> called{false};
+    CycloneError err = CYCLONE_OK;
+  } ctx;
+  auto callback = [](void *ud, const char *, size_t, CycloneError err) {
+    auto *c = static_cast<Context *>(ud);
+    c->err = err;
+    c->called.store(true);
+  };
+  REQUIRE(cyclone_cache_read_async(cache, key.data(), key.size(), callback,
+                                   &ctx) == CYCLONE_OK);
+  REQUIRE(ctx.called.load());
+  CHECK(ctx.err == CYCLONE_CORRUPTED);
+
+  cyclone_cache_destroy(cache);
+}
+
+// =============================================================================
+// Callback re-entrancy
+// =============================================================================
+
+TEST_CASE("C API: read_cb rejected by the in-flight limit may re-enter",
+          "[c_api][miss_callback]") {
+  // read_cb runs on the caller's stack.  Every path that calls it must do so
+  // with no bridge lock held, so a callback can call back into the same
+  // cache (chain another read, change the miss handler, drain).  The
+  // rejection at the in-flight limit is one such path.
+  TempCacheDir tmp;
+  std::string cache_path = tmp.path();
+  CycloneCacheConfig config{};
+  config.cache_path = cache_path.c_str();
+  config.cache_size_bytes = static_cast<uint64_t>(10 * 1024 * 1024);
+  config.ram_cache_size_bytes = static_cast<uint64_t>(1 * 1024 * 1024);
+  config.enable_checksum = 1;
+  config.num_segments = 2;
+  config.max_in_flight_requests = 1;
+
+  CycloneCacheHandle *cache = nullptr;
+  REQUIRE(cyclone_cache_create(&config, &cache) == CYCLONE_OK);
+
+  // A handler that parks the fetch, so the first key holds the only slot.
+  struct Parked {
+    CycloneMissDoneCallback done_cb = nullptr;
+    void *done_ud = nullptr;
+  } parked;
+  auto park = [](const char *, size_t, void *ud, CycloneMissDoneCallback cb,
+                 void *done_ud) {
+    auto *p = static_cast<Parked *>(ud);
+    p->done_cb = cb;
+    p->done_ud = done_ud;
+  };
+  REQUIRE(cyclone_cache_set_miss_handler(cache, park, &parked) == CYCLONE_OK);
+
+  auto ignore = [](void *, const char *, size_t, CycloneError) {};
+  REQUIRE(cyclone_cache_read_async(cache, "first", 5, ignore, nullptr) ==
+          CYCLONE_OK);
+  REQUIRE(parked.done_cb != nullptr);
+
+  struct Reentry {
+    CycloneCacheHandle *cache;
+    CycloneError err = CYCLONE_OK;
+    CycloneError nested = CYCLONE_INTERNAL_ERROR;
+  } reentry{cache};
+  auto reenter = [](void *ud, const char *, size_t, CycloneError err) {
+    auto *r = static_cast<Reentry *>(ud);
+    r->err = err;
+    // Takes the bridge lock: deadlocks if read_cb runs under it.
+    r->nested = cyclone_cache_set_miss_handler(r->cache, nullptr, nullptr);
+  };
+
+  std::atomic<bool> returned{false};
+  std::thread t([&] {
+    cyclone_cache_read_async(cache, "second", 6, reenter, &reentry);
+    returned.store(true);
+  });
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!returned.load() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  if (!returned.load()) {
+    // Deadlocked: the thread cannot be joined and the cache cannot be
+    // destroyed.  Leave both behind and fail.
+    t.detach();
+    FAIL("read_cb ran under the bridge lock: re-entry deadlocked");
+  }
+  t.join();
+  CHECK(reentry.err == CYCLONE_NO_SPACE);
+  CHECK(reentry.nested == CYCLONE_OK);
+
+  parked.done_cb(parked.done_ud, "v", 1, CYCLONE_OK);
+  cyclone_cache_destroy(cache);
+}
+
+// =============================================================================
+// Drain timeout and destroy with fetches outstanding
+// =============================================================================
+
+namespace {
+struct ParkedFetch {
+  std::atomic<CycloneMissDoneCallback> done_cb{nullptr};
+  std::atomic<void *> done_ud{nullptr};
+};
+
+void park_fetch(const char *, size_t, void *ud, CycloneMissDoneCallback cb,
+                void *done_ud) {
+  auto *p = static_cast<ParkedFetch *>(ud);
+  p->done_ud.store(done_ud);
+  p->done_cb.store(cb);
+}
+
+struct CountingWaiter {
+  std::atomic<int> calls{0};
+  std::atomic<CycloneError> err{CYCLONE_INTERNAL_ERROR};
+};
+
+void count_read(void *ud, const char *, size_t, CycloneError err) {
+  auto *w = static_cast<CountingWaiter *>(ud);
+  w->err.store(err);
+  w->calls.fetch_add(1);
+}
+
+CycloneCacheHandle *make_async_cache(const std::string &path) {
+  CycloneCacheConfig config{};
+  config.cache_path = path.c_str();
+  config.cache_size_bytes = static_cast<uint64_t>(10 * 1024 * 1024);
+  config.ram_cache_size_bytes = static_cast<uint64_t>(1 * 1024 * 1024);
+  config.enable_checksum = 1;
+  config.num_segments = 2;
+  CycloneCacheHandle *cache = nullptr;
+  REQUIRE(cyclone_cache_create(&config, &cache) == CYCLONE_OK);
+  return cache;
+}
+}  // namespace
+
+TEST_CASE("C API: drain timeout is reported and a late fetch is safe",
+          "[c_api][miss_callback][shutdown]") {
+  // A fetch that outlives drain_pending() must not be reported as drained,
+  // and its done callback may still arrive after cyclone_cache_destroy():
+  // the bridge must keep what that callback touches alive.
+  TempCacheDir tmp;
+  CycloneCacheHandle *cache = make_async_cache(tmp.path());
+  ParkedFetch parked;
+  REQUIRE(cyclone_cache_set_miss_handler(cache, park_fetch, &parked) ==
+          CYCLONE_OK);
+
+  CountingWaiter waiter;
+  REQUIRE(cyclone_cache_read_async(cache, "late", 4, count_read, &waiter) ==
+          CYCLONE_OK);
+  REQUIRE(parked.done_cb.load() != nullptr);
+
+  CHECK(cyclone_cache_drain_pending(cache, 20) == CYCLONE_TIMEOUT);
+  // The waiter was failed by the drain.
+  CHECK(waiter.calls.load() == 1);
+  CHECK(waiter.err.load() == CYCLONE_NOT_INITIALIZED);
+
+  cyclone_cache_destroy(cache);
+
+  // The fetch completes after the destroy.  It must neither touch freed
+  // memory nor answer the waiter a second time.
+  parked.done_cb.load()(parked.done_ud.load(), "value", 5, CYCLONE_OK);
+  CHECK(waiter.calls.load() == 1);
+}
+
+TEST_CASE("C API: destroy waits for a write-back that is under way",
+          "[c_api][miss_callback][shutdown]") {
+  // The done callback answers the waiters first and then writes the value
+  // back into the cache.  A destroy that runs while that write-back is
+  // pending must wait for it rather than free the cache under it.
+  TempCacheDir tmp;
+  CycloneCacheHandle *cache = make_async_cache(tmp.path());
+  ParkedFetch parked;
+  REQUIRE(cyclone_cache_set_miss_handler(cache, park_fetch, &parked) ==
+          CYCLONE_OK);
+
+  // A waiter that blocks inside read_cb, which runs after the write-back is
+  // registered and before it starts.
+  struct Blocking {
+    std::latch entered{1};
+    std::latch release{1};
+  } blocking;
+  auto block_read = [](void *ud, const char *, size_t, CycloneError) {
+    auto *b = static_cast<Blocking *>(ud);
+    b->entered.count_down();
+    b->release.wait();
+  };
+  REQUIRE(cyclone_cache_read_async(cache, "slow", 4, block_read, &blocking) ==
+          CYCLONE_OK);
+  REQUIRE(parked.done_cb.load() != nullptr);
+
+  std::thread fetcher([&] {
+    parked.done_cb.load()(parked.done_ud.load(), "value", 5, CYCLONE_OK);
+  });
+  blocking.entered.wait();
+
+  // The write-back is pending, so the drain times out.
+  CHECK(cyclone_cache_drain_pending(cache, 20) == CYCLONE_TIMEOUT);
+
+  std::atomic<bool> destroyed{false};
+  std::thread destroyer([&] {
+    cyclone_cache_destroy(cache);
+    destroyed.store(true);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  CHECK_FALSE(destroyed.load());
+
+  blocking.release.count_down();
+  fetcher.join();
+  destroyer.join();
+  CHECK(destroyed.load());
+}
+
+TEST_CASE("C API: a throwing read_cb does not leave a write-back pending",
+          "[c_api][miss_callback][shutdown]") {
+  // Callbacks must not throw (see cyclone_c.h), but one written in C++ might.
+  // The bridge contains the exception; it must not also leave its
+  // write-back accounting behind, or destroy waits for it forever.
+  TempCacheDir tmp;
+  CycloneCacheHandle *cache = make_async_cache(tmp.path());
+  ParkedFetch parked;
+  REQUIRE(cyclone_cache_set_miss_handler(cache, park_fetch, &parked) ==
+          CYCLONE_OK);
+
+  auto throwing_read = [](void *, const char *, size_t, CycloneError) {
+    throw std::runtime_error("read_cb failed");
+  };
+  REQUIRE(cyclone_cache_read_async(cache, "throws", 6, throwing_read,
+                                   nullptr) == CYCLONE_OK);
+  REQUIRE(parked.done_cb.load() != nullptr);
+  parked.done_cb.load()(parked.done_ud.load(), "value", 5, CYCLONE_OK);
+
+  std::atomic<bool> destroyed{false};
+  std::thread destroyer([&] {
+    cyclone_cache_destroy(cache);
+    destroyed.store(true);
+  });
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!destroyed.load() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  if (!destroyed.load()) {
+    destroyer.detach();
+    FAIL("destroy is waiting for a write-back that will never finish");
+  }
+  destroyer.join();
+}
+
+TEST_CASE(
+    "C API: a throwing miss handler leaves no read registered, so its "
+    "read_cb is never called",
+    "[c_api][miss_callback][shutdown]") {
+  // The miss handler must not throw (see cyclone_c.h), but one written in
+  // C++ might.  The read then returns an error, which promises that read_cb
+  // will not be called: the read must not stay registered and be answered
+  // later (at destroy, perhaps after the caller freed read_user_data).
+  TempCacheDir tmp;
+  CycloneCacheHandle *cache = make_async_cache(tmp.path());
+  auto throwing_handler = [](const char *, size_t, void *,
+                             CycloneMissDoneCallback, void *) {
+    throw std::runtime_error("miss handler failed");
+  };
+  REQUIRE(cyclone_cache_set_miss_handler(cache, throwing_handler, nullptr) ==
+          CYCLONE_OK);
+
+  std::atomic<int> calls{0};
+  auto counting_read = [](void *ud, const char *, size_t, CycloneError) {
+    static_cast<std::atomic<int> *>(ud)->fetch_add(1);
+  };
+  CHECK(cyclone_cache_read_async(cache, "handler-throws", 14, counting_read,
+                                 &calls) == CYCLONE_INTERNAL_ERROR);
+  CHECK(calls.load() == 0);
+
+  // Nothing is in flight: a drain is immediate, and destroy answers no one.
+  CHECK(cyclone_cache_drain_pending(cache, 1000) == CYCLONE_OK);
+  cyclone_cache_destroy(cache);
+  CHECK(calls.load() == 0);
+}
+
+#if defined(__GLIBC__) && defined(__GLIBCXX__)
+TEST_CASE("C API: a thread cancelled inside drain_pending unwinds cleanly",
+          "[c_api][shutdown]") {
+  // glibc implements thread cancellation as a forced unwind.  The bridge's
+  // exception barrier must let it pass: swallowing it aborts the process.
+  // drain_pending() waits on a condition variable, a cancellation point.
+  TempCacheDir tmp;
+  CycloneCacheHandle *cache = make_async_cache(tmp.path());
+  ParkedFetch parked;
+  REQUIRE(cyclone_cache_set_miss_handler(cache, park_fetch, &parked) ==
+          CYCLONE_OK);
+  CountingWaiter waiter;
+  REQUIRE(cyclone_cache_read_async(cache, "held", 4, count_read, &waiter) ==
+          CYCLONE_OK);
+  REQUIRE(parked.done_cb.load() != nullptr);
+
+  std::atomic<bool> returned{false};
+  std::thread drainer([&] {
+    cyclone_cache_drain_pending(cache, 60000);
+    returned.store(true);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  REQUIRE(pthread_cancel(drainer.native_handle()) == 0);
+  drainer.join();
+  CHECK_FALSE(returned.load());
+
+  // The bridge lock was released by the unwind: the fetch completes and the
+  // cache shuts down normally.
+  parked.done_cb.load()(parked.done_ud.load(), "value", 5, CYCLONE_OK);
+  CHECK(waiter.calls.load() == 1);
+  cyclone_cache_destroy(cache);
+}
+#endif

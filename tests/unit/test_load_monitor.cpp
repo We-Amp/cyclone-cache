@@ -3,8 +3,10 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <thread>
+#include <vector>
 
 #include "optimization/load_monitor.hpp"
 
@@ -99,6 +101,31 @@ TEST_CASE("LoadMonitor watermark checks", "[load][optimization]") {
     REQUIRE(monitor.is_above_high_watermark());
     REQUIRE_FALSE(monitor.is_below_low_watermark());
   }
+}
+
+// A zero baseline must not divide: that pinned the estimate at the maximum
+// and would keep load shedding on permanently once the counters are wired.
+TEST_CASE("LoadMonitor treats a non-positive baseline as no contribution",
+          "[load][optimization]") {
+  OptimizationConfig config;
+  config.baseline_ops_per_sec = 0.0;
+  config.baseline_bytes_per_sec = 0.0;
+  config.load_high_watermark = 0.8;
+  config.load_low_watermark = 0.5;
+  LoadMonitor monitor(config);
+
+  for (int i = 0; i < 1000; ++i) {
+    monitor.record_read_complete(1_KB);
+    monitor.record_write_complete(1_KB);
+  }
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  monitor.update_metrics();
+
+  auto metrics = monitor.metrics();
+  REQUIRE(std::isfinite(metrics.combined));
+  REQUIRE(metrics.combined == 0.0);
+  REQUIRE_FALSE(monitor.is_above_high_watermark());
 }
 
 TEST_CASE("LoadMonitor reset", "[load][optimization]") {
@@ -262,4 +289,44 @@ TEST_CASE("LoadMonitor multiple update cycles", "[load][optimization]") {
 
   // Third cycle should show lower rates since no new ops
   REQUIRE(metrics3.read_ops_per_sec < metrics2.read_ops_per_sec);
+}
+
+// The hot-path counters are sharded per thread; update_metrics() must still
+// report the exact totals recorded from many threads at once, and a commit
+// reported through the write-commit observer counts as a write.
+TEST_CASE("LoadMonitor sums counters recorded from many threads",
+          "[load][optimization]") {
+  OptimizationConfig config = default_config();
+  LoadMonitor monitor(config);
+
+  constexpr int kThreads = 24;  // more threads than counter shards
+  constexpr uint64_t kPerThread = 1000;
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&monitor] {
+      for (uint64_t i = 0; i < kPerThread; ++i) {
+        monitor.record_read_complete(4);
+        WriteCommitObserver &observer = monitor;
+        observer.on_write_committed(2);
+      }
+    });
+  }
+  for (auto &thread : threads) {
+    thread.join();
+  }
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  monitor.update_metrics();
+  auto metrics = monitor.metrics();
+  REQUIRE(metrics.read_ops == kThreads * kPerThread);
+  REQUIRE(metrics.read_bytes == kThreads * kPerThread * 4);
+  REQUIRE(metrics.write_ops == kThreads * kPerThread);
+  REQUIRE(metrics.write_bytes == kThreads * kPerThread * 2);
+
+  monitor.reset();
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  monitor.update_metrics();
+  REQUIRE(monitor.metrics().read_ops == 0);
+  REQUIRE(monitor.metrics().write_ops == 0);
 }

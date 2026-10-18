@@ -56,6 +56,15 @@ struct CacheStats {
   // drop is observable rather than silently counted as a success.
   uint64_t hit_flush_lock_contended = 0;
 
+  // Hits record_hit dropped without recording because the tracker's pending
+  // set was at its hard bound (twice the configured maximum) and no flush
+  // could drain it in time.  Best-effort like the contended drops above;
+  // nonzero means the flush thread (or the reader-side sweeps, without one)
+  // cannot keep up with the overflow.  Only hits that would add a NEW
+  // pending entry are dropped, and the memory bound holds per grace window
+  // (a quarter of a second), not instantaneously.
+  uint64_t hit_overload_drops = 0;
+
   // Completed periodic directory syncs across all volumes (persistent mode;
   // see CacheConfig::directory_sync_interval)
   uint64_t directory_syncs = 0;
@@ -128,6 +137,11 @@ struct CacheStats {
   // fails typically fails the blocking init lock first, so open() fails with
   // IoError before the gate can degrade).
   uint64_t volumes_with_degraded_reset_gate = 0;
+
+  // Volumes whose whole-file mapping failed at open and that run on the
+  // slower per-operation mapping fallback (a gauge).  Nonzero usually means
+  // address-space or memory-map limits; raise them for full speed.
+  uint64_t volumes_without_whole_file_map = 0;
 
   // Directory entries evicted because a bucket was completely full of
   // current-phase entries with no tag collision to displace — the entry
@@ -503,9 +517,20 @@ class Cache {
   [[nodiscard]] const OptimizationEngine *optimization_engine() const;
 
  private:
+  friend class OptimizationEngine;
+
   [[nodiscard]] std::expected<
       std::pair<std::shared_lock<std::shared_mutex>, Volume *>, CacheError>
   lock_and_select(const CacheKey &key, Tier tier) const;
+
+  // read_sync() / write_alternate_sync() for the optimization engine's own
+  // work: identical, except that they are not reported to the engine's load
+  // monitor (background work is not cache load).
+  std::expected<ReadHandle, CacheError> read_sync_unrecorded(
+      const CacheKey &key, Tier tier = Tier::kDefault);
+  std::expected<WriteHandle, CacheError> write_alternate_sync_unrecorded(
+      const CacheKey &key, AlternateId alternate_id, uint64_t content_length,
+      Tier tier = Tier::kDefault);
 
   // add_volume() body without locking; callers hold _impl->mutex exclusively.
   std::expected<void, CacheError> add_volume_locked(const VolumeConfig &config);

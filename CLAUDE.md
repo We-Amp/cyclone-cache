@@ -237,7 +237,7 @@ cyclone/
 | Subsystem | Source | Public header | Tests | Doc |
 |-----------|--------|---------------|-------|-----|
 | Core (Cache/Volume/Stripe/Directory/Document/HitTracker) | `src/core/` | `include/cyclone/cache.hpp`, `handle.hpp`, `key.hpp`, `config.hpp` | `tests/integration/test_lockfree_read_races.cpp`, `test_power_loss.cpp`, `tests/unit/` | `doc/architecture.md`, `doc/multi-process.md` |
-| IO (MappedFile/Executor) | `src/io/` | `include/cyclone/task.hpp` | `tests/unit/test_mapped_file.cpp` | `doc/architecture.md#memory-mapped-io` |
+| IO (MappedFile) | `src/io/` | `include/cyclone/task.hpp` | `tests/unit/test_mapped_file.cpp` | `doc/architecture.md#memory-mapped-io` |
 | RAM cache (CLFUS/LRU, segmented) | `src/ram_cache/` | internal: `src/ram_cache/ram_cache.hpp` | `tests/unit/test_clfus.cpp`, `test_lru.cpp` | `doc/architecture.md#ram-cache` |
 | Optimization engine | `src/optimization/` | `include/cyclone/plugin/optimization.hpp` | `tests/integration/test_optimization.cpp` | `doc/architecture.md#background-optimization-engine` |
 | Plugins (HTTP + custom) | `src/plugin/` | `include/cyclone/plugin/plugin.hpp` | `tests/unit/test_plugin.cpp`, `test_http_plugin.cpp` | `doc/plugin-development.md` |

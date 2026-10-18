@@ -3,7 +3,13 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <cstring>
+#include <limits>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "cyclone/plugin/alternate.hpp"
 #include "cyclone/plugin/plugin.hpp"
@@ -36,7 +42,10 @@ TEST_CASE("HttpCacheAlt serialization round-trip", "[http]") {
   auto data = alt.serialize();
   REQUIRE(!data.empty());
 
-  auto restored = HttpCacheAlt::deserialize(std::span<const std::byte>(data));
+  auto restored_opt =
+      HttpCacheAlt::deserialize(std::span<const std::byte>(data));
+  REQUIRE(restored_opt.has_value());
+  const auto &restored = *restored_opt;
 
   REQUIRE(restored.request_method() == "GET");
   REQUIRE(restored.request_url() == "http://example.com/path");
@@ -67,6 +76,26 @@ TEST_CASE("HttpCacheAlt freshness calculation", "[http]") {
   REQUIRE(max_age->count() == 3600);
 }
 
+TEST_CASE("HttpCacheAlt future response time is never fresh", "[http]") {
+  HttpCacheAlt alt;
+  alt.set_response_time(std::time(nullptr) + 86400);
+  alt.set_response_header("Cache-Control", "max-age=60");
+
+  REQUIRE(alt.age().count() >= 0);
+  REQUIRE_FALSE(alt.is_fresh());
+
+  auto plugin = create_http_alternate_plugin();
+  auto meta = alt.serialize();
+  CacheVariant variant{CacheKey("future"),
+                       Metadata(std::span<const std::byte>(meta)),
+                       0,
+                       {},
+                       {},
+                       0};
+  FreshnessContext fctx;
+  REQUIRE(plugin->check_freshness(variant, fctx) != FreshnessResult::Fresh);
+}
+
 TEST_CASE("HttpCacheAlt stale entry", "[http]") {
   HttpCacheAlt alt;
   auto past = std::time(nullptr) - 7200;
@@ -76,12 +105,561 @@ TEST_CASE("HttpCacheAlt stale entry", "[http]") {
   REQUIRE_FALSE(alt.is_fresh());
 }
 
-TEST_CASE("HttpCacheAlt no Cache-Control defaults to fresh", "[http]") {
+TEST_CASE("HttpCacheAlt no freshness lifetime is stale", "[http]") {
   HttpCacheAlt alt;
   alt.set_response_time(std::time(nullptr));
 
-  REQUIRE(alt.is_fresh());
+  REQUIRE_FALSE(alt.is_fresh());
   REQUIRE_FALSE(alt.max_age().has_value());
+
+  // Cache-Control without max-age gives no lifetime either.
+  alt.set_response_header("Cache-Control", "public");
+  REQUIRE_FALSE(alt.is_fresh());
+}
+
+namespace {
+std::string http_date(std::time_t t) {
+  std::tm *tm = std::gmtime(&t);
+  char buf[64];
+  std::strftime(buf, sizeof(buf), "%a, %d %b %Y %H:%M:%S GMT", tm);
+  return buf;
+}
+}  // namespace
+
+TEST_CASE("HttpCacheAlt max-age directive parsing", "[http]") {
+  auto now = std::time(nullptr);
+  HttpCacheAlt alt;
+  alt.set_response_time(now);
+
+  SECTION("directive name is case-insensitive") {
+    alt.set_response_header("Cache-Control", "public, MAX-AGE=60");
+    REQUIRE(alt.max_age().has_value());
+    REQUIRE(alt.max_age()->count() == 60);
+    REQUIRE(alt.is_fresh());
+  }
+  SECTION("directive is matched as a whole token") {
+    alt.set_response_header("Cache-Control", "x-max-age=60");
+    REQUIRE_FALSE(alt.max_age().has_value());
+    REQUIRE_FALSE(alt.is_fresh());
+  }
+  SECTION("s-maxage alone is not max-age") {
+    alt.set_response_header("Cache-Control", "s-maxage=60");
+    REQUIRE_FALSE(alt.max_age().has_value());
+  }
+  SECTION("max-age=0 is stale") {
+    alt.set_response_header("Cache-Control", "max-age=0");
+    REQUIRE_FALSE(alt.is_fresh());
+  }
+}
+
+TEST_CASE("HttpCacheAlt age includes the Age header", "[http]") {
+  auto now = std::time(nullptr);
+
+  SECTION("Age beyond max-age is stale") {
+    HttpCacheAlt alt;
+    alt.set_response_time(now);
+    alt.set_response_header("Cache-Control", "max-age=60");
+    alt.set_response_header("Age", "3600");
+    REQUIRE(alt.age().count() >= 3600);
+    REQUIRE_FALSE(alt.is_fresh());
+  }
+  SECTION("small Age stays fresh") {
+    HttpCacheAlt alt;
+    alt.set_response_time(now);
+    alt.set_response_header("Cache-Control", "max-age=600");
+    alt.set_response_header("Age", "10");
+    REQUIRE(alt.is_fresh());
+  }
+  SECTION("invalid Age is ignored") {
+    HttpCacheAlt alt;
+    alt.set_response_time(now);
+    alt.set_response_header("Cache-Control", "max-age=600");
+    alt.set_response_header("Age", "-5");
+    REQUIRE(alt.age().count() < 5);
+    alt.set_response_header("Age", "abc");
+    REQUIRE(alt.age().count() < 5);
+    REQUIRE(alt.is_fresh());
+  }
+  SECTION("response delay is added to Age") {
+    HttpCacheAlt alt;
+    alt.set_request_time(now - 100);
+    alt.set_response_time(now);
+    alt.set_response_header("Cache-Control", "max-age=600");
+    alt.set_response_header("Age", "550");
+    // 550 + 100 seconds of response delay exceeds the 600 second lifetime.
+    REQUIRE_FALSE(alt.is_fresh());
+  }
+  SECTION("larger of apparent age and corrected Age wins") {
+    HttpCacheAlt alt;
+    alt.set_response_time(now);
+    alt.set_response_header("Date", http_date(now - 1000));
+    alt.set_response_header("Age", "5");
+    alt.set_response_header("Cache-Control", "max-age=600");
+    REQUIRE(alt.age().count() >= 1000);
+  }
+}
+
+TEST_CASE("HttpCacheAlt s-maxage takes precedence", "[http]") {
+  auto now = std::time(nullptr);
+
+  SECTION("s-maxage overrides max-age and Expires") {
+    HttpCacheAlt alt;
+    alt.set_response_time(now - 120);
+    alt.set_response_header("Cache-Control", "max-age=3600, s-maxage=60");
+    alt.set_response_header("Expires", http_date(now + 3600));
+    REQUIRE(alt.freshness_lifetime().has_value());
+    REQUIRE(alt.freshness_lifetime()->count() == 60);
+    REQUIRE_FALSE(alt.is_fresh());
+  }
+  SECTION("longer s-maxage keeps the entry fresh") {
+    HttpCacheAlt alt;
+    alt.set_response_time(now - 120);
+    alt.set_response_header("Cache-Control", "S-MAXAGE=600, max-age=60");
+    REQUIRE(alt.is_fresh());
+  }
+  SECTION("s-maxage alone gives a lifetime") {
+    HttpCacheAlt alt;
+    alt.set_response_time(now);
+    alt.set_response_header("Cache-Control", "s-maxage=60");
+    REQUIRE(alt.freshness_lifetime()->count() == 60);
+    REQUIRE_FALSE(alt.max_age().has_value());
+  }
+}
+
+TEST_CASE("HttpCacheAlt accepts all HTTP date formats", "[http]") {
+  // Response received at Sun, 06 Nov 1994 08:49:37 GMT.
+  const std::time_t base = 784111777;
+  auto lifetime = [&](const char *expires) {
+    HttpCacheAlt alt;
+    alt.set_response_time(base);
+    alt.set_response_header("Expires", expires);
+    return alt.freshness_lifetime();
+  };
+
+  SECTION("IMF-fixdate") {
+    auto l = lifetime("Sun, 06 Nov 1994 09:49:37 GMT");
+    REQUIRE(l.has_value());
+    REQUIRE(l->count() == 3600);
+  }
+  SECTION("obsolete RFC 850 date") {
+    auto l = lifetime("Sunday, 06-Nov-94 09:49:37 GMT");
+    REQUIRE(l.has_value());
+    REQUIRE(l->count() == 3600);
+  }
+  SECTION("asctime date") {
+    auto l = lifetime("Sun Nov  6 09:49:37 1994");
+    REQUIRE(l.has_value());
+    REQUIRE(l->count() == 3600);
+    l = lifetime("Sun Nov 16 09:49:37 1994");
+    REQUIRE(l.has_value());
+    REQUIRE(l->count() == 3600 + 10 * 86400);
+  }
+  SECTION("two digit years within fifty years of now map to this century") {
+    auto l = lifetime("Sunday, 06-Nov-94 09:49:37 GMT");
+    REQUIRE(l->count() == 3600);  // 94 reads as 1994, not 2094
+  }
+  SECTION("garbage is rejected") {
+    REQUIRE(lifetime("Sun, 06 Nov 1994 09:49:37 PST")->count() == 0);
+    REQUIRE(lifetime("Sunday, 06-Foo-94 09:49:37 GMT")->count() == 0);
+    REQUIRE(lifetime("Sun Nov  6 09:49:37")->count() == 0);
+  }
+}
+
+TEST_CASE("HttpCacheAlt honours Expires", "[http]") {
+  auto now = std::time(nullptr);
+
+  SECTION("future Expires is fresh") {
+    HttpCacheAlt alt;
+    alt.set_response_time(now);
+    alt.set_response_header("Expires", http_date(now + 3600));
+    REQUIRE(alt.is_fresh());
+  }
+  SECTION("past Expires is stale") {
+    HttpCacheAlt alt;
+    alt.set_response_time(now - 7200);
+    alt.set_response_header("Expires", http_date(now - 3600));
+    REQUIRE_FALSE(alt.is_fresh());
+  }
+  SECTION("invalid Expires is stale") {
+    HttpCacheAlt alt;
+    alt.set_response_time(now);
+    alt.set_response_header("Expires", "0");
+    REQUIRE_FALSE(alt.is_fresh());
+  }
+  SECTION("max-age wins over Expires") {
+    HttpCacheAlt alt;
+    alt.set_response_time(now);
+    alt.set_response_header("Expires", http_date(now - 3600));
+    alt.set_response_header("Cache-Control", "max-age=600");
+    REQUIRE(alt.is_fresh());
+  }
+  SECTION("Expires is measured from the Date header") {
+    HttpCacheAlt alt;
+    // Response stored now but generated two hours ago with a one hour life.
+    alt.set_response_time(now);
+    alt.set_response_header("Date", http_date(now - 7200));
+    alt.set_response_header("Expires", http_date(now - 3600));
+    REQUIRE_FALSE(alt.is_fresh());
+  }
+}
+
+TEST_CASE("HttpCacheAlt heuristic freshness needs Last-Modified", "[http]") {
+  auto now = std::time(nullptr);
+  constexpr std::time_t kDay = 86400;
+
+  SECTION("recent response of an old resource is fresh") {
+    HttpCacheAlt alt;
+    alt.set_status_code(200);
+    alt.set_response_time(now);
+    alt.set_response_header("Last-Modified", http_date(now - 100 * kDay));
+    REQUIRE(alt.is_fresh());
+  }
+  SECTION("response older than a tenth of the resource age is stale") {
+    HttpCacheAlt alt;
+    alt.set_status_code(200);
+    alt.set_response_time(now - 20 * kDay);
+    alt.set_response_header("Date", http_date(now - 20 * kDay));
+    alt.set_response_header("Last-Modified", http_date(now - 120 * kDay));
+    // Resource was 100 days old at response time: heuristic life is 10 days.
+    REQUIRE_FALSE(alt.is_fresh());
+  }
+  SECTION("only statuses cacheable by default get a heuristic") {
+    for (uint16_t code :
+         {200, 203, 204, 206, 300, 301, 308, 404, 405, 410, 414, 501}) {
+      HttpCacheAlt alt;
+      alt.set_status_code(code);
+      alt.set_response_time(now);
+      alt.set_response_header("Last-Modified", http_date(now - 100 * kDay));
+      INFO("status " << code);
+      REQUIRE(alt.freshness_lifetime().has_value());
+    }
+    for (uint16_t code : {0, 201, 202, 302, 303, 307, 400, 403, 500, 503}) {
+      HttpCacheAlt alt;
+      alt.set_status_code(code);
+      alt.set_response_time(now);
+      alt.set_response_header("Last-Modified", http_date(now - 100 * kDay));
+      INFO("status " << code);
+      REQUIRE_FALSE(alt.freshness_lifetime().has_value());
+      REQUIRE_FALSE(alt.is_fresh());
+    }
+  }
+  SECTION("no Last-Modified gives no heuristic") {
+    HttpCacheAlt alt;
+    alt.set_response_time(now);
+    REQUIRE_FALSE(alt.is_fresh());
+  }
+}
+
+TEST_CASE("HttpCacheAlt header names are case-insensitive", "[http]") {
+  HttpCacheAlt alt;
+  alt.set_response_time(std::time(nullptr));
+  alt.set_response_header("cache-control", "max-age=3600");
+  alt.set_response_header("content-type", "text/html");
+  alt.set_request_header("ACCEPT-ENCODING", "gzip");
+
+  REQUIRE(alt.get_response_header("Cache-Control").value_or("") ==
+          "max-age=3600");
+  REQUIRE(alt.get_response_header("CONTENT-TYPE").value_or("") == "text/html");
+  REQUIRE(alt.get_request_header("accept-encoding").value_or("") == "gzip");
+  REQUIRE(alt.max_age().has_value());
+
+  // A later set under a different case replaces the earlier value.
+  alt.set_response_header("Cache-Control", "max-age=60");
+  REQUIRE(alt.get_response_header("cache-control").value_or("") ==
+          "max-age=60");
+
+  auto data = alt.serialize();
+  auto restored_opt =
+      HttpCacheAlt::deserialize(std::span<const std::byte>(data));
+  REQUIRE(restored_opt.has_value());
+  const auto &restored = *restored_opt;
+  REQUIRE(restored.get_response_header("CACHE-CONTROL").value_or("") ==
+          "max-age=60");
+  REQUIRE(restored.get_request_header("Accept-Encoding").value_or("") ==
+          "gzip");
+}
+
+TEST_CASE("HttpAlternatePlugin Vary matches names regardless of case",
+          "[http]") {
+  auto plugin = create_http_alternate_plugin();
+
+  HttpCacheAlt alt;
+  alt.set_response_header("vary", "accept-encoding");
+  alt.set_request_header("accept-encoding", "gzip");
+  auto meta = alt.serialize();
+
+  VariantCollection variants;
+  variants.add(CacheVariant{CacheKey("vary-case"),
+                            Metadata(std::span<const std::byte>(meta)),
+                            0,
+                            {},
+                            {},
+                            0});
+
+  std::string same = "Accept-Encoding: gzip\r\n";
+  LookupContext ctx;
+  ctx.request_headers = std::span<const std::byte>(
+      reinterpret_cast<const std::byte *>(same.data()), same.size());
+  REQUIRE(plugin->select_variant(variants, ctx).has_value());
+
+  std::string other = "Accept-Encoding: br\r\n";
+  ctx.request_headers = std::span<const std::byte>(
+      reinterpret_cast<const std::byte *>(other.data()), other.size());
+  REQUIRE_FALSE(plugin->select_variant(variants, ctx).has_value());
+}
+
+TEST_CASE("HttpCacheAlt metadata uses a fixed little-endian layout", "[http]") {
+  HttpCacheAlt alt;
+  alt.set_request_method("GET");
+  alt.set_request_url("/");
+  alt.set_status_code(0x0102);
+  alt.set_request_time(static_cast<std::time_t>(0x0000000A0B0C0D0ELL));
+  alt.set_response_time(static_cast<std::time_t>(0x0000000102030405LL));
+
+  auto data = alt.serialize();
+  const std::vector<unsigned char> expected = {
+      0xA5,                                            // format version
+      3,    0,    0,    0,    'G',  'E',  'T',         // method
+      1,    0,    0,    0,    '/',                     // url
+      0,    0,    0,    0,                             // request headers
+      0x02, 0x01,                                      // status
+      0,    0,    0,    0,                             // response headers
+      0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x00, 0x00, 0x00,  // request time
+      0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0x00, 0x00,  // response time
+  };
+  REQUIRE(data.size() == expected.size());
+  REQUIRE(std::memcmp(data.data(), expected.data(), expected.size()) == 0);
+
+  auto parsed = HttpCacheAlt::deserialize(data);
+  REQUIRE(parsed.has_value());
+  REQUIRE(parsed->status_code() == 0x0102);
+  REQUIRE(static_cast<long long>(parsed->request_time()) ==
+          0x0000000A0B0C0D0ELL);
+  REQUIRE(static_cast<long long>(parsed->response_time()) ==
+          0x0000000102030405LL);
+}
+
+TEST_CASE("HttpCacheAlt deserialize treats an unversioned blob as a miss",
+          "[http]") {
+  // The earlier layout had no version byte and started with the method
+  // length.
+  const std::vector<unsigned char> old_blob = {
+      3, 0, 0, 0, 'G', 'E', 'T', 1, 0, 0, 0, '/', 0, 0, 0, 0, 0xC8, 0, 0,
+      0, 0, 0, 1, 0,   0,   0,   0, 0, 0, 0, 2,   0, 0, 0, 0, 0,    0, 0};
+  auto bytes = std::as_bytes(std::span(old_blob));
+  REQUIRE_FALSE(HttpCacheAlt::deserialize(bytes).has_value());
+}
+
+TEST_CASE("HttpCacheAlt extreme stored times do not overflow", "[http]") {
+  for (long long extreme : {std::numeric_limits<long long>::min(),
+                            std::numeric_limits<long long>::min() + 1,
+                            std::numeric_limits<long long>::max()}) {
+    HttpCacheAlt alt;
+    alt.set_response_header("Cache-Control", "max-age=60");
+    alt.set_response_header("Age", "5");
+    alt.set_response_header("Date", "Sun, 06 Nov 1994 08:49:37 GMT");
+    alt.set_request_time(static_cast<std::time_t>(extreme));
+    alt.set_response_time(static_cast<std::time_t>(extreme));
+
+    // Through the blob, as a stored entry would arrive.
+    auto parsed = HttpCacheAlt::deserialize(alt.serialize());
+    REQUIRE(parsed.has_value());
+    REQUIRE(parsed->age().count() >= 0);
+    (void)parsed->freshness_lifetime();
+    (void)parsed->is_fresh();
+    (void)alt.age();
+    (void)alt.is_fresh();
+  }
+}
+
+TEST_CASE("HttpCacheAlt deserialize rejects truncated input", "[http]") {
+  HttpCacheAlt alt;
+  alt.set_request_method("GET");
+  alt.set_request_url("http://example.com/path");
+  alt.set_request_header("Accept", "text/html");
+  alt.set_status_code(200);
+  alt.set_response_header("Cache-Control", "max-age=3600");
+  alt.set_response_time(std::time(nullptr));
+  auto data = alt.serialize();
+
+  REQUIRE(
+      HttpCacheAlt::deserialize(std::span<const std::byte>(data)).has_value());
+
+  // Every strict prefix of a valid blob must be rejected as a whole.
+  for (size_t n = 0; n < data.size(); ++n) {
+    auto prefix =
+        HttpCacheAlt::deserialize(std::span<const std::byte>(data.data(), n));
+    INFO("prefix length " << n);
+    REQUIRE_FALSE(prefix.has_value());
+  }
+
+  // Trailing bytes are not part of a well-formed blob either.
+  auto longer = data;
+  longer.push_back(std::byte{0});
+  REQUIRE_FALSE(HttpCacheAlt::deserialize(std::span<const std::byte>(longer))
+                    .has_value());
+}
+
+TEST_CASE("HttpAlternatePlugin ignores variants with undecodable metadata",
+          "[http]") {
+  auto plugin = create_http_alternate_plugin();
+
+  HttpCacheAlt alt;
+  alt.set_response_header("Content-Type", "text/html");
+  alt.set_response_header("Cache-Control", "max-age=3600");
+  alt.set_response_time(std::time(nullptr));
+  auto good = alt.serialize();
+  auto bad = good;
+  bad.resize(bad.size() - 3);
+
+  VariantCollection variants;
+  variants.add(CacheVariant{CacheKey("bad"),
+                            Metadata(std::span<const std::byte>(bad)),
+                            0,
+                            {},
+                            {},
+                            0});
+  variants.add(CacheVariant{CacheKey("good"),
+                            Metadata(std::span<const std::byte>(good)),
+                            0,
+                            {},
+                            {},
+                            0});
+
+  LookupContext ctx;
+  auto picked = plugin->select_variant(variants, ctx);
+  REQUIRE(picked.has_value());
+  REQUIRE(*picked == 1);
+
+  FreshnessContext fctx;
+  REQUIRE(plugin->check_freshness(variants[0], fctx) == FreshnessResult::Error);
+  REQUIRE(plugin->check_freshness(variants[1], fctx) == FreshnessResult::Fresh);
+}
+
+TEST_CASE("HttpAlternatePlugin does not select unacceptable variants",
+          "[http][alternate]") {
+  auto plugin = create_http_alternate_plugin();
+
+  HttpCacheAlt html;
+  html.set_response_header("Content-Type", "text/html");
+  auto html_meta = html.serialize();
+  HttpCacheAlt png;
+  png.set_response_header("Content-Type", "image/png");
+  auto png_meta = png.serialize();
+
+  auto select = [&](const std::string &headers, bool both) {
+    VariantCollection variants;
+    variants.add(CacheVariant{CacheKey("html"),
+                              Metadata(std::span<const std::byte>(html_meta)),
+                              0,
+                              {},
+                              {},
+                              0});
+    if (both) {
+      variants.add(CacheVariant{CacheKey("png"),
+                                Metadata(std::span<const std::byte>(png_meta)),
+                                0,
+                                {},
+                                {},
+                                0});
+    }
+    LookupContext ctx;
+    ctx.request_headers = std::span<const std::byte>(
+        reinterpret_cast<const std::byte *>(headers.data()), headers.size());
+    return plugin->select_variant(variants, ctx);
+  };
+
+  SECTION("explicit q=0 on the only variant") {
+    REQUIRE_FALSE(select("Accept: text/html;q=0\r\n", false).has_value());
+    REQUIRE_FALSE(select("Accept: text/html;q=0.0\r\n", false).has_value());
+  }
+  SECTION("media type that does not match the only variant") {
+    REQUIRE_FALSE(select("Accept: image/png\r\n", false).has_value());
+  }
+  SECTION("q=0 variant loses to an acceptable one") {
+    auto r = select("Accept: text/html;q=0, image/png;q=0.1\r\n", true);
+    REQUIRE(r.has_value());
+    REQUIRE(*r == 1);
+  }
+  SECTION("nothing acceptable among several variants") {
+    REQUIRE_FALSE(
+        select("Accept: text/html;q=0, image/png;q=0\r\n", true).has_value());
+  }
+  SECTION("acceptable variant is still selected") {
+    auto r = select("Accept: text/html;q=0.5\r\n", false);
+    REQUIRE(r.has_value());
+    REQUIRE(*r == 0);
+  }
+}
+
+TEST_CASE("HttpAlternatePlugin ranks negotiation ranges by specificity",
+          "[http][alternate]") {
+  auto plugin = create_http_alternate_plugin();
+
+  // Index of the selected variant among those built from `variant_headers`
+  // (each entry is a list of response header pairs), or -1 for no match.
+  using Pairs = std::vector<std::pair<std::string, std::string>>;
+  auto select = [&](const std::string &request, const std::vector<Pairs> &vs) {
+    std::vector<std::vector<std::byte>> metas;
+    VariantCollection variants;
+    for (const auto &pairs : vs) {
+      HttpCacheAlt alt;
+      for (const auto &[n, v] : pairs) {
+        alt.set_response_header(n, v);
+      }
+      metas.push_back(alt.serialize());
+      variants.add(
+          CacheVariant{CacheKey("v"),
+                       Metadata(std::span<const std::byte>(metas.back())),
+                       0,
+                       {},
+                       {},
+                       0});
+    }
+    LookupContext ctx;
+    ctx.request_headers = std::span<const std::byte>(
+        reinterpret_cast<const std::byte *>(request.data()), request.size());
+    auto r = plugin->select_variant(variants, ctx);
+    return r ? static_cast<int>(*r) : -1;
+  };
+  const Pairs html{{"Content-Type", "text/html"}};
+  const Pairs png{{"Content-Type", "image/png"}};
+
+  SECTION("Accept: specific range beats wildcard regardless of order") {
+    REQUIRE(select("Accept: text/html;q=0, */*\r\n", {html}) == -1);
+    REQUIRE(select("Accept: */*, text/html;q=0\r\n", {html}) == -1);
+    REQUIRE(select("Accept: text/html;q=0, */*\r\n", {html, png}) == 1);
+    REQUIRE(select("Accept: text/*;q=0, text/html\r\n", {html}) == 0);
+    REQUIRE(select("Accept: text/html;q=0.1, text/*;q=0.9, image/png;q=0.5\r\n",
+                   {html, png}) == 1);
+  }
+  SECTION("Accept: whitespace around parameters and an upper case Q") {
+    REQUIRE(select("Accept: text/html ; q=0, */*\r\n", {html}) == -1);
+    REQUIRE(select("Accept: text/html;Q=0, */*\r\n", {html}) == -1);
+    REQUIRE(select("Accept: text/html; q = 0\r\n", {html}) == -1);
+    REQUIRE(select("Accept: text/html;level=1; q=0.5\r\n", {html}) == 0);
+  }
+  SECTION("Accept-Encoding: exact coding beats the wildcard") {
+    const Pairs gzip{{"Content-Type", "text/html"},
+                     {"Content-Encoding", "gzip"}};
+    const Pairs plain{{"Content-Type", "text/html"}};
+    REQUIRE(select("Accept-Encoding: *, gzip;q=0\r\n", {gzip}) == -1);
+    REQUIRE(select("Accept-Encoding: gzip;q=0, *\r\n", {gzip}) == -1);
+    REQUIRE(select("Accept-Encoding: *, gzip;q=0\r\n", {gzip, plain}) == 1);
+    REQUIRE(select("Accept-Encoding: gzip ; q=0.5, *;q=0.1\r\n",
+                   {gzip, plain}) == 0);
+    REQUIRE(select("Accept-Encoding: GZIP;Q=0\r\n", {gzip}) == -1);
+  }
+  SECTION("Accept-Language: the most specific range wins") {
+    const Pairs en{{"Content-Language", "en-US"}};
+    const Pairs fr{{"Content-Language", "fr"}};
+    REQUIRE(select("Accept-Language: *;q=0, en\r\n", {en}) == 0);
+    REQUIRE(select("Accept-Language: *;q=0, en\r\n", {fr}) == -1);
+    REQUIRE(select("Accept-Language: en-US;q=0, en\r\n", {en}) == -1);
+    REQUIRE(select("Accept-Language: en, en-US;q=0\r\n", {en}) == -1);
+    REQUIRE(select("Accept-Language: en;q=0.3, fr;q=0.9\r\n", {en, fr}) == 1);
+    REQUIRE(select("Accept-Language: en ; q=0\r\n", {en}) == -1);
+  }
 }
 
 TEST_CASE("HttpAlternatePlugin info", "[http]") {
@@ -173,6 +751,40 @@ TEST_CASE("HttpAlternatePlugin check_freshness", "[http]") {
   FreshnessContext ctx;
   auto result = plugin->check_freshness(variant, ctx);
   REQUIRE(result == FreshnessResult::Fresh);
+}
+
+TEST_CASE("HttpAlternatePlugin no-cache forces revalidation of fresh entries",
+          "[http]") {
+  auto plugin = create_http_alternate_plugin();
+  FreshnessContext fctx;
+
+  auto check = [&](const char *cache_control) {
+    HttpCacheAlt alt;
+    alt.set_response_time(std::time(nullptr));
+    alt.set_response_header("Cache-Control", cache_control);
+    auto meta = alt.serialize();
+    CacheVariant variant{CacheKey("nc"),
+                         Metadata(std::span<const std::byte>(meta)),
+                         0,
+                         {},
+                         {},
+                         0};
+    return plugin->check_freshness(variant, fctx);
+  };
+
+  REQUIRE(check("max-age=3600") == FreshnessResult::Fresh);
+  REQUIRE(check("max-age=3600, no-cache") == FreshnessResult::MustRevalidate);
+  REQUIRE(check("No-Cache, max-age=3600") == FreshnessResult::MustRevalidate);
+  // must-revalidate only matters once the entry is stale.
+  REQUIRE(check("max-age=3600, must-revalidate") == FreshnessResult::Fresh);
+  REQUIRE(check("max-age=0, must-revalidate") ==
+          FreshnessResult::MustRevalidate);
+  // A shared cache treats s-maxage and proxy-revalidate like must-revalidate
+  // once the entry is stale.
+  REQUIRE(check("max-age=3600, s-maxage=0") == FreshnessResult::MustRevalidate);
+  REQUIRE(check("max-age=0, proxy-revalidate") ==
+          FreshnessResult::MustRevalidate);
+  REQUIRE(check("max-age=0") == FreshnessResult::Stale);
 }
 
 TEST_CASE("HttpAlternatePlugin check_freshness force revalidate", "[http]") {
@@ -299,6 +911,69 @@ TEST_CASE("HttpAlternatePlugin Vary star rejects all", "[http]") {
   REQUIRE_FALSE(result.has_value());
 }
 
+namespace {
+
+bool vary_selects(const char *vary, const char *name, const char *cached_value,
+                  const std::string &request_headers) {
+  auto plugin = create_http_alternate_plugin();
+  HttpCacheAlt alt;
+  alt.set_response_header("Vary", vary);
+  alt.set_request_header(name, cached_value);
+  auto meta = alt.serialize();
+
+  VariantCollection variants;
+  variants.add(CacheVariant{CacheKey("vary-value"),
+                            Metadata(std::span<const std::byte>(meta)),
+                            0,
+                            {},
+                            {},
+                            0});
+  LookupContext ctx;
+  ctx.request_headers = std::span<const std::byte>(
+      reinterpret_cast<const std::byte *>(request_headers.data()),
+      request_headers.size());
+  return plugin->select_variant(variants, ctx).has_value();
+}
+
+}  // namespace
+
+TEST_CASE("HttpAlternatePlugin Vary compares list headers as token sets",
+          "[http]") {
+  // Order, optional whitespace and case do not change the token set.
+  REQUIRE(vary_selects("Accept-Encoding", "Accept-Encoding", "gzip, br",
+                       "Accept-Encoding: br,gzip\r\n"));
+  REQUIRE(vary_selects("Accept-Encoding", "Accept-Encoding", "gzip, br",
+                       "Accept-Encoding:   GZIP ,  BR \r\n"));
+  REQUIRE(vary_selects("Accept-Language", "Accept-Language", "en;q=0.5, nl",
+                       "Accept-Language: NL, en ; q=0.5\r\n"));
+  // A different set still differs.
+  REQUIRE_FALSE(vary_selects("Accept-Encoding", "Accept-Encoding", "gzip, br",
+                             "Accept-Encoding: gzip\r\n"));
+  REQUIRE_FALSE(vary_selects("Accept-Encoding", "Accept-Encoding", "gzip",
+                             "Accept-Encoding: gzip, br\r\n"));
+}
+
+TEST_CASE("HttpAlternatePlugin Vary token sets keep parameters significant",
+          "[http]") {
+  REQUIRE_FALSE(vary_selects("Accept-Encoding", "Accept-Encoding", "gzip",
+                             "Accept-Encoding: gzip;q=0\r\n"));
+  REQUIRE_FALSE(vary_selects("Accept-Encoding", "Accept-Encoding", "gzip;q=0",
+                             "Accept-Encoding: gzip\r\n"));
+  REQUIRE(vary_selects("Accept-Encoding", "Accept-Encoding", "gzip;q=0",
+                       "Accept-Encoding: GZIP ; Q=0\r\n"));
+}
+
+TEST_CASE("HttpAlternatePlugin Vary keeps case-sensitive values exact",
+          "[http]") {
+  // Surrounding whitespace is not part of a field value.
+  REQUIRE(vary_selects("X-Tenant", "X-Tenant", "Acme", "X-Tenant:  Acme \r\n"));
+  // Other headers keep their case and order.
+  REQUIRE_FALSE(
+      vary_selects("X-Tenant", "X-Tenant", "Acme", "X-Tenant: acme\r\n"));
+  REQUIRE_FALSE(
+      vary_selects("Cookie", "Cookie", "a=1; b=2", "Cookie: b=2; a=1\r\n"));
+}
+
 TEST_CASE("HttpAlternatePlugin eviction_priority", "[http]") {
   auto plugin = create_http_alternate_plugin();
 
@@ -317,6 +992,32 @@ TEST_CASE("HttpAlternatePlugin eviction_priority", "[http]") {
   double cold_priority = plugin->eviction_priority(cold_variant);
 
   REQUIRE(cold_priority > hot_priority);
+}
+
+TEST_CASE("HttpAlternatePlugin eviction_priority stays finite and positive",
+          "[http]") {
+  auto plugin = create_http_alternate_plugin();
+
+  CacheVariant saturated;
+  saturated.key = CacheKey("saturated-key");
+  saturated.last_accessed = std::chrono::system_clock::now();
+  saturated.hit_count = UINT32_MAX;
+  double saturated_priority = plugin->eviction_priority(saturated);
+  REQUIRE(std::isfinite(saturated_priority));
+  REQUIRE(saturated_priority > 0.0);
+
+  // A last-access time ahead of the clock must not lower the priority below
+  // that of a variant accessed right now.
+  CacheVariant future;
+  future.key = CacheKey("future-key");
+  future.last_accessed =
+      std::chrono::system_clock::now() + std::chrono::hours(24 * 365);
+  future.hit_count = 1;
+  CacheVariant now_variant = future;
+  now_variant.last_accessed = std::chrono::system_clock::now();
+  REQUIRE(plugin->eviction_priority(future) >=
+          plugin->eviction_priority(now_variant) - 1e-3);
+  REQUIRE(plugin->eviction_priority(future) > 0.0);
 }
 
 TEST_CASE("HTTP alternate Accept with multiple ranges and q-values",
@@ -747,6 +1448,7 @@ TEST_CASE("Crafted header count must not cause CPU DoS in deserialize",
 
   auto start = std::chrono::steady_clock::now();
   auto alt = HttpCacheAlt::deserialize(std::span<const std::byte>(crafted));
+  REQUIRE_FALSE(alt.has_value());
   auto elapsed = std::chrono::steady_clock::now() - start;
 
   // Must complete in well under 1 second (was previously ~seconds with 4B

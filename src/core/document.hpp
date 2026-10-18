@@ -18,7 +18,7 @@ namespace cyclone {
 struct Document {
   static constexpr uint32_t kMagic = 0x5F129B14;
   static constexpr uint8_t kVersionMajor =
-      8;  // Version 6: hit_count/next_alternate_offset/last_access laid out
+      9;  // Version 6: hit_count/next_alternate_offset/last_access laid out
           // naturally aligned so the in-place header RMW sites can store them
           // via std::atomic_ref (kept in lockstep with
           // VolumeHeader::kFormatVersionMajor; pre-v6 volumes auto-reset)
@@ -32,6 +32,13 @@ struct Document {
           // Pre-v8 documents would fail verification, and the fingerprinted
           // filename (which mixes the format major) makes them invisible
           // anyway -- consumers take a cold cache, never a misparse.
+          // Version 9: the checksum also covers the fixed header: every
+          // field that never changes after the write (see
+          // checksum_header_seed); fill_serial (formerly sync_serial) and
+          // the serial packed into next_alternate_offset bind a document to
+          // the write that filled it.  A v8 checksum covered header bytes +
+          // content only, so v8 documents would fail verification; the
+          // same fingerprinted-filename separation applies.
   static constexpr uint8_t kVersionMinor = 0;
 
   // Maximum alternates per cache key (bounds chain traversal).  Alias of the
@@ -75,7 +82,7 @@ struct Document {
   uint8_t version_minor = kVersionMinor;
   uint8_t flags = kFlagNone;
 
-  uint32_t sync_serial = 0;
+  uint32_t fill_serial = 0;  // see kFillSerialOffset
   uint32_t write_serial = 0;
   uint32_t pin_until = 0;  // Unix timestamp
   uint32_t checksum = 0;   // CRC-32C (v8+); CRC-32/ISO-HDLC before v8
@@ -84,7 +91,8 @@ struct Document {
   uint32_t hit_count = 0;    // Persistent hit counter (was: reserved)
 
   // Alternate chain fields (v2)
-  uint64_t next_alternate_offset = 0;  // Offset to next alternate, 0 = none
+  uint64_t next_alternate_offset = 0;  // Link to the next alternate, 0 = none
+                                       // (offset + serial, see make_link)
   uint8_t alternate_id = 0;            // AlternateId enum value (0 = Original)
   uint8_t reserved2[3] = {};           // Alignment padding
   int64_t last_access = 0;             // Unix timestamp in milliseconds
@@ -92,7 +100,7 @@ struct Document {
   // Header size calculation:
   // magic(4) + len(4) + total_len(8) + first_key(32) + fragment_key(32) +
   // header_len(4) + doc_type(1) + version_major(1) + version_minor(1) +
-  // flags(1) + sync_serial(4) + write_serial(4) + pin_until(4) + checksum(4) +
+  // flags(1) + fill_serial(4) + write_serial(4) + pin_until(4) + checksum(4) +
   // frag_offset(4) + hit_count(4) + next_alternate_offset(8) +
   // last_access(8) + alternate_id(1) + reserved2(3) = 132 bytes
   static constexpr size_t kHeaderSize = 132;
@@ -104,6 +112,18 @@ struct Document {
   // +doc_type(1) = 85.  Named so the version gate can be exercised on-disk
   // without a magic number; kept honest by a static_assert in document.cpp.
   static constexpr size_t kVersionMajorOffset = 85;
+  // fill_serial carries the serial of the fill that wrote the document (the
+  // write-lock acquisition it was written under; see WriteSlot::fill_serial
+  // in volume.hpp), and the directory entry that publishes it carries the
+  // same value, as does every chain link made to it (make_link below).  A
+  // read uses a document only when its serial agrees with the entry or the
+  // link it was reached through, so the late bytes of a writer whose lock
+  // was taken over in the middle of its fill are never served in place of
+  // the document the next holder published at the same offset, neither
+  // through its entry nor through a later alternate's link to it.  Stamped
+  // after the checksum is computed, so it sits outside it.  (Named
+  // sync_serial and always 0 before.)
+  static constexpr size_t kFillSerialOffset = 88;
   // write_serial carries the stripe PASS the document was written in (wrap
   // retention's pass stamp, mod 2^32; see Volume::patch_pass_stamp).  It
   // was always 0 before, and it sits outside the checksum.
@@ -113,6 +133,37 @@ struct Document {
   static constexpr size_t kNextAlternateOffsetPos = 112;
   static constexpr size_t kLastAccessOffset = 120;
   static constexpr size_t kAlternateIdOffset = 128;
+
+  // A chain link (next_alternate_offset) carries the successor's
+  // stripe-relative offset in its low 48 bits and the successor's
+  // fill_serial in its top 16 bits, so a hop can tell the document the link
+  // was made to from other bytes at the same offset (see kFillSerialOffset).
+  // Offsets are 40 bits (DirEntry), so the top bits were always zero; a link
+  // of 0 is still "no successor".  The field is outside the checksum and
+  // stored atomically, so a repoint writes offset and serial at once.
+  static constexpr unsigned kLinkSerialShift = 48;
+  static constexpr uint64_t kLinkOffsetMask =
+      (uint64_t{1} << kLinkSerialShift) - 1;
+  [[nodiscard]] static constexpr uint64_t make_link(uint64_t rel_offset,
+                                                    uint16_t serial) noexcept {
+    return rel_offset == 0 ? 0
+                           : (rel_offset & kLinkOffsetMask) |
+                                 (uint64_t{serial} << kLinkSerialShift);
+  }
+  [[nodiscard]] static constexpr uint64_t link_offset(uint64_t link) noexcept {
+    return link & kLinkOffsetMask;
+  }
+  [[nodiscard]] static constexpr uint16_t link_serial(uint64_t link) noexcept {
+    return static_cast<uint16_t>(link >> kLinkSerialShift);
+  }
+  // Is this document the one `link` was made to?
+  [[nodiscard]] bool bound_by_link(uint64_t link) const noexcept {
+    return fill_serial == link_serial(link);
+  }
+  // The link to this document, at `rel_offset`.
+  [[nodiscard]] uint64_t link_to(uint64_t rel_offset) const noexcept {
+    return make_link(rel_offset, static_cast<uint16_t>(fill_serial));
+  }
 
   [[nodiscard]] bool is_valid() const { return magic == kMagic; }
   [[nodiscard]] bool is_version_compatible() const {
@@ -139,10 +190,39 @@ struct Document {
     return len - kHeaderSize - header_len;
   }
 
+  // The shape every document a volume writes has: one complete fragment
+  // whose total_len is exactly its content size.  len, total_len, header_len
+  // and doc_type sit in the fixed header, outside the checksum, so a read
+  // that serves a document checks this identity as well as the CRC: a
+  // document whose fields disagree reads as corrupt (a miss), whatever its
+  // payload's checksum says.
+  [[nodiscard]] bool has_volume_shape() const {
+    return doc_type == Type::SingleFrag && frag_offset == 0 &&
+           len >= kHeaderSize && header_len <= len - kHeaderSize &&
+           total_len == uint64_t{len} - kHeaderSize - header_len;
+  }
+
   static uint32_t compute_checksum(std::span<const std::byte> data);
-  [[nodiscard]] bool verify_checksum(std::span<const std::byte> content) const;
+
+  // The document checksum (v9) is the CRC-32C over this document's
+  // canonical fixed header followed by its payload (header bytes +
+  // content).  The canonical header is the 132-byte wire header with the
+  // fields the cache stamps after the checksum is computed or updates in
+  // place set to zero: fill_serial and write_serial (the fill and pass
+  // stamps), the checksum itself, hit_count, next_alternate_offset and
+  // last_access.  Every other field -- magic, the lengths, both keys,
+  // header_len, doc_type, the version, flags, pin_until, frag_offset,
+  // alternate_id and the reserved bytes -- is covered, so a change to any
+  // of them fails verification.
+  // Returns the CRC-32C state after the canonical header, to be continued
+  // over the payload with crc32c_update().
+  [[nodiscard]] uint32_t checksum_header_seed() const;
+  // `payload` is header bytes + content (DocumentReader::payload()).
+  [[nodiscard]] bool verify_checksum(std::span<const std::byte> payload) const;
 
   std::span<std::byte> serialize(std::vector<std::byte> &buffer) const;
+  // The wire header into exactly kHeaderSize bytes at `out`.
+  void serialize_to(std::byte *out) const;
   static Document deserialize(std::span<const std::byte> data);
 };
 
@@ -201,11 +281,25 @@ class DocumentBuilder {
   int64_t _last_access = 0;
 };
 
+// Tag for a reader over bytes that live in a shared file mapping.
+struct SharedMappingTag {};
+inline constexpr SharedMappingTag kSharedMapping{};
+
 class DocumentReader {
  public:
   explicit DocumentReader(std::span<const std::byte> data);
+  // Bytes inside a shared mapping: documents start 8-aligned there, which the
+  // atomic loads of the live-mutated header fields rely on (a misaligned base
+  // would silently fall back to a racy plain read).  A misaligned base yields
+  // an invalid reader in every build.
+  DocumentReader(SharedMappingTag, std::span<const std::byte> data);
 
   [[nodiscard]] bool is_valid() const { return _valid; }
+  // is_valid() plus Document::has_volume_shape(): what every read path that
+  // serves or enumerates a stored document requires.
+  [[nodiscard]] bool is_servable() const {
+    return _valid && _doc.has_volume_shape();
+  }
   [[nodiscard]] const Document &document() const { return _doc; }
 
   [[nodiscard]] std::span<const std::byte> header() const;

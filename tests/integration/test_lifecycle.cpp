@@ -33,6 +33,27 @@
 using namespace cyclone;
 
 // =============================================================================
+// Volume reset is internal to open()
+// =============================================================================
+
+namespace {
+
+// Detects a reset() callable from outside Volume.
+template <typename V>
+concept CallableReset = requires(V &volume) { volume.reset(); };
+
+}  // namespace
+
+TEST_CASE("Volume::reset() is reachable only through open()", "[lifecycle]") {
+  // reset() zero-fills the stripes in place.  It has none of close()'s
+  // teardown handshake (teardown flag, stripe generation, wait for handle
+  // calls), so on an open volume it would rewrite the bytes and stripe state
+  // that live handles still use.  Only open() runs it, before any handle
+  // exists.
+  STATIC_REQUIRE_FALSE(CallableReset<Volume>);
+}
+
+// =============================================================================
 // Basic Lifecycle Tests
 // =============================================================================
 
@@ -456,7 +477,7 @@ TEST_CASE("Cache handles missing file on restart", "[lifecycle][error]") {
   }
 
   // Delete the REAL backing file(s).  add_volume() structural-fingerprints the
-  // filename (cyclone.dat -> cyclone-8-<hex>.dat, plus a possible ".small"
+  // filename (cyclone.dat -> cyclone-9-<hex>.dat, plus a possible ".small"
   // sibling), so removing the raw cache_path would miss the file the library
   // actually uses.  Remove the whole temp directory subtree and recreate it
   // empty (a single remove_all, not an iterate-while-removing loop, which is
@@ -1417,6 +1438,111 @@ TEST_CASE("A stale write handle on a bare Volume is refused after reopen",
   volume->close();
 }
 
+TEST_CASE("A read handle on a bare Volume keeps its mapping after close",
+          "[lifecycle][read][borrow]") {
+  // ReadHandle's lifetime contract holds without a Cache too: a disk-hit
+  // handle keeps the mapping it reads from alive, so header() and content()
+  // stay valid after the Volume closes or is destroyed.
+  for (const bool destroy : {false, true}) {
+    CAPTURE(destroy);
+    TempCacheDir tmp;
+    VolumeConfig vol_config;
+    vol_config.path = tmp.path();
+    vol_config.size = static_cast<size_t>(8 * 1024 * 1024);
+    auto volume = std::make_shared<Volume>(vol_config);
+    REQUIRE(volume->open().has_value());
+    const CacheKey key("read-handle-on-a-bare-volume");
+    std::vector<std::byte> body(16384);
+    for (size_t i = 0; i < body.size(); ++i) {
+      body[i] = static_cast<std::byte>((i * 37 + 11) & 0xFF);
+    }
+    auto wh = volume->write_sync(key, body.size());
+    REQUIRE(wh.has_value());
+    REQUIRE(wh->write_sync(std::span<const std::byte>(body)).has_value());
+    REQUIRE(wh->close_sync().has_value());
+
+    auto rh = volume->read_sync(key);
+    REQUIRE(rh.has_value());
+    REQUIRE_FALSE(rh->is_ram_cache_hit());
+
+    volume->close();
+    if (destroy) {
+      volume.reset();
+    }
+    const auto content = rh->content();
+    REQUIRE(content.size() == body.size());
+    CHECK(std::memcmp(content.data(), body.data(), body.size()) == 0);
+    CHECK_FALSE(rh->renew_lease());
+  }
+}
+
+TEST_CASE(
+    "A read handle on a bare Volume kept across close() and open() touches "
+    "no stripe",
+    "[lifecycle][read][borrow]") {
+  // Without a Cache there is no anchor and no per-generation latch: the
+  // handle's Stripe* belongs to the stripe generation it was read in, which
+  // close() freed.  After open() the volume is live again, so its calls
+  // must be refused by that generation; an admitted call would fire the
+  // seam below (and run on freed memory).
+  TempCacheDir tmp;
+  VolumeConfig vol_config;
+  vol_config.path = tmp.path();
+  vol_config.size = static_cast<size_t>(8 * 1024 * 1024);
+  auto volume = std::make_shared<Volume>(vol_config);
+  REQUIRE(volume->open().has_value());
+  const std::vector<std::byte> body(4096, std::byte{0x5D});
+  auto put = [&](const CacheKey &key) {
+    auto wh = volume->write_sync(key, body.size());
+    REQUIRE(wh.has_value());
+    REQUIRE(wh->write_sync(std::span<const std::byte>(body)).has_value());
+    REQUIRE(wh->close_sync().has_value());
+  };
+  const CacheKey key("bare-read-handle-across-reopen");
+  put(key);
+  auto read = volume->read_sync(key);
+  REQUIRE(read.has_value());
+  REQUIRE_FALSE(read->is_ram_cache_hit());
+  std::optional<ReadHandle> stale(std::move(*read));
+
+  volume->close();
+  REQUIRE(volume->open().has_value());
+  const CacheKey fresh_key("bare-read-handle-after-reopen");
+  put(fresh_key);
+  auto fresh_read = volume->read_sync(fresh_key);
+  REQUIRE(fresh_read.has_value());
+  std::optional<ReadHandle> fresh(std::move(*fresh_read));
+
+  std::atomic<int> admitted_calls{0};
+  Volume::s_teardown_seam_for_test = [&](Volume::TeardownSeam seam) {
+    if (seam == Volume::TeardownSeam::kHandleCallAdmitted) {
+      admitted_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+  };
+  // Its mapping is still pinned: the bytes stay readable.
+  const auto content = stale->content();
+  const bool same = content.size() == body.size() &&
+                    std::memcmp(content.data(), body.data(), body.size()) == 0;
+  const bool renewed = stale->renew_lease();
+  const LeaseRenewal strict = stale->renew_lease_strict();
+  const uint64_t forced_wrap_ns = stale->ns_until_forced_wrap();
+  stale.reset();
+  const int stale_admitted = admitted_calls.load();
+  const bool fresh_renewed = fresh->renew_lease();
+  fresh.reset();
+  const int fresh_admitted = admitted_calls.load() - stale_admitted;
+  Volume::s_teardown_seam_for_test = nullptr;
+
+  CHECK(same);
+  CHECK_FALSE(renewed);
+  CHECK(strict == LeaseRenewal::kTorn);
+  CHECK(forced_wrap_ns == UINT64_MAX);
+  CHECK(stale_admitted == 0);
+  CHECK(fresh_renewed);
+  CHECK(fresh_admitted == 2);  // The renew and the close
+  volume->close();
+}
+
 TEST_CASE("Concurrent stop with in-flight writes must not crash",
           "[lifecycle][concurrency]") {
   // Writers hold a filled write handle and commit it around the moment the
@@ -1668,6 +1794,65 @@ TEST_CASE("Cache teardown is fork-safe in a forked child",
   INFO(
       "forked child must exit promptly; a timeout means the fork-inherited "
       "Cyclone teardown hung in pthread_cond_destroy");
+  REQUIRE(exited);
+  REQUIRE(WIFEXITED(status));
+  REQUIRE(WEXITSTATUS(status) == 0);
+}
+
+// The same teardown, in a child whose PID equals the one that start()ed the
+// cache: PIDs are reused (a grandchild in a PID namespace can get its
+// ancestor's), so a PID comparison alone would take the ordinary teardown
+// path there and wait for threads that do not exist in this process.  The
+// child must still tell from the fork epoch that it inherited the cache.
+TEST_CASE("Cache teardown in a forked child that reuses the owner's PID",
+          "[lifecycle][fork]") {
+  TempCacheDir tmp;
+  CacheConfig config;
+  config.enable_hit_tracking = true;
+  config.hit_flush_interval = std::chrono::milliseconds(50);
+  config.optimization_config.enabled = true;
+  config.optimization_config.scale_check_interval =
+      std::chrono::milliseconds(50);
+  auto cache_result = Cache::create(config);
+  REQUIRE(cache_result.has_value());
+  auto &cache = *cache_result;
+  VolumeConfig vol_config;
+  vol_config.path = tmp.path();
+  vol_config.size = static_cast<size_t>(20 * 1024 * 1024);
+  REQUIRE(cache->add_volume(vol_config).has_value());
+  REQUIRE(cache->start().has_value());
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  const long owner_pid = static_cast<long>(::getpid());
+  pid_t pid = fork();
+  REQUIRE(pid >= 0);
+  if (pid == 0) {
+    set_pid_for_test(owner_pid);  // as if this child reused the PID
+    cache->stop();
+    _exit(cache->is_running() ? 2 : 0);
+  }
+
+  bool exited = false;
+  int status = 0;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(15);
+  while (std::chrono::steady_clock::now() < deadline) {
+    pid_t r = ::waitpid(pid, &status, WNOHANG);
+    if (r == pid) {
+      exited = true;
+      break;
+    }
+    REQUIRE(r != -1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
+  if (!exited) {
+    signal_child(pid, SIGKILL);
+    ::waitpid(pid, &status, 0);
+  }
+
+  cache->stop();
+
+  INFO("a child with the owner's PID must still abandon the inherited cache");
   REQUIRE(exited);
   REQUIRE(WIFEXITED(status));
   REQUIRE(WEXITSTATUS(status) == 0);

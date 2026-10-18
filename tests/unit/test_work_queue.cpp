@@ -262,6 +262,32 @@ TEST_CASE("WorkQueue stop behavior", "[queue][optimization]") {
   REQUIRE_FALSE(empty.has_value());
 }
 
+TEST_CASE("WorkQueue start after stop resumes operation",
+          "[queue][optimization]") {
+  OptimizationConfig config = default_config();
+  WorkQueue queue(config);
+
+  queue.enqueue(make_item("http://a.com", AlternateId::Brotli));
+  queue.stop();
+  REQUIRE(queue.is_stopped());
+  REQUIRE(queue.try_dequeue().has_value());  // Drain the pre-stop item
+
+  queue.start();
+  REQUIRE_FALSE(queue.is_stopped());
+
+  // Enqueue and dequeue operate again.
+  auto result = queue.enqueue(make_item("http://b.com", AlternateId::Gzip));
+  REQUIRE(result.has_value());
+  auto item = queue.try_dequeue();
+  REQUIRE(item.has_value());
+  REQUIRE(item->id.key == CacheKey::from_url("http://b.com"));
+
+  // Double start is harmless; stop still works afterwards.
+  queue.start();
+  queue.stop();
+  REQUIRE(queue.is_stopped());
+}
+
 TEST_CASE("WorkQueue blocking dequeue", "[queue][optimization][concurrent]") {
   OptimizationConfig config = default_config();
   WorkQueue queue(config);
@@ -434,4 +460,116 @@ TEST_CASE("WorkQueue concurrent stress",
   REQUIRE(stats.total_enqueued == produced.load());
   REQUIRE(stats.total_dequeued == consumed.load());
   REQUIRE(queue.empty());
+}
+
+TEST_CASE("WorkQueue statistics are readable during concurrent operations",
+          "[queue][optimization][concurrent]") {
+  OptimizationConfig config = default_config();
+  config.max_queue_size = 100000;
+  config.max_memory_bytes = 1_GB;
+  WorkQueue queue(config);
+
+  constexpr int kPerThread = 500;
+  std::atomic<bool> done{false};
+  std::atomic<uint64_t> reader_polls{0};
+  std::atomic<int> bad_reads{0};
+  std::atomic<int> failed_enqueues{0};
+
+  std::thread reader([&] {
+    while (!done.load(std::memory_order_acquire)) {
+      auto s = queue.stats();
+      if (s.current_size > 2 * kPerThread) bad_reads.fetch_add(1);
+      reader_polls.fetch_add(1, std::memory_order_relaxed);
+    }
+  });
+
+  std::vector<std::thread> producers;
+  for (int t = 0; t < 2; ++t) {
+    producers.emplace_back([&, t] {
+      for (int i = 0; i < kPerThread; ++i) {
+        auto item = make_item("http://example.com/s" + std::to_string(t) + "/" +
+                                  std::to_string(i),
+                              AlternateId::Brotli);
+        if (!queue.enqueue(item).has_value()) failed_enqueues.fetch_add(1);
+      }
+    });
+  }
+  for (auto &p : producers) p.join();
+  for (int i = 0; i < 2 * kPerThread; ++i) {
+    REQUIRE(queue.try_dequeue().has_value());
+  }
+  done.store(true, std::memory_order_release);
+  reader.join();
+
+  REQUIRE(bad_reads.load() == 0);
+  REQUIRE(failed_enqueues.load() == 0);
+  auto s = queue.stats();
+  REQUIRE(s.total_enqueued == 2 * kPerThread);
+  REQUIRE(s.total_dequeued == 2 * kPerThread);
+  REQUIRE(s.current_size == 0);
+  REQUIRE(s.current_memory == 0);
+}
+
+TEST_CASE("WorkQueue ages waiting items so low priority work is not starved",
+          "[queue][optimization]") {
+  OptimizationConfig config = default_config();
+  config.priority_aging_interval = std::chrono::milliseconds{20};
+  WorkQueue queue(config);
+
+  REQUIRE(queue
+              .enqueue(make_item("http://example.com/old", AlternateId::Brotli,
+                                 /*priority=*/0))
+              .has_value());
+  // About ten aging intervals: worth more than the priority gap below.
+  std::this_thread::sleep_for(std::chrono::milliseconds{250});
+  REQUIRE(queue
+              .enqueue(make_item("http://example.com/new", AlternateId::Brotli,
+                                 /*priority=*/3))
+              .has_value());
+
+  auto first = queue.try_dequeue();
+  REQUIRE(first.has_value());
+  REQUIRE(first->id.key == CacheKey::from_url("http://example.com/old"));
+  auto second = queue.try_dequeue();
+  REQUIRE(second.has_value());
+  REQUIRE(second->id.key == CacheKey::from_url("http://example.com/new"));
+}
+
+TEST_CASE("WorkQueue priority order holds when items are the same age",
+          "[queue][optimization]") {
+  OptimizationConfig config = default_config();
+  config.priority_aging_interval = std::chrono::hours{1};
+  WorkQueue queue(config);
+
+  REQUIRE(
+      queue.enqueue(make_item("http://example.com/a", AlternateId::Brotli, 1))
+          .has_value());
+  REQUIRE(
+      queue.enqueue(make_item("http://example.com/b", AlternateId::Brotli, 5))
+          .has_value());
+  REQUIRE(
+      queue.enqueue(make_item("http://example.com/c", AlternateId::Brotli, 3))
+          .has_value());
+  REQUIRE(queue.try_dequeue()->id.key ==
+          CacheKey::from_url("http://example.com/b"));
+  REQUIRE(queue.try_dequeue()->id.key ==
+          CacheKey::from_url("http://example.com/c"));
+  REQUIRE(queue.try_dequeue()->id.key ==
+          CacheKey::from_url("http://example.com/a"));
+}
+
+TEST_CASE("WorkQueue aging can be disabled", "[queue][optimization]") {
+  OptimizationConfig config = default_config();
+  config.priority_aging_interval = std::chrono::milliseconds{0};
+  WorkQueue queue(config);
+
+  REQUIRE(
+      queue.enqueue(make_item("http://example.com/old", AlternateId::Brotli, 0))
+          .has_value());
+  std::this_thread::sleep_for(std::chrono::milliseconds{50});
+  REQUIRE(
+      queue.enqueue(make_item("http://example.com/new", AlternateId::Brotli, 3))
+          .has_value());
+  REQUIRE(queue.try_dequeue()->id.key ==
+          CacheKey::from_url("http://example.com/new"));
 }

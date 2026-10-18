@@ -40,6 +40,7 @@
 #include "hit_tracker.hpp"
 #include "mmap_directory.hpp"
 #include "thread_shard.hpp"
+#include "write_commit_observer.hpp"
 
 namespace cyclone {
 
@@ -125,7 +126,19 @@ struct VolumeHeader {
   //   the v7 bump: COLD CACHE on upgrade, and the superseded v7 file stays on
   //   disk until it is reclaimed (CacheConfig::gc_superseded_on_start, or a
   //   manual delete).
-  static constexpr uint16_t kFormatVersionMajor = 8;
+  // Version 9: the document checksum also covers the fixed document header
+  //   (every field that never changes after the write; the fields updated
+  //   in place -- pass stamp, hit count, chain link, access time -- stay
+  //   outside).  The document's sync_serial became fill_serial, the
+  //   directory entry's unused next word its 16-bit twin, and
+  //   next_alternate_offset carries the successor's serial in bits 48-63:
+  //   a read uses a document only when the serial it was reached through
+  //   agrees.  No byte of the layout moved, but every pre-v9 checksum
+  //   covers less and would fail verification, so the bump leaves those
+  //   rings behind exactly as v7 and v8 did: COLD CACHE on upgrade, and the
+  //   superseded v8 file stays on disk until it is reclaimed
+  //   (CacheConfig::gc_superseded_on_start, or a manual delete).
+  static constexpr uint16_t kFormatVersionMajor = 9;
   static constexpr uint16_t kFormatVersionMinor = 0;
 
   uint32_t magic = kMagic;
@@ -740,18 +753,21 @@ struct Stripe {
               InsertAdmission *admission = nullptr,
               std::span<const uint64_t> clear_offsets = {},
               bool *busy = nullptr, const PublishView *view = nullptr,
-              bool *stale = nullptr) {
+              bool *stale = nullptr, uint16_t fill_serial = 0) {
     if (use_mmap_directory && mmap_directory) {
       // *busy: a capped cross-process lock wait gave up; nothing published.
       // *stale: the bucket no longer holds what `view` describes; nothing
-      // published (see PublishView in directory.hpp).
-      return mmap_directory->insert(
-          key, offset, size, verified_offset, collision_evicted,
-          bucket_full_evicted, admission, clear_offsets, busy, view, stale);
+      // published (see PublishView in directory.hpp).  The entry carries
+      // `fill_serial`, the published document's own (DirEntry::fill_serial).
+      return mmap_directory->insert(key, offset, size, verified_offset,
+                                    collision_evicted, bucket_full_evicted,
+                                    admission, clear_offsets, busy, view, stale,
+                                    fill_serial);
     } else if (directory) {
       return directory->insert(key, offset, size, verified_offset,
                                collision_evicted, bucket_full_evicted,
-                               admission, clear_offsets, view, stale);
+                               admission, clear_offsets, view, stale,
+                               fill_serial);
     }
     return false;
   }
@@ -1047,9 +1063,15 @@ struct VolumeStats {
   // there and is NOT normal (it was, when the gate was POSIX-only).
   uint64_t reset_gate_degraded = 0;
 
+  // 1 iff mapping the whole volume file failed at open() and this volume
+  // runs on the per-operation mmap/munmap fallback (correct, but a syscall
+  // pair on every read and write).  A GAUGE, cleared on every open().
+  uint64_t whole_file_map_failed = 0;
+
   // 1 iff this process holds no write-lock liveness slot on this
   // multi-process volume (WriterLiveness: all 251 slots taken, byte-range
-  // locking unsupported here, or the volume file was replaced by name).  Its
+  // locking unsupported here, the volume file was replaced by name, or the
+  // fork handlers could not be registered, out of memory).  Its
   // write-lock holds then carry no slot: if it dies holding the lock, peers
   // recover it only by the last-resort escalation (5 s) instead of within
   // about 50 ms.  A GAUGE.
@@ -1143,8 +1165,10 @@ class Volume;
 // outlives them keeps the Volume object and the mapping alive until it
 // closes (an upgrade over the weak scheme, where such a handle's spans
 // dangled and only destruction/renew were safe).  Volumes not owned by a
-// Cache (direct construction in tests) have no anchors and keep the
-// original per-read weak_ptr path.
+// Cache (direct construction) have no anchors: each disk-hit handle then
+// holds its own strong reference to the MappedFile, so its spans stay
+// valid after the Volume closes or is destroyed as well, and a weak_ptr to
+// the Volume for release and renew.
 struct VolumeReadAnchor {
   std::shared_ptr<Volume> volume;
   std::shared_ptr<MappedFile> mapped_file;
@@ -1209,11 +1233,17 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // The generation bump makes the usurped holder's commit_write_slot
   // revalidate fail, so its INSERT is skipped — but its already-in-flight
   // pwrite can still land over the span the usurper reserved at the same
-  // un-advanced cursor and already published, tearing the usurper's bytes
-  // UNDER a live directory entry.  That tear is detectable, never a wrong
-  // serve: the CRC + full-key gauntlet resolves it to Corrupted/miss (pinned
-  // by the F6-F escalation-usurp test in test_wrap_phase_aba.cpp); only the
-  // escalation deadline bounds how late the stalled pwrite can land.
+  // un-advanced cursor and already published, replacing the usurper's bytes
+  // UNDER a live directory entry.  A partial landing is a tear the CRC +
+  // full-key gauntlet resolves to Corrupted/miss (pinned by the F6-F
+  // escalation-usurp test in test_wrap_phase_aba.cpp).  A COMPLETE landing
+  // of a document of the same key passes that gauntlet -- it is a valid,
+  // older document -- and is refused by the fill serial instead: it carries
+  // the usurped holder's serial, while the entry, and any chain link a
+  // later alternate made to the usurper's document, carry the usurper's
+  // (fill_serial below; test_usurped_fill.cpp).  Either way a miss, never the
+  // older document served as current; only the escalation deadline bounds how
+  // late the stalled pwrite can land.
   struct WriteSlot {
     uint64_t write_offset = 0;   // reserved start (absolute)
     uint64_t new_write_pos = 0;  // write_offset + doc_size (absolute)
@@ -1229,6 +1259,33 @@ class Volume : public std::enable_shared_from_this<Volume> {
     // The pass the reservation belongs to: the caller stamps it into the
     // document's write_serial (patch_pass_stamp) before the pwrite.
     uint64_t pass = 0;
+    // The serial of this fill: the write-lock acquisition it holds (0 for a
+    // single-process stripe, which has no such lock and no takeover).  The
+    // caller stamps it into the document's fill_serial (patch_fill_serial)
+    // and publishes it with the directory entry.  A holder whose lock was
+    // taken over shares its reservation's offset with the next holder but
+    // never its serial: every acquisition and every forced release moves
+    // the lock's generation.  So the takeover residual on commit_write_slot
+    // -- the late pwrite of a stalled holder landing over the next holder's
+    // published document -- leaves bytes whose serial disagrees with the
+    // entry and with every chain link made to that document
+    // (Document::make_link), which no read serves.
+    //
+    // WHY 16 BITS ARE ENOUGH.  The generation is a 16-bit counter that
+    // wraps, so the guarantee needs the stalled holder's g and the serial of
+    // the document that replaced its bytes to differ mod 2^16.  While the
+    // stalled holder holds the lock (it never released it: it is stalled),
+    // the generation moves only when someone takes the lock from it: a
+    // forced release plus the taker's acquisition, so the taker holds g+1
+    // or g+2.  A live holder is taken over only by the last-resort
+    // escalation, after more than 5 s.  The taker publishes and advances
+    // the cursor past the offset, so the only later documents at that
+    // offset are those of further takers of a holder that also stalled
+    // there, each again more than 5 s later and at most 2 further on.  A
+    // wrap back to g therefore needs over 30000 consecutive takeovers --
+    // more than 40 hours -- while the first holder's pwrite is still in
+    // flight.
+    uint16_t fill_serial = 0;
     // Tail fill (issue #35; see kTailFillPage): when non-zero, the caller
     // writes zeros from the document's last byte up to this absolute offset
     // in the SAME write as the document.  At most one page past
@@ -1267,6 +1324,18 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // outside the checksum, which covers only header data + content.  The
   // stamp is what makes "one pass old" exact for admission (design 4.4).
   static void patch_pass_stamp(std::span<std::byte> doc, uint64_t pass);
+  // Stamp a fill serial (WriteSlot::fill_serial) into a built document's
+  // fill_serial field.  Outside the checksum, like the pass stamp.
+  static void patch_fill_serial(std::span<std::byte> doc, uint16_t serial);
+  // Does `entry` publish the document whose header is `doc`?  True when the
+  // document's fill serial is the entry's: the document is the one the
+  // entry's write filled, not the late fill of a holder taken over at the
+  // same offset.  Every read and election of a directory entry's document
+  // checks it alongside the key.
+  [[nodiscard]] static bool entry_binds(const DirEntry &entry,
+                                        const Document &doc) noexcept {
+    return doc.fill_serial == entry.fill_serial();
+  }
 
   // TEST SEAM ONLY -- never set in production.  When true, allocate_write_slot
   // reverts to the pre-F6 behavior: it advances the guard-visible write cursor
@@ -1310,8 +1379,9 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // shape and cost as s_write_tear_gate_for_test: one predicted-not-taken
   // branch, on the write path only, never on the lock-free read path.
   // Every seam fires with the stripe mutex held and, in multi-process mode,
-  // the cross-process write lock held -- except kAfterPublish, which fires
-  // after commit_write_slot has released that lock with the cursor.
+  // the cross-process write lock held -- except kAfterPublish,
+  // kBeforeAlternatePublish and kBeforePlainPublish, which fire after
+  // commit_write_slot has released that lock with the cursor.
   enum class WriterSeam : uint8_t {
     kAfterIntentSet,   // intent stored, gate loads not yet run
     kAfterGatePassed,  // gate said "proceed", nothing published yet
@@ -1324,6 +1394,16 @@ class Volume : public std::enable_shared_from_this<Volume> {
                        // eviction) has not.  A reader parked before its RAM
                        // put with the OLD bytes copied sees the window the
                        // put's bucket-version re-check exists for.
+    kBeforeAlternatePublish,  // alternate commit only: the slot is committed
+                              // (write lock released) and flushed, the
+                              // directory insert (the publish) has not run;
+                              // stripe mutex held.  Another process can wrap
+                              // the stripe inside this window.
+    kBeforePlainPublish,      // plain commit only: the document is written and
+                              // the key's entries are elected, the directory
+                              // insert (the publish) has not run.  Fires once
+                              // per publish attempt.  Another process can
+                              // publish the same key inside this window.
   };
   using WriterSeamHook = std::function<void(WriterSeam seam)>;
   static inline WriterSeamHook s_writer_seam_for_test{};
@@ -1343,6 +1423,8 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // EVERY step of the carry.  Same shape and cost as the hooks above; fires
   // with the stripe mutex held.
   enum class CarrySeam : uint8_t {
+    kSourcesChosen,  // retained nodes chosen, none copied yet (fires only
+                     // when there is something to copy)
     kSourcesCopied,  // retained nodes copied and validated; nothing reserved
     kFilled,         // chain + head durable and the cursor published; the
                      // directory insert (the publish) has not run
@@ -1367,6 +1449,10 @@ class Volume : public std::enable_shared_from_this<Volume> {
     kCrcVerify,     // about to run the CRC-32C pass over a document's
                     // payload: the CRC-validation cache missed for this
                     // incarnation (read_sync and read_alternate_sync)
+    kRamCopy,       // read_alternate_sync: borrow revalidated, about to copy
+                    // the selected document for the RAM tier
+    kRamCopied,     // read_alternate_sync: the RAM-tier copy is taken into
+                    // a private buffer, not yet revalidated or published
   };
   using ReaderSeamHook = std::function<void(ReaderSeam seam)>;
   static inline ReaderSeamHook s_reader_seam_for_test{};
@@ -1382,6 +1468,22 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // second process sharing the volume keeps the real clock, so tests that
   // compare lease stamps across processes must not use it.
   static inline std::atomic<uint64_t> s_steady_clock_ns_for_test{0};
+
+#ifdef CYCLONE_TEST_SEAMS
+  // TEST-SEAM BUILDS ONLY.  When nonzero, fsync_fd() sleeps this many
+  // microseconds before the real flush, so a test can make device flush
+  // latency dominate the write path on any filesystem and measure where on
+  // that path the flush runs.
+  static inline std::atomic<uint32_t> s_fsync_pause_us_for_test{0};
+  // When set, called on the flushing thread right before the real flush,
+  // so a test can run other writes, even wrap the stripe, while a commit
+  // sits in its durability flush.  A plain commit holds no volume lock
+  // there; an alternate commit holds its stripe mutex (but not the write
+  // lock), so the hook's writes must go through another Volume of the
+  // file, as another process's would.
+  static inline std::atomic<const std::function<void()> *>
+      s_fsync_hook_for_test{nullptr};
+#endif
 
   // Pause points of the handle-call / close() handshake (see HandleCall in
   // the private section).  Same rules as the reader seams: test-seam
@@ -1473,9 +1575,6 @@ class Volume : public std::enable_shared_from_this<Volume> {
   [[nodiscard]] std::optional<std::pair<dev_t, ino_t>> backing_identity() const;
 #endif
 
-  // Reset/purge the volume - clears all data and writes fresh header
-  std::expected<void, CacheError> reset();
-
   Task<std::expected<ReadHandle, CacheError>> open_read(const CacheKey &key);
   Task<std::expected<WriteHandle, CacheError>> open_write(
       const CacheKey &key, uint64_t content_length);
@@ -1493,6 +1592,12 @@ class Volume : public std::enable_shared_from_this<Volume> {
       const CacheKey &key);
   std::expected<WriteHandle, CacheError> write_alternate_sync(
       const CacheKey &key, AlternateId alternate_id, uint64_t content_length);
+
+  // Attach an observer told about the handle's successful commit.  The
+  // handle must come from write_sync() or write_alternate_sync() of a
+  // Volume.  Stored in the handle itself, so attaching allocates nothing.
+  static void set_commit_observer(WriteHandle &handle,
+                                  std::weak_ptr<WriteCommitObserver> observer);
 
   // Read with alternate selection
   std::expected<ReadHandle, CacheError> read_alternate_sync(
@@ -1594,6 +1699,16 @@ class Volume : public std::enable_shared_from_this<Volume> {
       std::span<const std::byte> content, uint64_t handle_generation);
 
   // Called by WriteHandle for alternates (internal use)
+  // Lost publish rounds a write runs again before it reports Busy: an
+  // alternate write (each lost round leaves a written document behind; see
+  // commit_alternate_write) and a plain one (which re-elects and publishes
+  // the same document; see commit_write_impl).
+  static constexpr unsigned kMaxStalePublishRetries = 32;
+  // The sleep before lost round `retries` (1-based) of a stale-publish
+  // retry: none for the first, then a uniform draw below a ceiling that
+  // doubles from 2 us to 256 us, so writers of one key stop meeting in
+  // lockstep.  The caller holds no lock while it sleeps.
+  static void stale_publish_backoff(unsigned retries);
   std::expected<void, CacheError> commit_alternate_write(
       Stripe *stripe, const CacheKey &key, AlternateId alternate_id,
       std::span<const std::byte> header, std::span<const std::byte> content,
@@ -1605,6 +1720,11 @@ class Volume : public std::enable_shared_from_this<Volume> {
   [[nodiscard]] uint64_t stripe_generation() const noexcept {
     return _stripe_generation.load(std::memory_order_seq_cst);
   }
+  // For the handle calls below: "no stripe generation to check" (a handle
+  // whose anchor's latch carries it instead).  A read handle of a Volume
+  // without a Cache has no anchor and passes the stripe_generation() it
+  // was read in, like a write handle's commit.
+  static constexpr uint64_t kAnyStripeGeneration = UINT64_MAX;
 
   // Re-stamp the read lease on a stripe (CAS-max now + T with the
   // write-avoidance guard).  Called by ReadHandle::renew_lease() for
@@ -1617,7 +1737,8 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // with _teardown; a call that finds either set touches no stripe.
   bool renew_read_lease(Stripe *stripe, const BorrowEpoch &epoch_start,
                         const BorrowToken &token,
-                        const std::atomic<bool> *generation_torn = nullptr);
+                        const std::atomic<bool> *generation_torn = nullptr,
+                        uint64_t handle_generation = kAnyStripeGeneration);
   // Lease amendment (2026-07-07): intent-checked lease renewal for the ALIASED
   // zero-copy serve path.  Stamps the lease FIRST, then Dekker-revalidates
   // (borrow_still_valid: wrap_intent loaded before epoch) so a normal wrap
@@ -1628,12 +1749,13 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // LeaseRenewal for how the embedder must act on each result.
   LeaseRenewal renew_read_lease_strict(
       Stripe *stripe, const BorrowEpoch &epoch_start, const BorrowToken &token,
-      const std::atomic<bool> *generation_torn = nullptr);
+      const std::atomic<bool> *generation_torn = nullptr,
+      uint64_t handle_generation = kAnyStripeGeneration);
   // Lease-protocol STEP-3: ns until a ceiling-forced wrap could overwrite a
   // borrow on this stripe (UINT64_MAX = none deferred / leases off).
   [[nodiscard]] uint64_t ns_until_forced_wrap(
-      const Stripe *stripe,
-      const std::atomic<bool> *generation_torn = nullptr) const;
+      const Stripe *stripe, const std::atomic<bool> *generation_torn = nullptr,
+      uint64_t handle_generation = kAnyStripeGeneration) const;
 
   // drop a live borrow from the stripe's outstanding-borrow
   // slot.  Called by the disk-hit ReadHandle on close/destruction (public
@@ -1642,7 +1764,8 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // ceiling-forced wrap reset the slot is a no-op.  Inert tokens (RAM hit,
   // leases disabled, saturated-slot ride-alongs) are ignored.
   void release_borrow(Stripe *stripe, BorrowToken token,
-                      const std::atomic<bool> *generation_torn = nullptr);
+                      const std::atomic<bool> *generation_torn = nullptr,
+                      uint64_t handle_generation = kAnyStripeGeneration);
 
   // Read-handle anchors (see VolumeReadAnchor above).  The Cache
   // calls make_read_anchors() after open() succeeds (requires this Volume
@@ -1651,7 +1774,7 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // set_read_anchors().  set_read_anchors(nullptr, 0) detaches (done under
   // the cache's exclusive gate before close()); count must be a power of
   // two.  Volumes without installed anchors serve reads through the
-  // legacy weak_ptr path.
+  // per-handle path (a MappedFile pin plus a Volume weak_ptr).
   static constexpr size_t kReadAnchorShards = 64;
   [[nodiscard]] std::vector<std::shared_ptr<VolumeReadAnchor>>
   make_read_anchors();
@@ -1672,6 +1795,8 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // fell back to the historical ungated behaviour.  Surfaced via stats(); see
   // VolumeStats::reset_gate_degraded.  A GAUGE: cleared on every open().
   std::atomic<bool> _reset_gate_degraded{false};
+  // See VolumeStats::whole_file_map_failed.  A GAUGE: cleared on every open().
+  std::atomic<bool> _whole_file_map_failed{false};
   // Monotonic COUNTERS of resets that actually wiped data, split by the gate
   // state they ran under (see ResetProvenance in volume.cpp).  Unlike the gauge
   // above they are NEVER cleared on open() -- a reset that already happened
@@ -1791,6 +1916,21 @@ class Volume : public std::enable_shared_from_this<Volume> {
       teardown_seam(TeardownSeam::kHandleCallAdmitted);
 #endif
       return true;
+    }
+
+    // Both: the anchor's latch (may be null) and, unless it is
+    // kAnyStripeGeneration, the stripe generation (an anchor-less read
+    // handle's, recorded when it was read).
+    [[nodiscard]] bool admitted(const std::atomic<bool> *generation_torn,
+                                uint64_t handle_generation) const noexcept {
+      if (handle_generation != kAnyStripeGeneration) {
+        if (generation_torn != nullptr &&
+            generation_torn->load(std::memory_order_seq_cst)) {
+          return false;
+        }
+        return admitted(handle_generation);
+      }
+      return admitted(generation_torn);
     }
 
     // The same for a write handle's commit.  A write handle has no anchor;
@@ -2164,21 +2304,28 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // IDENTITY.  A slot holds a 64-bit token of the incarnation, computed by
   // checksum_token() from the header the reader is about to trust: the
   // absolute file offset, the pass stamp (write_serial), the full 32-bit
-  // stored CRC, len and header_len, and the first 8 bytes of first_key,
-  // folded through a keyed 128-bit-multiply mixer (wyhash's "mum" step)
-  // under a per-Volume random salt.  A lookup hits only if the stored token
-  // equals the recomputed one, so a different document at the same offset --
-  // rewritten after a wrap, torn by a usurped writer's late pwrite, or read
-  // back unsynced after a crash -- matches a cached verdict only on a 64-bit
-  // token collision (~2^-64), not, as with the former {offset, top 16 bits
-  // of the CRC} key, whenever its CRC matched in 16 bits (2^-16).  See
-  // doc/design/verified-state.md, section 3.3.
+  // stored CRC, len and header_len, the first 8 bytes of first_key, and
+  // the CRC-32C of the canonical fixed header (every field the document
+  // checksum covers, see Document::checksum_header_seed), folded through a
+  // keyed 128-bit-multiply mixer (wyhash's "mum" step) under a per-Volume
+  // random salt.  A lookup hits only if the stored token equals the recomputed
+  // one, so a different document at the same offset -- rewritten after a wrap,
+  // torn by a usurped writer's late pwrite, or read back unsynced after a crash
+  // -- matches a cached verdict only on a 64-bit token collision (~2^-64), not,
+  // as with the former {offset, top 16 bits of the CRC} key, whenever its CRC
+  // matched in 16 bits (2^-16).  See doc/design/verified-state.md, section 3.3.
   //
   // WHAT IT DOES NOT COVER.  The token binds the HEADER fields; it cannot
   // see a payload changed under an intact header (a torn tail).  That is
   // the job of the other gauntlet legs -- admission, the positional guard,
   // the borrow/lease Dekker revalidation -- which run whether or not this
   // cache hits.  It is not the overwrite guard; never lean on it as one.
+  // As a bound on what a payload change the other legs cannot see (media
+  // damage, a write behind the cache's back) can cost, a cached verdict is
+  // not trusted forever: about one in kChecksumRevalidateInterval reads a
+  // thread would serve from a cached verdict runs the CRC pass anyway (a
+  // random draw per read), and a pass that fails drops the verdict, so the
+  // damaged incarnation is found and then never served again.
   //
   // Direct-mapped by offset (Fibonacci hashing: the multiply spreads
   // documents of similar size whose offsets differ by a constant stride),
@@ -2194,6 +2341,24 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // re-verified CRC32 on EVERY read (profiled as the top hot-path cost on a
   // 20k-entry corpus).
   static constexpr size_t kChecksumCacheSize = 65536;
+
+ public:
+  // About one in this many reads served from a cached CRC verdict re-runs
+  // the CRC pass (a per-read draw; see WHAT IT DOES NOT COVER above).  The cost
+  // is one CRC pass amortised over this many warm reads.  Public for tests.
+  static constexpr uint32_t kChecksumRevalidateInterval = 256;
+#ifdef CYCLONE_TEST_SEAMS
+  // Reseed the calling thread's re-check draw so a test sees a fixed
+  // sequence of draws.
+  static void seed_checksum_revalidation_for_test(uint64_t seed) noexcept {
+    t_checksum_revalidate_state = seed != 0 ? seed : 1;
+  }
+  // While set, no warm read draws a re-check: for tests that count the CRC
+  // passes the read path runs.
+  static inline std::atomic<bool> s_checksum_revalidation_off_for_test{false};
+#endif
+
+ private:
   static constexpr unsigned kChecksumCacheShift = 64 - 16;  // log2(65536)
   // Heap-backed (not an inline member): at 65536 slots this array is 512 KB.
   // As an inline member it pushed sizeof(Volume) past 520 KB, which overflows
@@ -2234,13 +2399,19 @@ class Volume : public std::enable_shared_from_this<Volume> {
         (static_cast<uint64_t>(doc.checksum) << 32U) | doc.write_serial;
     const uint64_t lengths =
         (static_cast<uint64_t>(doc.len) << 32U) | doc.header_len;
+    // Every other field the checksum covers (flags, the full keys, the
+    // version, ...), folded in through the canonical header's CRC-32C, so
+    // a cached verdict never vouches for a header that has changed in a
+    // covered field.
+    const uint64_t covered = static_cast<uint64_t>(doc.checksum_header_seed())
+                             << 32U;
     // Two independent multiplies (they issue in parallel), then a third
     // that mixes them; the constants are wyhash's default secrets.
     const uint64_t a =
         fold(offset ^ _checksum_salt[0], key_prefix ^ _checksum_salt[1]);
     const uint64_t b =
         fold(crc_stamp ^ _checksum_salt[2], lengths ^ _checksum_salt[3]);
-    return fold(a ^ uint64_t{0xa0761d6478bd642f},
+    return fold(a ^ covered ^ uint64_t{0xa0761d6478bd642f},
                 b ^ uint64_t{0xe7037ed1a0b428db});
   }
 
@@ -2253,6 +2424,48 @@ class Volume : public std::enable_shared_from_this<Volume> {
     (*_checksum_cache)[checksum_cache_index(offset)].store(
         token, std::memory_order_relaxed);
   }
+  // Drop every cached verdict.  Called whenever the stripes and directory
+  // are torn down or rebuilt (open, close, reset): a verdict describes an
+  // incarnation this Volume read through its current mapping, and must not
+  // vouch for whatever the same offsets hold after a reopen or a reset.
+  void clear_checksum_cache() noexcept {
+    for (auto &slot : *_checksum_cache) {
+      slot.store(0, std::memory_order_relaxed);
+    }
+  }
+  // A CRC pass over this incarnation failed: drop its cached verdict (if the
+  // slot still holds it), so the damaged bytes are not vouched for again.
+  void forget_checksum_validated(uint64_t offset, uint64_t token) {
+    uint64_t expected = token;
+    (*_checksum_cache)[checksum_cache_index(offset)].compare_exchange_strong(
+        expected, 0, std::memory_order_relaxed);
+  }
+  // True for about one in kChecksumRevalidateInterval warm (cached-verdict)
+  // reads: an independent draw per read from a thread-local xorshift64, so
+  // the warm path stays free of shared writes, and no access pattern (cold
+  // reads in between, a reader cycling over a set whose size divides the
+  // interval) can keep a given document from being drawn.
+  static bool checksum_revalidation_due() noexcept {
+#ifdef CYCLONE_TEST_SEAMS
+    if (s_checksum_revalidation_off_for_test.load(std::memory_order_relaxed)) {
+      return false;
+    }
+#endif
+    uint64_t x = t_checksum_revalidate_state;
+    x ^= x << 13U;
+    x ^= x >> 7U;
+    x ^= x << 17U;
+    t_checksum_revalidate_state = x;
+    static_assert(
+        (kChecksumRevalidateInterval & (kChecksumRevalidateInterval - 1)) == 0,
+        "the draw masks by the interval");
+    return (x >> 32U) % kChecksumRevalidateInterval == 0;
+  }
+  // Seeded per thread (splitmix64 over a process-wide counter, the state's
+  // own address and the clock); never 0, the xorshift fixed point.
+  static uint64_t checksum_revalidation_seed() noexcept;
+  static inline thread_local uint64_t t_checksum_revalidate_state =
+      checksum_revalidation_seed();
 
   // Large-document readahead (see VolumeConfig::readahead_min_bytes).
   // Called on the disk read path once a document's byte range is known but
@@ -2362,6 +2575,10 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // Body of open() that runs under the exclusive cross-process init
   // lock; see volume.cpp.
   std::expected<void, CacheError> open_locked(bool created_new);
+  // Clear all data and write a fresh header.  open_locked() only, before
+  // any stripe or handle exists: it has none of close()'s teardown
+  // handshake, so on an open volume it would rewrite what live handles use.
+  std::expected<void, CacheError> reset();
   // `exclusive` = this opener proved it has no live peer (it holds the
   // exclusive lifetime lock, or created the inode): only then may it touch
   // the shared reader-exclusion state (see repair_wrap_state).
@@ -2451,6 +2668,12 @@ class Volume : public std::enable_shared_from_this<Volume> {
     uint64_t rel = 0;  // stripe-relative offset
     uint32_t len = 0;  // Document::len from the walked header
     uint8_t id = 0;    // alternate id
+    // The fill serial the walk bound the node by (its head entry's or the
+    // link it was reached through; Document::fill_serial).  The copy is
+    // carried only if it still carries it: bytes that landed at the offset
+    // since the walk are another fill's, and re-stamping them with the new
+    // slot's serial would make them the key's.
+    uint16_t serial = 0;
   };
   // The carried documents, ready to be written directly below the new head:
   // OLDEST first (the lowest offset, so every link points downward), each
@@ -2467,9 +2690,9 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // kMaxAlternatesPerKey - 1 of them and at most carry_byte_budget() bytes:
   // the Original first, then newest first.  Each kept node is copied out of
   // the mapping, re-validated on the copy (magic, version, length, key, id,
-  // stamp, CRC) and, after all copies, re-checked for exposure against a
-  // fresh G; a node that fails any leg is dropped (counted).  Runs under
-  // the stripe mutex.
+  // stamp, fill serial, CRC) and, after all copies, re-checked for exposure
+  // against a fresh G; a node that fails any leg is dropped (counted).  Runs
+  // under the stripe mutex.
   [[nodiscard]] CarryPlan carry_retained_chain(
       const Stripe *stripe, const CacheKey &key, const StripeSnapshot &snap,
       std::span<const CarrySource> chain, uint8_t write_id,

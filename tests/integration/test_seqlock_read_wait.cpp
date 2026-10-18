@@ -310,6 +310,102 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Seqlock read wait: readers recover a shared bucket held past the "
+    "writer budget",
+    "[mmap_directory][concurrent][regression]") {
+  // A process that dies inside a bucket update leaves the bucket odd.  Only
+  // a writer of that bucket used to recover it, so a peer that only reads
+  // reported Busy for its keys for as long as no write came.  A reader now
+  // recovers a bucket it found held by the SAME holder (the same odd
+  // version) for the writers' bucket budget, and never sooner.
+  BudgetOverride budget(kShortBudgetUs);
+  constexpr auto kWriterBudget = std::chrono::milliseconds(50);
+  MmapDirectory::s_bucket_writer_budget_us_for_test.store(
+      std::chrono::microseconds(kWriterBudget).count());
+  struct RestoreWriterBudget {
+    ~RestoreWriterBudget() {
+      MmapDirectory::s_bucket_writer_budget_us_for_test.store(0);
+    }
+  } restore;
+
+  MappedDir d;
+  const CacheKey key("dead-holder-bucket");
+  REQUIRE(d.dir.insert(key, 4096, 512));
+  const auto answers = [&] {
+    size_t seen = 0;
+    const bool complete = d.dir.probe_each(key, [&](const DirEntry &) {
+      ++seen;
+      return false;
+    });
+    return complete && seen == 1;
+  };
+  const uint64_t recoveries =
+      MmapDirectory::s_bucket_recoveries_for_test.load();
+
+  SECTION("one holder past the budget") {
+    d.begin(key);  // never released: the holder died
+    // Inside the budget: unknown, as before, and the bucket is left alone.
+    CHECK_FALSE(answers());
+    CHECK_FALSE(answers());
+    CHECK(MmapDirectory::s_bucket_recoveries_for_test.load() == recoveries);
+
+    std::this_thread::sleep_for(kWriterBudget + std::chrono::milliseconds(20));
+    CHECK(answers());
+    CHECK(MmapDirectory::s_bucket_recoveries_for_test.load() == recoveries + 1);
+
+    // The usurped holder's late release is token-checked: a no-op.
+    d.end(key);
+    CHECK(answers());
+    REQUIRE(d.dir.insert(key, 8192, 512));
+    const auto entry = d.dir.probe(key);
+    REQUIRE(entry.has_value());
+    CHECK(entry->offset() == 8192);
+  }
+
+  SECTION("holders that change are each given the whole budget") {
+    d.begin(key);
+    CHECK_FALSE(answers());
+    d.end(key);
+    std::this_thread::sleep_for(kWriterBudget + std::chrono::milliseconds(20));
+    d.begin(key);  // a new holder, at a new odd version
+    CHECK_FALSE(answers());
+    CHECK(MmapDirectory::s_bucket_recoveries_for_test.load() == recoveries);
+    d.end(key);
+    CHECK(answers());
+  }
+}
+
+TEST_CASE(
+    "Seqlock read wait: MmapDirectory::probe rescans with the phase current "
+    "at each retry",
+    "[mmap_directory][concurrent][regression]") {
+  // A retry that follows a phase flip must filter by the new phase, as
+  // probe_each does, or an entry stamped with it is skipped: a false miss.
+  BudgetOverride budget(kUnboundedBudgetUs);
+  MappedDir d;
+  const CacheKey key("phase-flip-during-retry");
+  // The entry carries the phase the directory is about to flip to.
+  const bool before = d.dir.current_phase();
+  d.dir.set_current_phase(!before);
+  REQUIRE(d.dir.insert(key, 4096, 512));
+  d.dir.set_current_phase(before);
+  REQUIRE_FALSE(d.dir.probe(key).has_value());
+
+  const uint64_t baseline = SeqlockReadWait::s_timed_waits_for_test.load();
+  d.begin(key);
+  std::optional<DirEntry> found;
+  std::thread reader([&] { found = d.dir.probe(key); });
+  const bool reached = wait_for_timed_phase(baseline);
+  d.dir.toggle_phase();  // flips while the probe waits out the writer
+  d.end(key);
+  reader.join();
+
+  REQUIRE(reached);
+  REQUIRE(found.has_value());
+  CHECK(found->offset() == 4096);
+}
+
+TEST_CASE(
     "Seqlock read wait: every lock-free reader waits out a parked writer "
     "instead of reporting a false miss",
     "[concurrent][lockfree][regression]") {
@@ -543,6 +639,89 @@ TEST_CASE(
   auto rh = local->read_sync(key);
   REQUIRE_FALSE(rh.has_value());
   REQUIRE(rh.error() == CacheError::NotFound);
+}
+
+namespace {
+
+// Spins until released, one per slot: the CPU oversubscription under which
+// a sched_yield costs a scheduling quantum instead of returning at once.
+class CpuHogs {
+ public:
+  explicit CpuHogs(size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+      _hogs.emplace_back([this] {
+        while (!_stop.load(std::memory_order_relaxed)) {
+        }
+      });
+    }
+  }
+  ~CpuHogs() {
+    _stop.store(true, std::memory_order_relaxed);
+    for (auto &hog : _hogs) {
+      hog.join();
+    }
+  }
+  CpuHogs(const CpuHogs &) = delete;
+  CpuHogs &operator=(const CpuHogs &) = delete;
+
+ private:
+  std::atomic<bool> _stop{false};
+  std::vector<std::thread> _hogs;
+};
+
+}  // namespace
+
+template <typename Dir>
+void directory_fast_phase_bounded_under_oversubscription() {
+  // No budget override: the production 5 ms budget.  With the machine
+  // oversubscribed (each yield costs a scheduling quantum), the fast phase
+  // -- 100 attempts of 1000 pause hints plus a yield, never reading the
+  // clock -- could burn hundreds of milliseconds BEFORE the budget even
+  // started.  The fast phase must escalate to the sleeping phase by wall
+  // clock, keeping the whole probe within the budget and small slack.
+  Dir d;
+  const CacheKey key("oversubscribed-fast-phase");
+  REQUIRE(d.dir.insert(key, 4096, 512));
+
+  const unsigned cores = std::thread::hardware_concurrency();
+  const size_t hogs = cores == 0 ? 8 : 2 * cores;
+  CpuHogs busy(hogs);
+
+  d.begin(key);  // The bucket stays odd for the whole probe
+  const auto t0 = std::chrono::steady_clock::now();
+  size_t seen = 0;
+  const bool complete = d.dir.probe_each(key, [&](const DirEntry &) {
+    ++seen;
+    return false;
+  });
+  const auto waited = std::chrono::steady_clock::now() - t0;
+  d.end(key);
+
+  CAPTURE(cores, waited.count());
+  REQUIRE_FALSE(complete);
+  REQUIRE(seen == 0);
+  // The budget is 5 ms; the bound allows for one scheduling quantum of
+  // slack per phase.  The unbounded fast phase spent 100x that.  Windows
+  // schedules and sleeps on a timer tick of about 15.6 ms, so its quantum
+  // of slack per phase is several times larger.
+#ifdef _WIN32
+  constexpr auto kBound = std::chrono::milliseconds(200);
+#else
+  constexpr auto kBound = std::chrono::milliseconds(60);
+#endif
+  REQUIRE(waited < kBound);
+}
+
+TEST_CASE(
+    "Seqlock read wait: the clock-free fast phase is bounded by wall time "
+    "under CPU oversubscription",
+    "[directory][mmap_directory][concurrent][lockfree][regression]") {
+  SECTION("Directory") {
+    directory_fast_phase_bounded_under_oversubscription<InMemoryDir>();
+  }
+  SECTION("MmapDirectory") {
+    directory_fast_phase_bounded_under_oversubscription<MappedDir>();
+  }
 }
 
 namespace {

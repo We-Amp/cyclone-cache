@@ -16,9 +16,9 @@ as a C++ API and a C ABI.
 |------|---------|----------------|
 | **Stripe (= Segment)** | The cache partitioning unit. The C API `num_segments` (`cyclone_c.h`) and `CacheKey::segment_hash()` (`key.hpp`) refer to the SAME stripes this doc describes — there is exactly ONE partitioning dimension. `stripe_index = key.segment_hash() % num_stripes`. | `key.hpp`, `cyclone_c.h`, "Volumes and Stripes" |
 | **Volume** | A single cache file on disk, divided into stripes for parallel access. | `src/core/volume.hpp`, "Volumes and Stripes" |
-| **VolumeHeader** | 64-byte header at offset 0; magic `0x43594C4E` ("CYLN") + format major/minor. Format major is **v8**. | `src/core/volume.hpp` (`VolumeHeader`) |
-| **Directory entry** | Compact 10-byte key→offset record. Bitfields: `tag` (12-bit collision tag), `phase` (1-bit phase GC), `head` (1-bit, first fragment), `pinned` (1-bit, reserved for do-not-evict — not enforced by eviction today), 40-bit `offset` (byte offset within the stripe; 1 TiB/stripe), `next` (bucket chain). Carries **no key material**. | `src/core/directory.hpp` (`DirEntry`) |
-| **Document / fragment** | On-disk record (132-byte header, format major **v8**). The format reserves `FirstFrag`/`MiddleFrag`/`LastFrag` types, but the implementation writes only `SingleFrag` documents today — a document must fit in one stripe's data area (write fails with `NoSpace` otherwise) and under `max_object_size` (`ObjectTooLarge`). | `src/core/document.hpp` (`Document`) |
+| **VolumeHeader** | 64-byte header at offset 0; magic `0x43594C4E` ("CYLN") + format major/minor. Format major is **v9**. | `src/core/volume.hpp` (`VolumeHeader`) |
+| **Directory entry** | Compact 10-byte key→offset record. Bitfields: `tag` (12-bit collision tag), `phase` (1-bit phase GC), `head` (1-bit, first fragment), `pinned` (1-bit, reserved for do-not-evict, not enforced by eviction today), 40-bit `offset` (byte offset within the stripe; 1 TiB/stripe), `fill_serial` (16-bit serial of the write that filled the document; a read serves the document only when its own `fill_serial` matches). Carries **no key material**. | `src/core/directory.hpp` (`DirEntry`) |
+| **Document / fragment** | On-disk record (132-byte header, format major **v9**). The format reserves `FirstFrag`/`MiddleFrag`/`LastFrag` types, but the implementation writes only `SingleFrag` documents today: a document must fit in one stripe's data area (write fails with `NoSpace` otherwise) and under `max_object_size` (`ObjectTooLarge`). | `src/core/document.hpp` (`Document`) |
 | **bucket_hash / tag** | Within a stripe, `bucket_hash()` selects the directory bucket; `tag()` is the 12-bit collision tag. | `key.hpp` |
 | **Alternate / AlternateId** | A content variant under one key (Original, Brotli, Gzip, WebP, AVIF, JpegXL, Custom…). `AlternateId` normalizes UA capabilities into discrete classes. | `alternate.hpp` |
 | **Alternate chain** | Singly-linked list of alternates via `next_alternate_offset`. Directory points to the **head** (newest); **tail** is typically Original (oldest). Max 64 per key. | "Alternate Chains" |
@@ -204,7 +204,7 @@ implementations, same seqlock read protocol:
 Word 0: offset[0:15]
 Word 1: offset[16:23] │ big[2] │ size[6]
 Word 2: tag[12] │ phase[1] │ head[1] │ pinned[1] │ rsv[1]
-Word 3: next[16]  (bucket chain pointer)
+Word 3: fill_serial[16]  (serial of the write that filled the document)
 Word 4: offset[24:39]
 ```
 
@@ -213,10 +213,17 @@ Word 4: offset[24:39]
 - **tag** (12 bits) — collision tag (4096 values).
 - **phase / head / pinned** (1 bit each) — GC phase, first fragment; `pinned`
   is reserved for do-not-evict but not currently consulted by eviction.
-- **next** (16 bits) — chain to the next entry in the bucket.
+- **fill_serial** (16 bits): the serial of the write that filled the
+  document (its write-lock acquisition; 0 on a single-process stripe), the
+  same value the document carries in its own `fill_serial`. A read or an
+  in-place election uses the document only when the two agree. That is what
+  keeps the late fill of a write-lock holder that was taken over mid-fill
+  (it shares the offset with the next holder's document, never the serial)
+  from being served under the next holder's entry. This word was once the
+  ATS-style bucket-chain `next` pointer, which nothing linked.
 
 Entries are grouped into **buckets of 4** (`bucket_index = bucket_hash() % num_buckets`);
-overflow chains via `next`.
+a full bucket evicts (see the insert victim order), it never chains.
 
 #### Collision handling — no key material on disk
 
@@ -228,9 +235,9 @@ overwritten.
 
 ### Document Format
 
-Each cached entry is a document with a 132-byte header (**v8** format,
+Each cached entry is a document with a 132-byte header (**v9** format,
 `document.hpp` (`Document`)). `Document::kVersionMajor` and
-`VolumeHeader::kFormatVersionMajor` are kept in lockstep at 8. The format
+`VolumeHeader::kFormatVersionMajor` are kept in lockstep at 9. The format
 reserves `FirstFrag`/`MiddleFrag`/`LastFrag` document types for spanning a
 large value across fragments, but the implementation writes only
 `SingleFrag` documents today (both write sites hardcode `Document::Type::SingleFrag`,
@@ -246,25 +253,38 @@ Document Header (132 bytes)
 ├─ frag_key     32 bytes  SHA-256 of this fragment
 ├─ header_len   uint32_t  metadata header size
 ├─ doc_type     uint8_t   Single / First / Middle / Last fragment (SingleFrag only, in practice)
-├─ ver_major    uint8_t   format version (8)
+├─ ver_major    uint8_t   format version (9)
 ├─ ver_minor    uint8_t   format version
 ├─ flags        uint8_t   document flags
-├─ sync_serial  uint32_t
+├─ fill_serial  uint32_t  serial of the write that filled it (matches its directory entry)
 ├─ write_serial uint32_t
 ├─ pin_until    uint32_t  pin expiration (Unix time)
-├─ checksum     uint32_t  CRC-32C over header_data + content
+├─ checksum     uint32_t  CRC-32C over the canonical header + header_data + content
 ├─ frag_offset  uint32_t  offset within a multi-fragment document
 ├─ hit_count            uint32_t  persisted hit counter
-├─ next_alternate_offset uint64_t offset to next alternate (chain)
+├─ next_alternate_offset uint64_t link to next alternate: offset (bits 0-47) + its fill_serial (bits 48-63)
 ├─ alternate_id         uint8_t   AlternateId enum value
 ├─ last_access          int64_t   Unix timestamp (ms)
 ├─ Header Data (variable)
 └─ Content Data (variable)
 ```
 
-**Document checksum.** `checksum` is a CRC-32**C** (Castagnoli) over
-header_data + content — everything after the 132-byte header. The convention
-is part of the on-disk format and is frozen: reflected polynomial
+**Document checksum.** `checksum` is a CRC-32**C** (Castagnoli) over the
+document's *canonical fixed header* followed by header_data + content
+(`Document::checksum_header_seed`, `Document::verify_checksum`). The canonical
+header is the 132-byte wire header with the fields stamped after the checksum
+is computed or updated in place set to zero: `fill_serial` and `write_serial` (the fill and pass stamps), `checksum`
+itself, `hit_count`, `next_alternate_offset` and `last_access`. Every other
+header field is covered: `magic`, `len`, `total_len`, both keys,
+`header_len`, `doc_type`, both version bytes, `flags`,
+`pin_until`, `frag_offset`, `alternate_id` and the reserved bytes. A change
+to any covered field fails verification and the read is a miss; the in-place
+updates (pass stamp, hit count, access time, chain repoint) and the
+retained-chain carry change only uncovered fields, so they never invalidate
+a document. The CRC-validation cache token folds in the CRC of the canonical
+header, so a cached verdict does not vouch for a header changed in a covered
+field either. The coverage (v9) and the CRC convention are part of the
+on-disk format. The convention is frozen: reflected polynomial
 `0x82F63B78`, init `0xFFFFFFFF`, reflected in and out, final XOR
 `0xFFFFFFFF`, so `crc32c("123456789") == 0xE3069283`. It lives in
 `src/core/crc32c.{hpp,cpp}`, behind `crc32c()` / `crc32c_update()`.
@@ -321,6 +341,7 @@ auto-resets on open when `auto_reset_on_incompatible`, default true,
 | v6 | `hit_count` / `next_alternate_offset` / `last_access` laid out naturally aligned, so the in-place header RMW sites can store them atomically |
 | v7 | alternate chains are depth-bounded at write time; the bump leaves pre-bound (over-deep, possibly cyclic) chains behind rather than repairing them |
 | v8 | the document checksum is CRC-32C instead of CRC-32/ISO-HDLC; no byte of the layout moved, but every pre-v8 checksum was computed over a different polynomial, so the bump leaves those rings behind |
+| v9 | the document checksum also covers the fixed document header (every field that never changes after the write); no byte of the layout moved, but every pre-v9 checksum covers less and would fail verification, so the bump leaves those rings behind. The document's `sync_serial` became `fill_serial` and the directory entry's unused `next` word its 16-bit twin, and `next_alternate_offset` carries the successor's serial in bits 48-63 above its 40-bit offset: all carry the serial of the write that filled the document, and a read uses a document only when the serial of the entry or link it was reached through agrees |
 
 ### Alternate Chains
 
@@ -639,9 +660,8 @@ Cyclone in a DLL, `ExitProcess` terminates the other threads before
 `DLL_PROCESS_DETACH` runs the DLL's static destructors; in a statically linked
 executable the UCRT's `exit()` runs the executable's static destructors with
 the other threads alive, and there the safety rests on MSVC's `~mutex` being a
-no-op in release builds (as glibc's is). Nothing is `detach()`ed, and
-`Executor::global()` — the only legitimate `leak_thread_on_shutdown` caller
-(`thread_util.hpp`) — has no caller. The same holds for the embedder's own
+no-op in release builds (as glibc's is). Nothing is `detach()`ed. The same
+holds for the embedder's own
 threads still inside cache calls when the process exits: the only state of a
 dependency they reach is the key hash, and both backends compute it on the
 caller's stack. The OpenSSL backend uses the `SHA256_Init` / `_Update` /
@@ -740,6 +760,16 @@ but descheduled. `writer_probe` releases it with `touch_bucket` (whose
 once more. Releases are token-checked: `release_writer` moves the version from
 exactly its own odd value to the next even one, so a usurped live holder's
 late release is a no-op and cannot turn the bucket odd again.
+
+A reader does not wait for that write, which on a peer that only reads may
+never come. Each process remembers, for the few buckets its readers found odd
+past their whole budget, the odd version and when it first saw it. A version
+only grows, so the same odd value seen again is one unbroken hold; once a
+reader finds the same holder there for the writers' bucket budget
+(`kBucketWriterBudget`, 250 ms), it recovers the bucket with the same CAS a
+waiting writer uses and makes one more attempt. Each probe still waits at most
+the 5 ms read budget; a holder that changes in the meantime starts the count
+over.
 
 ### Read anchors (keeping the mapping alive without a global RMW)
 

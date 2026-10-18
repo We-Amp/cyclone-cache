@@ -40,6 +40,33 @@ TEST_CASE("Document serialization round-trip", "[document]") {
   REQUIRE(reader.content().size() == content.size());
 }
 
+TEST_CASE("Shared-mapping reader is invalid on a misaligned base",
+          "[document]") {
+  CacheKey key("test-key");
+  std::vector<std::byte> content(100, std::byte{0x5a});
+  auto doc = DocumentBuilder()
+                 .set_key(key)
+                 .set_content(content)
+                 .set_type(Document::Type::SingleFrag)
+                 .build();
+
+  // The same bytes at an 8-aligned and at a misaligned address.
+  alignas(8) std::vector<std::byte> storage(doc.size() + 16);
+  std::byte *aligned = storage.data();
+  while (reinterpret_cast<std::uintptr_t>(aligned) % 8 != 0) ++aligned;
+  std::copy(doc.begin(), doc.end(), aligned + 1);
+  std::copy(doc.begin(), doc.end(), aligned + 8);
+
+  DocumentReader ok(kSharedMapping,
+                    std::span<const std::byte>(aligned + 8, doc.size()));
+  REQUIRE(ok.is_valid());
+
+  DocumentReader misaligned(
+      kSharedMapping, std::span<const std::byte>(aligned + 1, doc.size()));
+  REQUIRE_FALSE(misaligned.is_valid());
+  REQUIRE(misaligned.content().empty());
+}
+
 TEST_CASE("Document checksum", "[document]") {
   std::vector<std::byte> data = {std::byte{0x00}, std::byte{0x11},
                                  std::byte{0x22}, std::byte{0x33}};
@@ -130,10 +157,10 @@ TEST_CASE("DocumentBuilder::build_head plus content equals build()",
 TEST_CASE("Document header size is 132 bytes", "[document][alternate]") {
   REQUIRE(Document::kHeaderSize == 132);
   // Deliberate tripwire: a version bump is a cross-release decision (cold
-  // cache for every consumer), never an incidental edit.  Version 8 switches
-  // the document checksum to CRC-32C; it must stay in lockstep with
-  // VolumeHeader::kFormatVersionMajor.
-  REQUIRE(Document::kVersionMajor == 8);
+  // cache for every consumer), never an incidental edit.  Version 9 extends
+  // the document checksum over the fixed header; it must stay in lockstep
+  // with VolumeHeader::kFormatVersionMajor.
+  REQUIRE(Document::kVersionMajor == 9);
 }
 
 TEST_CASE("Document alternate chain fields default values",
@@ -228,7 +255,7 @@ TEST_CASE("Document serialize/deserialize preserves all fields exactly",
   doc.version_major = 3;
   doc.version_minor = 7;
   doc.flags = Document::kFlagCompressed | Document::kFlagPinned;
-  doc.sync_serial = 0x11223344;
+  doc.fill_serial = 0x11223344;
   doc.write_serial = 0x55667788;
   doc.pin_until = 0xDEADBEEF;
   doc.checksum = 0xCAFEBABE;
@@ -257,7 +284,7 @@ TEST_CASE("Document serialize/deserialize preserves all fields exactly",
   REQUIRE(restored.version_major == doc.version_major);
   REQUIRE(restored.version_minor == doc.version_minor);
   REQUIRE(restored.flags == doc.flags);
-  REQUIRE(restored.sync_serial == doc.sync_serial);
+  REQUIRE(restored.fill_serial == doc.fill_serial);
   REQUIRE(restored.write_serial == doc.write_serial);
   REQUIRE(restored.pin_until == doc.pin_until);
   REQUIRE(restored.checksum == doc.checksum);
@@ -345,4 +372,21 @@ TEST_CASE("Document alternate fields with zero next offset",
   DocumentReader reader(data);
   REQUIRE(reader.is_valid());
   REQUIRE(reader.document().next_alternate_offset == 0);
+}
+
+TEST_CASE("Chain links carry the successor's fill serial", "[document]") {
+  constexpr uint64_t kRel = 0xAB12345678ULL;  // a 40-bit stripe offset
+  const uint64_t link = Document::make_link(kRel, 0xBEEF);
+  CHECK(Document::link_offset(link) == kRel);
+  CHECK(Document::link_serial(link) == 0xBEEF);
+  CHECK(Document::make_link(0, 0xBEEF) == 0);  // still "no successor"
+  // A link from before serials existed binds a serial-0 document.
+  CHECK(Document::link_offset(kRel) == kRel);
+  Document doc;
+  doc.fill_serial = 0;
+  CHECK(doc.bound_by_link(kRel));
+  doc.fill_serial = 0xBEEF;
+  CHECK(doc.bound_by_link(link));
+  CHECK_FALSE(doc.bound_by_link(Document::make_link(kRel, 0xBEF0)));
+  CHECK(doc.link_to(kRel) == link);
 }

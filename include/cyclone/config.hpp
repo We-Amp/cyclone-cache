@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -129,15 +130,29 @@ struct OptimizationConfig {
   double max_io_bandwidth_fraction =
       0.3;  // Max fraction of I/O for optimization
   size_t max_queue_size = 10000;
+  // A queued item's priority rises by one level for every interval it has
+  // waited, so low priority work cannot be starved forever by a steady
+  // stream of higher priority work.  Zero (or negative) disables aging.
+  std::chrono::milliseconds priority_aging_interval{10000};
   size_t max_memory_bytes = 256_MB;
 
-  // Load shedding watermarks
+  // Load shedding: pause the pool and cancel deferrable queued work while
+  // the estimated load is above load_high_watermark, and resume once it has
+  // stayed below load_low_watermark for load_shedding_cooldown.  Off by
+  // default.  The estimate is
+  //   0.3 * min(1, ops_per_sec / baseline_ops_per_sec)
+  //   + 0.7 * min(1, bytes_per_sec / baseline_bytes_per_sec)
+  // over the cache's completed reads and writes, so with the default
+  // baselines (100k ops/s, 500 MiB/s) about 100k reads/s of 4 KiB objects
+  // already score 0.86, past the default high watermark.  Before enabling,
+  // set the baselines to what this host sustains at full load.
+  bool enable_load_shedding = false;
   double load_high_watermark = 0.8;  // Pause when load exceeds this
   double load_low_watermark = 0.5;   // Resume when load drops below this
   std::chrono::milliseconds load_shedding_cooldown{
       5000};  // Wait this long after load drops before resuming
 
-  // LoadMonitor baseline capacities for load estimation
+  // LoadMonitor baseline capacities for load estimation (see above)
   double baseline_ops_per_sec = 100000.0;  // Ops/sec at 100% CPU
   double baseline_bytes_per_sec = 500_MB;  // Bytes/sec at 100% I/O
 
@@ -179,7 +194,10 @@ struct OptimizationConfig {
     return *this;
   }
   OptimizationConfig &set_scale_check_interval(std::chrono::milliseconds val) {
-    scale_check_interval = val;
+    // A non-positive interval would spin the monitoring thread in a
+    // sleep_for(0) loop; clamp to a positive minimum.  is_valid() still
+    // rejects a non-positive value set through the public field.
+    scale_check_interval = std::max(val, std::chrono::milliseconds{1});
     return *this;
   }
   OptimizationConfig &set_max_cpu_usage(double val) {
@@ -188,6 +206,11 @@ struct OptimizationConfig {
   }
   OptimizationConfig &set_max_io_bandwidth_fraction(double val) {
     max_io_bandwidth_fraction = val;
+    return *this;
+  }
+  OptimizationConfig &set_priority_aging_interval(
+      std::chrono::milliseconds val) {
+    priority_aging_interval = val;
     return *this;
   }
   OptimizationConfig &set_max_queue_size(size_t val) {
@@ -222,6 +245,10 @@ struct OptimizationConfig {
     min_hits_before_optimize = val;
     return *this;
   }
+  OptimizationConfig &set_enable_load_shedding(bool val) {
+    enable_load_shedding = val;
+    return *this;
+  }
   OptimizationConfig &set_load_shedding_cooldown(
       std::chrono::milliseconds val) {
     load_shedding_cooldown = val;
@@ -240,9 +267,33 @@ struct OptimizationConfig {
   [[nodiscard]] size_t effective_max_threads() const {
     if (max_threads == 0) {
       size_t hw = std::thread::hardware_concurrency();
-      return hw > 2 ? hw / 2 : 1;
+      // Automatic: never below min_threads, so a small host does not make
+      // an otherwise valid min_threads setting unusable.
+      return std::max(hw > 2 ? hw / 2 : size_t{1}, min_threads);
     }
     return max_threads;
+  }
+
+  // Validation, checked by OptimizationEngine::start() (Cache::start()
+  // reports a failure as InvalidConfiguration).  A non-positive
+  // scale_check_interval would spin the monitoring thread in a
+  // sleep_for(0) loop, and an explicit max_threads below min_threads breaks
+  // the pool's clamping.  With load shedding enabled, a non-positive (or
+  // NaN) baseline cannot be measured against; without shedding such a
+  // baseline stays allowed and is treated as "no contribution" (see
+  // LoadMonitor::update_metrics()).
+  [[nodiscard]] bool is_valid() const {
+    if (scale_check_interval.count() <= 0) {
+      return false;
+    }
+    if (max_threads != 0 && min_threads > max_threads) {
+      return false;
+    }
+    if (enable_load_shedding &&
+        (!(baseline_ops_per_sec > 0.0) || !(baseline_bytes_per_sec > 0.0))) {
+      return false;
+    }
+    return true;
   }
 };
 
@@ -274,12 +325,13 @@ struct CacheConfig {
   std::chrono::seconds gc_interval{60};
   double gc_evacuate_threshold = 0.8;
 
-  // Store a CRC-32C with each document (verified on read whenever the
-  // stored CRC is non-zero).  The C API copies
-  // CycloneCacheConfig::enable_checksum here verbatim with no default and no
-  // sentinel mapping, so a zero-initialised C config runs with checksums
-  // DISABLED rather than this default of true -- the one remaining C field
-  // whose zero-init diverges; see CycloneCacheConfig::enable_checksum.
+  // Every document is written with a CRC-32C whatever this says; whether
+  // reads verify it is verify_checksum_on_read (forced on in multi-process
+  // mode).  The only effect of enable_checksum today: with
+  // multi_process_config.enabled, start() refuses to run
+  // (InvalidConfiguration) when it is false.  The C API copies
+  // CycloneCacheConfig::enable_checksum here verbatim, so a zero-initialised
+  // C config sets it false; see CycloneCacheConfig::enable_checksum.
   bool enable_checksum = true;
   bool verify_checksum_on_read =
       true;  // Verify CRC-32C on every read (disable for perf)
@@ -318,9 +370,9 @@ struct CacheConfig {
   //
   // A document at least this large and below readahead_min_bytes gets the
   // same readahead hint over its own byte range, but only on a read that is
-  // about to run the CRC pass: verify_checksum_on_read is on, the document
-  // carries a checksum, and this incarnation has not been verified in this
-  // process yet (first read after a write, a restart, or an eviction from
+  // about to run the CRC pass: verify_checksum_on_read is on and this
+  // incarnation has not been verified in this process yet (first read
+  // after a write, a restart, or an eviction from
   // the checksum-validation cache).  That is the read that makes Cyclone's
   // first content touch, and the one a cold document takes.  A warm
   // re-read whose checksum is already validated never reaches the hint, so

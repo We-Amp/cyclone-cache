@@ -624,13 +624,28 @@ uint32_t WriterLiveness::current_pid() {
 #endif
 }
 
-void WriterLiveness::attach(int probe_fd, const std::string &path) {
-  install_fork_handlers();
+bool WriterLiveness::attach(int probe_fd, const std::string &path) {
+  bool handlers = install_fork_handlers();
+#ifdef CYCLONE_TEST_SEAMS
+  if (s_fork_handlers_fail_for_test.load(std::memory_order_relaxed)) {
+    handlers = false;
+  }
+#endif
   detach();
   std::lock_guard<std::mutex> lock(liveness_mutex());
   _probe_fd = probe_fd;
   _path = path;
-  (void)claim_locked(g_fork_epoch.load(std::memory_order_relaxed));
+  const uint32_t epoch = g_fork_epoch.load(std::memory_order_relaxed);
+  if (!handlers) {
+    // The fork epoch only moves in a child through the handlers: without
+    // them a forked child would take this claim for its own, and its death
+    // would look alive while this process lives.  Claim nothing, now or
+    // later (a failed outcome for this epoch is never retried by
+    // slot_for); probing peers still works.
+    _state.store(uint64_t{epoch} | kFailed, std::memory_order_release);
+    return false;
+  }
+  return claim_locked(epoch);
 }
 
 void WriterLiveness::detach() {
@@ -857,9 +872,15 @@ std::optional<MmapDirectory> MmapDirectory::init(std::span<std::byte> region,
   const size_t entries_off = entries_offset(num_buckets);
   const size_t retention_off = retention_offset(num_buckets);
 
-  // Initialize header
+  // Initialize header.  The magic is what open() validates, so it is
+  // cleared first and published last, after everything else is written: an
+  // open() that lands in between (a peer, or the next opener after a crash
+  // in here) rejects the region instead of accepting unwritten bucket
+  // versions and entries -- over recycled memory too, which starts with an
+  // old directory's valid magic.
   auto *header = reinterpret_cast<Header *>(region.data());
-  header->magic = kMagic;
+  std::atomic_ref<uint32_t>(header->magic).store(0, std::memory_order_relaxed);
+  std::atomic_thread_fence(std::memory_order_release);
   header->version = kVersion;
   header->reserved = 0;
   header->num_buckets = static_cast<uint32_t>(num_buckets);
@@ -897,8 +918,16 @@ std::optional<MmapDirectory> MmapDirectory::init(std::span<std::byte> region,
       reinterpret_cast<RetentionRegion *>(region.data() + retention_off);
   std::memset(retention, 0, sizeof(RetentionRegion));
 
-  // Ensure all writes are visible
+#ifdef CYCLONE_TEST_SEAMS
+  if (s_init_before_publish_for_test != nullptr) {
+    s_init_before_publish_for_test(region);
+  }
+#endif
+
+  // Ensure all writes are visible before the magic that validates them.
   std::atomic_thread_fence(std::memory_order_release);
+  std::atomic_ref<uint32_t>(header->magic)
+      .store(kMagic, std::memory_order_release);
 
   return MmapDirectory(header, versions, entries, retention, num_buckets);
 }
@@ -910,8 +939,9 @@ std::optional<MmapDirectory> MmapDirectory::open(std::span<std::byte> region) {
 
   auto *header = reinterpret_cast<Header *>(region.data());
 
-  // Validate magic and version
-  if (header->magic != kMagic) {
+  // Validate magic and version.  Acquire: pairs with init()'s publish.
+  if (std::atomic_ref<uint32_t>(header->magic)
+          .load(std::memory_order_acquire) != kMagic) {
     return std::nullopt;
   }
   if (header->version != kVersion) {
@@ -997,6 +1027,7 @@ MmapDirectory &MmapDirectory::operator=(MmapDirectory &&other) noexcept {
     _retention = other._retention;
     _num_buckets = other._num_buckets;
     _liveness = other._liveness;
+    _sightings = {};  // They named buckets of the region left behind
 
     other._header = nullptr;
     other._versions = nullptr;
@@ -1014,12 +1045,15 @@ std::optional<DirEntry> MmapDirectory::probe(const CacheKey &key) const {
 
   uint32_t bucket_idx = key.bucket_hash() % _num_buckets;
   uint16_t target_tag = key.tag();
-  bool cur_phase = current_phase();
 
   // Retry loop for torn read detection, bounded like probe_each_impl;
   // `continue` lands on wait.retry().
   SeqlockReadWait wait;
   do {
+    // Inside the loop, as in probe_each_impl: a retry after a concurrent
+    // toggle_phase() must filter by the new phase (else a spurious miss).
+    bool cur_phase = current_phase();
+
     // Wait for an even version before starting the scan.
     const uint32_t version_before =
         wait.even_version([&] { return load_version(bucket_idx); });
@@ -1083,7 +1117,8 @@ bool MmapDirectory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
                            bool *bucket_full_evicted,
                            InsertAdmission *admission,
                            std::span<const uint64_t> clear_offsets, bool *busy,
-                           const PublishView *view, bool *stale) {
+                           const PublishView *view, bool *stale,
+                           uint16_t fill_serial) {
   if (_header == nullptr) {
     return false;
   }
@@ -1093,31 +1128,54 @@ bool MmapDirectory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
 
   DirEntry *bucket = &_entries[bucket_idx * kEntriesPerBucket];
 
-  // Acquire cross-process phase lock FIRST, then bucket writer lock.
-  // This ensures no phase toggle can happen between reading current_phase
-  // and writing the entry with that phase — preventing the ABA race where
-  // another process's evict_if_needed() invalidates our freshly-written entry.
+  // Acquire the bucket writer lock FIRST (the sleepy, per-holder-budgeted
+  // wait holds nothing else), then the phase lock.  The phase lock is
+  // stripe-wide: held across the bucket wait, one hot or wedged bucket
+  // serialized every insert of the stripe behind it and queued the wrap
+  // path's phase publication (set_current_phase, under the write lock)
+  // behind it too.  Taken second, it is held only for the short bracket
+  // below and no waiter of it is ever waiting on anything else.
+  //
+  // The ABA protection the phase bracket exists for is order-independent:
+  // current_phase is read and every entry store happens under the phase
+  // lock, so no phase toggle can interleave between them and invalidate the
+  // freshly-written entry's phase.  The bucket bracket still covers the
+  // entry stores themselves (the seqlock readers watch).
   //
   // Both waits are capped: behind live holders that keep changing, give up
   // and publish nothing (*busy) rather than stall the writer.
+  //
+  // The bucket is held odd (readers of it spin, other writers wait on it
+  // under a 250 ms per-holder budget) so the phase lock is only TRIED while
+  // it is held: waiting for it there could outlast that budget and have a
+  // live holder force-released, and readers of the bucket would see it odd
+  // for the whole wait.  When the phase lock is busy, the bucket is released,
+  // the capped (recovering) wait for the phase lock runs holding nothing,
+  // and the bracket is retried from the bucket, a bounded number of times.
+  uint32_t writer_token = 0;
   PhaseLockToken phase_token;
-  if (!acquire_phase_lock(phase_token, /*capped=*/true)) {
-    if (busy != nullptr) {
-      *busy = true;
+  for (int attempt = 0;; ++attempt) {
+    if (!acquire_writer(bucket_idx, writer_token, /*capped=*/true)) {
+      if (busy != nullptr) {
+        *busy = true;
+      }
+      return false;
     }
-    return false;
+    if (try_acquire_phase_lock(phase_token)) {
+      break;
+    }
+    release_writer(bucket_idx, writer_token);
+    PhaseLockToken waited;
+    if (attempt >= kInsertPhaseAttempts ||
+        !acquire_phase_lock(waited, /*capped=*/true)) {
+      if (busy != nullptr) {
+        *busy = true;
+      }
+      return false;
+    }
+    release_phase_lock(waited);
   }
   bool cur_phase = current_phase();
-
-  // Acquire writer lock (CAS even → odd, waits if another writer holds it).
-  uint32_t writer_token = 0;
-  if (!acquire_writer(bucket_idx, writer_token, /*capped=*/true)) {
-    release_phase_lock(phase_token);
-    if (busy != nullptr) {
-      *busy = true;
-    }
-    return false;
-  }
 
   if (admission != nullptr) {
     // Boundaries are loaded HERE, inside the bracket and under phase_lock:
@@ -1149,6 +1207,7 @@ bool MmapDirectory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
       DirEntry new_entry = choice.verified ? bucket[choice.slot] : DirEntry{};
       new_entry.set_offset(offset);
       new_entry.set_approx_size(size);
+      new_entry.set_fill_serial(fill_serial);
       new_entry.set_tag(tag);
       new_entry.set_phase(cur_phase);
       if (!choice.verified) {
@@ -1228,6 +1287,7 @@ bool MmapDirectory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
         DirEntry new_entry = bucket[i];
         new_entry.set_offset(offset);
         new_entry.set_approx_size(size);
+        new_entry.set_fill_serial(fill_serial);
         new_entry.set_phase(cur_phase);
         std::memcpy(&bucket[i], &new_entry, sizeof(DirEntry));
         success = true;
@@ -1252,6 +1312,7 @@ bool MmapDirectory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
     DirEntry new_entry;
     new_entry.set_offset(offset);
     new_entry.set_approx_size(size);
+    new_entry.set_fill_serial(fill_serial);
     new_entry.set_tag(tag);
     new_entry.set_phase(cur_phase);
     new_entry.set_head(true);
@@ -1265,6 +1326,7 @@ bool MmapDirectory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
     DirEntry new_entry;
     new_entry.set_offset(offset);
     new_entry.set_approx_size(size);
+    new_entry.set_fill_serial(fill_serial);
     new_entry.set_tag(tag);
     new_entry.set_phase(cur_phase);
     new_entry.set_head(true);
@@ -1281,6 +1343,7 @@ bool MmapDirectory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
     DirEntry new_entry;
     new_entry.set_offset(offset);
     new_entry.set_approx_size(size);
+    new_entry.set_fill_serial(fill_serial);
     new_entry.set_tag(tag);
     new_entry.set_phase(cur_phase);
     new_entry.set_head(true);
@@ -1304,6 +1367,7 @@ bool MmapDirectory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
     DirEntry new_entry;
     new_entry.set_offset(offset);
     new_entry.set_approx_size(size);
+    new_entry.set_fill_serial(fill_serial);
     new_entry.set_tag(tag);
     new_entry.set_phase(cur_phase);
     new_entry.set_head(true);
@@ -1554,9 +1618,10 @@ void MmapDirectory::reset_reader_state_exclusive() {
 // release nor another holder.  The header has no room to publish the
 // holder's PID for a liveness proof like the write lock's, so the budget is
 // what separates "descheduled" from "stuck": it is set well above the
-// longest live hold measured under CPU oversubscription, and above
-// kBucketWriterBudget, which bounds the holder's own nested wait on a
-// bucket (see the PR for #27).
+// longest live hold measured under CPU oversubscription (the bracket the
+// lock covers is the insert's phase read + entry stores, microseconds;
+// insert() only TRIES the lock while it holds a bucket, so no holder of it is
+// ever parked on a bucket).
 //
 // Why presuming is acceptable here, unlike the write lock: what can a
 // usurped holder that is still executing do?  Its insert already read the
@@ -1584,6 +1649,13 @@ bool MmapDirectory::acquire_phase_lock(PhaseLockToken &token, bool capped) {
     return true;
   }
   return acquire_phase_lock_slow(token, capped);
+}
+
+bool MmapDirectory::try_acquire_phase_lock(PhaseLockToken &token) {
+  uint8_t observed = 0;
+  return try_take_token_lock(std::atomic_ref<uint8_t>(_header->phase_lock),
+                             std::atomic_ref<uint16_t>(_header->phase_lock_gen),
+                             token.generation, token.value, observed);
 }
 
 bool MmapDirectory::acquire_phase_lock_slow(PhaseLockToken &token,
@@ -2031,6 +2103,55 @@ bool MmapDirectory::acquire_writer_slow(size_t bucket_idx, uint32_t &token,
   }
 }
 
+bool MmapDirectory::reader_recover_stuck_bucket(size_t bucket_idx,
+                                                uint32_t version) const {
+  if (_sightings_busy.test_and_set(std::memory_order_acquire)) {
+    return false;  // Another reader is recording: try again next probe
+  }
+  const auto now = std::chrono::steady_clock::now();
+  StuckBucketSighting *sighting = nullptr;
+  StuckBucketSighting *victim = &_sightings[0];
+  for (StuckBucketSighting &s : _sightings) {
+    if (s.version != 0 && s.bucket == bucket_idx) {
+      sighting = &s;
+      break;
+    }
+    if (victim->version != 0 &&
+        (s.version == 0 || s.first_seen < victim->first_seen)) {
+      victim = &s;  // A free slot, else the oldest sighting
+    }
+  }
+  bool recover = false;
+  if (sighting == nullptr) {
+    *victim = {bucket_idx, version, now};
+  } else if (sighting->version != version) {
+    *sighting = {bucket_idx, version, now};  // Another holder: start over
+  } else if (now - sighting->first_seen >= bucket_writer_budget()) {
+    *sighting = {};
+    recover = true;
+  }
+  _sightings_busy.clear(std::memory_order_release);
+  if (!recover) {
+    return false;
+  }
+  // The same holder kept the bucket for the writers' whole budget: recover
+  // it as acquire_writer_slow does, from exactly that odd version (a CAS,
+  // so a release or a new holder in the meantime is never overwritten),
+  // with the same contained exposure to a usurped holder that is still
+  // running (see the AUDIT note there).  Its token-checked release is then
+  // a no-op.
+  uint32_t expected = version;
+  if (std::atomic_ref<uint32_t>(_versions[bucket_idx])
+          .compare_exchange_strong(expected, version + 1,
+                                   std::memory_order_acq_rel,
+                                   std::memory_order_acquire)) {
+#ifdef CYCLONE_TEST_SEAMS
+    s_bucket_recoveries_for_test.fetch_add(1, std::memory_order_relaxed);
+#endif
+  }
+  return true;
+}
+
 void MmapDirectory::release_writer(size_t bucket_idx, uint32_t token) {
   // Ensure all entry writes are visible before making the version even.
   std::atomic_thread_fence(std::memory_order_release);
@@ -2052,8 +2173,14 @@ void MmapDirectory::increment_count() {
 }
 
 void MmapDirectory::decrement_count() {
-  std::atomic_ref<uint32_t>(_header->entry_count)
-      .fetch_sub(1, std::memory_order_relaxed);
+  // Saturating: the count is updated after the bucket is released, so a
+  // process that died in between can leave it short of the entries; a
+  // removal must then stop at zero, not wrap to about four billion.
+  std::atomic_ref<uint32_t> count(_header->entry_count);
+  uint32_t current = count.load(std::memory_order_relaxed);
+  while (current != 0 && !count.compare_exchange_weak(
+                             current, current - 1, std::memory_order_relaxed)) {
+  }
 }
 
 uint64_t MmapDirectory::get_shared_write_pos() const {

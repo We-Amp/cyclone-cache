@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -16,6 +17,7 @@
 #include <shared_mutex>
 #include <unordered_set>
 
+#include "../core/thread_shard.hpp"
 #include "cyclone/alternate.hpp"
 #include "cyclone/config.hpp"
 #include "cyclone/error.hpp"
@@ -63,6 +65,12 @@ struct WorkItem {
   [[nodiscard]] uint64_t effective_priority() const {
     return (static_cast<uint64_t>(priority) << 32) | hit_count;
   }
+
+  // Heap ordering key set by WorkQueue::enqueue() (larger dequeues first).
+  // With aging it is priority * interval - enqueue_time: every item gains
+  // one priority level per interval, so the difference of two items' aged
+  // priorities never changes and a fixed key gives the aged order.
+  double order_key = 0.0;
 
   // Comparison for priority queue (max heap by effective priority)
   bool operator<(const WorkItem &other) const {
@@ -125,14 +133,29 @@ class WorkQueue {
   // Stop the queue (unblocks all waiting dequeue calls)
   void stop();
 
+  // Start the queue after a stop(): clears the stopped flag so enqueue and
+  // dequeue operate again.  Pairs with stop(); a freshly constructed queue
+  // is already started.  Any items still queued at stop() stay queued.
+  void start();
+
   // Check if the queue has been stopped
   bool is_stopped() const noexcept;
 
-  // Get statistics
+  // Get statistics.
+  // Not a consistent snapshot: each counter is read on its own.  End counters
+  // (dequeued) are read before start counters, so an
+  // end never appears to exceed its start.
   WorkQueueStats stats() const;
 
  private:
   void rebuild_heap();
+  // Heap order: larger order_key first, ties by effective priority.
+  static bool heap_less(const WorkItem &a, const WorkItem &b) {
+    if (a.order_key != b.order_key) {
+      return a.order_key < b.order_key;
+    }
+    return a.effective_priority() < b.effective_priority();
+  }
 
   OptimizationConfig _config;
 
@@ -149,8 +172,21 @@ class WorkQueue {
 
   // Statistics
   std::atomic<size_t> _memory_usage{0};
-  mutable std::mutex _stats_mutex;
-  WorkQueueStats _stats;
+  // Counters incremented per queue operation, so relaxed atomics read field
+  // by field in stats(), never under a mutex.  The current size and memory
+  // gauges are derived on read (from _heap under a shared lock and
+  // _memory_usage).
+  struct alignas(kShardPad) HotCounters {
+    std::atomic<uint64_t> total_enqueued{0};
+    std::atomic<uint64_t> total_dequeued{0};
+    std::atomic<uint64_t> total_cancelled{0};
+    std::atomic<uint64_t> rejected_full{0};
+    std::atomic<uint64_t> rejected_memory{0};
+    std::atomic<uint64_t> duplicates{0};
+  };
+  static_assert(alignof(HotCounters) == kShardPad &&
+                sizeof(HotCounters) % kShardPad == 0);
+  HotCounters _stat;
 };
 
 }  // namespace cyclone

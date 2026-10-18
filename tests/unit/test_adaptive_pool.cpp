@@ -5,12 +5,21 @@
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <latch>
 #include <mutex>
 #include <queue>
+#include <stdexcept>
 #include <thread>
 
 #include "optimization/adaptive_pool.hpp"
+
+#if defined(__GLIBCXX__) && defined(__linux__)
+#include <pthread.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 using namespace cyclone;
 
@@ -30,9 +39,16 @@ class MockTaskProvider : public TaskProvider {
     _cv.notify_all();
   }
 
+  void reset() {
+    std::lock_guard lock(_mutex);
+    _stopped = false;
+  }
+
   TaskFunction get_task() override {
     std::unique_lock lock(_mutex);
+    _waiting_count.fetch_add(1, std::memory_order_release);
     _cv.wait(lock, [this] { return !_tasks.empty() || _stopped; });
+    _waiting_count.fetch_sub(1, std::memory_order_release);
 
     if (_stopped && _tasks.empty()) {
       return nullptr;
@@ -48,11 +64,17 @@ class MockTaskProvider : public TaskProvider {
     return _tasks.size();
   }
 
+  // Number of workers currently parked inside get_task().
+  size_t waiting_count() const {
+    return _waiting_count.load(std::memory_order_acquire);
+  }
+
  private:
   mutable std::mutex _mutex;
   std::condition_variable _cv;
   std::queue<TaskFunction> _tasks;
   bool _stopped = false;
+  std::atomic<size_t> _waiting_count{0};
 };
 
 OptimizationConfig default_config() {
@@ -198,6 +220,52 @@ TEST_CASE("AdaptiveThreadPool pause and resume", "[pool][optimization]") {
   pool.stop();
 }
 
+// Regression: pause()/stop() were only checked BEFORE the blocking
+// get_task(), so when a pause landed while a worker was parked inside
+// get_task(), the worker still executed one full task per enqueued item
+// before noticing (e.g. every load-shedding event ran one task per parked
+// worker).  The worker must re-check the flags after get_task() returns.
+TEST_CASE("AdaptiveThreadPool pause reaches a worker parked in get_task",
+          "[pool][optimization][regression]") {
+  OptimizationConfig config = default_config();
+  config.min_threads = 1;
+  config.max_threads = 1;
+  MockTaskProvider provider;
+  AdaptiveThreadPool pool(config, provider);
+  pool.start();
+
+  // Wait until the single worker is parked inside get_task().
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (provider.waiting_count() != 1 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  REQUIRE(provider.waiting_count() == 1);
+
+  // The pause lands while the worker is parked; the enqueued task must not
+  // run until resume().
+  pool.pause();
+  std::atomic<bool> task_ran{false};
+  provider.add_task([&] { task_ran.store(true, std::memory_order_release); });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  const bool ran_while_paused = task_ran.load(std::memory_order_acquire);
+
+  pool.resume();
+  deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!task_ran.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const bool ran_after_resume = task_ran.load(std::memory_order_acquire);
+
+  provider.signal_stop();
+  pool.stop();
+
+  REQUIRE_FALSE(ran_while_paused);
+  REQUIRE(ran_after_resume);
+}
+
 TEST_CASE("AdaptiveThreadPool scaling", "[pool][optimization]") {
   OptimizationConfig config;
   config.min_threads = 1;
@@ -257,6 +325,91 @@ TEST_CASE("AdaptiveThreadPool scaling", "[pool][optimization]") {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
   }
+
+  provider.signal_stop();
+  pool.stop();
+}
+
+// Regression: after a scale-down the self-terminated workers stayed in the
+// worker list, and both spawn paths compared the list size (the historical
+// maximum) against the new target, so no later scale-up below that watermark
+// ever spawned again: the target rose but the live thread count stayed low.
+// The spawn decision must be based on the live worker count.
+TEST_CASE("AdaptiveThreadPool scales back up after scaling down",
+          "[pool][optimization][regression]") {
+  OptimizationConfig config;
+  config.min_threads = 1;
+  config.max_threads = 4;
+
+  MockTaskProvider provider;
+  AdaptiveThreadPool pool(config, provider);
+  pool.start();
+
+  auto wait_for_threads = [&](size_t expected) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (pool.thread_count() != expected &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return pool.thread_count() == expected;
+  };
+
+  REQUIRE(wait_for_threads(1));
+
+  // Scale up to max and let the workers register.
+  pool.scale_to(4);
+  REQUIRE(wait_for_threads(4));
+
+  // Scale down to min.  Parked workers only observe the lowered target when
+  // they cycle through the loop, so feed tasks until the surplus exits.
+  pool.scale_to(1);
+  for (int i = 0; i < 32 && pool.thread_count() > 1; ++i) {
+    provider.add_task([] {});
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  REQUIRE(wait_for_threads(1));
+
+  // Scale back up below the historical maximum: the pool must spawn workers
+  // again rather than comparing against the list of long-dead threads.
+  pool.scale_to(3);
+  const bool recovered = wait_for_threads(3);
+
+  provider.signal_stop();
+  pool.stop();
+
+  REQUIRE(recovered);
+  REQUIRE(pool.stats().current_threads == 0);
+}
+
+// Regression: a task that threw an exception propagated out of worker_loop
+// and terminated the process.  The pool must guard the call, record the
+// failure, and keep the worker alive for later tasks.
+TEST_CASE("AdaptiveThreadPool survives a throwing task",
+          "[pool][optimization][regression]") {
+  OptimizationConfig config = default_config();
+  config.min_threads = 1;
+  config.max_threads = 1;
+  MockTaskProvider provider;
+  AdaptiveThreadPool pool(config, provider);
+  pool.start();
+
+  std::latch next_ran(1);
+  provider.add_task([] { throw std::runtime_error("task failure"); });
+  provider.add_task([&] { next_ran.count_down(); });
+
+  // The worker survived the throw and ran the next task.
+  next_ran.wait();
+  REQUIRE(pool.thread_count() == 1);
+
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (pool.stats().tasks_failed != 1 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+
+  auto stats = pool.stats();
+  REQUIRE(stats.tasks_failed == 1);
+  REQUIRE(stats.tasks_completed == 1);
 
   provider.signal_stop();
   pool.stop();
@@ -433,12 +586,11 @@ TEST_CASE("AdaptiveThreadPool stop is safe after threads exit early",
   REQUIRE(pool.thread_count() == 0);
 }
 
-// Regression for the staged-teardown fix (leak_thread_on_shutdown UAF
-// class).
+// Regression for the staged-teardown fix (the abandoned-thread UAF class).
 //
 // The old AdaptiveThreadPool::stop() waited up to 5 s for _live_count to reach
-// zero and, on timeout, abandoned the still-running workers via
-// leak_thread_on_shutdown().  A pool worker executes cache-touching
+// zero and, on timeout, abandoned the still-running workers by leaking their
+// std::thread objects.  A pool worker executes cache-touching
 // optimization tasks; a leaked worker abandoned mid-task then dereferences
 // cache state that teardown frees.  The fix joins unconditionally: stop() must
 // not return until every worker that is mid-task has returned.
@@ -509,4 +661,148 @@ TEST_CASE("AdaptiveThreadPool::stop() joins an in-flight task (no leak)",
   REQUIRE(stop_elapsed >= std::chrono::milliseconds(5500));
   REQUIRE_FALSE(pool.is_running());
   REQUIRE(pool.thread_count() == 0);
+}
+
+// Regression: workers that exited while join_workers() was joining the
+// previous generation registered their exit after the bookkeeping had been
+// cleared.  A later reap matched those stale entries against workers of the
+// next start() (thread ids are reused by the platform) and joined a live
+// worker while holding the workers mutex, which that worker needed in order
+// to register its own exit: the pool deadlocked.  Repeated start/scale/stop
+// cycles must always complete.
+TEST_CASE("AdaptiveThreadPool restart cycles with scaling never deadlock",
+          "[pool][optimization][regression]") {
+  // Provider that hands out a no-op task every 20 ms, so workers cycle
+  // through the loop and observe target changes, until stopped.
+  struct TickingProvider : TaskProvider {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool stopped = false;
+    TaskFunction get_task() override {
+      std::unique_lock lock(mutex);
+      cv.wait_for(lock, std::chrono::milliseconds(20), [&] { return stopped; });
+      if (stopped) {
+        return nullptr;
+      }
+      return [] {};
+    }
+    size_t queue_depth() const override { return 0; }
+  };
+
+  OptimizationConfig config;
+  config.min_threads = 2;
+  config.max_threads = 8;
+
+  TickingProvider provider;
+  AdaptiveThreadPool pool(config, provider);
+
+  std::atomic<int> rounds_done{0};
+  constexpr int kRounds = 30;
+  std::thread driver([&] {
+    for (int round = 0; round < kRounds; ++round) {
+      {
+        std::lock_guard lock(provider.mutex);
+        provider.stopped = false;
+      }
+      pool.start();
+      pool.scale_to(4);
+      pool.scale_to(2);
+      std::this_thread::sleep_for(std::chrono::milliseconds(60));
+      pool.scale_to(6);
+      {
+        std::lock_guard lock(provider.mutex);
+        provider.stopped = true;
+      }
+      provider.cv.notify_all();
+      pool.stop();
+      rounds_done.fetch_add(1, std::memory_order_release);
+    }
+  });
+
+  // Bounded wait: a deadlocked pool can never be unwound, so report and exit
+  // instead of hanging the suite.
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+  while (rounds_done.load(std::memory_order_acquire) < kRounds) {
+    if (std::chrono::steady_clock::now() > deadline) {
+      std::fprintf(stderr, "pool deadlocked after %d of %d rounds\n",
+                   rounds_done.load(), kRounds);
+      std::fflush(stderr);
+      std::_Exit(1);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  driver.join();
+  REQUIRE(rounds_done.load() == kRounds);
+  REQUIRE(pool.thread_count() == 0);
+}
+
+#if defined(__GLIBCXX__) && defined(__linux__)
+// Regression: thread cancellation on glibc unwinds the thread with a forced
+// unwind exception, which must propagate.  The worker loop's catch-all
+// swallowed it, and the runtime aborts the process when that happens.  Run in
+// a child process so the outcome is observable as an exit status.
+TEST_CASE("AdaptiveThreadPool lets a thread cancellation unwind a worker",
+          "[pool][optimization][regression]") {
+  const pid_t child = fork();
+  REQUIRE(child >= 0);
+  if (child == 0) {
+    OptimizationConfig config;
+    config.min_threads = 1;
+    config.max_threads = 1;
+    MockTaskProvider provider;
+    AdaptiveThreadPool pool(config, provider);
+    pool.start();
+    std::atomic<bool> reached{false};
+    provider.add_task([&] {
+      reached.store(true, std::memory_order_release);
+      pthread_exit(nullptr);
+    });
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!reached.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    // The cancelled worker is gone: it must not stay counted as live or as
+    // running a task until stop().
+    const bool counts_restored =
+        pool.thread_count() == 0 && pool.active_count() == 0 &&
+        pool.stats().current_threads == 0 && pool.stats().active_threads == 0;
+    provider.signal_stop();
+    pool.stop();
+    if (!reached.load()) {
+      std::_Exit(2);
+    }
+    std::_Exit(counts_restored ? 0 : 3);
+  }
+  int status = 0;
+  REQUIRE(waitpid(child, &status, 0) == child);
+  INFO("child status " << status);
+  REQUIRE(WIFEXITED(status));
+  REQUIRE(WEXITSTATUS(status) == 0);
+}
+#endif
+
+// A worker counts as live from the moment it is spawned, not from when it is
+// first scheduled: otherwise the spawn paths, which gate on the live count,
+// could spawn again for a worker that simply had not run yet, and
+// thread_count() lagged behind a scale_to() that had already returned.
+TEST_CASE("AdaptiveThreadPool counts a worker as live when it is spawned",
+          "[pool][optimization][regression]") {
+  OptimizationConfig config;
+  config.min_threads = 1;
+  config.max_threads = 8;
+  MockTaskProvider provider;
+  AdaptiveThreadPool pool(config, provider);
+
+  for (int round = 0; round < 20; ++round) {
+    pool.start();
+    REQUIRE(pool.thread_count() == 1);
+    pool.scale_to(8);
+    REQUIRE(pool.thread_count() == 8);
+    provider.signal_stop();
+    pool.stop();
+    REQUIRE(pool.thread_count() == 0);
+    provider.reset();
+  }
 }

@@ -12,6 +12,7 @@
 #include <thread>
 #include <vector>
 
+#include "../core/thread_shard.hpp"
 #include "cyclone/config.hpp"
 
 namespace cyclone {
@@ -22,6 +23,7 @@ struct ThreadPoolStats {
   size_t active_threads = 0;
   uint64_t tasks_started = 0;
   uint64_t tasks_completed = 0;
+  uint64_t tasks_failed = 0;  // Tasks that threw an exception
   uint64_t scale_up_count = 0;
   uint64_t scale_down_count = 0;
 };
@@ -88,34 +90,66 @@ class AdaptiveThreadPool {
   // Force scale to specific thread count
   void scale_to(size_t target);
 
-  // Get statistics
+  // Get statistics.
+  // Not a consistent snapshot: each counter is read on its own.  End counters
+  // (completed, failed, dequeued) are read before start counters, so an
+  // end never appears to exceed its start.
   ThreadPoolStats stats() const;
 
  private:
-  void worker_loop(size_t worker_id);
-  // Spawn a new worker thread. Requires: _workers_mutex must be held by caller.
+  void worker_loop(uint64_t generation);
+  // Spawn a new worker thread and count it as live.  Requires: _workers_mutex
+  // must be held by caller.
   void spawn_worker();
+  // Join and erase workers that exited on their own (scale-down
+  // self-termination).  Keeps _workers bounded to live threads so the spawn
+  // paths can compare against the live count.  Requires: _workers_mutex must
+  // be held by caller.
+  void reap_finished_workers();
   bool should_scale_up() const;
   bool should_scale_down() const;
 
   OptimizationConfig _config;
   TaskProvider &_provider;
 
-  std::vector<std::thread> _workers;
+  // One entry per spawned worker.  Workers are identified by a generation
+  // number that is unique for the lifetime of the pool, never by
+  // std::thread::id: the platform reuses thread ids once a thread is joined,
+  // so an id recorded by an exited worker could alias a live one.
+  struct WorkerSlot {
+    uint64_t generation;
+    std::thread thread;
+  };
+  std::vector<WorkerSlot> _workers;
+  // Generations of workers that exited worker_loop but whose entries have
+  // not been reaped from _workers yet (see reap_finished_workers).
+  std::vector<uint64_t> _finished_workers;
+  uint64_t _next_generation = 0;  // Guarded by _workers_mutex.
   mutable std::mutex _workers_mutex;
 
   std::atomic<bool> _running{false};
   std::atomic<bool> _paused{false};
   std::atomic<bool> _stopping{false};
   std::atomic<size_t> _target_thread_count{0};
-  std::atomic<size_t> _active_count{0};
-  std::atomic<size_t> _live_count{0};
 
   std::mutex _pause_mutex;
   std::condition_variable _pause_cv;
 
-  mutable std::mutex _stats_mutex;
-  ThreadPoolStats _stats;
+  // Counters updated on the per-task hot path (relaxed atomics, read field by
+  // field in stats(), never under a mutex).  Kept on their own cache lines so
+  // the read-mostly flags above are not invalidated by every task.
+  struct alignas(kShardPad) HotCounters {
+    std::atomic<size_t> active{0};
+    std::atomic<size_t> live{0};
+    std::atomic<uint64_t> tasks_started{0};
+    std::atomic<uint64_t> tasks_completed{0};
+    std::atomic<uint64_t> tasks_failed{0};  // Tasks that threw an exception
+    std::atomic<uint64_t> scale_up_count{0};
+    std::atomic<uint64_t> scale_down_count{0};
+  };
+  static_assert(alignof(HotCounters) == kShardPad &&
+                sizeof(HotCounters) % kShardPad == 0);
+  HotCounters _hot;
 };
 
 }  // namespace cyclone
