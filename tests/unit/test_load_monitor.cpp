@@ -3,6 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <thread>
 
@@ -99,6 +100,31 @@ TEST_CASE("LoadMonitor watermark checks", "[load][optimization]") {
     REQUIRE(monitor.is_above_high_watermark());
     REQUIRE_FALSE(monitor.is_below_low_watermark());
   }
+}
+
+// A zero baseline must not divide: that pinned the estimate at the maximum
+// and would keep load shedding on permanently once the counters are wired.
+TEST_CASE("LoadMonitor treats a non-positive baseline as no contribution",
+          "[load][optimization]") {
+  OptimizationConfig config;
+  config.baseline_ops_per_sec = 0.0;
+  config.baseline_bytes_per_sec = 0.0;
+  config.load_high_watermark = 0.8;
+  config.load_low_watermark = 0.5;
+  LoadMonitor monitor(config);
+
+  for (int i = 0; i < 1000; ++i) {
+    monitor.record_read_complete(1_KB);
+    monitor.record_write_complete(1_KB);
+  }
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  monitor.update_metrics();
+
+  auto metrics = monitor.metrics();
+  REQUIRE(std::isfinite(metrics.combined));
+  REQUIRE(metrics.combined == 0.0);
+  REQUIRE_FALSE(monitor.is_above_high_watermark());
 }
 
 TEST_CASE("LoadMonitor reset", "[load][optimization]") {

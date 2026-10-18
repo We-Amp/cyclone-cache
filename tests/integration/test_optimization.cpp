@@ -929,3 +929,66 @@ TEST_CASE("OptimizationEngine guards exceptions from plugin planning",
   cache->stop();
   cleanup_temp(cache_path);
 }
+
+// Regression: record_read_complete()/record_write_complete() had no callers
+// outside tests, so every counter stayed at zero, the computed load stayed
+// pinned at 0.0, and load shedding (pool pause + cancel_deferrable at the
+// high watermark) could never engage.  Completed cache reads and writes must
+// feed the monitor.
+TEST_CASE("OptimizationEngine load monitor observes cache traffic",
+          "[optimization][integration][regression]") {
+  auto cache_path = temp_cache_path();
+
+  CacheConfig config;
+  config.optimization_config.set_enabled(true)
+      .set_min_threads(1)
+      .set_min_hits_before_optimize(0)
+      .set_scale_check_interval(std::chrono::milliseconds(50));
+
+  auto cache_result = Cache::create(config);
+  REQUIRE(cache_result.has_value());
+  auto &cache = *cache_result;
+
+  REQUIRE(cache->add_volume(cache_path + "/vol1", 10_MB).has_value());
+  REQUIRE(cache->start().has_value());
+
+  auto *engine = cache->optimization_engine();
+  REQUIRE(engine != nullptr);
+
+  constexpr uint64_t kWrites = 3;
+  constexpr size_t kContentSize = 256;
+  for (uint64_t i = 0; i < kWrites; ++i) {
+    auto key =
+        CacheKey::from_url("http://test.com/load-" + std::to_string(i));
+    std::vector<std::byte> content(kContentSize, std::byte{0x42});
+    auto write_result = cache->write_sync(key, content.size());
+    REQUIRE(write_result.has_value());
+    REQUIRE(write_result->write_sync(content).has_value());
+    REQUIRE(write_result->close_sync().has_value());
+  }
+
+  constexpr uint64_t kReads = 5;
+  for (uint64_t i = 0; i < kReads; ++i) {
+    auto read_result =
+        cache->read_sync(CacheKey::from_url("http://test.com/load-0"));
+    REQUIRE(read_result.has_value());
+  }
+
+  // The monitoring thread folds the counters into metrics every
+  // scale_check_interval; wait for that.
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  auto metrics = engine->stats().load_metrics;
+  while ((metrics.write_ops < kWrites || metrics.read_ops < kReads) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    metrics = engine->stats().load_metrics;
+  }
+
+  cache->stop();
+  cleanup_temp(cache_path);
+
+  REQUIRE(metrics.write_ops >= kWrites);
+  REQUIRE(metrics.write_bytes >= kWrites * kContentSize);
+  REQUIRE(metrics.read_ops >= kReads);
+  REQUIRE(metrics.read_bytes >= kContentSize);
+}

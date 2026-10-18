@@ -30,7 +30,7 @@ OptimizationEngine::OptimizationEngine(const OptimizationConfig &config,
     : _config(config),
       _cache(cache),
       _work_queue(config),
-      _load_monitor(config) {
+      _load_monitor(std::make_shared<LoadMonitor>(config)) {
   _thread_pool = std::make_unique<AdaptiveThreadPool>(config, *this);
 }
 
@@ -237,7 +237,7 @@ OptimizationStats OptimizationEngine::stats() const {
   OptimizationStats result = _stats;
   result.queue_stats = _work_queue.stats();
   result.pool_stats = _thread_pool->stats();
-  result.load_metrics = _load_monitor.metrics();
+  result.load_metrics = _load_monitor->metrics();
   return result;
 }
 
@@ -455,10 +455,10 @@ void OptimizationEngine::monitoring_loop() {
     }
 
     // Update load metrics
-    _load_monitor.update_metrics();
+    _load_monitor->update_metrics();
 
     // Check for load shedding
-    if (_load_monitor.is_above_high_watermark()) {
+    if (_load_monitor->is_above_high_watermark()) {
       _in_cooldown = false;  // Reset cooldown if load goes back up
       if (!_load_shedding.exchange(true, std::memory_order_acq_rel)) {
         // Just crossed above high watermark
@@ -472,7 +472,7 @@ void OptimizationEngine::monitoring_loop() {
         }
       }
     } else if (_load_shedding.load(std::memory_order_acquire) &&
-               _load_monitor.is_below_low_watermark()) {
+               _load_monitor->is_below_low_watermark()) {
       // Crossed below low watermark, start cooldown if not already started
       auto now = std::chrono::steady_clock::now();
       if (!_in_cooldown) {

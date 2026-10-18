@@ -183,6 +183,56 @@ class GateExclusive {
   std::array<GateShard, kGateShards> &_gate;
 };
 
+// WriteHandleImpl decorator that reports a successful commit (bytes written)
+// to the optimization engine's load monitor, so the monitor's counters move
+// on production traffic and its load-shedding watermarks can engage.  The
+// monitor reference is weak: a write handle may outlive the Cache and its
+// engine, and a commit that lands afterwards simply goes uncounted.
+class LoadRecordingWriteHandle final : public WriteHandleImpl {
+ public:
+  LoadRecordingWriteHandle(std::shared_ptr<WriteHandleImpl> inner,
+                           std::weak_ptr<LoadMonitor> load_monitor)
+      : _inner(std::move(inner)), _load_monitor(std::move(load_monitor)) {}
+
+  void set_header(std::span<const std::byte> header) override {
+    _inner->set_header(header);
+  }
+
+  void set_content_length(uint64_t length) override {
+    _inner->set_content_length(length);
+  }
+
+  std::expected<size_t, CacheError> write(
+      std::span<const std::byte> data) override {
+    return _inner->write(data);
+  }
+
+  std::expected<std::span<std::byte>, CacheError> reserve(
+      size_t length) override {
+    return _inner->reserve(length);
+  }
+
+  std::expected<void, CacheError> close() override {
+    auto result = _inner->close();
+    if (result) {
+      if (auto monitor = _load_monitor.lock()) {
+        monitor->record_write_complete(_inner->bytes_written());
+      }
+    }
+    return result;
+  }
+
+  void abort() override { _inner->abort(); }
+
+  [[nodiscard]] size_t bytes_written() const override {
+    return _inner->bytes_written();
+  }
+
+ private:
+  std::shared_ptr<WriteHandleImpl> _inner;
+  std::weak_ptr<LoadMonitor> _load_monitor;
+};
+
 Task<std::expected<size_t, CacheError>> ReadHandle::read(
     std::span<std::byte> buffer) {
   if (!_impl) {
@@ -1024,7 +1074,15 @@ std::expected<ReadHandle, CacheError> Cache::read_sync(const CacheKey &key,
                                                        Tier tier) {
   auto guard = lock_and_select(key, tier);
   if (!guard) return make_unexpected(guard.error());
-  return guard->second->read_sync(key);
+  auto result = guard->second->read_sync(key);
+  if (result && _impl->optimization_engine) {
+    // Feed the load monitor from the hot read path: two relaxed atomic
+    // increments.  Without this its counters stay zero and load shedding
+    // can never engage.
+    _impl->optimization_engine->load_monitor().record_read_complete(
+        result->content_length());
+  }
+  return result;
 }
 
 std::expected<WriteHandle, CacheError> Cache::write_sync(const CacheKey &key,
@@ -1036,7 +1094,16 @@ std::expected<WriteHandle, CacheError> Cache::write_sync(
     const CacheKey &key, uint64_t content_length, Tier tier) {
   auto guard = lock_and_select(key, tier);
   if (!guard) return make_unexpected(guard.error());
-  return guard->second->write_sync(key, content_length);
+  auto result = guard->second->write_sync(key, content_length);
+  if (result && _impl->optimization_engine) {
+    // The commit runs later, on close(): wrap the handle so a successful
+    // commit is reported to the load monitor (see record_read_complete above).
+    auto inner = std::move(result->_impl);
+    return WriteHandle(std::make_shared<LoadRecordingWriteHandle>(
+        std::move(inner),
+        _impl->optimization_engine->load_monitor_shared()));
+  }
+  return result;
 }
 
 std::expected<void, CacheError> Cache::remove_sync(const CacheKey &key,
@@ -1065,7 +1132,16 @@ std::expected<WriteHandle, CacheError> Cache::write_alternate_sync(
     Tier tier) {
   auto guard = lock_and_select(key, tier);
   if (!guard) return make_unexpected(guard.error());
-  return guard->second->write_alternate_sync(key, alternate_id, content_length);
+  auto result = guard->second->write_alternate_sync(key, alternate_id,
+                                                    content_length);
+  if (result && _impl->optimization_engine) {
+    // Same load-monitor reporting as write_sync().
+    auto inner = std::move(result->_impl);
+    return WriteHandle(std::make_shared<LoadRecordingWriteHandle>(
+        std::move(inner),
+        _impl->optimization_engine->load_monitor_shared()));
+  }
+  return result;
 }
 
 std::expected<ReadHandle, CacheError> Cache::read_alternate_sync(
@@ -1073,7 +1149,13 @@ std::expected<ReadHandle, CacheError> Cache::read_alternate_sync(
     const AlternateSelectionContext &ctx, Tier tier) {
   auto guard = lock_and_select(key, tier);
   if (!guard) return make_unexpected(guard.error());
-  return guard->second->read_alternate_sync(key, selector, ctx);
+  auto result = guard->second->read_alternate_sync(key, selector, ctx);
+  if (result && _impl->optimization_engine) {
+    // Same load-monitor reporting as read_sync().
+    _impl->optimization_engine->load_monitor().record_read_complete(
+        result->content_length());
+  }
+  return result;
 }
 
 std::expected<void, CacheError> Cache::remove_alternate_sync(

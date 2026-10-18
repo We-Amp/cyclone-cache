@@ -71,8 +71,14 @@ class OptimizationEngine : public TaskProvider {
                          uint32_t hit_count);
 
   // Access to sub-components
-  LoadMonitor &load_monitor() { return _load_monitor; }
-  const LoadMonitor &load_monitor() const { return _load_monitor; }
+  LoadMonitor &load_monitor() { return *_load_monitor; }
+  const LoadMonitor &load_monitor() const { return *_load_monitor; }
+
+  // Shared handle for write-completion reporting (Cache write handles hold a
+  // weak reference and may outlive this engine).
+  std::shared_ptr<LoadMonitor> load_monitor_shared() const {
+    return _load_monitor;
+  }
 
   WorkQueue &work_queue() { return _work_queue; }
   const WorkQueue &work_queue() const { return _work_queue; }
@@ -97,7 +103,9 @@ class OptimizationEngine : public TaskProvider {
   Cache *_cache;
 
   WorkQueue _work_queue;
-  LoadMonitor _load_monitor;
+  // Shared so Cache write handles can hold a weak reference for reporting
+  // completed writes; such a handle may outlive this engine.
+  std::shared_ptr<LoadMonitor> _load_monitor;
   std::unique_ptr<AdaptiveThreadPool> _thread_pool;
 
   // Plugin list
