@@ -887,3 +887,70 @@ TEST_CASE(
   const int recorded = kThreads * kPerThread;
   REQUIRE(flushed_delta.load() + tracker.dropped_overflow_hits() == recorded);
 }
+
+TEST_CASE(
+    "HitTracker overflow: past the hard bound a hit on an already pending "
+    "key is still counted and only new keys are dropped",
+    "[hit_tracker][regression]") {
+  HitTrackerConfig config;
+  config.enable_background_flush = true;
+  config.flush_interval = std::chrono::milliseconds(10000);
+  config.max_pending_entries = 8;
+  config.flush_threshold = 1000000;
+  HitTracker tracker(config);
+
+  // A callback that never returns until released: the first sweep stalls on
+  // its first key, leaving every other stripe's entries pending and the set
+  // over the hard bound (16) for good.
+  std::atomic<bool> in_callback{false};
+  std::atomic<bool> release{false};
+  struct Releaser {
+    std::atomic<bool> &flag;
+    ~Releaser() { flag.store(true); }
+  } releaser{release};
+  tracker.start([&](const CacheKey &, AlternateId, uint32_t, int64_t) {
+    in_callback.store(true);
+    while (!release.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+  });
+
+  std::vector<CacheKey> keys;
+  for (int i = 0; i < 40; ++i) {
+    keys.emplace_back("overflow-existing-" + std::to_string(i));
+    tracker.record_hit(keys.back());
+  }
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!in_callback.load() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  REQUIRE(in_callback.load());
+  REQUIRE(tracker.pending_count() > 16);
+
+  // Arm the grace window with one more new key, let it lapse, then probe.
+  tracker.record_hit(CacheKey("overflow-arm"));
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+
+  // Pick a key that is still pending (the stalled sweep took one).
+  const CacheKey *pending = nullptr;
+  for (const auto &key : keys) {
+    if (tracker.pending_hits(key) == 1) {
+      pending = &key;
+      break;
+    }
+  }
+  REQUIRE(pending != nullptr);
+
+  tracker.record_hit(*pending);
+  REQUIRE(tracker.pending_hits(*pending) == 2);
+  REQUIRE(tracker.dropped_overflow_hits() == 0);
+
+  tracker.record_hit(CacheKey("overflow-new-key"));
+  REQUIRE(tracker.pending_hits(CacheKey("overflow-new-key")) == 0);
+  REQUIRE(tracker.dropped_overflow_hits() == 1);
+
+  release.store(true);
+  tracker.stop();
+}

@@ -74,20 +74,23 @@ void HitTracker::record_hit(const CacheKey& key, AlternateId alternate_id) {
     std::lock_guard<std::mutex> lock(stripe.mutex);
 
     // Past the hard bound, and only once that has been true for longer
-    // than the grace window without a sweep draining it, the hit is
-    // sacrificed, not recorded: the pending set is memory-bounded no
-    // matter how fast records arrive while no flush can keep up (a
-    // stalled callback, or sustained overload with no flush thread).  A
-    // burst that merely outruns the next sweep is fully recorded.  Hit
-    // statistics are best-effort, like a dropped delta on a Busy flush.
-    if (_pending_entries.load(std::memory_order_relaxed) > hard_pending_cap() &&
-        over_cap_past_grace()) {
-      _overflow_drops.fetch_add(1, std::memory_order_relaxed);
-      return;
-    }
-
-    auto [it, inserted] = stripe.pending.try_emplace(tracking_key);
-    if (inserted) {
+    // than the grace window without a sweep draining it, a hit that would
+    // need a NEW pending entry is sacrificed, not recorded: the pending
+    // set is memory-bounded (per grace window) no matter how fast records
+    // arrive while no flush can keep up (a stalled callback, or sustained
+    // overload with no flush thread).  A hit on a key that is already
+    // pending costs no memory and is always counted.  A burst that merely
+    // outruns the next sweep is fully recorded.  Hit statistics are
+    // best-effort, like a dropped delta on a Busy flush.
+    auto it = stripe.pending.find(tracking_key);
+    if (it == stripe.pending.end()) {
+      if (_pending_entries.load(std::memory_order_relaxed) >
+              hard_pending_cap() &&
+          over_cap_past_grace()) {
+        _overflow_drops.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+      it = stripe.pending.emplace(tracking_key, HitRecord{}).first;
       _pending_entries.fetch_add(1, std::memory_order_relaxed);
     }
     auto& record = it->second;
@@ -129,7 +132,9 @@ bool HitTracker::over_cap_past_grace() {
     _over_cap_since.store(now_ns, std::memory_order_relaxed);
     return false;  // The grace window starts now.
   }
-  return now_ns - since > kOverCapGraceNs;
+  // Another thread may have stored a later stamp than our clock read: never
+  // let the unsigned difference wrap into a spurious "past grace".
+  return now_ns > since && now_ns - since > kOverCapGraceNs;
 }
 
 void HitTracker::flush_soon() {

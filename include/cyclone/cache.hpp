@@ -60,7 +60,9 @@ struct CacheStats {
   // set was at its hard bound (twice the configured maximum) and no flush
   // could drain it in time.  Best-effort like the contended drops above;
   // nonzero means the flush thread (or the reader-side sweeps, without one)
-  // cannot keep up with the overflow.
+  // cannot keep up with the overflow.  Only hits that would add a NEW
+  // pending entry are dropped, and the memory bound holds per grace window
+  // (a quarter of a second), not instantaneously.
   uint64_t hit_overload_drops = 0;
 
   // Completed periodic directory syncs across all volumes (persistent mode;
