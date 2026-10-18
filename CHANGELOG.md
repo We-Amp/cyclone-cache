@@ -626,8 +626,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   queued optimization work gains priority while it waits, so low-priority work
   is not starved. `Cache::start()` returns `InvalidConfiguration` for an
   invalid optimization configuration.
-- Writes with `sync_on_write` no longer serialize every writer of a stripe
-  behind the device flush; a directory insert no longer holds the stripe-wide
+- Plain writes with `sync_on_write` no longer serialize every writer of a
+  stripe behind the device flush (alternate writes still flush under the
+  stripe mutex); a directory insert no longer holds the stripe-wide
   phase lock while it waits on a busy bucket; directory reads under CPU
   oversubscription stop spinning after 0.5 ms; hit recording past
   `max_pending_entries` hands the sweep to the flush thread, dropping and

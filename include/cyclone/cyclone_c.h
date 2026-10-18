@@ -640,9 +640,12 @@ typedef void (*CycloneReadCallback)(void *, const char *, size_t, CycloneError);
  * return (CYCLONE_INVALID_ARGUMENT, CYCLONE_INTERNAL_ERROR) means read_cb
  * has not been called and will not be, with one exception: callbacks must
  * not throw, and a read_cb that throws has already been called when
- * CYCLONE_INTERNAL_ERROR is returned.  A miss handler that throws makes
- * the call return CYCLONE_INTERNAL_ERROR without calling read_cb; reads
- * that coalesced onto its fetch meanwhile get CYCLONE_INTERNAL_ERROR.
+ * CYCLONE_INTERNAL_ERROR is returned.  A miss handler that throws before
+ * it completes the fetch makes the call return CYCLONE_INTERNAL_ERROR
+ * without calling read_cb, and reads that coalesced onto its fetch
+ * meanwhile get CYCLONE_INTERNAL_ERROR; if the fetch was already completed
+ * (or a timed-out drain already answered the read), the call returns
+ * CYCLONE_OK and read_cb has been or will be called.
  */
 CycloneError cyclone_cache_read_async(CycloneCacheHandle *cache,
                                       const char *key, size_t key_len,
