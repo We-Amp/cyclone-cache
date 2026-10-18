@@ -274,13 +274,13 @@ struct CacheConfig {
   std::chrono::seconds gc_interval{60};
   double gc_evacuate_threshold = 0.8;
 
-  // Store a CRC-32C with each document (verified on every read while
-  // verify_checksum_on_read is on, whatever value is stored).  The C API
-  // copies CycloneCacheConfig::enable_checksum here verbatim with no default
-  // and no sentinel mapping, so a zero-initialised C config runs with
-  // checksums DISABLED rather than this default of true -- the one
-  // remaining C field whose zero-init diverges; see
-  // CycloneCacheConfig::enable_checksum.
+  // Every document is written with a CRC-32C whatever this says; whether
+  // reads verify it is verify_checksum_on_read (forced on in multi-process
+  // mode).  The only effect of enable_checksum today: with
+  // multi_process_config.enabled, start() refuses to run
+  // (InvalidConfiguration) when it is false.  The C API copies
+  // CycloneCacheConfig::enable_checksum here verbatim, so a zero-initialised
+  // C config sets it false; see CycloneCacheConfig::enable_checksum.
   bool enable_checksum = true;
   bool verify_checksum_on_read =
       true;  // Verify CRC-32C on every read (disable for perf)

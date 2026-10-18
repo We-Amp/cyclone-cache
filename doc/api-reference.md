@@ -797,22 +797,22 @@ to be discovered at runtime.
 
 **Checksums.**
 
-- C++ `CacheConfig::enable_checksum` defaults to `true`: every document
-  stored carries a CRC-32C, verified on read. (A stored CRC of `0` skips
-  verification, so documents written with checksums off still read back.)
-- C `CycloneCacheConfig::enable_checksum` is copied verbatim (`!= 0`). There
-  is **no default and no sentinel mapping**, so `0` means **disabled** — the
-  opposite of the C++ default. A zero-initialised `CycloneCacheConfig`
-  therefore runs with **no integrity checking**: corruption is served rather
-  than detected. Set it to `1` explicitly for the C++ behaviour.
-  (Multi-process mode — `enable_mmap_directory` — refuses to start with
-  checksums off either way, so that combination fails loudly instead.)
+- Every document is written with a CRC-32C, whatever `enable_checksum`
+  says, and reads verify it while `CacheConfig::verify_checksum_on_read` is
+  on (the default; multi-process mode forces it on). A stored CRC of `0` is
+  verified like any other value.
+- `enable_checksum` (C++ default `true`) no longer changes what is written
+  or read. Its only effect: with multi-process mode enabled, `start()`
+  refuses to run (`InvalidConfiguration`) when it is `false`.
+- C `CycloneCacheConfig::enable_checksum` is copied verbatim (`!= 0`), so a
+  zero-initialised config sets it `false`. That is harmless in
+  single-process mode and refused in multi-process mode
+  (`enable_mmap_directory`); set it to `1`.
 
-So a zero-initialised `CycloneCacheConfig` runs with **no RAM tier**, **a
-64 MB per-object bound**, and **checksums disabled**. All are working
-configurations, but they get there by opposite conventions: `max_object_size`
-treats `0` as "unset, use the default", while `ram_cache_size_bytes` and
-`enable_checksum` treat it as the literal value it says.
+So a zero-initialised `CycloneCacheConfig` runs with **no RAM tier** and **a
+64 MB per-object bound**. Both are working configurations, but they get there
+by opposite conventions: `max_object_size` treats `0` as "unset, use the
+default", while `ram_cache_size_bytes` treats it as the literal value it says.
 
 `ram_cache_size_bytes = 0` keeps meaning "disabled". For a size knob, a
 zero-byte cache is the natural reading of zero, and giving it the
@@ -821,12 +821,9 @@ every caller that passes `0` today — a caller that cannot currently distinguis
 "default" from "disabled". The asymmetry is documented rather than papered
 over.
 
-`enable_checksum = 0` keeps meaning "disabled" for the same reason, and then
-some: remapping `0` to the C++ `true` would silently switch integrity checking
-on for every caller that passes `0` today and, without a new opt-out sentinel,
-remove the only way a C caller can turn checksums off. For an integrity knob a
-silent change in either direction is worse than a documented divergence — so
-documented it is.
+`enable_checksum = 0` is copied as `false` for the same reason; since every
+document now carries a verified CRC regardless, the field only decides
+whether multi-process mode starts.
 
 ### Alternate-Chain Depth Bound
 
@@ -1470,8 +1467,8 @@ Cyclone Cache provides a C ABI wrapper (`include/cyclone/cyclone_c.h`) for integ
 defaults field for field. In particular `ram_cache_size_bytes = 0` means the
 RAM tier is **disabled** (not the 256 MB C++ default), `max_object_size = 0`
 means the **library default** (64 MB, not "unbounded"), and
-`enable_checksum = 0` means checksums are **disabled** (the C++ default is
-on). See ["Zero Values"](#zero-values) above for
+`enable_checksum = 0` makes multi-process mode refuse to start (the C++
+default is `true`; it no longer turns checksums off). See ["Zero Values"](#zero-values) above for
 the full mapping, and the field comments in `cyclone_c.h`.
 
 **Eviction mode.**  `disable_wrap_retention` is stated in the negative, like

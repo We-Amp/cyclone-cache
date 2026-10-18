@@ -121,23 +121,15 @@ typedef struct {
                                     zero-byte cache is the natural reading of
                                     zero, and remapping it would silently
                                     change every config that passes 0 today. */
-  int enable_checksum;           /* Non-zero: store a CRC-32C with each
-                                    document (verified on every read
-                                    while read verification is on).  Copied
-                                    verbatim to CacheConfig::enable_checksum,
-                                    whose C++
-                                    default is TRUE -- so a zero-initialised
-                                    config runs with checksums DISABLED, the one
-                                    remaining field where C zero-init diverges
-                                    from the C++ default.  Set this to 1
-                                    explicitly for the C++ behaviour.  0 keeps
-                                    meaning "disabled": remapping it to the C++
-                                    default would silently change every config
-                                    that passes 0 today and, absent a new opt-out
-                                    sentinel, remove the only way a C caller can
-                                    turn checksums off.  (Multi-process mode --
-                                    enable_mmap_directory -- refuses to start
-                                    with checksums off either way.) */
+  int enable_checksum;           /* Copied verbatim to
+                                    CacheConfig::enable_checksum (C++
+                                    default TRUE).  Every document is
+                                    written with a CRC-32C and verified on
+                                    read whatever this says; 0 does not
+                                    turn either off.  Its only effect:
+                                    multi-process mode
+                                    (enable_mmap_directory) refuses to start
+                                    when it is 0, so set it to 1. */
   uint32_t num_segments;
   uint32_t max_in_flight_requests; /* Max concurrent miss handler calls.  0 is
                                       NOT unlimited: the bridge maps 0 to the
