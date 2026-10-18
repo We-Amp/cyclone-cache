@@ -279,7 +279,8 @@ TEST_CASE("C API: A waiter observes the fetched value already stored",
 
   auto callback = [](void *ud, const char *, size_t, CycloneError) {
     auto *c = static_cast<Context *>(ud);
-    c->exists_in_callback = cyclone_cache_exists(c->cache, c->key, strlen(c->key));
+    c->exists_in_callback =
+        cyclone_cache_exists(c->cache, c->key, strlen(c->key));
     c->called = true;
   };
 

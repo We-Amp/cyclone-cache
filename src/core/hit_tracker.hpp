@@ -59,8 +59,8 @@ using HitFlushCallback =
                        uint32_t hit_delta, int64_t last_access_ms)>;
 
 // Callback invoked once at the end of flush_now() after all per-key callbacks
-// complete (only when at least one key was flushed successfully).  Allows batching a single
-// fsync per flush cycle instead of per-key.
+// complete (only when at least one key was flushed successfully).  Allows
+// batching a single fsync per flush cycle instead of per-key.
 using HitFlushBatchDoneCallback = std::function<void()>;
 
 // Configuration for the hit tracker

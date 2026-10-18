@@ -7,7 +7,6 @@
 #include <string>
 
 #include "../../src/core/sha256.hpp"
-
 #include "cyclone/key.hpp"
 
 using namespace cyclone;
