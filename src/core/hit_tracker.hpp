@@ -96,7 +96,12 @@ class HitTracker {
   // Stop the background flush thread and perform final flush
   void stop();
 
-  // Record a cache hit for the given key and alternate
+  // Record a cache hit for the given key and alternate.
+  //
+  // Bounded work on the reading thread, in order: the stripe-lock bracket
+  // above; past max_pending_entries a hand-off (flush_soon) -- never a
+  // synchronous full flush; past twice that, the hit is dropped and counted
+  // (dropped_overflow_hits) so the pending set stays memory-bounded.
   void record_hit(const CacheKey& key,
                   AlternateId alternate_id = AlternateId::Original);
 
@@ -117,6 +122,14 @@ class HitTracker {
   // Get number of entries with pending hits
   size_t pending_count() const;
 
+  // Hits dropped without recording because the pending set was at its hard
+  // bound (twice max_pending_entries) and no flush could drain it fast
+  // enough.  Hit statistics are best-effort; this counts the sacrifice
+  // that keeps the reader's memory bounded.
+  uint64_t dropped_overflow_hits() const {
+    return _overflow_drops.load(std::memory_order_relaxed);
+  }
+
   // Get total pending hits across all entries
   uint64_t total_pending_hits() const;
 
@@ -133,6 +146,32 @@ class HitTracker {
 
  private:
   void flush_thread_func();
+
+  // Twice the configured bound: the hard cap of the pending set.  Past it,
+  // and only once that has held for longer than the grace window below
+  // without a sweep draining it, record_hit drops further hits (counted in
+  // _overflow_drops) instead of recording them.
+  size_t hard_pending_cap() const { return 2 * _config.max_pending_entries; }
+
+  // How long an overflow past the hard cap may go undrained before hits
+  // are dropped: comfortably above the flush thread's sleep slice (100 ms,
+  // the worst case before a handed-off sweep starts), far below any
+  // acceptable unbounded-growth window.
+  static constexpr uint64_t kOverCapGraceNs =
+      uint64_t{250} * 1000 * 1000;  // 250 ms
+
+  // Arms and answers the grace window (see the .cpp).  Called only on the
+  // over-cap path, never on the fast path.
+  bool over_cap_past_grace();
+
+  // What a reader that pushed the pending set past max_pending_entries
+  // does about it.  With a flush thread, it only asks for an early sweep
+  // (the flag breaks the thread's sleep slices, so the sweep starts within
+  // ~100 ms) -- a full 4096-stripe sweep plus per-key callbacks never runs
+  // on the reading thread.  Without one, at most ONE reader at a time
+  // sweeps (the exchange gate); the rest proceed, and the next over-limit
+  // reader re-opens the gate.
+  void flush_soon();
 
   Config _config;
   HitFlushCallback _flush_callback;
@@ -182,6 +221,20 @@ class HitTracker {
   // (max_pending_entries / kNumStripes), which at 4096 stripes would round
   // to ~24 entries and let ordinary hash variance trigger forced flushes.
   std::atomic<size_t> _pending_entries{0};
+
+  std::atomic<uint64_t> _overflow_drops{0};
+
+  // Steady-clock nanoseconds of the first sighting of the pending set past
+  // hard_pending_cap() since the last completed sweep (0 = under the cap).
+  // See over_cap_past_grace.
+  std::atomic<uint64_t> _over_cap_since{0};
+
+  // Set by an over-limit reader (flush_soon), cleared by the flush thread
+  // right before its sweep, so an overflow arriving DURING the sweep re-arms
+  // the early wake-up instead of being lost.
+  std::atomic<bool> _flush_soon{false};
+  // The single-observer gate of flush_soon's no-flush-thread path.
+  std::atomic<bool> _flush_in_progress{false};
 
   std::atomic<bool> _running{false};
   std::thread _flush_thread;

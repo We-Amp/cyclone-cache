@@ -1178,6 +1178,9 @@ CacheStats Cache::stats() const {
       _impl->flush_stats.hit_flush_total_delta.load(std::memory_order_relaxed);
   result.hit_flush_fsyncs =
       _impl->flush_stats.hit_flush_fsyncs.load(std::memory_order_relaxed);
+  if (_impl->hit_tracker) {
+    result.hit_overload_drops = _impl->hit_tracker->dropped_overflow_hits();
+  }
   result.hit_flush_lock_contended =
       _impl->flush_stats.hit_flush_lock_contended.load(
           std::memory_order_relaxed);

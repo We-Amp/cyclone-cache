@@ -56,6 +56,13 @@ struct CacheStats {
   // drop is observable rather than silently counted as a success.
   uint64_t hit_flush_lock_contended = 0;
 
+  // Hits record_hit dropped without recording because the tracker's pending
+  // set was at its hard bound (twice the configured maximum) and no flush
+  // could drain it in time.  Best-effort like the contended drops above;
+  // nonzero means the flush thread (or the reader-side sweeps, without one)
+  // cannot keep up with the overflow.
+  uint64_t hit_overload_drops = 0;
+
   // Completed periodic directory syncs across all volumes (persistent mode;
   // see CacheConfig::directory_sync_interval)
   uint64_t directory_syncs = 0;
