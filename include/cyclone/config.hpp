@@ -267,7 +267,9 @@ struct OptimizationConfig {
   [[nodiscard]] size_t effective_max_threads() const {
     if (max_threads == 0) {
       size_t hw = std::thread::hardware_concurrency();
-      return hw > 2 ? hw / 2 : 1;
+      // Automatic: never below min_threads, so a small host does not make
+      // an otherwise valid min_threads setting unusable.
+      return std::max(hw > 2 ? hw / 2 : size_t{1}, min_threads);
     }
     return max_threads;
   }
@@ -275,7 +277,7 @@ struct OptimizationConfig {
   // Validation, checked by OptimizationEngine::start() (Cache::start()
   // reports a failure as InvalidConfiguration).  A non-positive
   // scale_check_interval would spin the monitoring thread in a
-  // sleep_for(0) loop, and min_threads above the effective maximum breaks
+  // sleep_for(0) loop, and an explicit max_threads below min_threads breaks
   // the pool's clamping.  With load shedding enabled, a non-positive (or
   // NaN) baseline cannot be measured against; without shedding such a
   // baseline stays allowed and is treated as "no contribution" (see
@@ -284,7 +286,7 @@ struct OptimizationConfig {
     if (scale_check_interval.count() <= 0) {
       return false;
     }
-    if (min_threads > effective_max_threads()) {
+    if (max_threads != 0 && min_threads > max_threads) {
       return false;
     }
     if (enable_load_shedding &&

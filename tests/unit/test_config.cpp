@@ -193,7 +193,15 @@ TEST_CASE("OptimizationConfig validation", "[config]") {
     REQUIRE_FALSE(opt.is_valid());
   }
 
-  SECTION("min_threads above the effective maximum is invalid") {
+  SECTION("an automatic maximum never falls below min_threads") {
+    OptimizationConfig opt;
+    opt.max_threads = 0;
+    opt.min_threads = 4096;
+    REQUIRE(opt.effective_max_threads() >= opt.min_threads);
+    REQUIRE(opt.is_valid());
+  }
+
+  SECTION("an explicit maximum below min_threads is invalid") {
     OptimizationConfig opt;
     opt.min_threads = 4;
     opt.max_threads = 2;
