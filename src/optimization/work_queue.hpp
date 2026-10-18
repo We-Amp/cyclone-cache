@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -63,6 +64,21 @@ struct WorkItem {
   // Combined priority for queue ordering (higher = dequeue first)
   [[nodiscard]] uint64_t effective_priority() const {
     return (static_cast<uint64_t>(priority) << 32) | hit_count;
+  }
+
+  // effective_priority() with the time spent waiting folded in: one priority
+  // level per `aging` interval, so old low priority work eventually outranks
+  // newer high priority work.  `aging` must be positive.
+  [[nodiscard]] uint64_t aged_priority(
+      std::chrono::steady_clock::time_point now,
+      std::chrono::milliseconds aging) const {
+    uint64_t steps = 0;
+    if (now > enqueue_time) {
+      steps = static_cast<uint64_t>((now - enqueue_time) / aging);
+    }
+    uint64_t level =
+        std::min<uint64_t>(static_cast<uint64_t>(priority) + steps, UINT32_MAX);
+    return (level << 32) | hit_count;
   }
 
   // Comparison for priority queue (max heap by effective priority)
@@ -139,6 +155,8 @@ class WorkQueue {
 
  private:
   void rebuild_heap();
+  // Remove and return the best item.  Requires: _mutex held, _heap non-empty.
+  WorkItem pop_best_locked();
 
   OptimizationConfig _config;
 

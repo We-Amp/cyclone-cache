@@ -509,3 +509,67 @@ TEST_CASE("WorkQueue statistics are readable during concurrent operations",
   REQUIRE(s.current_size == 0);
   REQUIRE(s.current_memory == 0);
 }
+
+TEST_CASE("WorkQueue ages waiting items so low priority work is not starved",
+          "[queue][optimization]") {
+  OptimizationConfig config = default_config();
+  config.priority_aging_interval = std::chrono::milliseconds{20};
+  WorkQueue queue(config);
+
+  REQUIRE(queue
+              .enqueue(make_item("http://example.com/old", AlternateId::Brotli,
+                                 /*priority=*/0))
+              .has_value());
+  // About ten aging intervals: worth more than the priority gap below.
+  std::this_thread::sleep_for(std::chrono::milliseconds{250});
+  REQUIRE(queue
+              .enqueue(make_item("http://example.com/new", AlternateId::Brotli,
+                                 /*priority=*/3))
+              .has_value());
+
+  auto first = queue.try_dequeue();
+  REQUIRE(first.has_value());
+  REQUIRE(first->id.key == CacheKey::from_url("http://example.com/old"));
+  auto second = queue.try_dequeue();
+  REQUIRE(second.has_value());
+  REQUIRE(second->id.key == CacheKey::from_url("http://example.com/new"));
+}
+
+TEST_CASE("WorkQueue priority order holds when items are the same age",
+          "[queue][optimization]") {
+  OptimizationConfig config = default_config();
+  config.priority_aging_interval = std::chrono::hours{1};
+  WorkQueue queue(config);
+
+  REQUIRE(
+      queue.enqueue(make_item("http://example.com/a", AlternateId::Brotli, 1))
+          .has_value());
+  REQUIRE(
+      queue.enqueue(make_item("http://example.com/b", AlternateId::Brotli, 5))
+          .has_value());
+  REQUIRE(
+      queue.enqueue(make_item("http://example.com/c", AlternateId::Brotli, 3))
+          .has_value());
+  REQUIRE(queue.try_dequeue()->id.key ==
+          CacheKey::from_url("http://example.com/b"));
+  REQUIRE(queue.try_dequeue()->id.key ==
+          CacheKey::from_url("http://example.com/c"));
+  REQUIRE(queue.try_dequeue()->id.key ==
+          CacheKey::from_url("http://example.com/a"));
+}
+
+TEST_CASE("WorkQueue aging can be disabled", "[queue][optimization]") {
+  OptimizationConfig config = default_config();
+  config.priority_aging_interval = std::chrono::milliseconds{0};
+  WorkQueue queue(config);
+
+  REQUIRE(
+      queue.enqueue(make_item("http://example.com/old", AlternateId::Brotli, 0))
+          .has_value());
+  std::this_thread::sleep_for(std::chrono::milliseconds{50});
+  REQUIRE(
+      queue.enqueue(make_item("http://example.com/new", AlternateId::Brotli, 3))
+          .has_value());
+  REQUIRE(queue.try_dequeue()->id.key ==
+          CacheKey::from_url("http://example.com/new"));
+}

@@ -130,6 +130,10 @@ struct OptimizationConfig {
   double max_io_bandwidth_fraction =
       0.3;  // Max fraction of I/O for optimization
   size_t max_queue_size = 10000;
+  // A queued item's priority rises by one level for every interval it has
+  // waited, so low priority work cannot be starved forever by a steady
+  // stream of higher priority work.  Zero (or negative) disables aging.
+  std::chrono::milliseconds priority_aging_interval{10000};
   size_t max_memory_bytes = 256_MB;
 
   // Load shedding: pause the pool and cancel deferrable queued work while
@@ -202,6 +206,11 @@ struct OptimizationConfig {
   }
   OptimizationConfig &set_max_io_bandwidth_fraction(double val) {
     max_io_bandwidth_fraction = val;
+    return *this;
+  }
+  OptimizationConfig &set_priority_aging_interval(
+      std::chrono::milliseconds val) {
+    priority_aging_interval = val;
     return *this;
   }
   OptimizationConfig &set_max_queue_size(size_t val) {

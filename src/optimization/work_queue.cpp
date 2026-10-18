@@ -63,6 +63,35 @@ std::expected<void, CacheError> WorkQueue::enqueue(WorkItem item) {
   return {};
 }
 
+WorkItem WorkQueue::pop_best_locked() {
+  const auto aging = _config.priority_aging_interval;
+  if (aging.count() <= 0 || _heap.size() == 1) {
+    std::pop_heap(_heap.begin(), _heap.end());
+    WorkItem item = std::move(_heap.back());
+    _heap.pop_back();
+    return item;
+  }
+
+  // Aging changes the order over time, so the heap's static order is not
+  // enough: pick the best aged priority with a scan.  The queue is bounded
+  // by max_queue_size and each item is milliseconds of optimization work.
+  const auto now = std::chrono::steady_clock::now();
+  size_t best = 0;
+  uint64_t best_priority = _heap[0].aged_priority(now, aging);
+  for (size_t i = 1; i < _heap.size(); ++i) {
+    uint64_t candidate = _heap[i].aged_priority(now, aging);
+    if (candidate > best_priority) {
+      best_priority = candidate;
+      best = i;
+    }
+  }
+  std::swap(_heap[best], _heap.back());
+  WorkItem item = std::move(_heap.back());
+  _heap.pop_back();
+  rebuild_heap();
+  return item;
+}
+
 std::optional<WorkItem> WorkQueue::dequeue() {
   std::unique_lock lock(_mutex);
 
@@ -78,9 +107,7 @@ std::optional<WorkItem> WorkQueue::dequeue() {
     return std::nullopt;
   }
 
-  std::pop_heap(_heap.begin(), _heap.end());
-  WorkItem item = _heap.back();
-  _heap.pop_back();
+  WorkItem item = pop_best_locked();
 
   _queued_ids.erase(item.id);
   _memory_usage.fetch_sub(item.estimated_memory, std::memory_order_relaxed);
@@ -96,9 +123,7 @@ std::optional<WorkItem> WorkQueue::try_dequeue() {
     return std::nullopt;
   }
 
-  std::pop_heap(_heap.begin(), _heap.end());
-  WorkItem item = _heap.back();
-  _heap.pop_back();
+  WorkItem item = pop_best_locked();
 
   _queued_ids.erase(item.id);
   _memory_usage.fetch_sub(item.estimated_memory, std::memory_order_relaxed);
