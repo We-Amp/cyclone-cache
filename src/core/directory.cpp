@@ -239,7 +239,7 @@ std::optional<DirEntry> Directory::probe(const CacheKey &key) const {
       }
       // No chain walk: insert() never links chains (the ATS-style `next`
       // word is the fill serial now), and chain nodes would live in OTHER
-      // buckets guarded by OTHER seqlock versions — this bucket's version
+      // buckets guarded by OTHER seqlock versions: this bucket's version
       // recheck below could not validate them.
     }
 

@@ -5196,7 +5196,7 @@ std::expected<void, CacheError> Volume::commit_write_impl(
     }
     writer_seam(WriterSeam::kBeforePlainPublish);
 
-    // Update directory — publishes the entry.  MUST stay after the
+    // Update directory: publishes the entry.  MUST stay after the
     // durability flush above; see the ordering-invariant comment there.
     StripeAdmission admission(*this, *stripe);
     bool insert_busy = false;
