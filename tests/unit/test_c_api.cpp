@@ -247,6 +247,50 @@ TEST_CASE("C API: Basic miss handler invocation", "[c_api][miss_callback]") {
   cyclone_cache_destroy(cache);
 }
 
+TEST_CASE("C API: A waiter observes the fetched value already stored",
+          "[c_api][miss_callback]") {
+  TempCacheDir tmp;
+  std::string cache_path = tmp.path();
+  CycloneCacheConfig config{};
+  config.cache_path = cache_path.c_str();
+  config.cache_size_bytes = static_cast<uint64_t>(10 * 1024 * 1024);
+  config.ram_cache_size_bytes = static_cast<uint64_t>(1 * 1024 * 1024);
+  config.enable_checksum = 1;
+  config.num_segments = 2;
+
+  CycloneCacheHandle *cache = nullptr;
+  REQUIRE(cyclone_cache_create(&config, &cache) == CYCLONE_OK);
+
+  auto miss_handler = [](const char *, size_t, void *,
+                         CycloneMissDoneCallback done_cb, void *done_ud) {
+    const char value[] = "fetched";
+    done_cb(done_ud, value, sizeof(value) - 1, CYCLONE_OK);
+  };
+  REQUIRE(cyclone_cache_set_miss_handler(cache, miss_handler, nullptr) ==
+          CYCLONE_OK);
+
+  const char *key = "store_before_notify";
+  struct Context {
+    CycloneCacheHandle *cache;
+    const char *key;
+    CycloneError exists_in_callback = CYCLONE_NOT_FOUND;
+    bool called = false;
+  } ctx{cache, key};
+
+  auto callback = [](void *ud, const char *, size_t, CycloneError) {
+    auto *c = static_cast<Context *>(ud);
+    c->exists_in_callback = cyclone_cache_exists(c->cache, c->key, strlen(c->key));
+    c->called = true;
+  };
+
+  REQUIRE(cyclone_cache_read_async(cache, key, strlen(key), callback, &ctx) ==
+          CYCLONE_OK);
+  REQUIRE(ctx.called);
+  REQUIRE(ctx.exists_in_callback == CYCLONE_OK);
+
+  cyclone_cache_destroy(cache);
+}
+
 TEST_CASE("C API: Miss handler error propagation", "[c_api][miss_callback]") {
   TempCacheDir tmp;
   std::string cache_path = tmp.path();

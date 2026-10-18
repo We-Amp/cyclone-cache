@@ -488,7 +488,7 @@ static void miss_done_impl(MissDoneContext *ctx, const char *data,
   auto *ch = owner.get();
 
   // Collect waiters under lock, then notify outside lock.
-  // We notify BEFORE writing to cache so disk I/O doesn't block callbacks.
+  // The value is stored BEFORE the waiters are notified.
   // Move ctx to the completed list so it stays alive for any erroneous
   // second done_cb call (the atomic guard above will safely reject it).
   //
@@ -554,15 +554,16 @@ static void miss_done_impl(MissDoneContext *ctx, const char *data,
     }
   } write_back_done{ch, will_write};
 
-  // Notify all coalesced waiters FIRST (before cache write).
-  for (auto &[cb, ud] : waiters) {
-    cb(ud, data, data_len, err);
-  }
-
-  // THEN store in cache (non-blocking for waiters).
-  // Failure to write is non-fatal: waiters already have the data.
+  // Store in the cache FIRST, so a waiter that reads the key back from its
+  // callback finds the value.  Failure to write is non-fatal: the waiters
+  // are answered with the fetched data either way.
   if (will_write) {
     cyclone_cache_write(ch, key.data(), key.size(), data, data_len);
+  }
+
+  // THEN notify all coalesced waiters.
+  for (auto &[cb, ud] : waiters) {
+    cb(ud, data, data_len, err);
   }
 }
 
