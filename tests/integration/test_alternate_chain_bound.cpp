@@ -555,7 +555,9 @@ TEST_CASE("A cyclic alternate chain terminates the walk and heals",
   REQUIRE(tail != nullptr);
 
   const std::string file = volume_file(*cache);
-  const uint64_t tail_rel = read_next_link(file, head->disk_offset);
+  // The link field also carries the target's fill serial in its top bits.
+  const uint64_t tail_rel =
+      Document::link_offset(read_next_link(file, head->disk_offset));
   REQUIRE(tail_rel != 0);
   // disk_offset is absolute; the link field is stripe-relative.  One known
   // (absolute, relative) pair gives the stripe base for any other node.
