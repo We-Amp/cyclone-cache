@@ -570,3 +570,62 @@ TEST_CASE("OptimizationEngine concurrent stress",
   cache->stop();
   cleanup_temp(cache_path);
 }
+
+// Regression: the pool's start() resets its stop/pause flags, so stop -> start
+// cycles are meant to work, but the WorkQueue's stopped flag was never reset.
+// A restarted engine then refused every enqueue (Closed) and its workers
+// exited immediately on a stopped queue: the engine reported running while
+// silently dead.
+TEST_CASE("OptimizationEngine stop/start cycle resumes work",
+          "[optimization][integration][regression]") {
+  auto cache_path = temp_cache_path();
+
+  CacheConfig config;
+  config.optimization_config.set_enabled(true)
+      .set_min_threads(1)
+      .set_min_hits_before_optimize(0);
+
+  auto cache_result = Cache::create(config);
+  REQUIRE(cache_result.has_value());
+  auto &cache = *cache_result;
+
+  REQUIRE(cache->add_volume(cache_path + "/vol1", 10_MB).has_value());
+  REQUIRE(cache->start().has_value());
+
+  auto *engine = cache->optimization_engine();
+  REQUIRE(engine != nullptr);
+  auto plugin = std::make_shared<TestOptimizationPlugin>();
+  engine->register_plugin(plugin);
+
+  auto run_one = [&](const char *url, int expected_calls) {
+    auto key = CacheKey::from_url(url);
+    std::vector<std::byte> content(100, std::byte{0x42});
+    auto write_result = cache->write_sync(key, content.size());
+    REQUIRE(write_result.has_value());
+    REQUIRE(write_result->write_sync(content).has_value());
+    REQUIRE(write_result->close_sync().has_value());
+
+    std::vector<std::byte> header = {std::byte{0x01}};
+    engine->on_write_complete(key, header, content.size(),
+                              AlternateId::Original, 10);
+
+    auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (plugin->transform_calls.load() < expected_calls &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return plugin->transform_calls.load() >= expected_calls;
+  };
+
+  REQUIRE(run_one("http://test.com/before-restart", 1));
+
+  cache->stop();
+  REQUIRE(cache->start().has_value());
+  REQUIRE(engine->is_running());
+
+  REQUIRE(run_one("http://test.com/after-restart", 2));
+
+  cache->stop();
+  cleanup_temp(cache_path);
+}

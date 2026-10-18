@@ -50,6 +50,12 @@ void OptimizationEngine::start() {
   install_fork_handlers();
   _start_epoch.store(fork_epoch(), std::memory_order_release);
 
+  // Restart the queue before the pool: the pool's start() resets its own
+  // stop/pause flags, so a stop -> start cycle must clear the queue's stopped
+  // flag too, else restarted workers exit at once on the stopped queue and
+  // every enqueue is refused with Closed.
+  _work_queue.start();
+
   // Start thread pool
   _thread_pool->start();
 

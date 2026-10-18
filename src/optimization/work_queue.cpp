@@ -247,6 +247,12 @@ void WorkQueue::stop() {
   _cv.notify_all();
 }
 
+void WorkQueue::start() {
+  _stopped.store(false, std::memory_order_release);
+  // No notify: dequeue waiters from before the stop already returned, and new
+  // waiters are woken by the next enqueue.
+}
+
 bool WorkQueue::is_stopped() const noexcept {
   return _stopped.load(std::memory_order_acquire);
 }

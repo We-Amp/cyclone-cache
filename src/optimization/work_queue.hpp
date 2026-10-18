@@ -125,6 +125,11 @@ class WorkQueue {
   // Stop the queue (unblocks all waiting dequeue calls)
   void stop();
 
+  // Start the queue after a stop(): clears the stopped flag so enqueue and
+  // dequeue operate again.  Pairs with stop(); a freshly constructed queue
+  // is already started.  Any items still queued at stop() stay queued.
+  void start();
+
   // Check if the queue has been stopped
   bool is_stopped() const noexcept;
 

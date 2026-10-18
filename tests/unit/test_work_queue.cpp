@@ -262,6 +262,32 @@ TEST_CASE("WorkQueue stop behavior", "[queue][optimization]") {
   REQUIRE_FALSE(empty.has_value());
 }
 
+TEST_CASE("WorkQueue start after stop resumes operation",
+          "[queue][optimization]") {
+  OptimizationConfig config = default_config();
+  WorkQueue queue(config);
+
+  queue.enqueue(make_item("http://a.com", AlternateId::Brotli));
+  queue.stop();
+  REQUIRE(queue.is_stopped());
+  REQUIRE(queue.try_dequeue().has_value());  // Drain the pre-stop item
+
+  queue.start();
+  REQUIRE_FALSE(queue.is_stopped());
+
+  // Enqueue and dequeue operate again.
+  auto result = queue.enqueue(make_item("http://b.com", AlternateId::Gzip));
+  REQUIRE(result.has_value());
+  auto item = queue.try_dequeue();
+  REQUIRE(item.has_value());
+  REQUIRE(item->id.key == CacheKey::from_url("http://b.com"));
+
+  // Double start is harmless; stop still works afterwards.
+  queue.start();
+  queue.stop();
+  REQUIRE(queue.is_stopped());
+}
+
 TEST_CASE("WorkQueue blocking dequeue", "[queue][optimization][concurrent]") {
   OptimizationConfig config = default_config();
   WorkQueue queue(config);
