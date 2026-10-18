@@ -279,8 +279,7 @@ TEST_CASE("AdaptiveThreadPool scales back up after scaling down",
   pool.start();
 
   auto wait_for_threads = [&](size_t expected) {
-    auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (pool.thread_count() != expected &&
            std::chrono::steady_clock::now() < deadline) {
       std::this_thread::sleep_for(std::chrono::milliseconds(5));

@@ -1100,8 +1100,7 @@ std::expected<WriteHandle, CacheError> Cache::write_sync(
     // commit is reported to the load monitor (see record_read_complete above).
     auto inner = std::move(result->_impl);
     return WriteHandle(std::make_shared<LoadRecordingWriteHandle>(
-        std::move(inner),
-        _impl->optimization_engine->load_monitor_shared()));
+        std::move(inner), _impl->optimization_engine->load_monitor_shared()));
   }
   return result;
 }
@@ -1132,14 +1131,13 @@ std::expected<WriteHandle, CacheError> Cache::write_alternate_sync(
     Tier tier) {
   auto guard = lock_and_select(key, tier);
   if (!guard) return make_unexpected(guard.error());
-  auto result = guard->second->write_alternate_sync(key, alternate_id,
-                                                    content_length);
+  auto result =
+      guard->second->write_alternate_sync(key, alternate_id, content_length);
   if (result && _impl->optimization_engine) {
     // Same load-monitor reporting as write_sync().
     auto inner = std::move(result->_impl);
     return WriteHandle(std::make_shared<LoadRecordingWriteHandle>(
-        std::move(inner),
-        _impl->optimization_engine->load_monitor_shared()));
+        std::move(inner), _impl->optimization_engine->load_monitor_shared()));
   }
   return result;
 }

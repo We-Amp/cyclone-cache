@@ -267,10 +267,9 @@ void AdaptiveThreadPool::worker_loop(size_t /*worker_id*/) {
 
 void AdaptiveThreadPool::reap_finished_workers() {
   for (const auto id : _finished_workers) {
-    auto it = std::find_if(_workers.begin(), _workers.end(),
-                           [id](const std::thread &t) {
-                             return t.get_id() == id;
-                           });
+    auto it =
+        std::find_if(_workers.begin(), _workers.end(),
+                     [id](const std::thread &t) { return t.get_id() == id; });
     if (it != _workers.end()) {
       // The worker pushed its id on the way out of worker_loop and never
       // touches _workers_mutex afterwards, so this join waits at most for the

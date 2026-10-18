@@ -721,8 +721,7 @@ TEST_CASE("OptimizationEngine stop/start cycle resumes work",
     engine->on_write_complete(key, header, content.size(),
                               AlternateId::Original, 10);
 
-    auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (plugin->transform_calls.load() < expected_calls &&
            std::chrono::steady_clock::now() < deadline) {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -781,8 +780,7 @@ TEST_CASE("OptimizationEngine refuses duplicate in-flight work items",
   std::vector<std::byte> header = {std::byte{0x01}};
 
   auto wait_for_entries = [&](int expected) {
-    auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (plugin->entries.load(std::memory_order_acquire) < expected &&
            std::chrono::steady_clock::now() < deadline) {
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -958,8 +956,7 @@ TEST_CASE("OptimizationEngine load monitor observes cache traffic",
   constexpr uint64_t kWrites = 3;
   constexpr size_t kContentSize = 256;
   for (uint64_t i = 0; i < kWrites; ++i) {
-    auto key =
-        CacheKey::from_url("http://test.com/load-" + std::to_string(i));
+    auto key = CacheKey::from_url("http://test.com/load-" + std::to_string(i));
     std::vector<std::byte> content(kContentSize, std::byte{0x42});
     auto write_result = cache->write_sync(key, content.size());
     REQUIRE(write_result.has_value());

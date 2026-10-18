@@ -58,14 +58,14 @@ void LoadMonitor::update_metrics() {
   // Estimate load.  A non-positive baseline contributes nothing (fail open):
   // dividing by it would pin the estimate at the maximum and keep load
   // shedding engaged permanently.
-  double cpu_usage = _config.baseline_ops_per_sec > 0.0
-                         ? std::min(1.0, total_ops_per_sec /
-                                             _config.baseline_ops_per_sec)
-                         : 0.0;
-  double io_usage = _config.baseline_bytes_per_sec > 0.0
-                        ? std::min(1.0, total_bytes_per_sec /
-                                            _config.baseline_bytes_per_sec)
-                        : 0.0;
+  double cpu_usage =
+      _config.baseline_ops_per_sec > 0.0
+          ? std::min(1.0, total_ops_per_sec / _config.baseline_ops_per_sec)
+          : 0.0;
+  double io_usage =
+      _config.baseline_bytes_per_sec > 0.0
+          ? std::min(1.0, total_bytes_per_sec / _config.baseline_bytes_per_sec)
+          : 0.0;
   double combined = kCpuWeight * cpu_usage + kIoWeight * io_usage;
 
   // Update metrics
