@@ -667,6 +667,38 @@ StripeGeometry compute_stripe_geometry(size_t volume_size,
   return {num_stripes, base_stripe_size, stripe_remainder};
 }
 
+// Bytes from a stripe's start to its data area: the directory, page-rounded
+// for an mmap directory, 8-aligned for an in-memory one so document starts
+// stay 8-aligned (the v6 atomic-ref RMW requirement; DirEntry::kSize is 10).
+size_t stripe_directory_span(bool mmap_directory) {
+  if (mmap_directory) {
+    constexpr size_t kPageSize = 4096;
+    const size_t dir_size =
+        MmapDirectory::required_size(kDirectoryEntriesPerSegment);
+    return ((dir_size + kPageSize - 1) / kPageSize) * kPageSize;
+  }
+  const size_t dir_area = kDirectoryEntriesPerSegment *
+                          Directory::kEntriesPerBucket * DirEntry::kSize;
+  return (dir_area + 7u) & ~static_cast<size_t>(7u);
+}
+
+// True when every stripe of the geometry holds its directory and at least
+// one document header after it.  A smaller stripe would seat its data area
+// past the stripe end, so the capacity arithmetic underflows and every
+// write extends the file before it fails.
+bool stripe_geometry_fits(size_t volume_size, size_t explicit_stripe_size,
+                          bool mmap_directory) {
+  if (volume_size <= VolumeHeader::kSize) {
+    return false;
+  }
+  // The last stripe only ever gains the remainder, so the base stripe is
+  // the smallest one.
+  const StripeGeometry geom =
+      compute_stripe_geometry(volume_size, explicit_stripe_size);
+  return geom.base_stripe_size >=
+         stripe_directory_span(mmap_directory) + Document::kHeaderSize;
+}
+
 // Helper function to build AlternateInfo from a document
 // Extracts common code from chain traversal lambdas
 AlternateInfo build_alternate_info(const DocumentReader& reader,
@@ -1685,6 +1717,13 @@ std::expected<void, CacheError> Volume::open() {
   if (_fd >= 0) {
     return make_unexpected(CacheError::AlreadyOpen);
   }
+  // Refuse a geometry that cannot hold its directories before creating or
+  // growing any file (an unsized volume is checked once its size is known).
+  if (_config.size != 0 &&
+      !stripe_geometry_fits(_config.size, _config.stripe_size,
+                            _mp_config.enabled)) {
+    return make_unexpected(CacheError::InvalidArgument);
+  }
   _teardown.store(false, std::memory_order_seq_cst);  // (Re)opening.
 
   // Two-stage open to prevent TOCTOU race when multiple processes initialize
@@ -1763,7 +1802,9 @@ std::expected<void, CacheError> Volume::open_locked(bool created_new) {
     _config.size = st.st_size;
   }
 
-  if (_config.size == 0) {
+  if (_config.size == 0 ||
+      !stripe_geometry_fits(_config.size, _config.stripe_size,
+                            _mp_config.enabled)) {
     return make_unexpected(CacheError::InvalidArgument);
   }
 
@@ -2469,9 +2510,7 @@ std::expected<void, CacheError> Volume::init_stripes(bool exclusive) {
       stripe->mmap_directory->set_liveness(&_writer_liveness);
 
       // Data starts after directory, aligned to page size
-      size_t page_size = 4096;
-      stripe->data_offset =
-          offset + ((dir_size + page_size - 1) / page_size) * page_size;
+      stripe->data_offset = offset + stripe_directory_span(true);
       configure_frontier(*stripe);
 
       // Recover write_pos from the mmap'd directory header.
@@ -2510,12 +2549,7 @@ std::expected<void, CacheError> Volume::init_stripes(bool exclusive) {
       stripe->directory =
           std::make_unique<Directory>(kDirectoryEntriesPerSegment);
 
-      size_t dir_area = stripe->directory->capacity() * DirEntry::kSize;
-      // 8-align the data region so document starts stay 8-aligned (the v6
-      // atomic-ref RMW requirement); DirEntry::kSize is 10, so without this
-      // the alignment would only be accidental (holds iff capacity % 4 == 0).
-      dir_area = (dir_area + 7u) & ~static_cast<size_t>(7u);
-      stripe->data_offset = stripe->offset + dir_area;
+      stripe->data_offset = stripe->offset + stripe_directory_span(false);
       stripe->write_pos = stripe->data_offset;
       configure_frontier(*stripe);
     }
