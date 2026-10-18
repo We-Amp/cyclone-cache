@@ -28,6 +28,30 @@
 
 namespace cyclone {
 
+#ifdef CYCLONE_TEST_SEAMS
+namespace {
+std::atomic<long> g_pid_for_test{0};
+}  // namespace
+
+void set_pid_for_test(long pid) noexcept {
+  g_pid_for_test.store(pid, std::memory_order_relaxed);
+}
+#endif
+
+#ifndef _WIN32
+namespace {
+long current_pid() noexcept {
+#ifdef CYCLONE_TEST_SEAMS
+  if (const long pid = g_pid_for_test.load(std::memory_order_relaxed);
+      pid != 0) {
+    return pid;
+  }
+#endif
+  return static_cast<long>(::getpid());
+}
+}  // namespace
+#endif
+
 // Background thread that periodically flushes persistent (mmap'd) cache
 // directories to disk.  Owns the bounded power-loss window documented on
 // Volume::sync_directory(): without it, directory durability would ride
@@ -735,11 +759,17 @@ void Cache::stop() {
   //
   // owner_pid is written under the gate in start() and not changed while
   // the cache runs, so reading it without the gate is safe here.
+  //
+  // A PID can be reused (a grandchild in a PID namespace may get its
+  // ancestor's), so the fork epoch decides as well: it moves in every forked
+  // child whatever the PIDs say.  The PID comparison stays for a process
+  // whose fork handlers could not be registered (the epoch then never moves).
   if (_impl->abandoned_after_fork.load(std::memory_order_acquire)) {
     return;
   }
-  if (_impl->running && _impl->owner_pid != 0 &&
-      _impl->owner_pid != static_cast<long>(::getpid())) {
+  if (_impl->running &&
+      ((_impl->owner_pid != 0 && _impl->owner_pid != current_pid()) ||
+       _impl->owner_epoch.load(std::memory_order_acquire) != fork_epoch())) {
     if (_impl->abandoned_after_fork.exchange(true, std::memory_order_acq_rel)) {
       return;  // Another thread of this child got here first.
     }

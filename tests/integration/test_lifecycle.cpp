@@ -1673,6 +1673,65 @@ TEST_CASE("Cache teardown is fork-safe in a forked child",
   REQUIRE(WEXITSTATUS(status) == 0);
 }
 
+// The same teardown, in a child whose PID equals the one that start()ed the
+// cache: PIDs are reused (a grandchild in a PID namespace can get its
+// ancestor's), so a PID comparison alone would take the ordinary teardown
+// path there and wait for threads that do not exist in this process.  The
+// child must still tell from the fork epoch that it inherited the cache.
+TEST_CASE("Cache teardown in a forked child that reuses the owner's PID",
+          "[lifecycle][fork]") {
+  TempCacheDir tmp;
+  CacheConfig config;
+  config.enable_hit_tracking = true;
+  config.hit_flush_interval = std::chrono::milliseconds(50);
+  config.optimization_config.enabled = true;
+  config.optimization_config.scale_check_interval =
+      std::chrono::milliseconds(50);
+  auto cache_result = Cache::create(config);
+  REQUIRE(cache_result.has_value());
+  auto &cache = *cache_result;
+  VolumeConfig vol_config;
+  vol_config.path = tmp.path();
+  vol_config.size = static_cast<size_t>(20 * 1024 * 1024);
+  REQUIRE(cache->add_volume(vol_config).has_value());
+  REQUIRE(cache->start().has_value());
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  const long owner_pid = static_cast<long>(::getpid());
+  pid_t pid = fork();
+  REQUIRE(pid >= 0);
+  if (pid == 0) {
+    set_pid_for_test(owner_pid);  // as if this child reused the PID
+    cache->stop();
+    _exit(cache->is_running() ? 2 : 0);
+  }
+
+  bool exited = false;
+  int status = 0;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(15);
+  while (std::chrono::steady_clock::now() < deadline) {
+    pid_t r = ::waitpid(pid, &status, WNOHANG);
+    if (r == pid) {
+      exited = true;
+      break;
+    }
+    REQUIRE(r != -1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
+  if (!exited) {
+    signal_child(pid, SIGKILL);
+    ::waitpid(pid, &status, 0);
+  }
+
+  cache->stop();
+
+  INFO("a child with the owner's PID must still abandon the inherited cache");
+  REQUIRE(exited);
+  REQUIRE(WIFEXITED(status));
+  REQUIRE(WEXITSTATUS(status) == 0);
+}
+
 // Not under ThreadSanitizer: the parent has a test thread alive at the
 // fork, and the sanitizer's exit hook in the child reports that thread as
 // leaked and replaces the exit code this case reads.
