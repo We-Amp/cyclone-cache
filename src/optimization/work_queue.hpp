@@ -141,7 +141,10 @@ class WorkQueue {
   // Check if the queue has been stopped
   bool is_stopped() const noexcept;
 
-  // Get statistics
+  // Get statistics.
+  // Not a consistent snapshot: each counter is read on its own.  End counters
+  // (dequeued) are read before start counters, so an
+  // end never appears to exceed its start.
   WorkQueueStats stats() const;
 
  private:

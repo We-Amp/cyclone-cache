@@ -90,7 +90,10 @@ class AdaptiveThreadPool {
   // Force scale to specific thread count
   void scale_to(size_t target);
 
-  // Get statistics
+  // Get statistics.
+  // Not a consistent snapshot: each counter is read on its own.  End counters
+  // (completed, failed, dequeued) are read before start counters, so an
+  // end never appears to exceed its start.
   ThreadPoolStats stats() const;
 
  private:

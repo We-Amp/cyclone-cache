@@ -184,9 +184,10 @@ ThreadPoolStats AdaptiveThreadPool::stats() const {
   ThreadPoolStats result;
   result.current_threads = _hot.live.load(std::memory_order_relaxed);
   result.active_threads = _hot.active.load(std::memory_order_relaxed);
+  // End counters first (acquire keeps the later loads after them).
+  result.tasks_completed = _hot.tasks_completed.load(std::memory_order_acquire);
+  result.tasks_failed = _hot.tasks_failed.load(std::memory_order_acquire);
   result.tasks_started = _hot.tasks_started.load(std::memory_order_relaxed);
-  result.tasks_completed = _hot.tasks_completed.load(std::memory_order_relaxed);
-  result.tasks_failed = _hot.tasks_failed.load(std::memory_order_relaxed);
   result.scale_up_count = _hot.scale_up_count.load(std::memory_order_relaxed);
   result.scale_down_count =
       _hot.scale_down_count.load(std::memory_order_relaxed);

@@ -247,12 +247,13 @@ bool WorkQueue::is_stopped() const noexcept {
 
 WorkQueueStats WorkQueue::stats() const {
   WorkQueueStats result;
+  // End counters first (acquire keeps the later loads after them).
+  result.total_dequeued = _stat.total_dequeued.load(std::memory_order_acquire);
+  result.total_cancelled =
+      _stat.total_cancelled.load(std::memory_order_acquire);
+  result.total_enqueued = _stat.total_enqueued.load(std::memory_order_relaxed);
   result.current_size = size();
   result.current_memory = _memory_usage.load(std::memory_order_relaxed);
-  result.total_enqueued = _stat.total_enqueued.load(std::memory_order_relaxed);
-  result.total_dequeued = _stat.total_dequeued.load(std::memory_order_relaxed);
-  result.total_cancelled =
-      _stat.total_cancelled.load(std::memory_order_relaxed);
   result.rejected_full = _stat.rejected_full.load(std::memory_order_relaxed);
   result.rejected_memory =
       _stat.rejected_memory.load(std::memory_order_relaxed);

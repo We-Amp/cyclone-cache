@@ -99,7 +99,10 @@ class OptimizationEngine : public TaskProvider {
     return _load_shedding.load(std::memory_order_acquire);
   }
 
-  // Get combined statistics
+  // Get combined statistics.
+  // Not a consistent snapshot: each counter is read on its own.  End counters
+  // (completed, failed) are read before start counters, so an
+  // end never appears to exceed its start.
   OptimizationStats stats() const;
 
   // TaskProvider interface

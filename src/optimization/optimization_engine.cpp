@@ -253,10 +253,11 @@ bool OptimizationEngine::is_paused() const noexcept {
 
 OptimizationStats OptimizationEngine::stats() const {
   OptimizationStats result;
+  // End counters first (acquire keeps the later loads after them).
+  result.completed = _stat.completed.load(std::memory_order_acquire);
+  result.cancelled = _stat.cancelled.load(std::memory_order_acquire);
+  result.failed = _stat.failed.load(std::memory_order_acquire);
   result.queued = _stat.queued.load(std::memory_order_relaxed);
-  result.completed = _stat.completed.load(std::memory_order_relaxed);
-  result.cancelled = _stat.cancelled.load(std::memory_order_relaxed);
-  result.failed = _stat.failed.load(std::memory_order_relaxed);
   result.skipped = _stat.skipped.load(std::memory_order_relaxed);
   result.duplicates = _stat.duplicates.load(std::memory_order_relaxed);
   result.queue_stats = _work_queue.stats();
