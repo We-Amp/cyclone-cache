@@ -133,8 +133,13 @@ class AdaptiveThreadPool {
   std::mutex _pause_mutex;
   std::condition_variable _pause_cv;
 
-  mutable std::mutex _stats_mutex;
-  ThreadPoolStats _stats;
+  // Statistics counters: incremented on the per-task hot path, so they are
+  // relaxed atomics read field by field in stats(), never under a mutex.
+  std::atomic<uint64_t> _tasks_started{0};
+  std::atomic<uint64_t> _tasks_completed{0};
+  std::atomic<uint64_t> _tasks_failed{0};  // Tasks that threw an exception
+  std::atomic<uint64_t> _scale_up_count{0};
+  std::atomic<uint64_t> _scale_down_count{0};
 };
 
 }  // namespace cyclone

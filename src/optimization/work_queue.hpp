@@ -154,8 +154,16 @@ class WorkQueue {
 
   // Statistics
   std::atomic<size_t> _memory_usage{0};
-  mutable std::mutex _stats_mutex;
-  WorkQueueStats _stats;
+  // Counters incremented per queue operation, so relaxed atomics read field
+  // by field in stats(), never under a mutex.  The current size and memory
+  // gauges are derived on read (from _heap under a shared lock and
+  // _memory_usage).
+  std::atomic<uint64_t> _total_enqueued{0};
+  std::atomic<uint64_t> _total_dequeued{0};
+  std::atomic<uint64_t> _total_cancelled{0};
+  std::atomic<uint64_t> _rejected_full{0};
+  std::atomic<uint64_t> _rejected_memory{0};
+  std::atomic<uint64_t> _duplicates{0};
 };
 
 }  // namespace cyclone

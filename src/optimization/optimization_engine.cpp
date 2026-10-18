@@ -181,8 +181,7 @@ void OptimizationEngine::on_write_complete(const CacheKey &key,
 
   // Check minimum hits threshold
   if (hit_count < _config.min_hits_before_optimize) {
-    std::lock_guard stats_lock(_stats_mutex);
-    ++_stats.skipped;
+    _skipped.fetch_add(1, std::memory_order_relaxed);
     return;
   }
 
@@ -224,8 +223,7 @@ void OptimizationEngine::on_write_complete(const CacheKey &key,
 
         auto result = _work_queue.enqueue(item);
         if (result.has_value()) {
-          std::lock_guard stats_lock(_stats_mutex);
-          ++_stats.queued;
+          _queued.fetch_add(1, std::memory_order_relaxed);
         }
       }
 #if CYCLONE_OPT_FORCED_UNWIND
@@ -233,8 +231,7 @@ void OptimizationEngine::on_write_complete(const CacheKey &key,
       throw;
 #endif
     } catch (...) {
-      std::lock_guard stats_lock(_stats_mutex);
-      ++_stats.failed;
+      _failed.fetch_add(1, std::memory_order_relaxed);
     }
   }
 }
@@ -255,8 +252,13 @@ bool OptimizationEngine::is_paused() const noexcept {
 }
 
 OptimizationStats OptimizationEngine::stats() const {
-  std::lock_guard lock(_stats_mutex);
-  OptimizationStats result = _stats;
+  OptimizationStats result;
+  result.queued = _queued.load(std::memory_order_relaxed);
+  result.completed = _completed.load(std::memory_order_relaxed);
+  result.cancelled = _cancelled.load(std::memory_order_relaxed);
+  result.failed = _failed.load(std::memory_order_relaxed);
+  result.skipped = _skipped.load(std::memory_order_relaxed);
+  result.duplicates = _duplicates.load(std::memory_order_relaxed);
   result.queue_stats = _work_queue.stats();
   result.pool_stats = _thread_pool->stats();
   result.load_metrics = _load_monitor->metrics();
@@ -312,8 +314,7 @@ void OptimizationEngine::process_work_item(WorkItem item) {
     }
   }
   if (refused) {
-    std::lock_guard stats_lock(_stats_mutex);
-    ++_stats.duplicates;
+    _duplicates.fetch_add(1, std::memory_order_relaxed);
     return;
   }
 
@@ -365,8 +366,7 @@ void OptimizationEngine::process_work_item(WorkItem item) {
     }
     if (!source) {
       if (read_pass_entered) {
-        std::lock_guard stats_lock(_stats_mutex);
-        ++_stats.failed;
+        _failed.fetch_add(1, std::memory_order_relaxed);
       }
       std::lock_guard lock(_active_work_mutex);
       _active_work.erase(item.id);
@@ -395,11 +395,9 @@ void OptimizationEngine::process_work_item(WorkItem item) {
     if (!transform_result) {
       if (transform_result.error() == CacheError::OptimizationCancelled) {
         plugin->on_cancelled(item.id.key, item.id.target_alternate);
-        std::lock_guard stats_lock(_stats_mutex);
-        ++_stats.cancelled;
+        _cancelled.fetch_add(1, std::memory_order_relaxed);
       } else {
-        std::lock_guard stats_lock(_stats_mutex);
-        ++_stats.failed;
+        _failed.fetch_add(1, std::memory_order_relaxed);
       }
       return;
     }
@@ -410,8 +408,7 @@ void OptimizationEngine::process_work_item(WorkItem item) {
     if (!write_pass) {
       // No pass is open here, so calling the plugin is allowed.
       plugin->on_cancelled(item.id.key, item.id.target_alternate);
-      std::lock_guard stats_lock(_stats_mutex);
-      ++_stats.cancelled;
+      _cancelled.fetch_add(1, std::memory_order_relaxed);
       return;
     }
 
@@ -420,8 +417,7 @@ void OptimizationEngine::process_work_item(WorkItem item) {
         transform_result->content.size());
 
     if (!write_result) {
-      std::lock_guard stats_lock(_stats_mutex);
-      ++_stats.failed;
+      _failed.fetch_add(1, std::memory_order_relaxed);
       return;
     }
 
@@ -435,21 +431,18 @@ void OptimizationEngine::process_work_item(WorkItem item) {
         write_handle.write_sync(transform_result->content);
     if (!write_content_result) {
       write_handle.abort();
-      std::lock_guard stats_lock(_stats_mutex);
-      ++_stats.failed;
+      _failed.fetch_add(1, std::memory_order_relaxed);
       return;
     }
 
     // Close/commit
     auto close_result = write_handle.close_sync();
     if (!close_result) {
-      std::lock_guard stats_lock(_stats_mutex);
-      ++_stats.failed;
+      _failed.fetch_add(1, std::memory_order_relaxed);
       return;
     }
 
-    std::lock_guard stats_lock(_stats_mutex);
-    ++_stats.completed;
+    _completed.fetch_add(1, std::memory_order_relaxed);
 #if CYCLONE_OPT_FORCED_UNWIND
   } catch (abi::__forced_unwind &) {
     throw;
@@ -466,8 +459,7 @@ void OptimizationEngine::process_work_item(WorkItem item) {
         _active_work.erase(it);
       }
     }
-    std::lock_guard stats_lock(_stats_mutex);
-    ++_stats.failed;
+    _failed.fetch_add(1, std::memory_order_relaxed);
   }
 }
 
@@ -502,8 +494,7 @@ void OptimizationEngine::monitoring_loop() {
         // Cancel deferrable work
         size_t cancelled = _work_queue.cancel_deferrable();
         if (cancelled > 0) {
-          std::lock_guard lock(_stats_mutex);
-          _stats.cancelled += cancelled;
+          _cancelled.fetch_add(cancelled, std::memory_order_relaxed);
         }
       }
     } else if (_load_shedding.load(std::memory_order_acquire) &&

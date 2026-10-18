@@ -24,15 +24,13 @@ std::expected<void, CacheError> WorkQueue::enqueue(WorkItem item) {
 
   // Check for duplicates
   if (_queued_ids.contains(item.id)) {
-    std::lock_guard stats_lock(_stats_mutex);
-    ++_stats.duplicates;
+    _duplicates.fetch_add(1, std::memory_order_relaxed);
     return {};  // Silently succeed for duplicates
   }
 
   // Check queue size limit
   if (_heap.size() >= _config.max_queue_size) {
-    std::lock_guard stats_lock(_stats_mutex);
-    ++_stats.rejected_full;
+    _rejected_full.fetch_add(1, std::memory_order_relaxed);
     return std::unexpected(CacheError::OptimizationQueueFull);
   }
 
@@ -41,8 +39,7 @@ std::expected<void, CacheError> WorkQueue::enqueue(WorkItem item) {
   size_t item_memory = item.estimated_memory;
   if (item_memory > _config.max_memory_bytes - current_memory) {
     // Would overflow or exceed limit
-    std::lock_guard stats_lock(_stats_mutex);
-    ++_stats.rejected_memory;
+    _rejected_memory.fetch_add(1, std::memory_order_relaxed);
     return std::unexpected(CacheError::OptimizationQueueFull);
   }
 
@@ -58,13 +55,7 @@ std::expected<void, CacheError> WorkQueue::enqueue(WorkItem item) {
   std::push_heap(_heap.begin(), _heap.end());
 
   _memory_usage.fetch_add(item_memory, std::memory_order_relaxed);
-
-  {
-    std::lock_guard stats_lock(_stats_mutex);
-    ++_stats.total_enqueued;
-    _stats.current_size = _heap.size();
-    _stats.current_memory = _memory_usage.load(std::memory_order_relaxed);
-  }
+  _total_enqueued.fetch_add(1, std::memory_order_relaxed);
 
   lock.unlock();
   _cv.notify_one();
@@ -93,13 +84,7 @@ std::optional<WorkItem> WorkQueue::dequeue() {
 
   _queued_ids.erase(item.id);
   _memory_usage.fetch_sub(item.estimated_memory, std::memory_order_relaxed);
-
-  {
-    std::lock_guard stats_lock(_stats_mutex);
-    ++_stats.total_dequeued;
-    _stats.current_size = _heap.size();
-    _stats.current_memory = _memory_usage.load(std::memory_order_relaxed);
-  }
+  _total_dequeued.fetch_add(1, std::memory_order_relaxed);
 
   return item;
 }
@@ -117,13 +102,7 @@ std::optional<WorkItem> WorkQueue::try_dequeue() {
 
   _queued_ids.erase(item.id);
   _memory_usage.fetch_sub(item.estimated_memory, std::memory_order_relaxed);
-
-  {
-    std::lock_guard stats_lock(_stats_mutex);
-    ++_stats.total_dequeued;
-    _stats.current_size = _heap.size();
-    _stats.current_memory = _memory_usage.load(std::memory_order_relaxed);
-  }
+  _total_dequeued.fetch_add(1, std::memory_order_relaxed);
 
   return item;
 }
@@ -151,12 +130,7 @@ bool WorkQueue::cancel(const WorkItemId &id) {
 
   rebuild_heap();
 
-  {
-    std::lock_guard stats_lock(_stats_mutex);
-    ++_stats.total_cancelled;
-    _stats.current_size = _heap.size();
-    _stats.current_memory = _memory_usage.load(std::memory_order_relaxed);
-  }
+  _total_cancelled.fetch_add(1, std::memory_order_relaxed);
 
   return true;
 }
@@ -183,10 +157,7 @@ size_t WorkQueue::cancel_by_key(const CacheKey &key) {
     _memory_usage.fetch_sub(mem_freed, std::memory_order_relaxed);
     rebuild_heap();
 
-    std::lock_guard stats_lock(_stats_mutex);
-    _stats.total_cancelled += cancelled;
-    _stats.current_size = _heap.size();
-    _stats.current_memory = _memory_usage.load(std::memory_order_relaxed);
+    _total_cancelled.fetch_add(cancelled, std::memory_order_relaxed);
   }
 
   return cancelled;
@@ -214,10 +185,7 @@ size_t WorkQueue::cancel_deferrable() {
     _memory_usage.fetch_sub(mem_freed, std::memory_order_relaxed);
     rebuild_heap();
 
-    std::lock_guard stats_lock(_stats_mutex);
-    _stats.total_cancelled += cancelled;
-    _stats.current_size = _heap.size();
-    _stats.current_memory = _memory_usage.load(std::memory_order_relaxed);
+    _total_cancelled.fetch_add(cancelled, std::memory_order_relaxed);
   }
 
   return cancelled;
@@ -258,8 +226,16 @@ bool WorkQueue::is_stopped() const noexcept {
 }
 
 WorkQueueStats WorkQueue::stats() const {
-  std::lock_guard lock(_stats_mutex);
-  return _stats;
+  WorkQueueStats result;
+  result.current_size = size();
+  result.current_memory = _memory_usage.load(std::memory_order_relaxed);
+  result.total_enqueued = _total_enqueued.load(std::memory_order_relaxed);
+  result.total_dequeued = _total_dequeued.load(std::memory_order_relaxed);
+  result.total_cancelled = _total_cancelled.load(std::memory_order_relaxed);
+  result.rejected_full = _rejected_full.load(std::memory_order_relaxed);
+  result.rejected_memory = _rejected_memory.load(std::memory_order_relaxed);
+  result.duplicates = _duplicates.load(std::memory_order_relaxed);
+  return result;
 }
 
 void WorkQueue::rebuild_heap() { std::make_heap(_heap.begin(), _heap.end()); }

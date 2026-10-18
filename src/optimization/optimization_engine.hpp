@@ -138,9 +138,14 @@ class OptimizationEngine : public TaskProvider {
   std::chrono::steady_clock::time_point _load_drop_time;
   bool _in_cooldown{false};
 
-  // Statistics
-  mutable std::mutex _stats_mutex;
-  OptimizationStats _stats;
+  // Statistics counters: incremented on the per-task hot path, so relaxed
+  // atomics read field by field in stats(), never under a mutex.
+  std::atomic<uint64_t> _queued{0};
+  std::atomic<uint64_t> _completed{0};
+  std::atomic<uint64_t> _cancelled{0};
+  std::atomic<uint64_t> _failed{0};
+  std::atomic<uint64_t> _skipped{0};
+  std::atomic<uint64_t> _duplicates{0};
 
   // Cancellation tokens for in-progress work items
   mutable std::mutex _active_work_mutex;

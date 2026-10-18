@@ -40,11 +40,6 @@ void AdaptiveThreadPool::start() {
   for (size_t i = 0; i < initial; ++i) {
     spawn_worker();
   }
-
-  {
-    std::lock_guard stats_lock(_stats_mutex);
-    _stats.current_threads = _workers.size();
-  }
 }
 
 void AdaptiveThreadPool::stop() {
@@ -154,8 +149,7 @@ void AdaptiveThreadPool::check_scaling() {
       // the historical maximum, blocking every later scale-up below it.
       if (_live_count.load(std::memory_order_acquire) < new_target) {
         spawn_worker();
-        std::lock_guard stats_lock(_stats_mutex);
-        ++_stats.scale_up_count;
+        _scale_up_count.fetch_add(1, std::memory_order_relaxed);
       }
     }
   } else if (should_scale_down()) {
@@ -165,8 +159,7 @@ void AdaptiveThreadPool::check_scaling() {
       size_t new_target = std::max(current - 1, min);
       _target_thread_count.store(new_target, std::memory_order_release);
 
-      std::lock_guard stats_lock(_stats_mutex);
-      ++_stats.scale_down_count;
+      _scale_down_count.fetch_add(1, std::memory_order_relaxed);
     }
   }
 }
@@ -185,18 +178,17 @@ void AdaptiveThreadPool::scale_to(size_t target) {
   while (_live_count.load(std::memory_order_acquire) < target) {
     spawn_worker();
   }
-
-  {
-    std::lock_guard stats_lock(_stats_mutex);
-    _stats.current_threads = _workers.size();
-  }
 }
 
 ThreadPoolStats AdaptiveThreadPool::stats() const {
-  std::lock_guard lock(_stats_mutex);
-  ThreadPoolStats result = _stats;
+  ThreadPoolStats result;
   result.current_threads = _live_count.load(std::memory_order_relaxed);
   result.active_threads = _active_count.load(std::memory_order_relaxed);
+  result.tasks_started = _tasks_started.load(std::memory_order_relaxed);
+  result.tasks_completed = _tasks_completed.load(std::memory_order_relaxed);
+  result.tasks_failed = _tasks_failed.load(std::memory_order_relaxed);
+  result.scale_up_count = _scale_up_count.load(std::memory_order_relaxed);
+  result.scale_down_count = _scale_down_count.load(std::memory_order_relaxed);
   return result;
 }
 
@@ -257,15 +249,11 @@ void AdaptiveThreadPool::worker_loop(uint64_t generation) {
     }
 
     _active_count.fetch_add(1, std::memory_order_relaxed);
-    {
-      std::lock_guard stats_lock(_stats_mutex);
-      ++_stats.tasks_started;
-    }
+    _tasks_started.fetch_add(1, std::memory_order_relaxed);
 
     try {
       task();
-      std::lock_guard stats_lock(_stats_mutex);
-      ++_stats.tasks_completed;
+      _tasks_completed.fetch_add(1, std::memory_order_relaxed);
 #if CYCLONE_OPT_FORCED_UNWIND
     } catch (abi::__forced_unwind &) {
       throw;
@@ -274,8 +262,7 @@ void AdaptiveThreadPool::worker_loop(uint64_t generation) {
       // Tasks run embedder-supplied code (plugin transforms); an exception
       // escaping worker_loop would terminate the host process.  Record the
       // failure and keep serving later tasks.
-      std::lock_guard stats_lock(_stats_mutex);
-      ++_stats.tasks_failed;
+      _tasks_failed.fetch_add(1, std::memory_order_relaxed);
     }
 
     _active_count.fetch_sub(1, std::memory_order_relaxed);

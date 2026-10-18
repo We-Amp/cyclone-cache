@@ -461,3 +461,51 @@ TEST_CASE("WorkQueue concurrent stress",
   REQUIRE(stats.total_dequeued == consumed.load());
   REQUIRE(queue.empty());
 }
+
+TEST_CASE("WorkQueue statistics are readable during concurrent operations",
+          "[queue][optimization][concurrent]") {
+  OptimizationConfig config = default_config();
+  config.max_queue_size = 100000;
+  config.max_memory_bytes = 1_GB;
+  WorkQueue queue(config);
+
+  constexpr int kPerThread = 500;
+  std::atomic<bool> done{false};
+  std::atomic<uint64_t> reader_polls{0};
+  std::atomic<int> bad_reads{0};
+  std::atomic<int> failed_enqueues{0};
+
+  std::thread reader([&] {
+    while (!done.load(std::memory_order_acquire)) {
+      auto s = queue.stats();
+      if (s.current_size > 2 * kPerThread) bad_reads.fetch_add(1);
+      reader_polls.fetch_add(1, std::memory_order_relaxed);
+    }
+  });
+
+  std::vector<std::thread> producers;
+  for (int t = 0; t < 2; ++t) {
+    producers.emplace_back([&, t] {
+      for (int i = 0; i < kPerThread; ++i) {
+        auto item = make_item("http://example.com/s" + std::to_string(t) + "/" +
+                                  std::to_string(i),
+                              AlternateId::Brotli);
+        if (!queue.enqueue(item).has_value()) failed_enqueues.fetch_add(1);
+      }
+    });
+  }
+  for (auto &p : producers) p.join();
+  for (int i = 0; i < 2 * kPerThread; ++i) {
+    REQUIRE(queue.try_dequeue().has_value());
+  }
+  done.store(true, std::memory_order_release);
+  reader.join();
+
+  REQUIRE(bad_reads.load() == 0);
+  REQUIRE(failed_enqueues.load() == 0);
+  auto s = queue.stats();
+  REQUIRE(s.total_enqueued == 2 * kPerThread);
+  REQUIRE(s.total_dequeued == 2 * kPerThread);
+  REQUIRE(s.current_size == 0);
+  REQUIRE(s.current_memory == 0);
+}
