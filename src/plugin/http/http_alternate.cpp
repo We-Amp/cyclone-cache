@@ -115,6 +115,14 @@ std::optional<size_t> HttpAlternatePlugin::select_variant(
   size_t best_index = 0;
   float best_quality = 0.0f;
 
+  // The negotiation headers do not depend on the variant: scan the request
+  // header block once per lookup instead of once per variant.
+  const auto accept = parse_header_value(ctx.request_headers, "Accept");
+  const auto accept_encoding =
+      parse_header_value(ctx.request_headers, "Accept-Encoding");
+  const auto accept_language =
+      parse_header_value(ctx.request_headers, "Accept-Language");
+
   for (size_t i = 0; i < variants.size(); ++i) {
     const auto &variant = variants[i];
 
@@ -135,7 +143,6 @@ std::optional<size_t> HttpAlternatePlugin::select_variant(
 
     float quality = 1.0f;
 
-    auto accept = parse_header_value(ctx.request_headers, "Accept");
     if (!accept.empty()) {
       auto content_type = alt.get_response_header("Content-Type");
       if (content_type) {
@@ -143,16 +150,12 @@ std::optional<size_t> HttpAlternatePlugin::select_variant(
       }
     }
 
-    auto accept_encoding =
-        parse_header_value(ctx.request_headers, "Accept-Encoding");
     if (!accept_encoding.empty()) {
       auto content_encoding = alt.get_response_header("Content-Encoding");
       quality *= calculate_accept_encoding_quality(
           accept_encoding, content_encoding.value_or("identity"));
     }
 
-    auto accept_language =
-        parse_header_value(ctx.request_headers, "Accept-Language");
     if (!accept_language.empty()) {
       auto content_language = alt.get_response_header("Content-Language");
       if (content_language) {
