@@ -1744,3 +1744,79 @@ TEST_CASE("C API: read_async without a miss handler reports corruption",
 
   cyclone_cache_destroy(cache);
 }
+
+// =============================================================================
+// Callback re-entrancy
+// =============================================================================
+
+TEST_CASE("C API: read_cb rejected by the in-flight limit may re-enter",
+          "[c_api][miss_callback]") {
+  // read_cb runs on the caller's stack.  Every path that calls it must do so
+  // with no bridge lock held, so a callback can call back into the same
+  // cache (chain another read, change the miss handler, drain).  The
+  // rejection at the in-flight limit is one such path.
+  TempCacheDir tmp;
+  std::string cache_path = tmp.path();
+  CycloneCacheConfig config{};
+  config.cache_path = cache_path.c_str();
+  config.cache_size_bytes = static_cast<uint64_t>(10 * 1024 * 1024);
+  config.ram_cache_size_bytes = static_cast<uint64_t>(1 * 1024 * 1024);
+  config.enable_checksum = 1;
+  config.num_segments = 2;
+  config.max_in_flight_requests = 1;
+
+  CycloneCacheHandle *cache = nullptr;
+  REQUIRE(cyclone_cache_create(&config, &cache) == CYCLONE_OK);
+
+  // A handler that parks the fetch, so the first key holds the only slot.
+  struct Parked {
+    CycloneMissDoneCallback done_cb = nullptr;
+    void *done_ud = nullptr;
+  } parked;
+  auto park = [](const char *, size_t, void *ud, CycloneMissDoneCallback cb,
+                 void *done_ud) {
+    auto *p = static_cast<Parked *>(ud);
+    p->done_cb = cb;
+    p->done_ud = done_ud;
+  };
+  REQUIRE(cyclone_cache_set_miss_handler(cache, park, &parked) == CYCLONE_OK);
+
+  auto ignore = [](void *, const char *, size_t, CycloneError) {};
+  REQUIRE(cyclone_cache_read_async(cache, "first", 5, ignore, nullptr) ==
+          CYCLONE_OK);
+  REQUIRE(parked.done_cb != nullptr);
+
+  struct Reentry {
+    CycloneCacheHandle *cache;
+    CycloneError err = CYCLONE_OK;
+    CycloneError nested = CYCLONE_INTERNAL_ERROR;
+  } reentry{cache};
+  auto reenter = [](void *ud, const char *, size_t, CycloneError err) {
+    auto *r = static_cast<Reentry *>(ud);
+    r->err = err;
+    // Takes the bridge lock: deadlocks if read_cb runs under it.
+    r->nested = cyclone_cache_set_miss_handler(r->cache, nullptr, nullptr);
+  };
+
+  std::atomic<bool> returned{false};
+  std::thread t([&] {
+    cyclone_cache_read_async(cache, "second", 6, reenter, &reentry);
+    returned.store(true);
+  });
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!returned.load() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  if (!returned.load()) {
+    // Deadlocked: the thread cannot be joined and the cache cannot be
+    // destroyed.  Leave both behind and fail.
+    t.detach();
+    FAIL("read_cb ran under the bridge lock: re-entry deadlocked");
+  }
+  t.join();
+  CHECK(reentry.err == CYCLONE_NO_SPACE);
+  CHECK(reentry.nested == CYCLONE_OK);
+
+  parked.done_cb(parked.done_ud, "v", 1, CYCLONE_OK);
+  cyclone_cache_destroy(cache);
+}

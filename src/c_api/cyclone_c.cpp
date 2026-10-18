@@ -495,30 +495,37 @@ CycloneError cyclone_cache_read_async(CycloneCacheHandle *cache,
   // Coalescing logic.
   std::string key_str(key, key_len);
   bool should_invoke_handler = false;
+  // A rejection decided under the lock is reported after it is released:
+  // read_cb may call back into this cache, and in_flight_mu is not
+  // recursive.
+  CycloneError rejected = CYCLONE_OK;
   {
     std::lock_guard<std::mutex> lock(cache->in_flight_mu);
 
     // Re-check shutdown under lock.
     if (cache->shutting_down.load(std::memory_order_relaxed)) {
-      read_cb(read_user_data, nullptr, 0, CYCLONE_NOT_INITIALIZED);
-      return CYCLONE_OK;
-    }
+      rejected = CYCLONE_NOT_INITIALIZED;
+    } else {
+      // Check in-flight limit (only for new keys, coalescing is always
+      // allowed).
+      auto it = cache->in_flight.find(key_str);
+      if (it == cache->in_flight.end() && cache->max_in_flight > 0 &&
+          cache->in_flight.size() >= cache->max_in_flight) {
+        rejected = CYCLONE_NO_SPACE;
+      } else {
+        auto &entry = cache->in_flight[key_str];
+        entry.waiters.emplace_back(read_cb, read_user_data);
 
-    // Check in-flight limit (only for new keys, coalescing is always allowed).
-    auto it = cache->in_flight.find(key_str);
-    if (it == cache->in_flight.end() && cache->max_in_flight > 0 &&
-        cache->in_flight.size() >= cache->max_in_flight) {
-      read_cb(read_user_data, nullptr, 0, CYCLONE_NO_SPACE);
-      return CYCLONE_OK;
+        if (!entry.fetch_in_progress) {
+          entry.fetch_in_progress = true;
+          should_invoke_handler = true;
+        }
+      }
     }
-
-    auto &entry = cache->in_flight[key_str];
-    entry.waiters.emplace_back(read_cb, read_user_data);
-
-    if (!entry.fetch_in_progress) {
-      entry.fetch_in_progress = true;
-      should_invoke_handler = true;
-    }
+  }
+  if (rejected != CYCLONE_OK) {
+    read_cb(read_user_data, nullptr, 0, rejected);
+    return CYCLONE_OK;
   }
 
   if (should_invoke_handler) {
