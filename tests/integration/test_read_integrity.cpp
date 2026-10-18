@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "core/document.hpp"
+#include "core/volume.hpp"
 #include "cyclone/alternate.hpp"
 #include "cyclone/cache.hpp"
 #include "cyclone/config.hpp"
@@ -361,5 +362,51 @@ TEST_CASE(
       }
     }
   }
+}
+TEST_CASE(
+    "Read integrity: payload damage under an unchanged header is found on "
+    "the warm path within a bounded number of reads",
+    "[integrity][crc_cache]") {
+  OpenCache oc(integrity_config());
+  Cache &cache = *oc.cache;
+  const CacheKey key("integrity-warm-damage");
+  const auto content = make_content(5, 8192);
+  REQUIRE(write_entry(cache, key, content));
+  // The first read verifies the document and caches the verdict.
+  const uint64_t doc = document_offset(cache, key, content);
+
+  // Damage one payload byte; the fixed header, and so the cached verdict's
+  // identity, is unchanged.
+  const std::array<std::byte, 1> flipped = {content[4000] ^ std::byte{0x3C}};
+  pwrite_bytes(oc.file, doc + Document::kHeaderSize + 4000, flipped);
+
+  const int limit = static_cast<int>(Volume::kChecksumRevalidateInterval) * 2;
+  int first_miss = -1;
+  int served_after_miss = 0;
+  for (int i = 0; i < limit; ++i) {
+    auto rh = cache.read_sync(key);
+    if (!rh.has_value()) {
+      if (first_miss < 0) {
+        first_miss = i;
+      }
+      continue;
+    }
+    if (first_miss >= 0) {
+      ++served_after_miss;
+    }
+  }
+  // Found within one interval of warm reads...
+  REQUIRE(first_miss >= 0);
+  CHECK(first_miss <= static_cast<int>(Volume::kChecksumRevalidateInterval));
+  // ...and, once found, never served again: the failed pass drops the
+  // cached verdict instead of leaving it to vouch for the damaged bytes.
+  CHECK(served_after_miss == 0);
+
+  // Repairing the byte makes the document verify and serve again.
+  const std::array<std::byte, 1> original = {content[4000]};
+  pwrite_bytes(oc.file, doc + Document::kHeaderSize + 4000, original);
+  auto rh = cache.read_sync(key);
+  REQUIRE(rh.has_value());
+  REQUIRE(same_bytes(rh->content(), content));
 }
 #endif  // !_WIN32

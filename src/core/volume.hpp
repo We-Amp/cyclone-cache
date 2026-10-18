@@ -2179,6 +2179,12 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // the job of the other gauntlet legs -- admission, the positional guard,
   // the borrow/lease Dekker revalidation -- which run whether or not this
   // cache hits.  It is not the overwrite guard; never lean on it as one.
+  // As a bound on what a payload change the other legs cannot see (media
+  // damage, a write behind the cache's back) can cost, a cached verdict is
+  // not trusted forever: every kChecksumRevalidateInterval-th read a thread
+  // would serve from a cached verdict runs the CRC pass anyway, and a pass
+  // that fails drops the verdict, so the damaged incarnation is found and
+  // then never served again.
   //
   // Direct-mapped by offset (Fibonacci hashing: the multiply spreads
   // documents of similar size whose offsets differ by a constant stride),
@@ -2194,6 +2200,14 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // re-verified CRC32 on EVERY read (profiled as the top hot-path cost on a
   // 20k-entry corpus).
   static constexpr size_t kChecksumCacheSize = 65536;
+
+ public:
+  // One in this many reads served from a cached CRC verdict re-runs the
+  // CRC pass (per thread; see WHAT IT DOES NOT COVER above).  The cost is
+  // one CRC pass amortised over this many warm reads.  Public for tests.
+  static constexpr uint32_t kChecksumRevalidateInterval = 256;
+
+ private:
   static constexpr unsigned kChecksumCacheShift = 64 - 16;  // log2(65536)
   // Heap-backed (not an inline member): at 65536 slots this array is 512 KB.
   // As an inline member it pushed sizeof(Volume) past 520 KB, which overflows
@@ -2252,7 +2266,28 @@ class Volume : public std::enable_shared_from_this<Volume> {
   void mark_checksum_validated(uint64_t offset, uint64_t token) {
     (*_checksum_cache)[checksum_cache_index(offset)].store(
         token, std::memory_order_relaxed);
+    t_checksum_revalidate_countdown = kChecksumRevalidateInterval;
   }
+  // A CRC pass over this incarnation failed: drop its cached verdict (if the
+  // slot still holds it), so the damaged bytes are not vouched for again.
+  void forget_checksum_validated(uint64_t offset, uint64_t token) {
+    uint64_t expected = token;
+    (*_checksum_cache)[checksum_cache_index(offset)].compare_exchange_strong(
+        expected, 0, std::memory_order_relaxed);
+  }
+  // True on every kChecksumRevalidateInterval-th warm (cached-verdict) read
+  // of the calling thread since its last CRC pass.  Thread-local, so the
+  // warm path stays free of shared writes; counting from the last pass
+  // keeps the schedule deterministic for a single-threaded caller.
+  static bool checksum_revalidation_due() noexcept {
+    if (--t_checksum_revalidate_countdown != 0) {
+      return false;
+    }
+    t_checksum_revalidate_countdown = kChecksumRevalidateInterval;
+    return true;
+  }
+  static inline thread_local uint32_t t_checksum_revalidate_countdown =
+      kChecksumRevalidateInterval;
 
   // Large-document readahead (see VolumeConfig::readahead_min_bytes).
   // Called on the disk read path once a document's byte range is known but

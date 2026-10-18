@@ -3088,21 +3088,28 @@ std::expected<ReadHandle, CacheError> Volume::read_sync(const CacheKey& key) {
           // A stored checksum of 0 is not a "no checksum" marker: every
           // writer stores the computed CRC-32C, so a zero is either that
           // genuine value (which verifies) or damage (which must not).
+          // A cached verdict is still re-checked on every
+          // kChecksumRevalidateInterval-th warm read (see _checksum_cache).
           uint64_t token = 0;
+          bool cached = false;
           bool crc_pending = false;
           if (_config.verify_checksum_on_read) {
             token = checksum_token(doc_offset, reader.document());
-            crc_pending = !is_checksum_validated(doc_offset, token);
+            cached = is_checksum_validated(doc_offset, token);
+            crc_pending = !cached || checksum_revalidation_due();
           }
           if (crc_pending) {
             // Cold-read and sequential readahead: only on the read that
             // makes the first content touch (see advise_cold_read).  A
-            // validated warm re-read never gets here.
-            advise_cold_read(stripe, snap.cursor_rel, doc_offset, doc_span);
+            // validated warm re-read, re-checked or not, never advises.
+            if (!cached) {
+              advise_cold_read(stripe, snap.cursor_rel, doc_offset, doc_span);
+            }
 #ifdef CYCLONE_TEST_SEAMS
             reader_seam(ReaderSeam::kCrcVerify);
 #endif
             if (!reader.document().verify_checksum(reader.payload())) {
+              forget_checksum_validated(doc_offset, token);
               _mapped_file->unmap_region(*mapped);
               checksum_failed = true;
               return true;  // Continue to next candidate
@@ -7055,22 +7062,29 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
           // Verify checksum of selected alternate.  Skip it only if this
           // exact incarnation -- the token of the header just read and
           // key-verified above -- already passed in this process.
+          // A cached verdict is still re-checked now and then, as in
+          // read_sync.
           uint64_t token = 0;
+          bool cached = false;
           bool crc_pending = false;
           // A stored zero is verified like any other value (see read_sync).
           if (_config.verify_checksum_on_read) {
             token = checksum_token(selected_offset, selected_reader.document());
-            crc_pending = !is_checksum_validated(selected_offset, token);
+            cached = is_checksum_validated(selected_offset, token);
+            crc_pending = !cached || checksum_revalidation_due();
           }
           if (crc_pending) {
             // Same cold-read placement as read_sync().
-            advise_cold_read(stripe, snap.cursor_rel, selected_offset,
-                             selected_span);
+            if (!cached) {
+              advise_cold_read(stripe, snap.cursor_rel, selected_offset,
+                               selected_span);
+            }
 #ifdef CYCLONE_TEST_SEAMS
             reader_seam(ReaderSeam::kCrcVerify);
 #endif
             if (!selected_reader.document().verify_checksum(
                     selected_reader.payload())) {
+              forget_checksum_validated(selected_offset, token);
               _mapped_file->unmap_region(*selected_mapped);
               _mapped_file->unmap_region(*mapped);
               checksum_failed = true;
