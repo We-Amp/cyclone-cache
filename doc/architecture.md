@@ -262,7 +262,7 @@ Document Header (132 bytes)
 ├─ checksum     uint32_t  CRC-32C over the canonical header + header_data + content
 ├─ frag_offset  uint32_t  offset within a multi-fragment document
 ├─ hit_count            uint32_t  persisted hit counter
-├─ next_alternate_offset uint64_t offset to next alternate (chain)
+├─ next_alternate_offset uint64_t link to next alternate: offset (bits 0-47) + its fill_serial (bits 48-63)
 ├─ alternate_id         uint8_t   AlternateId enum value
 ├─ last_access          int64_t   Unix timestamp (ms)
 ├─ Header Data (variable)
@@ -341,7 +341,7 @@ auto-resets on open when `auto_reset_on_incompatible`, default true,
 | v6 | `hit_count` / `next_alternate_offset` / `last_access` laid out naturally aligned, so the in-place header RMW sites can store them atomically |
 | v7 | alternate chains are depth-bounded at write time; the bump leaves pre-bound (over-deep, possibly cyclic) chains behind rather than repairing them |
 | v8 | the document checksum is CRC-32C instead of CRC-32/ISO-HDLC; no byte of the layout moved, but every pre-v8 checksum was computed over a different polynomial, so the bump leaves those rings behind |
-| v9 | the document checksum also covers the fixed document header (every field that never changes after the write); no byte of the layout moved, but every pre-v9 checksum covers less and would fail verification, so the bump leaves those rings behind. The document's `sync_serial` became `fill_serial` and the directory entry's unused `next` word its 16-bit twin: both carry the serial of the write that filled the document, and a read serves it only when they agree |
+| v9 | the document checksum also covers the fixed document header (every field that never changes after the write); no byte of the layout moved, but every pre-v9 checksum covers less and would fail verification, so the bump leaves those rings behind. The document's `sync_serial` became `fill_serial` and the directory entry's unused `next` word its 16-bit twin, and `next_alternate_offset` carries the successor's serial in bits 48-63 above its 40-bit offset: all carry the serial of the write that filled the document, and a read uses a document only when the serial of the entry or link it was reached through agrees |
 
 ### Alternate Chains
 

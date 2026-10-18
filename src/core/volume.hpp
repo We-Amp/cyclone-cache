@@ -1230,9 +1230,10 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // escalation-usurp test in test_wrap_phase_aba.cpp).  A COMPLETE landing
   // of a document of the same key passes that gauntlet -- it is a valid,
   // older document -- and is refused by the fill serial instead: it carries
-  // the usurped holder's serial, the entry the usurper's (fill_serial
-  // below; test_usurped_fill.cpp).  Either way a miss, never the older
-  // document served as current; only the escalation deadline bounds how
+  // the usurped holder's serial, while the entry, and any chain link a
+  // later alternate made to the usurper's document, carry the usurper's
+  // (fill_serial below; test_usurped_fill.cpp).  Either way a miss, never the
+  // older document served as current; only the escalation deadline bounds how
   // late the stalled pwrite can land.
   struct WriteSlot {
     uint64_t write_offset = 0;   // reserved start (absolute)
@@ -1258,7 +1259,23 @@ class Volume : public std::enable_shared_from_this<Volume> {
     // the lock's generation.  So the takeover residual on commit_write_slot
     // -- the late pwrite of a stalled holder landing over the next holder's
     // published document -- leaves bytes whose serial disagrees with the
-    // entry, which no read serves.
+    // entry and with every chain link made to that document
+    // (Document::make_link), which no read serves.
+    //
+    // WHY 16 BITS ARE ENOUGH.  The generation is a 16-bit counter that
+    // wraps, so the guarantee needs the stalled holder's g and the serial of
+    // the document that replaced its bytes to differ mod 2^16.  While the
+    // stalled holder holds the lock (it never released it: it is stalled),
+    // the generation moves only when someone takes the lock from it: a
+    // forced release plus the taker's acquisition, so the taker holds g+1
+    // or g+2.  A live holder is taken over only by the last-resort
+    // escalation, after more than 5 s.  The taker publishes and advances
+    // the cursor past the offset, so the only later documents at that
+    // offset are those of further takers of a holder that also stalled
+    // there, each again more than 5 s later and at most 2 further on.  A
+    // wrap back to g therefore needs over 30000 consecutive takeovers --
+    // more than 40 hours -- while the first holder's pwrite is still in
+    // flight.
     uint16_t fill_serial = 0;
     // Tail fill (issue #35; see kTailFillPage): when non-zero, the caller
     // writes zeros from the document's last byte up to this absolute offset

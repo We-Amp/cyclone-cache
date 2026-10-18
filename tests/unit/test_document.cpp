@@ -373,3 +373,20 @@ TEST_CASE("Document alternate fields with zero next offset",
   REQUIRE(reader.is_valid());
   REQUIRE(reader.document().next_alternate_offset == 0);
 }
+
+TEST_CASE("Chain links carry the successor's fill serial", "[document]") {
+  constexpr uint64_t kRel = 0xAB12345678ULL;  // a 40-bit stripe offset
+  const uint64_t link = Document::make_link(kRel, 0xBEEF);
+  CHECK(Document::link_offset(link) == kRel);
+  CHECK(Document::link_serial(link) == 0xBEEF);
+  CHECK(Document::make_link(0, 0xBEEF) == 0);  // still "no successor"
+  // A link from before serials existed binds a serial-0 document.
+  CHECK(Document::link_offset(kRel) == kRel);
+  Document doc;
+  doc.fill_serial = 0;
+  CHECK(doc.bound_by_link(kRel));
+  doc.fill_serial = 0xBEEF;
+  CHECK(doc.bound_by_link(link));
+  CHECK_FALSE(doc.bound_by_link(Document::make_link(kRel, 0xBEF0)));
+  CHECK(doc.link_to(kRel) == link);
+}

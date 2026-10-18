@@ -89,7 +89,8 @@ struct Document {
   uint32_t hit_count = 0;    // Persistent hit counter (was: reserved)
 
   // Alternate chain fields (v2)
-  uint64_t next_alternate_offset = 0;  // Offset to next alternate, 0 = none
+  uint64_t next_alternate_offset = 0;  // Link to the next alternate, 0 = none
+                                       // (offset + serial, see make_link)
   uint8_t alternate_id = 0;            // AlternateId enum value (0 = Original)
   uint8_t reserved2[3] = {};           // Alignment padding
   int64_t last_access = 0;             // Unix timestamp in milliseconds
@@ -112,10 +113,13 @@ struct Document {
   // fill_serial carries the serial of the fill that wrote the document (the
   // write-lock acquisition it was written under; see WriteSlot::fill_serial
   // in volume.hpp), and the directory entry that publishes it carries the
-  // same value.  A read serves a document only when the two agree, so the
-  // late bytes of a writer whose lock was taken over in the middle of its
-  // fill are never served under the entry of the write that took it over.
-  // Stamped after the checksum is computed, so it sits outside it.  (Named
+  // same value, as does every chain link made to it (make_link below).  A
+  // read uses a document only when its serial agrees with the entry or the
+  // link it was reached through, so the late bytes of a writer whose lock
+  // was taken over in the middle of its fill are never served in place of
+  // the document the next holder published at the same offset, neither
+  // through its entry nor through a later alternate's link to it.  Stamped
+  // after the checksum is computed, so it sits outside it.  (Named
   // sync_serial and always 0 before.)
   static constexpr size_t kFillSerialOffset = 88;
   // write_serial carries the stripe PASS the document was written in (wrap
@@ -127,6 +131,37 @@ struct Document {
   static constexpr size_t kNextAlternateOffsetPos = 112;
   static constexpr size_t kLastAccessOffset = 120;
   static constexpr size_t kAlternateIdOffset = 128;
+
+  // A chain link (next_alternate_offset) carries the successor's
+  // stripe-relative offset in its low 48 bits and the successor's
+  // fill_serial in its top 16 bits, so a hop can tell the document the link
+  // was made to from other bytes at the same offset (see kFillSerialOffset).
+  // Offsets are 40 bits (DirEntry), so the top bits were always zero; a link
+  // of 0 is still "no successor".  The field is outside the checksum and
+  // stored atomically, so a repoint writes offset and serial at once.
+  static constexpr unsigned kLinkSerialShift = 48;
+  static constexpr uint64_t kLinkOffsetMask =
+      (uint64_t{1} << kLinkSerialShift) - 1;
+  [[nodiscard]] static constexpr uint64_t make_link(uint64_t rel_offset,
+                                                    uint16_t serial) noexcept {
+    return rel_offset == 0 ? 0
+                           : (rel_offset & kLinkOffsetMask) |
+                                 (uint64_t{serial} << kLinkSerialShift);
+  }
+  [[nodiscard]] static constexpr uint64_t link_offset(uint64_t link) noexcept {
+    return link & kLinkOffsetMask;
+  }
+  [[nodiscard]] static constexpr uint16_t link_serial(uint64_t link) noexcept {
+    return static_cast<uint16_t>(link >> kLinkSerialShift);
+  }
+  // Is this document the one `link` was made to?
+  [[nodiscard]] bool bound_by_link(uint64_t link) const noexcept {
+    return fill_serial == link_serial(link);
+  }
+  // The link to this document, at `rel_offset`.
+  [[nodiscard]] uint64_t link_to(uint64_t rel_offset) const noexcept {
+    return make_link(rel_offset, static_cast<uint16_t>(fill_serial));
+  }
 
   [[nodiscard]] bool is_valid() const { return magic == kMagic; }
   [[nodiscard]] bool is_version_compatible() const {

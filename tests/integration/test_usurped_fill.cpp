@@ -281,6 +281,73 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "A taken-over writer's late fill is not reached through a later "
+    "alternate's chain link",
+    "[multiprocess][writelock][usurp][alternate]") {
+  // The next holder publishes head X; a second alternate of the key is
+  // published as head Y linking to X; then the stalled fill lands at X.  The
+  // entry now names Y, whose own serial matches, so only the link Y -> X can
+  // tell X's bytes from the document it was made to.
+  const TempCacheDir dir("usurped-fill-chain");
+  ProcessView stalled;
+  ProcessView usurper;
+  REQUIRE(stalled.open(dir.path()));
+  REQUIRE(usurper.open(dir.path()));
+  REQUIRE(stalled.volume->stats().stripe_count == 1);
+  const std::string file = dir.path();
+  const CacheKey key("http://example.test/usurped/chain.css");
+  const AlternateId x_id = AlternateId::Brotli;
+  const AlternateId y_id = AlternateId::Gzip;
+  const std::string y_text = "the second alternate, linked to the first";
+
+  CacheError x_result = CacheError::InternalError;
+  CacheError y_result = CacheError::InternalError;
+  Served published;
+  const Takeover t = run_takeover(*stalled.volume, key, x_id, kOlder, [&] {
+    x_result = write_doc(*usurper.volume, key, x_id, kNewer);
+    published = read_doc(*usurper.volume, key, x_id);
+    y_result = write_doc(*usurper.volume, key, y_id, y_text);
+  });
+  REQUIRE(t.parked);
+  REQUIRE(x_result == CacheError::Success);
+  REQUIRE(y_result == CacheError::Success);
+  CHECK(t.stalled_result == CacheError::Busy);
+  REQUIRE(published.text == std::optional<std::string>(kNewer));
+  REQUIRE(pread_text(file, published.content_offset, kNewer.size()) == kOlder);
+
+  for (Volume *view : {stalled.volume.get(), usurper.volume.get()}) {
+    // read_alternate_sync walks Y -> X.
+    CHECK(read_doc(*view, key, x_id).text !=
+          std::optional<std::string>(kOlder));
+    CHECK(read_doc(*view, key, y_id).text ==
+          std::optional<std::string>(y_text));
+    // list_alternates walks the same link.
+    auto listed = view->list_alternates_sync(key);
+    REQUIRE(listed.has_value());
+    for (const AlternateInfo &info : *listed) {
+      CAPTURE(static_cast<int>(info.id));
+      CHECK(info.id != x_id);
+    }
+  }
+
+  // Removing the head Y republishes its successor -- which must not make
+  // the late fill at X the key's head.
+  REQUIRE(usurper.volume->remove_alternate_sync(key, y_id).has_value());
+  for (Volume *view : {stalled.volume.get(), usurper.volume.get()}) {
+    CHECK(read_doc(*view, key, x_id).text !=
+          std::optional<std::string>(kOlder));
+    CHECK(read_doc(*view, key, std::nullopt).text !=
+          std::optional<std::string>(kOlder));
+  }
+
+  // The key is writable again.
+  REQUIRE(write_doc(*usurper.volume, key, x_id, "fourth") ==
+          CacheError::Success);
+  CHECK(read_doc(*stalled.volume, key, x_id).text ==
+        std::optional<std::string>("fourth"));
+}
+
+TEST_CASE(
     "A key whose only entry does not bind its document removes as NotFound",
     "[multiprocess][writelock][usurp][remove]") {
   const TempCacheDir dir("usurped-fill-remove");

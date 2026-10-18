@@ -766,7 +766,7 @@ first_key      (32 B, SHA-256 of the key)
 fragment_key   (32 B)
 header_len · type · version · flags · fill_serial · write_serial
 pin_until · checksum (CRC-32C) · frag_offset · hit_count
-next_alternate_offset (8 B) · last_access · alternate_id · reserved
+next_alternate_offset (8 B: offset + the next node's fill_serial) · last_access · alternate_id · reserved
 ```
 
 The checksum covers the fixed header as well as the header bytes and
