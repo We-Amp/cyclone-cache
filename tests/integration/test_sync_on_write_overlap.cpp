@@ -79,6 +79,11 @@ std::shared_ptr<Volume> open_volume(const std::string &path) {
 
 }  // namespace
 
+// POSIX only: on Windows the sync_on_write flush is part of the fill, a
+// flush of the mapped region under the write lock and the stripe mutex,
+// and fsync_fd() (the seam that makes each flush cost ~2 ms) is not on the
+// commit path, so commits there neither overlap nor pay the pause.
+#ifndef _WIN32
 TEST_CASE(
     "sync_on_write: concurrent commits to one stripe overlap instead of "
     "serializing behind the flush",
@@ -146,6 +151,8 @@ TEST_CASE(
   }
 }
 
+#endif  // !_WIN32
+
 TEST_CASE(
     "sync_on_write: a stripe wrap during the unlocked flush does not let the "
     "commit overwrite a newer write of the same key",
@@ -184,11 +191,24 @@ TEST_CASE(
   // point the key at its own, now overwritten, bytes.
   (void)write_doc(*volume, key, older);
   Volume::s_fsync_hook_for_test.store(nullptr);
+#ifdef _WIN32
+  // On Windows the sync_on_write flush is part of the fill (a flush of the
+  // mapped region, under the write lock and the stripe mutex) and the
+  // commit path never calls fsync_fd(), where the hook runs: there is no
+  // flush window for a wrap to land in, so the hook does not fire and the
+  // only write of the key is the first one.  That is what is checked here.
+  REQUIRE_FALSE(fired.load());
+  auto only = volume->read_sync(key);
+  REQUIRE(only.has_value());
+  REQUIRE(only->content()[0] == std::byte{0x11});
+#else
+  REQUIRE(fired.load());
 
   auto rh = volume->read_sync(key);
   REQUIRE(rh.has_value());
   REQUIRE(rh->content().size() == kDocBytes);
   REQUIRE(rh->content()[0] == std::byte{0x22});
+#endif
 }
 
 TEST_CASE(
@@ -238,6 +258,20 @@ TEST_CASE(
 
   (void)write_alt(*volume, older);
   Volume::s_fsync_hook_for_test.store(nullptr);
+#ifdef _WIN32
+  // No flush window on Windows (see the plain-commit case above): the hook
+  // does not fire, and the only write of the alternate is the first one.
+  REQUIRE_FALSE(fired.load());
+  {
+    const CompressionAwareSelector only_selector;
+    AlternateSelectionContext only_ctx;
+    only_ctx.prefer_compressed = true;
+    auto only = volume->read_alternate_sync(key, only_selector, only_ctx);
+    REQUIRE(only.has_value());
+    REQUIRE(only->content()[0] == std::byte{0x11});
+  }
+#else
+  REQUIRE(fired.load());
 
   const CompressionAwareSelector selector;
   AlternateSelectionContext ctx;
@@ -246,8 +280,13 @@ TEST_CASE(
   REQUIRE(rh.has_value());
   REQUIRE(rh->content().size() == kDocBytes);
   REQUIRE(rh->content()[0] == std::byte{0x22});
+#endif
 }
 
+// POSIX only: the hook that parks the writer runs in fsync_fd(), which the
+// commit path calls only on POSIX (on Windows the flush is part of the
+// fill, under the stripe mutex, so the removal cannot run inside it).
+#ifndef _WIN32
 TEST_CASE(
     "sync_on_write: an alternate removed while another alternate write of "
     "the key sits in its flush stays removed",
@@ -334,3 +373,4 @@ TEST_CASE(
   REQUIRE(rh.has_value());
   CHECK(rh->content()[0] == std::byte{0x1A});
 }
+#endif  // !_WIN32
