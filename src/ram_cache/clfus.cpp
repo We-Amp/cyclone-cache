@@ -418,6 +418,14 @@ void RamCacheCLFUS::Segment::evict_if_needed(size_t required_space) {
 
 void RamCacheCLFUS::Segment::promote_from_history(
     EntryIter it, std::span<const std::byte> data, uint32_t stamp) {
+  // Build the body before touching any bookkeeping: assigning it below
+  // used to happen with the node already spliced onto _active_lru while
+  // its bookkeeping still said history, and an allocation failure there
+  // left a node that remove() later erased from the wrong list.  With the
+  // body pre-built, the entry moves in through a noexcept vector move
+  // assignment after the splices.
+  std::vector<std::byte> body(data.begin(), data.end());
+
   // Splice the node out of history before making room: evict_if_needed()
   // trims _history_lru from the back, and `it` can name that back node, so
   // the eviction triggered by this very promotion would otherwise free the
@@ -432,7 +440,7 @@ void RamCacheCLFUS::Segment::promote_from_history(
   auto& entry = *_active_lru.begin();
   _entry_map[entry.key] = _active_lru.begin();
 
-  entry.data.assign(data.begin(), data.end());
+  entry.data = std::move(body);
   entry.stamp = stamp;
   entry.in_cache = true;
   ++entry.hits;
