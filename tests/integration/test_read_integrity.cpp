@@ -736,4 +736,230 @@ TEST_CASE(
     CHECK(same_bytes(rh->content(), content));
   }
 }
+
+// --- Header coverage of the document checksum ------------------------------
+
+struct HeaderField {
+  const char *name;
+  uint64_t offset;  // wire offset in the fixed header (document.cpp table)
+  uint64_t size;
+};
+
+// Fields that never change after the write: the checksum covers them.
+const std::vector<HeaderField> &covered_fields() {
+  static const std::vector<HeaderField> fields = {
+      {"magic", 0, 4},          {"len", 4, 4},
+      {"total_len", 8, 8},      {"first_key", 16, 32},
+      {"fragment_key", 48, 32}, {"header_len", 80, 4},
+      {"doc_type", 84, 1},      {"version_major", 85, 1},
+      {"version_minor", 86, 1}, {"flags", 87, 1},
+      {"sync_serial", 88, 4},   {"pin_until", 96, 4},
+      {"frag_offset", 104, 4},  {"alternate_id", 128, 1},
+      {"reserved", 129, 3},
+  };
+  return fields;
+}
+
+// Flip the lowest bit of the field's last byte: a small change that keeps
+// lengths in range, so only the checksum can tell.
+void damage_field(const std::string &file, uint64_t doc,
+                  const HeaderField &field) {
+  const uint64_t at = doc + field.offset + field.size - 1;
+  const auto b = pread_value<std::byte>(file, at);
+  pwrite_value<std::byte>(file, at, b ^ std::byte{0x01});
+}
+
+TEST_CASE(
+    "Read integrity: damage to any fixed header field the checksum covers "
+    "reads as a miss",
+    "[integrity][format]") {
+  OpenCache oc(integrity_config());
+  Cache &cache = *oc.cache;
+  const auto content = make_content(30, 4096);
+  size_t n = 0;
+  for (const auto &field : covered_fields()) {
+    CAPTURE(field.name);
+    for (const bool warm : {false, true}) {
+      CAPTURE(warm);
+      // An Original-id alternate is what read_sync serves; a Brotli one is
+      // only reachable through read_alternate_sync.
+      const CacheKey key("integrity-cover-" + std::to_string(n));
+      const CacheKey alt_key("integrity-cover-alt-" + std::to_string(n));
+      ++n;
+      REQUIRE(write_alternate(cache, key, AlternateId::Original, content));
+      REQUIRE(write_alternate(cache, alt_key, AlternateId::Brotli, content));
+      auto alts = cache.list_alternates_sync(key);
+      REQUIRE(alts.has_value());
+      REQUIRE(alts->size() == 1);
+      const uint64_t doc = (*alts)[0].disk_offset;
+      auto alt_alts = cache.list_alternates_sync(alt_key);
+      REQUIRE(alt_alts.has_value());
+      REQUIRE(alt_alts->size() == 1);
+      const uint64_t alt_doc = (*alt_alts)[0].disk_offset;
+      OnlyId want(AlternateId::Brotli);
+      AlternateSelectionContext ctx;
+      if (warm) {
+        // A verified, cached verdict must not vouch for the changed header.
+        REQUIRE(cache.read_sync(key).has_value());
+        REQUIRE(cache.read_alternate_sync(alt_key, want, ctx).has_value());
+      }
+
+      damage_field(oc.file, doc, field);
+      damage_field(oc.file, alt_doc, field);
+
+      auto rh = cache.read_sync(key);
+      CHECK_FALSE(rh.has_value());
+      auto ah = cache.read_alternate_sync(alt_key, want, ctx);
+      CHECK_FALSE(ah.has_value());
+    }
+  }
+}
+
+TEST_CASE(
+    "Read integrity: the fields updated in place stay outside the checksum",
+    "[integrity][format]") {
+  // Flush mode: retention admission compares the pass stamp itself, which
+  // would reject a changed stamp before the checksum is consulted.
+  CacheConfig config = integrity_config();
+  config.wrap_retention = false;
+  OpenCache oc(config);
+  Cache &cache = *oc.cache;
+  const auto content = make_content(31, 4096);
+  const CacheKey key("integrity-inplace");
+  const CacheKey alt_key("integrity-inplace-alt");
+  REQUIRE(write_alternate(cache, key, AlternateId::Original, content));
+  REQUIRE(write_alternate(cache, alt_key, AlternateId::Brotli, content));
+  auto alts = cache.list_alternates_sync(key);
+  REQUIRE(alts.has_value());
+  const uint64_t doc = (*alts)[0].disk_offset;
+  auto alt_alts = cache.list_alternates_sync(alt_key);
+  REQUIRE(alt_alts.has_value());
+  const uint64_t alt_doc = (*alt_alts)[0].disk_offset;
+
+  // write_serial (pass stamp), hit_count and last_access.
+  for (const uint64_t d : {doc, alt_doc}) {
+    pwrite_value<uint32_t>(oc.file, d + Document::kWriteSerialOffset, 77);
+    pwrite_value<uint32_t>(oc.file, d + Document::kHitCountOffset, 12345);
+    pwrite_value<int64_t>(oc.file, d + Document::kLastAccessOffset,
+                          int64_t{1700000000000});
+  }
+
+  auto rh = cache.read_sync(key);
+  REQUIRE(rh.has_value());
+  CHECK(same_bytes(rh->content(), content));
+  OnlyId want(AlternateId::Brotli);
+  AlternateSelectionContext ctx;
+  auto ah = cache.read_alternate_sync(alt_key, want, ctx);
+  REQUIRE(ah.has_value());
+  CHECK(same_bytes(ah->content(), content));
+
+  // The library's own in-place path keeps the documents valid as well:
+  // removing the middle node of a three-node chain repoints the head's
+  // next_alternate_offset in place.
+  const CacheKey chain_key("integrity-inplace-chain");
+  REQUIRE(write_alternate(cache, chain_key, AlternateId::Original, content));
+  REQUIRE(write_alternate(cache, chain_key, AlternateId::Gzip, content));
+  REQUIRE(write_alternate(cache, chain_key, AlternateId::Brotli, content));
+  REQUIRE(
+      cache.remove_alternate_sync(chain_key, AlternateId::Gzip).has_value());
+  for (const AlternateId id : {AlternateId::Brotli, AlternateId::Original}) {
+    OnlyId pick(id);
+    AlternateSelectionContext pick_ctx;
+    auto got = cache.read_alternate_sync(chain_key, pick, pick_ctx);
+    REQUIRE(got.has_value());
+    CHECK(same_bytes(got->content(), content));
+  }
+}
+
+// Rewrite a document written by this build into the previous format: the
+// version byte says 8 and the checksum covers header bytes + content only.
+void age_document_to_v8(const std::string &file, uint64_t doc,
+                        size_t payload_len) {
+  pwrite_value<uint8_t>(file, doc + Document::kVersionMajorOffset, 8);
+  std::vector<std::byte> payload(payload_len);
+  const int fd = ::open(file.c_str(), O_RDONLY);
+  REQUIRE(fd >= 0);
+  const ssize_t got = ::pread(fd, payload.data(), payload.size(),
+                              static_cast<off_t>(doc + Document::kHeaderSize));
+  ::close(fd);
+  REQUIRE(got == static_cast<ssize_t>(payload.size()));
+  pwrite_value<uint32_t>(file, doc + Document::kChecksumOffset,
+                         oracle_crc32c(payload));
+}
+
+TEST_CASE(
+    "Read integrity: a volume written in the previous format opens as a "
+    "clean, empty cache",
+    "[integrity][format][version]") {
+  CacheConfig config = integrity_config();
+  config.multi_process_config.enabled = true;  // persistent directory
+  config.multi_process_config.process_index = 0;
+  config.multi_process_config.total_processes = 1;
+  const auto content = make_content(32, 4096);
+  constexpr int kKeys = 8;
+
+  for (const int mode : {0, 1, 2}) {
+    // 0: volume header and documents in the previous format, auto reset on
+    // 1: the same, auto reset off
+    // 2: only the documents in the previous format (a header the gate
+    //    passes, e.g. a reset that never ran)
+    CAPTURE(mode);
+    TempCacheDir dir("integrity-v8");
+    std::string file;
+    {
+      auto created = Cache::create(config);
+      REQUIRE(created.has_value());
+      auto &cache = *created;
+      VolumeConfig vol;
+      vol.path = dir.path();
+      vol.size = kVolBytes;
+      REQUIRE(cache->add_volume(vol).has_value());
+      REQUIRE(cache->start().has_value());
+      file = cache->volume_files().at(0).file_path;
+      for (int i = 0; i < kKeys; ++i) {
+        const CacheKey key("integrity-v8-" + std::to_string(i));
+        REQUIRE(write_alternate(*cache, key, AlternateId::Original, content));
+        auto alts = cache->list_alternates_sync(key);
+        REQUIRE(alts.has_value());
+        REQUIRE(alts->size() == 1);
+        age_document_to_v8(file, (*alts)[0].disk_offset, content.size());
+      }
+      cache->stop();
+    }
+    if (mode != 2) {
+      // VolumeHeader: magic (4 bytes), then the u16 format major.
+      pwrite_value<uint16_t>(file, 4, 8);
+    }
+
+    auto created = Cache::create(config);
+    REQUIRE(created.has_value());
+    auto &cache = *created;
+    VolumeConfig vol;
+    vol.path = dir.path();
+    vol.size = kVolBytes;
+    vol.auto_reset_on_incompatible = mode != 1;
+    REQUIRE(cache->add_volume(vol).has_value());
+    auto started = cache->start();
+    if (mode == 1) {
+      REQUIRE_FALSE(started.has_value());
+      CHECK(started.error() == CacheError::IncompatibleVersion);
+      continue;
+    }
+    REQUIRE(started.has_value());
+    if (mode == 0) {
+      CHECK(cache->stats().current_entries == 0);
+    }
+    for (int i = 0; i < kKeys; ++i) {
+      const CacheKey key("integrity-v8-" + std::to_string(i));
+      CHECK_FALSE(cache->read_sync(key).has_value());
+    }
+    // The volume is usable.
+    const CacheKey fresh("integrity-v8-fresh");
+    REQUIRE(write_entry(*cache, fresh, content));
+    auto rh = cache->read_sync(fresh);
+    REQUIRE(rh.has_value());
+    CHECK(same_bytes(rh->content(), content));
+    cache->stop();
+  }
+}
 #endif  // !_WIN32
