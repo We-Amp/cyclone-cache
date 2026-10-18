@@ -84,6 +84,61 @@ TEST_CASE("HttpCacheAlt no Cache-Control defaults to fresh", "[http]") {
   REQUIRE_FALSE(alt.max_age().has_value());
 }
 
+TEST_CASE("HttpCacheAlt header names are case-insensitive", "[http]") {
+  HttpCacheAlt alt;
+  alt.set_response_time(std::time(nullptr));
+  alt.set_response_header("cache-control", "max-age=3600");
+  alt.set_response_header("content-type", "text/html");
+  alt.set_request_header("ACCEPT-ENCODING", "gzip");
+
+  REQUIRE(alt.get_response_header("Cache-Control").value_or("") ==
+          "max-age=3600");
+  REQUIRE(alt.get_response_header("CONTENT-TYPE").value_or("") == "text/html");
+  REQUIRE(alt.get_request_header("accept-encoding").value_or("") == "gzip");
+  REQUIRE(alt.max_age().has_value());
+
+  // A later set under a different case replaces the earlier value.
+  alt.set_response_header("Cache-Control", "max-age=60");
+  REQUIRE(alt.get_response_header("cache-control").value_or("") ==
+          "max-age=60");
+
+  auto data = alt.serialize();
+  auto restored = HttpCacheAlt::deserialize(std::span<const std::byte>(data));
+  REQUIRE(restored.get_response_header("CACHE-CONTROL").value_or("") ==
+          "max-age=60");
+  REQUIRE(restored.get_request_header("Accept-Encoding").value_or("") ==
+          "gzip");
+}
+
+TEST_CASE("HttpAlternatePlugin Vary matches names regardless of case",
+          "[http]") {
+  auto plugin = create_http_alternate_plugin();
+
+  HttpCacheAlt alt;
+  alt.set_response_header("vary", "accept-encoding");
+  alt.set_request_header("accept-encoding", "gzip");
+  auto meta = alt.serialize();
+
+  VariantCollection variants;
+  variants.add(CacheVariant{CacheKey("vary-case"),
+                            Metadata(std::span<const std::byte>(meta)),
+                            0,
+                            {},
+                            {},
+                            0});
+
+  std::string same = "Accept-Encoding: gzip\r\n";
+  LookupContext ctx;
+  ctx.request_headers = std::span<const std::byte>(
+      reinterpret_cast<const std::byte *>(same.data()), same.size());
+  REQUIRE(plugin->select_variant(variants, ctx).has_value());
+
+  std::string other = "Accept-Encoding: br\r\n";
+  ctx.request_headers = std::span<const std::byte>(
+      reinterpret_cast<const std::byte *>(other.data()), other.size());
+  REQUIRE_FALSE(plugin->select_variant(variants, ctx).has_value());
+}
+
 TEST_CASE("HttpAlternatePlugin info", "[http]") {
   auto plugin = create_http_alternate_plugin();
   REQUIRE(plugin != nullptr);

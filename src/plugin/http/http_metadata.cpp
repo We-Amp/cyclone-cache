@@ -8,21 +8,37 @@
 
 namespace cyclone {
 
+namespace {
+
+// HTTP field names are case-insensitive; headers are stored and looked up
+// under their lowercase form.
+std::string lower_name(std::string_view name) {
+  std::string result(name);
+  for (char &c : result) {
+    if (c >= 'A' && c <= 'Z') {
+      c = static_cast<char>(c - 'A' + 'a');
+    }
+  }
+  return result;
+}
+
+}  // namespace
+
 HttpCacheAlt::HttpCacheAlt() = default;
 
 void HttpCacheAlt::set_request_header(std::string_view name,
                                       std::string_view value) {
-  _request_headers[std::string(name)] = std::string(value);
+  _request_headers[lower_name(name)] = std::string(value);
 }
 
 void HttpCacheAlt::set_response_header(std::string_view name,
                                        std::string_view value) {
-  _response_headers[std::string(name)] = std::string(value);
+  _response_headers[lower_name(name)] = std::string(value);
 }
 
 std::optional<std::string_view> HttpCacheAlt::get_request_header(
     std::string_view name) const {
-  auto it = _request_headers.find(std::string(name));
+  auto it = _request_headers.find(lower_name(name));
   if (it != _request_headers.end()) {
     return it->second;
   }
@@ -31,7 +47,7 @@ std::optional<std::string_view> HttpCacheAlt::get_request_header(
 
 std::optional<std::string_view> HttpCacheAlt::get_response_header(
     std::string_view name) const {
-  auto it = _response_headers.find(std::string(name));
+  auto it = _response_headers.find(lower_name(name));
   if (it != _response_headers.end()) {
     return it->second;
   }
@@ -125,7 +141,7 @@ HttpCacheAlt HttpCacheAlt::deserialize(std::span<const std::byte> data) {
       std::string name = read_string();
       std::string value = read_string();
       if (!name.empty()) {
-        headers[name] = value;
+        headers[lower_name(name)] = value;
       }
     }
     return headers;
@@ -162,7 +178,7 @@ std::chrono::seconds HttpCacheAlt::age() const {
 }
 
 std::optional<std::chrono::seconds> HttpCacheAlt::max_age() const {
-  auto cc = get_response_header("Cache-Control");
+  auto cc = get_response_header("cache-control");
   if (!cc) {
     return std::nullopt;
   }
