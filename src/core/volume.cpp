@@ -3170,6 +3170,15 @@ std::expected<ReadHandle, CacheError> Volume::read_sync(const CacheKey& key) {
 #ifdef CYCLONE_TEST_SEAMS
           reader_seam(ReaderSeam::kAfterBorrow);
 #endif
+          // Read-side acquire fence (see renew_read_lease), as in
+          // read_alternate_sync: the header (and, unless the checksum
+          // verdict was cached, the payload) was read above from the live
+          // mmap with plain loads.  Do NOT rely on the RMWs
+          // just above to order them -- the stamp can degrade to a pure
+          // load via the write-avoidance skip guard, and with leases
+          // disabled both degrade to nothing.  Pin all preceding reads
+          // ahead of the epoch verdict below.
+          std::atomic_thread_fence(std::memory_order_acquire);
           if (!borrow_still_valid(stripe, epoch_start, borrow)) {
             release_borrow(stripe, borrow);
             _mapped_file->unmap_region(*mapped);
