@@ -3085,7 +3085,8 @@ std::expected<ReadHandle, CacheError> Volume::read_sync(const CacheKey& key) {
           // a document whose fields disagree is corrupt whatever the
           // checksum pass below would say about its payload.
           CacheKey stored_key = reader.first_key();
-          if (stored_key != key || !reader.is_servable()) {
+          if (stored_key != key || !reader.is_servable() ||
+              !entry_binds(dir_entry, reader.document())) {
             _mapped_file->unmap_region(*mapped);
             return true;  // Continue to next candidate
           }
@@ -4447,6 +4448,7 @@ std::expected<Volume::WriteSlot, CacheError> Volume::allocate_write_slot(
   // lock G cannot move, so a fresh load equals what the prologue saw.
   slot.pass =
       retained_pass ? *retained_pass : stripe->pass_of(stripe->exposure_gen());
+  slot.fill_serial = has_write_lock ? write_token.generation : uint16_t{0};
   // Tail fill (issue #35, kTailFillPage; opt-in through
   // VolumeConfig::fill_large_document_tail, default off, in which case
   // fill_end stays 0 and both commit paths write exactly as before): let a
@@ -4542,9 +4544,12 @@ std::expected<void, CacheError> Volume::commit_write_slot(Stripe* stripe,
   // Honesty note (bounded residual, not closed): this gate cannot recall a
   // pwrite already in flight.  A stalled holder's late pwrite can land over
   // the span the usurper reserved at the same un-advanced cursor and already
-  // published, tearing the usurper's bytes under a live entry.  The tear is
-  // detectable (CRC + full-key resolve it to Corrupted/miss, never a wrong
-  // serve -- pinned by F6-F) and only the escalation deadline bounds it.
+  // published, replacing the usurper's bytes under a live entry.  A tear is
+  // detectable (CRC + full-key resolve it to Corrupted/miss -- pinned by
+  // F6-F); a complete document of ours, which passes those, carries our
+  // fill serial and not the usurper's, so the entry does not bind it and no
+  // read serves it (WriteSlot::fill_serial).  Only the escalation deadline
+  // bounds how late it lands.
   if (!stripe->mmap_directory->revalidate_write_lock(slot.write_token)) {
     _write_lock_usurp_aborts.fetch_add(1, std::memory_order_relaxed);
     return make_unexpected(CacheError::Busy);
@@ -4870,6 +4875,7 @@ std::expected<void, CacheError> Volume::commit_write_impl(
   // Pass stamp: part of the same pwrite as the document header (design
   // 5.1(2)).
   patch_pass_stamp(doc_head, slot.pass);
+  patch_fill_serial(doc_head, slot.fill_serial);
   uint64_t write_offset = slot.write_offset;
   // Release the held lock on any unexpected unwind before commit_write_slot
   // (see HeldWriteSlotReleaser above).
@@ -5081,8 +5087,12 @@ std::expected<void, CacheError> Volume::commit_write_impl(
             return true;
           }
           CacheKey stored_key = reader.first_key();
+          // A document the entry does not bind is not the one its write
+          // published (a taken-over holder's late fill): dead like a stale
+          // survivor, whoever's key it carries.
           const bool stamp_ok =
-              stamp_admits(stripe, snap, cls, reader.document());
+              stamp_admits(stripe, snap, cls, reader.document()) &&
+              entry_binds(dir_entry, reader.document());
           _mapped_file->unmap_region(*region);
           if (!stamp_ok) {
             add_clear(dir_entry.offset());  // a stale survivor, whoever's key
@@ -5124,7 +5134,7 @@ std::expected<void, CacheError> Volume::commit_write_impl(
             key, relative_offset, doc_size, verified_offset, &collision_evicted,
             &bucket_full_evicted, &admission,
             std::span<const uint64_t>(clear_offsets.data(), clear_count),
-            &insert_busy, &publish_view, &insert_stale)) {
+            &insert_busy, &publish_view, &insert_stale, slot.fill_serial)) {
       break;
     }
     if (insert_stale) {
@@ -5219,6 +5229,14 @@ void Volume::patch_pass_stamp(std::span<std::byte> doc, uint64_t pass) {
   }
   const auto stamp = static_cast<uint32_t>(pass);
   std::memcpy(doc.data() + Document::kWriteSerialOffset, &stamp, sizeof(stamp));
+}
+
+void Volume::patch_fill_serial(std::span<std::byte> doc, uint16_t serial) {
+  if (doc.size() < Document::kHeaderSize) {
+    return;
+  }
+  const uint32_t stamp = serial;
+  std::memcpy(doc.data() + Document::kFillSerialOffset, &stamp, sizeof(stamp));
 }
 
 bool Volume::stamp_admits(const Stripe* stripe, const StripeSnapshot& snap,
@@ -5868,8 +5886,11 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
             return true;
           }
           const bool same_key = mdoc->reader.first_key() == key;
+          // Not live either when the entry does not bind the document (see
+          // entry_binds): such a head is cleared, never elected.
           const bool stamp_ok =
-              stamp_admits(stripe, snap, cls, mdoc->reader.document());
+              stamp_admits(stripe, snap, cls, mdoc->reader.document()) &&
+              entry_binds(dir_entry, mdoc->reader.document());
           _mapped_file->unmap_region(mdoc->region);
           if (same_key && head_count < heads.size()) {
             heads[head_count++] = {dir_entry.offset(), cls, stamp_ok};
@@ -6219,6 +6240,7 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
   const WriteSlot slot = *slot_res;
   // Pass stamp: part of the same pwrite as the document (design 5.1(2)).
   patch_pass_stamp(head_doc, slot.pass);
+  patch_fill_serial(head_doc, slot.fill_serial);
   uint64_t write_offset = slot.write_offset;
   // Release the held lock on any unexpected unwind before commit_write_slot
   // (see HeldWriteSlotReleaser at commit_write).
@@ -6307,6 +6329,7 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
     for (size_t i = 0; i < carried_nodes; ++i) {
       const std::span<std::byte> node = fill.subspan(carry.starts[i]);
       patch_pass_stamp(node, slot.pass);
+      patch_fill_serial(node, slot.fill_serial);
       const uint64_t next = i == 0 ? 0 : base_rel + carry.starts[i - 1];
       std::memcpy(node.data() + Document::kNextAlternateOffsetPos, &next,
                   sizeof(next));
@@ -6498,7 +6521,7 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
           key_exists ? head_relative_offset : Directory::kNoVerifiedEntry,
           &collision_evicted, &bucket_full_evicted, &admission,
           std::span<const uint64_t>(clear_offsets.data(), clear_count),
-          &insert_busy, &publish_view, &insert_stale)) {
+          &insert_busy, &publish_view, &insert_stale, slot.fill_serial)) {
     if (insert_stale) {
       // Nothing was published and nothing below runs: no splice, no
       // counter, no write-behind for bytes nothing refers to.  The document
@@ -6779,7 +6802,8 @@ Volume::list_alternates_sync(const CacheKey& key) {
           // Verify the key matches
           CacheKey stored_key = reader.first_key();
           if (stored_key != key ||
-              !stamp_admits(stripe, snap, cls, reader.document())) {
+              !stamp_admits(stripe, snap, cls, reader.document()) ||
+              !entry_binds(dir_entry, reader.document())) {
             _mapped_file->unmap_region(*mapped);
             return true;  // Continue to next candidate
           }
@@ -7009,7 +7033,8 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
 
           CacheKey stored_key = reader.first_key();
           if (stored_key != key ||
-              !stamp_admits(stripe, snap, cls, reader.document())) {
+              !stamp_admits(stripe, snap, cls, reader.document()) ||
+              !entry_binds(dir_entry, reader.document())) {
             _mapped_file->unmap_region(*mapped);
             return true;
           }
@@ -7702,7 +7727,8 @@ std::expected<void, CacheError> Volume::remove_alternate_sync(
 
           CacheKey stored_key = reader.first_key();
           if (stored_key != key ||
-              !stamp_admits(stripe, snap, cls, reader.document())) {
+              !stamp_admits(stripe, snap, cls, reader.document()) ||
+              !entry_binds(dir_entry, reader.document())) {
             _mapped_file->unmap_region(*mapped);
             return true;
           }
@@ -7829,6 +7855,10 @@ std::expected<void, CacheError> Volume::remove_alternate_sync(
           return make_unexpected(CacheError::Corrupted);
         }
         size_t next_doc_size = next_reader.document().len;
+        // The successor keeps the fill serial it was written with: the
+        // republished entry must bind to it as its own write's entry did.
+        const auto next_fill_serial =
+            static_cast<uint16_t>(next_reader.document().fill_serial);
         _mapped_file->unmap_region(*next_mapped);
 
 #ifdef CYCLONE_TEST_SEAMS
@@ -7854,7 +7884,7 @@ std::expected<void, CacheError> Volume::remove_alternate_sync(
             std::span<const uint64_t>(seen_offsets.data(), seen_count)};
         stripe->insert(key, target_next_offset, next_doc_size,
                        head_relative_offset, nullptr, nullptr, &admission, {},
-                       &busy, &publish_view, &stale);
+                       &busy, &publish_view, &stale, next_fill_serial);
         if (stale) {
           _alternate_publish_retries.fetch_add(1, std::memory_order_relaxed);
           continue;  // Nothing repointed: the head moved under us
@@ -7980,7 +8010,8 @@ std::expected<void, CacheError> Volume::update_hit_count_sync(
 
         CacheKey stored_key = reader.first_key();
         if (stored_key != key ||
-            !stamp_admits(stripe, snap, cls, reader.document())) {
+            !stamp_admits(stripe, snap, cls, reader.document()) ||
+            !entry_binds(dir_entry, reader.document())) {
           _mapped_file->unmap_region(*mapped);
           return true;  // Continue to next candidate
         }

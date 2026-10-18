@@ -17,7 +17,7 @@ as a C++ API and a C ABI.
 | **Stripe (= Segment)** | The cache partitioning unit. The C API `num_segments` (`cyclone_c.h`) and `CacheKey::segment_hash()` (`key.hpp`) refer to the SAME stripes this doc describes — there is exactly ONE partitioning dimension. `stripe_index = key.segment_hash() % num_stripes`. | `key.hpp`, `cyclone_c.h`, "Volumes and Stripes" |
 | **Volume** | A single cache file on disk, divided into stripes for parallel access. | `src/core/volume.hpp`, "Volumes and Stripes" |
 | **VolumeHeader** | 64-byte header at offset 0; magic `0x43594C4E` ("CYLN") + format major/minor. Format major is **v9**. | `src/core/volume.hpp` (`VolumeHeader`) |
-| **Directory entry** | Compact 10-byte key→offset record. Bitfields: `tag` (12-bit collision tag), `phase` (1-bit phase GC), `head` (1-bit, first fragment), `pinned` (1-bit, reserved for do-not-evict — not enforced by eviction today), 40-bit `offset` (byte offset within the stripe; 1 TiB/stripe), `next` (bucket chain). Carries **no key material**. | `src/core/directory.hpp` (`DirEntry`) |
+| **Directory entry** | Compact 10-byte key→offset record. Bitfields: `tag` (12-bit collision tag), `phase` (1-bit phase GC), `head` (1-bit, first fragment), `pinned` (1-bit, reserved for do-not-evict — not enforced by eviction today), 40-bit `offset` (byte offset within the stripe; 1 TiB/stripe), `fill_serial` (16-bit serial of the write that filled the document; a read serves the document only when its own `fill_serial` matches). Carries **no key material**. | `src/core/directory.hpp` (`DirEntry`) |
 | **Document / fragment** | On-disk record (132-byte header, format major **v9**). The format reserves `FirstFrag`/`MiddleFrag`/`LastFrag` types, but the implementation writes only `SingleFrag` documents today: a document must fit in one stripe's data area (write fails with `NoSpace` otherwise) and under `max_object_size` (`ObjectTooLarge`). | `src/core/document.hpp` (`Document`) |
 | **bucket_hash / tag** | Within a stripe, `bucket_hash()` selects the directory bucket; `tag()` is the 12-bit collision tag. | `key.hpp` |
 | **Alternate / AlternateId** | A content variant under one key (Original, Brotli, Gzip, WebP, AVIF, JpegXL, Custom…). `AlternateId` normalizes UA capabilities into discrete classes. | `alternate.hpp` |
@@ -204,7 +204,7 @@ implementations, same seqlock read protocol:
 Word 0: offset[0:15]
 Word 1: offset[16:23] │ big[2] │ size[6]
 Word 2: tag[12] │ phase[1] │ head[1] │ pinned[1] │ rsv[1]
-Word 3: next[16]  (bucket chain pointer)
+Word 3: fill_serial[16]  (serial of the write that filled the document)
 Word 4: offset[24:39]
 ```
 
@@ -213,10 +213,17 @@ Word 4: offset[24:39]
 - **tag** (12 bits) — collision tag (4096 values).
 - **phase / head / pinned** (1 bit each) — GC phase, first fragment; `pinned`
   is reserved for do-not-evict but not currently consulted by eviction.
-- **next** (16 bits) — chain to the next entry in the bucket.
+- **fill_serial** (16 bits): the serial of the write that filled the
+  document (its write-lock acquisition; 0 on a single-process stripe), the
+  same value the document carries in its own `fill_serial`. A read or an
+  in-place election uses the document only when the two agree. That is what
+  keeps the late fill of a write-lock holder that was taken over mid-fill
+  (it shares the offset with the next holder's document, never the serial)
+  from being served under the next holder's entry. This word was once the
+  ATS-style bucket-chain `next` pointer, which nothing linked.
 
 Entries are grouped into **buckets of 4** (`bucket_index = bucket_hash() % num_buckets`);
-overflow chains via `next`.
+a full bucket evicts (see the insert victim order), it never chains.
 
 #### Collision handling — no key material on disk
 
@@ -249,7 +256,7 @@ Document Header (132 bytes)
 ├─ ver_major    uint8_t   format version (9)
 ├─ ver_minor    uint8_t   format version
 ├─ flags        uint8_t   document flags
-├─ sync_serial  uint32_t
+├─ fill_serial  uint32_t  serial of the write that filled it (matches its directory entry)
 ├─ write_serial uint32_t
 ├─ pin_until    uint32_t  pin expiration (Unix time)
 ├─ checksum     uint32_t  CRC-32C over the canonical header + header_data + content
@@ -266,10 +273,10 @@ Document Header (132 bytes)
 document's *canonical fixed header* followed by header_data + content
 (`Document::checksum_header_seed`, `Document::verify_checksum`). The canonical
 header is the 132-byte wire header with the fields stamped after the checksum
-is computed or updated in place set to zero: `write_serial` (the pass stamp), `checksum`
+is computed or updated in place set to zero: `fill_serial` and `write_serial` (the fill and pass stamps), `checksum`
 itself, `hit_count`, `next_alternate_offset` and `last_access`. Every other
 header field is covered: `magic`, `len`, `total_len`, both keys,
-`header_len`, `doc_type`, both version bytes, `flags`, `sync_serial`,
+`header_len`, `doc_type`, both version bytes, `flags`,
 `pin_until`, `frag_offset`, `alternate_id` and the reserved bytes. A change
 to any covered field fails verification and the read is a miss; the in-place
 updates (pass stamp, hit count, access time, chain repoint) and the
@@ -334,7 +341,7 @@ auto-resets on open when `auto_reset_on_incompatible`, default true,
 | v6 | `hit_count` / `next_alternate_offset` / `last_access` laid out naturally aligned, so the in-place header RMW sites can store them atomically |
 | v7 | alternate chains are depth-bounded at write time; the bump leaves pre-bound (over-deep, possibly cyclic) chains behind rather than repairing them |
 | v8 | the document checksum is CRC-32C instead of CRC-32/ISO-HDLC; no byte of the layout moved, but every pre-v8 checksum was computed over a different polynomial, so the bump leaves those rings behind |
-| v9 | the document checksum also covers the fixed document header (every field that never changes after the write); no byte of the layout moved, but every pre-v9 checksum covers less and would fail verification, so the bump leaves those rings behind |
+| v9 | the document checksum also covers the fixed document header (every field that never changes after the write); no byte of the layout moved, but every pre-v9 checksum covers less and would fail verification, so the bump leaves those rings behind. The document's `sync_serial` became `fill_serial` and the directory entry's unused `next` word its 16-bit twin: both carry the serial of the write that filled the document, and a read serves it only when they agree |
 
 ### Alternate Chains
 

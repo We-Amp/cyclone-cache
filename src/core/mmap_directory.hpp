@@ -639,6 +639,7 @@ class MmapDirectory {
   /// refreshed INSIDE the bracket, under phase_lock.
   /// A capped wait on the phase lock or the bucket that gave up (see
   /// kLockWaitCap) sets *busy and publishes nothing.
+  /// The published entry carries `fill_serial` (DirEntry::fill_serial).
   bool insert(const CacheKey &key, uint64_t offset, uint64_t size,
               uint64_t verified_offset = kMatchAnyTag,
               bool *collision_evicted = nullptr,
@@ -646,7 +647,7 @@ class MmapDirectory {
               InsertAdmission *admission = nullptr,
               std::span<const uint64_t> clear_offsets = {},
               bool *busy = nullptr, const PublishView *view = nullptr,
-              bool *stale = nullptr);
+              bool *stale = nullptr, uint16_t fill_serial = 0);
 
   /// Remove an entry
   /// Returns true if entry was found and removed

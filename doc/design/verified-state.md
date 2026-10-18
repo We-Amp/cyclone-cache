@@ -766,7 +766,9 @@ the table is sized right.
 ## 10. Layout and version impact
 
 - **Document format and `VolumeHeader`:** unchanged. No format-major bump.
-  `sync_serial` stays unused.
+  (Since then `sync_serial` became `fill_serial`, the serial of the write
+  that filled the document, matched against its directory entry; it is
+  outside the checksum like the pass stamp.)
 - **`MmapDirectory`:**
   - `required_size` grows by the 64-byte-aligned table: 721 224 →
     1 245 632 bytes.

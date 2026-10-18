@@ -52,7 +52,7 @@ TEST_CASE("DirEntry offset preserves other fields", "[edge][directory]") {
   entry.set_phase(true);
   entry.set_head(true);
   entry.set_pinned(true);
-  entry.set_next(0x1234);
+  entry.set_fill_serial(0x1234);
 
   entry.set_offset(0x123456789AULL);
 
@@ -63,7 +63,7 @@ TEST_CASE("DirEntry offset preserves other fields", "[edge][directory]") {
   REQUIRE(entry.phase() == true);
   REQUIRE(entry.head() == true);
   REQUIRE(entry.pinned() == true);
-  REQUIRE(entry.next() == 0x1234);
+  REQUIRE(entry.fill_serial() == 0x1234);
 }
 
 TEST_CASE("DirEntry size encoding boundary values", "[edge][directory]") {
@@ -100,17 +100,17 @@ TEST_CASE("DirEntry all tag values", "[edge][directory]") {
   REQUIRE(entry.tag() == 0xFFF);
 }
 
-TEST_CASE("DirEntry next pointer full range", "[edge][directory]") {
+TEST_CASE("DirEntry fill serial full range", "[edge][directory]") {
   DirEntry entry;
 
-  entry.set_next(0);
-  REQUIRE(entry.next() == 0);
+  entry.set_fill_serial(0);
+  REQUIRE(entry.fill_serial() == 0);
 
-  entry.set_next(0xFFFF);
-  REQUIRE(entry.next() == 0xFFFF);
+  entry.set_fill_serial(0xFFFF);
+  REQUIRE(entry.fill_serial() == 0xFFFF);
 
-  entry.set_next(0x8000);
-  REQUIRE(entry.next() == 0x8000);
+  entry.set_fill_serial(0x8000);
+  REQUIRE(entry.fill_serial() == 0x8000);
 }
 
 // =============================================================================

@@ -451,7 +451,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   header, except the fields the cache stamps or updates itself, so damage
   to a header field reads as a miss instead of being served. The added
   cost is small (one checksum over the 132-byte header per write and per
-  verified read).
+  verified read). Each directory entry and the document it publishes
+  also carry the serial of the write that filled the document, and a
+  read serves the document only when the two agree, so a writer whose
+  write lock was taken over while it was stalled can no longer have its
+  late bytes served in place of the newer document published at the
+  same offset.
   **Existing cache files are abandoned (not deleted) on open**, exactly as
   for v8: a v9 binary resolves to a different fingerprinted file and
   starts cold; the superseded v8 file stays on disk until

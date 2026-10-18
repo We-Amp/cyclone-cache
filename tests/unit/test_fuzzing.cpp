@@ -224,7 +224,7 @@ TEST_CASE("DirEntry handles random bit patterns", "[fuzzing][directory]") {
     (void)entry.phase();
     (void)entry.head();
     (void)entry.pinned();
-    (void)entry.next();
+    (void)entry.fill_serial();
     (void)entry.is_empty();
     (void)entry.approx_size();
   }

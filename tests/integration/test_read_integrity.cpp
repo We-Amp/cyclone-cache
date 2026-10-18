@@ -114,9 +114,9 @@ std::vector<std::byte> canonical_header(const CacheKey &key,
                   .build_head(content);
   REQUIRE(head.size() == Document::kHeaderSize);
   const std::pair<size_t, size_t> in_place[] = {
-      {Document::kWriteSerialOffset, 4}, {Document::kChecksumOffset, 4},
-      {Document::kHitCountOffset, 4},    {Document::kNextAlternateOffsetPos, 8},
-      {Document::kLastAccessOffset, 8},
+      {Document::kFillSerialOffset, 4},       {Document::kWriteSerialOffset, 4},
+      {Document::kChecksumOffset, 4},         {Document::kHitCountOffset, 4},
+      {Document::kNextAlternateOffsetPos, 8}, {Document::kLastAccessOffset, 8},
   };
   for (const auto &[off, size] : in_place) {
     std::memset(head.data() + off, 0, size);
@@ -753,9 +753,8 @@ const std::vector<HeaderField> &covered_fields() {
       {"fragment_key", 48, 32}, {"header_len", 80, 4},
       {"doc_type", 84, 1},      {"version_major", 85, 1},
       {"version_minor", 86, 1}, {"flags", 87, 1},
-      {"sync_serial", 88, 4},   {"pin_until", 96, 4},
-      {"frag_offset", 104, 4},  {"alternate_id", 128, 1},
-      {"reserved", 129, 3},
+      {"pin_until", 96, 4},     {"frag_offset", 104, 4},
+      {"alternate_id", 128, 1}, {"reserved", 129, 3},
   };
   return fields;
 }

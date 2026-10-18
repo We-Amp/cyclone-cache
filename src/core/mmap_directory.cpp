@@ -1117,7 +1117,8 @@ bool MmapDirectory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
                            bool *bucket_full_evicted,
                            InsertAdmission *admission,
                            std::span<const uint64_t> clear_offsets, bool *busy,
-                           const PublishView *view, bool *stale) {
+                           const PublishView *view, bool *stale,
+                           uint16_t fill_serial) {
   if (_header == nullptr) {
     return false;
   }
@@ -1183,6 +1184,7 @@ bool MmapDirectory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
       DirEntry new_entry = choice.verified ? bucket[choice.slot] : DirEntry{};
       new_entry.set_offset(offset);
       new_entry.set_approx_size(size);
+      new_entry.set_fill_serial(fill_serial);
       new_entry.set_tag(tag);
       new_entry.set_phase(cur_phase);
       if (!choice.verified) {
@@ -1262,6 +1264,7 @@ bool MmapDirectory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
         DirEntry new_entry = bucket[i];
         new_entry.set_offset(offset);
         new_entry.set_approx_size(size);
+        new_entry.set_fill_serial(fill_serial);
         new_entry.set_phase(cur_phase);
         std::memcpy(&bucket[i], &new_entry, sizeof(DirEntry));
         success = true;
@@ -1286,6 +1289,7 @@ bool MmapDirectory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
     DirEntry new_entry;
     new_entry.set_offset(offset);
     new_entry.set_approx_size(size);
+    new_entry.set_fill_serial(fill_serial);
     new_entry.set_tag(tag);
     new_entry.set_phase(cur_phase);
     new_entry.set_head(true);
@@ -1299,6 +1303,7 @@ bool MmapDirectory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
     DirEntry new_entry;
     new_entry.set_offset(offset);
     new_entry.set_approx_size(size);
+    new_entry.set_fill_serial(fill_serial);
     new_entry.set_tag(tag);
     new_entry.set_phase(cur_phase);
     new_entry.set_head(true);
@@ -1315,6 +1320,7 @@ bool MmapDirectory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
     DirEntry new_entry;
     new_entry.set_offset(offset);
     new_entry.set_approx_size(size);
+    new_entry.set_fill_serial(fill_serial);
     new_entry.set_tag(tag);
     new_entry.set_phase(cur_phase);
     new_entry.set_head(true);
@@ -1338,6 +1344,7 @@ bool MmapDirectory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
     DirEntry new_entry;
     new_entry.set_offset(offset);
     new_entry.set_approx_size(size);
+    new_entry.set_fill_serial(fill_serial);
     new_entry.set_tag(tag);
     new_entry.set_phase(cur_phase);
     new_entry.set_head(true);

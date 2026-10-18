@@ -255,7 +255,7 @@ TEST_CASE("Document serialize/deserialize preserves all fields exactly",
   doc.version_major = 3;
   doc.version_minor = 7;
   doc.flags = Document::kFlagCompressed | Document::kFlagPinned;
-  doc.sync_serial = 0x11223344;
+  doc.fill_serial = 0x11223344;
   doc.write_serial = 0x55667788;
   doc.pin_until = 0xDEADBEEF;
   doc.checksum = 0xCAFEBABE;
@@ -284,7 +284,7 @@ TEST_CASE("Document serialize/deserialize preserves all fields exactly",
   REQUIRE(restored.version_major == doc.version_major);
   REQUIRE(restored.version_minor == doc.version_minor);
   REQUIRE(restored.flags == doc.flags);
-  REQUIRE(restored.sync_serial == doc.sync_serial);
+  REQUIRE(restored.fill_serial == doc.fill_serial);
   REQUIRE(restored.write_serial == doc.write_serial);
   REQUIRE(restored.pin_until == doc.pin_until);
   REQUIRE(restored.checksum == doc.checksum);

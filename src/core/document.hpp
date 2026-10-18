@@ -80,7 +80,7 @@ struct Document {
   uint8_t version_minor = kVersionMinor;
   uint8_t flags = kFlagNone;
 
-  uint32_t sync_serial = 0;
+  uint32_t fill_serial = 0;  // see kFillSerialOffset
   uint32_t write_serial = 0;
   uint32_t pin_until = 0;  // Unix timestamp
   uint32_t checksum = 0;   // CRC-32C (v8+); CRC-32/ISO-HDLC before v8
@@ -97,7 +97,7 @@ struct Document {
   // Header size calculation:
   // magic(4) + len(4) + total_len(8) + first_key(32) + fragment_key(32) +
   // header_len(4) + doc_type(1) + version_major(1) + version_minor(1) +
-  // flags(1) + sync_serial(4) + write_serial(4) + pin_until(4) + checksum(4) +
+  // flags(1) + fill_serial(4) + write_serial(4) + pin_until(4) + checksum(4) +
   // frag_offset(4) + hit_count(4) + next_alternate_offset(8) +
   // last_access(8) + alternate_id(1) + reserved2(3) = 132 bytes
   static constexpr size_t kHeaderSize = 132;
@@ -109,6 +109,15 @@ struct Document {
   // +doc_type(1) = 85.  Named so the version gate can be exercised on-disk
   // without a magic number; kept honest by a static_assert in document.cpp.
   static constexpr size_t kVersionMajorOffset = 85;
+  // fill_serial carries the serial of the fill that wrote the document (the
+  // write-lock acquisition it was written under; see WriteSlot::fill_serial
+  // in volume.hpp), and the directory entry that publishes it carries the
+  // same value.  A read serves a document only when the two agree, so the
+  // late bytes of a writer whose lock was taken over in the middle of its
+  // fill are never served under the entry of the write that took it over.
+  // Stamped after the checksum is computed, so it sits outside it.  (Named
+  // sync_serial and always 0 before.)
+  static constexpr size_t kFillSerialOffset = 88;
   // write_serial carries the stripe PASS the document was written in (wrap
   // retention's pass stamp, mod 2^32; see Volume::patch_pass_stamp).  It
   // was always 0 before, and it sits outside the checksum.
@@ -162,11 +171,12 @@ struct Document {
   // canonical fixed header followed by its payload (header bytes +
   // content).  The canonical header is the 132-byte wire header with the
   // fields the cache stamps after the checksum is computed or updates in
-  // place set to zero: write_serial (the pass stamp), the checksum itself,
-  // hit_count, next_alternate_offset and last_access.  Every other field --
-  // magic, the lengths, both keys, header_len, doc_type, the version, flags,
-  // sync_serial, pin_until, frag_offset, alternate_id and the reserved
-  // bytes -- is covered, so a change to any of them fails verification.
+  // place set to zero: fill_serial and write_serial (the fill and pass
+  // stamps), the checksum itself, hit_count, next_alternate_offset and
+  // last_access.  Every other field -- magic, the lengths, both keys,
+  // header_len, doc_type, the version, flags, pin_until, frag_offset,
+  // alternate_id and the reserved bytes -- is covered, so a change to any
+  // of them fails verification.
   // Returns the CRC-32C state after the canonical header, to be continued
   // over the payload with crc32c_update().
   [[nodiscard]] uint32_t checksum_header_seed() const;

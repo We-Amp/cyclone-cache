@@ -74,8 +74,12 @@ struct alignas(2) DirEntry {
   [[nodiscard]] bool pinned() const;
   void set_pinned(bool pinned);
 
-  [[nodiscard]] uint16_t next() const;
-  void set_next(uint16_t next);
+  // The serial of the fill that wrote the document this entry publishes
+  // (Document::fill_serial).  A read serves the document only when its own
+  // fill_serial matches.  Was the ATS-style bucket-chain `next` word, which
+  // nothing ever linked.
+  [[nodiscard]] uint16_t fill_serial() const;
+  void set_fill_serial(uint16_t serial);
 
   [[nodiscard]] bool is_empty() const;
   void clear();
@@ -703,14 +707,16 @@ class Directory {
   // `clear_offsets` is cleared in the same seqlock bracket (the uniqueness
   // rule: one resolvable entry per key; the caller verified those offsets
   // hold a stale or duplicate copy of this key).  Without it: the legacy
-  // current-phase-only behaviour described above.
+  // current-phase-only behaviour described above.  The published entry
+  // carries `fill_serial` (see DirEntry::fill_serial), in place or new.
   bool insert(const CacheKey &key, uint64_t offset, uint64_t size,
               uint64_t verified_offset = kMatchAnyTag,
               bool *collision_evicted = nullptr,
               bool *bucket_full_evicted = nullptr,
               InsertAdmission *admission = nullptr,
               std::span<const uint64_t> clear_offsets = {},
-              const PublishView *view = nullptr, bool *stale = nullptr);
+              const PublishView *view = nullptr, bool *stale = nullptr,
+              uint16_t fill_serial = 0);
 
   // WARNING: matches on the 12-bit tag only (a DirEntry holds no key
   // material), so a colliding foreign key's entry can be removed.

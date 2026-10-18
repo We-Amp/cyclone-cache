@@ -67,9 +67,10 @@ void sleep_for(std::chrono::nanoseconds d) { std::this_thread::sleep_for(d); }
 // DirEntry bit layout (10 bytes = 5 x 16-bit words):
 // w[0]: offset bits 0-15
 // w[1]: offset bits 16-23 (8 bits), big (2 bits), size (6 bits)
-// w[2]: tag (12 bits), phase (1 bit), head (1 bit), pinned (1 bit), reserved (1
-// bit) w[3]: next pointer (16 bits) - bucket chain w[4]: offset bits 24-39 (16
-// bits for 40-bit total = 512TB max)
+// w[2]: tag (12 bits), phase (1 bit), head (1 bit), pinned (1 bit),
+//       reserved (1 bit)
+// w[3]: fill serial (16 bits), see DirEntry::fill_serial
+// w[4]: offset bits 24-39 (16 bits for 40-bit total = 512TB max)
 
 uint64_t DirEntry::offset() const {
   uint64_t result = _w[0];
@@ -124,9 +125,9 @@ void DirEntry::set_pinned(bool pinned) {
   _w[2] = static_cast<uint16_t>((_w[2] & ~0x4000) | (pinned ? 0x4000 : 0));
 }
 
-uint16_t DirEntry::next() const { return _w[3]; }
+uint16_t DirEntry::fill_serial() const { return _w[3]; }
 
-void DirEntry::set_next(uint16_t next) { _w[3] = next; }
+void DirEntry::set_fill_serial(uint16_t serial) { _w[3] = serial; }
 
 bool DirEntry::is_empty() const { return offset() == 0; }
 
@@ -237,9 +238,9 @@ std::optional<DirEntry> Directory::probe(const CacheKey &key) const {
         break;
       }
       // No chain walk: insert() never links chains (the ATS-style `next`
-      // field is unused), and chain nodes would live in OTHER buckets
-      // guarded by OTHER seqlock versions — this bucket's version recheck
-      // below could not validate them.
+      // word is the fill serial now), and chain nodes would live in OTHER
+      // buckets guarded by OTHER seqlock versions — this bucket's version
+      // recheck below could not validate them.
     }
 
     std::atomic_thread_fence(std::memory_order_acquire);
@@ -375,7 +376,8 @@ bool Directory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
                        uint64_t verified_offset, bool *collision_evicted,
                        bool *bucket_full_evicted, InsertAdmission *admission,
                        std::span<const uint64_t> clear_offsets,
-                       const PublishView *view, bool *stale) {
+                       const PublishView *view, bool *stale,
+                       uint16_t fill_serial) {
   uint32_t bucket_idx = key.bucket_hash() % _num_buckets;
   uint16_t tag = key.tag();
   bool cur_phase = current_phase();
@@ -410,11 +412,13 @@ bool Directory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
     if (choice.verified) {
       bucket[choice.slot].set_offset(offset);
       bucket[choice.slot].set_approx_size(size);
+      bucket[choice.slot].set_fill_serial(fill_serial);
       bucket[choice.slot].set_phase(cur_phase);
     } else {
       DirEntry new_entry;
       new_entry.set_offset(offset);
       new_entry.set_approx_size(size);
+      new_entry.set_fill_serial(fill_serial);
       new_entry.set_tag(tag);
       new_entry.set_phase(cur_phase);
       new_entry.set_head(true);
@@ -510,6 +514,7 @@ bool Directory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
     begin_bucket_write(bucket_idx);
     bucket[target].set_offset(offset);
     bucket[target].set_approx_size(size);
+    bucket[target].set_fill_serial(fill_serial);
     bucket[target].set_phase(cur_phase);
     end_bucket_write(bucket_idx);
     return true;
@@ -520,6 +525,7 @@ bool Directory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
     begin_bucket_write(bucket_idx);
     bucket[first_empty].set_offset(offset);
     bucket[first_empty].set_approx_size(size);
+    bucket[first_empty].set_fill_serial(fill_serial);
     bucket[first_empty].set_tag(tag);
     bucket[first_empty].set_phase(cur_phase);
     bucket[first_empty].set_head(true);
@@ -533,6 +539,7 @@ bool Directory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
     begin_bucket_write(bucket_idx);
     bucket[first_stale].set_offset(offset);
     bucket[first_stale].set_approx_size(size);
+    bucket[first_stale].set_fill_serial(fill_serial);
     bucket[first_stale].set_tag(tag);
     bucket[first_stale].set_phase(cur_phase);
     bucket[first_stale].set_head(true);
@@ -547,6 +554,7 @@ bool Directory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
     begin_bucket_write(bucket_idx);
     bucket[first_collider].set_offset(offset);
     bucket[first_collider].set_approx_size(size);
+    bucket[first_collider].set_fill_serial(fill_serial);
     bucket[first_collider].set_tag(tag);
     bucket[first_collider].set_phase(cur_phase);
     bucket[first_collider].set_head(true);
@@ -566,11 +574,12 @@ bool Directory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
   // current-phase with a HIGH offset.  Correctness never depends on the choice.
   if (nearest_to_clobber >= 0) {
     // Build a complete entry locally, then assign — a fresh DirEntry zeroes
-    // next/pinned, so the new key cannot inherit the victim's chain pointer.
+    // pinned, so the new key cannot inherit the victim's flags.
     // Matches the MmapDirectory twin, which memcpy's a fresh entry.
     DirEntry new_entry;
     new_entry.set_offset(offset);
     new_entry.set_approx_size(size);
+    new_entry.set_fill_serial(fill_serial);
     new_entry.set_tag(tag);
     new_entry.set_phase(cur_phase);
     new_entry.set_head(true);

@@ -55,7 +55,7 @@ constexpr FieldDesc kDocumentFields[] = {
     {offsetof(Document, version_major), sizeof(Document::version_major)},
     {offsetof(Document, version_minor), sizeof(Document::version_minor)},
     {offsetof(Document, flags), sizeof(Document::flags)},
-    {offsetof(Document, sync_serial), sizeof(Document::sync_serial)},
+    {offsetof(Document, fill_serial), sizeof(Document::fill_serial)},
     {offsetof(Document, write_serial), sizeof(Document::write_serial)},
     {offsetof(Document, pin_until), sizeof(Document::pin_until)},
     {offsetof(Document, checksum), sizeof(Document::checksum)},
@@ -88,6 +88,8 @@ consteval size_t wire_offset_of(size_t field_index) {
 // next_alternate_offset is 16, last_access is 17, alternate_id is 18 (v6)
 static_assert(wire_offset_of(7) == Document::kVersionMajorOffset,
               "kVersionMajorOffset out of sync with field table");
+static_assert(wire_offset_of(10) == Document::kFillSerialOffset,
+              "kFillSerialOffset out of sync with field table");
 static_assert(wire_offset_of(11) == Document::kWriteSerialOffset,
               "kWriteSerialOffset out of sync with field table");
 static_assert(wire_offset_of(13) == Document::kChecksumOffset,
@@ -130,9 +132,10 @@ void Document::serialize_to(std::byte *out) const {
 uint32_t Document::checksum_header_seed() const {
   std::array<std::byte, kHeaderSize> canonical;
   serialize_to(canonical.data());
-  // The fields stamped after the checksum is computed (the pass stamp) or
-  // updated in place, and the checksum itself.
+  // The fields stamped after the checksum is computed (the fill and pass
+  // stamps) or updated in place, and the checksum itself.
   constexpr std::pair<size_t, size_t> kInPlace[] = {
+      {kFillSerialOffset, sizeof(uint32_t)},
       {kWriteSerialOffset, sizeof(uint32_t)},
       {kChecksumOffset, sizeof(uint32_t)},
       {kHitCountOffset, sizeof(uint32_t)},

@@ -544,3 +544,78 @@ TEST_CASE("Directory insert evicts the entry nearest the wrap cursor",
     REQUIRE(survivor->offset() == (i + 1) * 1000);
   }
 }
+
+namespace {
+
+// Every position admissible: the insert's victim order and in-place update
+// without a stripe behind them.
+class AdmitAll final : public InsertAdmission {
+ public:
+  void refresh() override {}
+  [[nodiscard]] AdmitClass classify(uint64_t /*relative_offset*/,
+                                    bool /*phase*/) const override {
+    return AdmitClass::kCurrent;
+  }
+};
+
+// The two directories' inserts take the same arguments, plus the mmap
+// directory's capped-wait flag.
+bool insert_with(Directory &dir, const CacheKey &key, uint64_t offset,
+                 uint64_t verified, InsertAdmission *adm, uint16_t serial) {
+  return dir.insert(key, offset, 512, verified, nullptr, nullptr, adm, {},
+                    nullptr, nullptr, serial);
+}
+bool insert_with(MmapDirectory &dir, const CacheKey &key, uint64_t offset,
+                 uint64_t verified, InsertAdmission *adm, uint16_t serial) {
+  return dir.insert(key, offset, 512, verified, nullptr, nullptr, adm, {},
+                    nullptr, nullptr, nullptr, serial);
+}
+
+// The fill serial an insert is given is what the published entry carries,
+// for a new entry and for an in-place update alike, so a read can tell the
+// document the entry's write filled from other bytes at the same offset.
+template <typename Dir>
+void check_fill_serial_published(Dir &dir) {
+  const CacheKey key("fill-serial-published");
+  AdmitAll admit;
+  SECTION("with an admission") {
+    REQUIRE(insert_with(dir, key, 4096, Dir::kNoVerifiedEntry, &admit, 0x1234));
+    auto first = dir.probe(key);
+    REQUIRE(first.has_value());
+    CHECK(first->fill_serial() == 0x1234);
+    // Updated in place: the serial follows the new document.
+    REQUIRE(insert_with(dir, key, 8192, 4096, &admit, 0xBEEF));
+    auto second = dir.probe(key);
+    REQUIRE(second.has_value());
+    CHECK(second->offset() == 8192);
+    CHECK(second->fill_serial() == 0xBEEF);
+    CHECK(dir.count() == 1);
+  }
+  SECTION("without an admission") {
+    REQUIRE(insert_with(dir, key, 4096, Dir::kMatchAnyTag, nullptr, 7));
+    REQUIRE(dir.probe(key)->fill_serial() == 7);
+    REQUIRE(insert_with(dir, key, 8192, Dir::kMatchAnyTag, nullptr, 9));
+    auto entry = dir.probe(key);
+    REQUIRE(entry.has_value());
+    CHECK(entry->offset() == 8192);
+    CHECK(entry->fill_serial() == 9);
+  }
+}
+
+}  // namespace
+
+TEST_CASE("Directory insert publishes the fill serial",
+          "[directory][fill_serial]") {
+  Directory dir(256);
+  check_fill_serial_published(dir);
+}
+
+TEST_CASE("MmapDirectory insert publishes the fill serial",
+          "[directory][fill_serial]") {
+  constexpr size_t kBuckets = 256;
+  std::vector<std::byte> region(MmapDirectory::required_size(kBuckets),
+                                std::byte{0});
+  auto dir_opt = MmapDirectory::init(std::span<std::byte>(region), kBuckets);
+  REQUIRE(dir_opt.has_value());
+  check_fill_serial_published(*dir_opt);
+}

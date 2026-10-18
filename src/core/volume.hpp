@@ -749,18 +749,21 @@ struct Stripe {
               InsertAdmission *admission = nullptr,
               std::span<const uint64_t> clear_offsets = {},
               bool *busy = nullptr, const PublishView *view = nullptr,
-              bool *stale = nullptr) {
+              bool *stale = nullptr, uint16_t fill_serial = 0) {
     if (use_mmap_directory && mmap_directory) {
       // *busy: a capped cross-process lock wait gave up; nothing published.
       // *stale: the bucket no longer holds what `view` describes; nothing
-      // published (see PublishView in directory.hpp).
-      return mmap_directory->insert(
-          key, offset, size, verified_offset, collision_evicted,
-          bucket_full_evicted, admission, clear_offsets, busy, view, stale);
+      // published (see PublishView in directory.hpp).  The entry carries
+      // `fill_serial`, the published document's own (DirEntry::fill_serial).
+      return mmap_directory->insert(key, offset, size, verified_offset,
+                                    collision_evicted, bucket_full_evicted,
+                                    admission, clear_offsets, busy, view, stale,
+                                    fill_serial);
     } else if (directory) {
       return directory->insert(key, offset, size, verified_offset,
                                collision_evicted, bucket_full_evicted,
-                               admission, clear_offsets, view, stale);
+                               admission, clear_offsets, view, stale,
+                               fill_serial);
     }
     return false;
   }
@@ -1221,11 +1224,16 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // The generation bump makes the usurped holder's commit_write_slot
   // revalidate fail, so its INSERT is skipped — but its already-in-flight
   // pwrite can still land over the span the usurper reserved at the same
-  // un-advanced cursor and already published, tearing the usurper's bytes
-  // UNDER a live directory entry.  That tear is detectable, never a wrong
-  // serve: the CRC + full-key gauntlet resolves it to Corrupted/miss (pinned
-  // by the F6-F escalation-usurp test in test_wrap_phase_aba.cpp); only the
-  // escalation deadline bounds how late the stalled pwrite can land.
+  // un-advanced cursor and already published, replacing the usurper's bytes
+  // UNDER a live directory entry.  A partial landing is a tear the CRC +
+  // full-key gauntlet resolves to Corrupted/miss (pinned by the F6-F
+  // escalation-usurp test in test_wrap_phase_aba.cpp).  A COMPLETE landing
+  // of a document of the same key passes that gauntlet -- it is a valid,
+  // older document -- and is refused by the fill serial instead: it carries
+  // the usurped holder's serial, the entry the usurper's (fill_serial
+  // below; test_usurped_fill.cpp).  Either way a miss, never the older
+  // document served as current; only the escalation deadline bounds how
+  // late the stalled pwrite can land.
   struct WriteSlot {
     uint64_t write_offset = 0;   // reserved start (absolute)
     uint64_t new_write_pos = 0;  // write_offset + doc_size (absolute)
@@ -1241,6 +1249,17 @@ class Volume : public std::enable_shared_from_this<Volume> {
     // The pass the reservation belongs to: the caller stamps it into the
     // document's write_serial (patch_pass_stamp) before the pwrite.
     uint64_t pass = 0;
+    // The serial of this fill: the write-lock acquisition it holds (0 for a
+    // single-process stripe, which has no such lock and no takeover).  The
+    // caller stamps it into the document's fill_serial (patch_fill_serial)
+    // and publishes it with the directory entry.  A holder whose lock was
+    // taken over shares its reservation's offset with the next holder but
+    // never its serial: every acquisition and every forced release moves
+    // the lock's generation.  So the takeover residual on commit_write_slot
+    // -- the late pwrite of a stalled holder landing over the next holder's
+    // published document -- leaves bytes whose serial disagrees with the
+    // entry, which no read serves.
+    uint16_t fill_serial = 0;
     // Tail fill (issue #35; see kTailFillPage): when non-zero, the caller
     // writes zeros from the document's last byte up to this absolute offset
     // in the SAME write as the document.  At most one page past
@@ -1279,6 +1298,18 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // outside the checksum, which covers only header data + content.  The
   // stamp is what makes "one pass old" exact for admission (design 4.4).
   static void patch_pass_stamp(std::span<std::byte> doc, uint64_t pass);
+  // Stamp a fill serial (WriteSlot::fill_serial) into a built document's
+  // fill_serial field.  Outside the checksum, like the pass stamp.
+  static void patch_fill_serial(std::span<std::byte> doc, uint16_t serial);
+  // Does `entry` publish the document whose header is `doc`?  True when the
+  // document's fill serial is the entry's: the document is the one the
+  // entry's write filled, not the late fill of a holder taken over at the
+  // same offset.  Every read and election of a directory entry's document
+  // checks it alongside the key.
+  [[nodiscard]] static bool entry_binds(const DirEntry &entry,
+                                        const Document &doc) noexcept {
+    return doc.fill_serial == entry.fill_serial();
+  }
 
   // TEST SEAM ONLY -- never set in production.  When true, allocate_write_slot
   // reverts to the pre-F6 behavior: it advances the guard-visible write cursor

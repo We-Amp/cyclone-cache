@@ -754,7 +754,7 @@ Directory entry — 10 bytes, no key material:
 w0  offset[0:15]
 w1  offset[16:23] | big[2] | size[6]         approximate size = (size+1) × 512 << big
 w2  tag[12] | phase[1] | head[1] | pinned[1] | reserved[1]
-w3  next                                     bucket chain, 4 entries per bucket
+w3  fill_serial                              serial of the write that filled the document
 w4  offset[24:39]                            40-bit byte offset → 1 TiB per stripe
 ```
 
@@ -764,16 +764,17 @@ Document — 132-byte header, then header bytes, then content:
 magic · len · total_len
 first_key      (32 B, SHA-256 of the key)
 fragment_key   (32 B)
-header_len · type · version · flags · sync_serial · write_serial
+header_len · type · version · flags · fill_serial · write_serial
 pin_until · checksum (CRC-32C) · frag_offset · hit_count
 next_alternate_offset (8 B) · last_access · alternate_id · reserved
 ```
 
 The checksum covers the fixed header as well as the header bytes and
 content: every field except the ones stamped after the checksum is
-computed or updated in place (write_serial, hit_count,
+computed or updated in place (fill_serial, write_serial, hit_count,
 next_alternate_offset, last_access) and the
-checksum itself.
+checksum itself. A read serves a document only when its fill_serial
+matches the directory entry's.
 
 ## Performance
 
