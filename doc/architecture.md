@@ -16,9 +16,9 @@ as a C++ API and a C ABI.
 |------|---------|----------------|
 | **Stripe (= Segment)** | The cache partitioning unit. The C API `num_segments` (`cyclone_c.h`) and `CacheKey::segment_hash()` (`key.hpp`) refer to the SAME stripes this doc describes — there is exactly ONE partitioning dimension. `stripe_index = key.segment_hash() % num_stripes`. | `key.hpp`, `cyclone_c.h`, "Volumes and Stripes" |
 | **Volume** | A single cache file on disk, divided into stripes for parallel access. | `src/core/volume.hpp`, "Volumes and Stripes" |
-| **VolumeHeader** | 64-byte header at offset 0; magic `0x43594C4E` ("CYLN") + format major/minor. Format major is **v8**. | `src/core/volume.hpp` (`VolumeHeader`) |
+| **VolumeHeader** | 64-byte header at offset 0; magic `0x43594C4E` ("CYLN") + format major/minor. Format major is **v9**. | `src/core/volume.hpp` (`VolumeHeader`) |
 | **Directory entry** | Compact 10-byte key→offset record. Bitfields: `tag` (12-bit collision tag), `phase` (1-bit phase GC), `head` (1-bit, first fragment), `pinned` (1-bit, reserved for do-not-evict — not enforced by eviction today), 40-bit `offset` (byte offset within the stripe; 1 TiB/stripe), `next` (bucket chain). Carries **no key material**. | `src/core/directory.hpp` (`DirEntry`) |
-| **Document / fragment** | On-disk record (132-byte header, format major **v8**). The format reserves `FirstFrag`/`MiddleFrag`/`LastFrag` types, but the implementation writes only `SingleFrag` documents today — a document must fit in one stripe's data area (write fails with `NoSpace` otherwise) and under `max_object_size` (`ObjectTooLarge`). | `src/core/document.hpp` (`Document`) |
+| **Document / fragment** | On-disk record (132-byte header, format major **v9**). The format reserves `FirstFrag`/`MiddleFrag`/`LastFrag` types, but the implementation writes only `SingleFrag` documents today — a document must fit in one stripe's data area (write fails with `NoSpace` otherwise) and under `max_object_size` (`ObjectTooLarge`). | `src/core/document.hpp` (`Document`) |
 | **bucket_hash / tag** | Within a stripe, `bucket_hash()` selects the directory bucket; `tag()` is the 12-bit collision tag. | `key.hpp` |
 | **Alternate / AlternateId** | A content variant under one key (Original, Brotli, Gzip, WebP, AVIF, JpegXL, Custom…). `AlternateId` normalizes UA capabilities into discrete classes. | `alternate.hpp` |
 | **Alternate chain** | Singly-linked list of alternates via `next_alternate_offset`. Directory points to the **head** (newest); **tail** is typically Original (oldest). Max 64 per key. | "Alternate Chains" |
@@ -228,9 +228,9 @@ overwritten.
 
 ### Document Format
 
-Each cached entry is a document with a 132-byte header (**v8** format,
+Each cached entry is a document with a 132-byte header (**v9** format,
 `document.hpp` (`Document`)). `Document::kVersionMajor` and
-`VolumeHeader::kFormatVersionMajor` are kept in lockstep at 8. The format
+`VolumeHeader::kFormatVersionMajor` are kept in lockstep at 9. The format
 reserves `FirstFrag`/`MiddleFrag`/`LastFrag` document types for spanning a
 large value across fragments, but the implementation writes only
 `SingleFrag` documents today (both write sites hardcode `Document::Type::SingleFrag`,
@@ -246,13 +246,13 @@ Document Header (132 bytes)
 ├─ frag_key     32 bytes  SHA-256 of this fragment
 ├─ header_len   uint32_t  metadata header size
 ├─ doc_type     uint8_t   Single / First / Middle / Last fragment (SingleFrag only, in practice)
-├─ ver_major    uint8_t   format version (8)
+├─ ver_major    uint8_t   format version (9)
 ├─ ver_minor    uint8_t   format version
 ├─ flags        uint8_t   document flags
 ├─ sync_serial  uint32_t
 ├─ write_serial uint32_t
 ├─ pin_until    uint32_t  pin expiration (Unix time)
-├─ checksum     uint32_t  CRC-32C over header_data + content
+├─ checksum     uint32_t  CRC-32C over the canonical header + header_data + content
 ├─ frag_offset  uint32_t  offset within a multi-fragment document
 ├─ hit_count            uint32_t  persisted hit counter
 ├─ next_alternate_offset uint64_t offset to next alternate (chain)
@@ -262,9 +262,22 @@ Document Header (132 bytes)
 └─ Content Data (variable)
 ```
 
-**Document checksum.** `checksum` is a CRC-32**C** (Castagnoli) over
-header_data + content — everything after the 132-byte header. The convention
-is part of the on-disk format and is frozen: reflected polynomial
+**Document checksum.** `checksum` is a CRC-32**C** (Castagnoli) over the
+document's *canonical fixed header* followed by header_data + content
+(`Document::checksum_header_seed`, `Document::verify_checksum`). The canonical
+header is the 132-byte wire header with the fields that are written in place
+after the store set to zero: `write_serial` (the pass stamp), `checksum`
+itself, `hit_count`, `next_alternate_offset` and `last_access`. Every other
+header field is covered: `magic`, `len`, `total_len`, both keys,
+`header_len`, `doc_type`, both version bytes, `flags`, `sync_serial`,
+`pin_until`, `frag_offset`, `alternate_id` and the reserved bytes. A change
+to any covered field fails verification and the read is a miss; the in-place
+updates (pass stamp, hit count, access time, chain repoint) and the
+retained-chain carry change only uncovered fields, so they never invalidate
+a document. The CRC-validation cache token folds in the CRC of the canonical
+header, so a cached verdict does not vouch for a header changed in a covered
+field either. The coverage (v9) and the CRC convention are part of the
+on-disk format. The convention is frozen: reflected polynomial
 `0x82F63B78`, init `0xFFFFFFFF`, reflected in and out, final XOR
 `0xFFFFFFFF`, so `crc32c("123456789") == 0xE3069283`. It lives in
 `src/core/crc32c.{hpp,cpp}`, behind `crc32c()` / `crc32c_update()`.
@@ -321,6 +334,7 @@ auto-resets on open when `auto_reset_on_incompatible`, default true,
 | v6 | `hit_count` / `next_alternate_offset` / `last_access` laid out naturally aligned, so the in-place header RMW sites can store them atomically |
 | v7 | alternate chains are depth-bounded at write time; the bump leaves pre-bound (over-deep, possibly cyclic) chains behind rather than repairing them |
 | v8 | the document checksum is CRC-32C instead of CRC-32/ISO-HDLC; no byte of the layout moved, but every pre-v8 checksum was computed over a different polynomial, so the bump leaves those rings behind |
+| v9 | the document checksum also covers the fixed document header (every field that never changes after the write); no byte of the layout moved, but every pre-v9 checksum covers less and would fail verification, so the bump leaves those rings behind |
 
 ### Alternate Chains
 

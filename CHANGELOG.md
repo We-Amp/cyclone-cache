@@ -446,6 +446,21 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   resolves to a different file and starts cold rather than failing to verify
   v7 documents; the superseded v7 file stays on disk until
   `gc_superseded_on_start` (POSIX only) or a manual delete reclaims it.
+- **On-disk format v9 (was v8): the document checksum covers the fixed
+  document header.** The CRC-32C used to cover only the header bytes and
+  content, so damage to a field of the 132-byte fixed header (flags,
+  `pin_until`, `alternate_id`, the fragment key, the version minor and
+  others) was not detected. It now starts from a canonical copy of the
+  fixed header in which the fields updated in place after the write (pass
+  stamp, hit count, alternate chain link, access time) and the checksum
+  itself are zero, so every other field is covered and a document with a
+  changed field reads as a miss. Cost per operation: one CRC-32C over 132
+  bytes on write and on each verification, and one on a read served from
+  a cached verification (about 11 ns each, measured on an ARM64 core).
+  **Existing cache files are abandoned (not deleted) on open**, exactly as
+  for v8: a v9 binary resolves to a different fingerprinted file and
+  starts cold; the superseded v8 file stays on disk until
+  `gc_superseded_on_start` (POSIX only) or a manual delete reclaims it.
 - **Bazel and vendored consumers:** add the new sources
   `src/core/crc32c.cpp` and `src/core/crc32c.hpp` to any downstream BUILD
   file that lists srcs explicitly. No new copts or defines are needed: the

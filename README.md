@@ -17,7 +17,7 @@ It is a general-purpose blob store for anything keyed by a hash — HTTP
 responses and their content-negotiated variants, rendered pages, transcoded
 images, or the [KV-cache tensors of an LLM prefix](#kv-cache-for-llm-inference).
 
-**Status:** v0.1.0, pre-release. On-disk format v8. The API is not yet frozen;
+**Status:** v0.1.0, pre-release. On-disk format v9. The API is not yet frozen;
 pin a commit when you depend on it. The numbers below are from one machine
 (Apple M5 / macOS 27) unless they name another; expect different absolutes
 on Linux/NVMe.
@@ -732,12 +732,12 @@ probes) is documented in [include/cyclone/cyclone_c.h](include/cyclone/cyclone_c
 
 ## On-disk format
 
-Format major **v8**. Each volume file starts with a 64-byte `VolumeHeader`
+Format major **v9**. Each volume file starts with a 64-byte `VolumeHeader`
 (magic `CYLN`, format version, creation time, size); a major-version mismatch
 resets the volume (or fails with `IncompatibleVersion` when
 `auto_reset_on_incompatible = false`), a minor mismatch is compatible. File
 names are fingerprinted with the format version and geometry
-(`cache-8-<hash>.dat`), so an upgrade starts a fresh file and leaves the old
+(`cache-9-<hash>.dat`), so an upgrade starts a fresh file and leaves the old
 one on disk until `gc_superseded_on_start` (POSIX only) or you delete it.
 
 Directory entry — 10 bytes, no key material:
@@ -760,6 +760,11 @@ header_len · type · version · flags · sync_serial · write_serial
 pin_until · checksum (CRC-32C) · frag_offset · hit_count
 next_alternate_offset (8 B) · last_access · alternate_id · reserved
 ```
+
+The checksum covers the fixed header as well as the header bytes and
+content: every field except the ones written in place after the store
+(write_serial, hit_count, next_alternate_offset, last_access) and the
+checksum itself.
 
 ## Performance
 

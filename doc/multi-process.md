@@ -800,7 +800,7 @@ switch (result.error()) {
 
 ## On-Disk Format Versions
 
-The current on-disk format major version is **v8**
+The current on-disk format major version is **v9**
 (`VolumeHeader::kFormatVersionMajor` and `Document::kVersionMajor`, kept in
 lockstep). Version history:
 
@@ -812,10 +812,11 @@ lockstep). Version history:
 | v6 | `hit_count` / `next_alternate_offset` / `last_access` laid out naturally aligned, so the in-place header RMW sites can store them atomically |
 | v7 | alternate chains are depth-bounded at write time; the bump leaves pre-bound (over-deep, possibly cyclic) chains behind rather than repairing them |
 | v8 | the document checksum is CRC-32C (Castagnoli) instead of CRC-32/ISO-HDLC, so it has hardware instructions on x86-64 as well as ARMv8; pre-v8 checksums were computed over a different polynomial and the bump leaves those rings behind |
+| v9 | the document checksum also covers the fixed document header: every field that never changes after the write (the in-place pass stamp, hit count, chain link and access time stay outside); pre-v9 checksums cover less and the bump leaves those rings behind |
 
 ### Automatic Migration
 
-Migration is automatic: opening a volume whose major version predates v8
+Migration is automatic: opening a volume whose major version predates v9
 resets (reinitializes) it with the current format, losing the cached data —
 entries are cache data, so the cost is a one-time miss spike while the cache
 re-populates. With `auto_reset_on_incompatible = false`, the open fails with

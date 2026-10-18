@@ -165,9 +165,13 @@ What this says:
 
 ## 3. Threat model: what the CRC protects against today
 
-The CRC covers header_data + content, everything after the 132-byte header
-(`Document::verify_checksum`). It says nothing about the header itself: key,
-length, stamp and the mutable fields are guarded by the other legs.
+(Written against format v8.) The CRC then covered header_data + content,
+everything after the 132-byte header, and said nothing about the header
+itself: key, length, stamp and the mutable fields were guarded by the other
+legs. From format v9 the CRC also covers every header field that never
+changes after the write, and the token folds in the CRC of that canonical
+header; the pass stamp and the other in-place fields are still guarded by
+the other legs (`Document::checksum_header_seed`).
 
 ### 3.1 Threats and whether a token may stand in for the CRC
 
