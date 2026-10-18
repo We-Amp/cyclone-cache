@@ -13,9 +13,10 @@
 
 namespace cyclone::c_api_detail {
 
-// Every enumerator is listed (no default), so a new CacheError fails the
-// build's -Wswitch until it is mapped here.  Conditions the C API cannot
-// reach map to CYCLONE_INTERNAL_ERROR, as does a value outside the enum.
+// Every enumerator is listed (no default), so a new CacheError draws a
+// -Wswitch warning (not an error: the build does not use -Werror) until it
+// is mapped here.  Conditions the C API cannot reach map to
+// CYCLONE_INTERNAL_ERROR, as does a value outside the enum.
 inline CycloneError to_c_error(CacheError e) {
   switch (e) {
     case CacheError::Success:

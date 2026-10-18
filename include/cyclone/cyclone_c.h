@@ -483,11 +483,17 @@ typedef struct {
  *   cyclone_cache_drain_pending()): if the application had asynchronous
  *   reads with a miss handler in flight at the fork, their entries were
  *   copied into the child, nothing completes them there, and the destroy
- *   waits out the drain's 30 seconds.  Fork when no such read is in flight
- *   (a server parent has none), or let such a child exit without
- *   destroying.  The destroy ends the child's use of the handle only: the
- *   parent's cache keeps running.  A child that wants background threads of
- *   its own creates a cache of its own with cyclone_cache_create().
+ *   waits out the drain's 30 seconds.  Worse, if a done callback of the
+ *   parent was storing a fetched value at the instant of the fork, the
+ *   child inherits that write-back as still under way; nothing ends it in
+ *   the child, and the child's destroy, which waits for every write-back
+ *   under way before closing the cache, never returns.  So fork only when
+ *   no asynchronous read with a miss handler is in flight and no done
+ *   callback is running (a server parent that forks before it serves has
+ *   neither), or let such a child exit without destroying.  The destroy
+ *   ends the child's use of the handle only: the parent's cache keeps
+ *   running.  A child that wants background threads of its own creates a
+ *   cache of its own with cyclone_cache_create().
  * - Not covered: other threads of the application that are inside a cache
  *   call at the instant of the fork, and children made with vfork() or a
  *   direct clone().  Read and write handles open at the fork stay the
@@ -593,7 +599,11 @@ typedef void (*CycloneMissDoneCallback)(void *, const char *, size_t,
  * fetch and call done_cb(done_user_data, ...) when complete.
  *   key/key_len:        the cache key that missed
  *   handler_user_data:  opaque pointer registered with set_miss_handler
- *   done_cb:            completion callback the handler MUST call exactly once
+ *   done_cb:            completion callback the handler MUST call exactly once.
+ *                       A second call is ignored while the cache is alive;
+ *                       after cyclone_cache_destroy() the first call is
+ *                       still safe (see cyclone_cache_drain_pending()), but
+ *                       a second call is undefined behaviour.
  *   done_user_data:     opaque pointer to pass back to done_cb
  */
 typedef void (*CycloneMissHandler)(const char *, size_t, void *,
