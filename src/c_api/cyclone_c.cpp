@@ -487,7 +487,7 @@ static void miss_done_impl(MissDoneContext *ctx, const char *data,
     }
     key = std::move(ctx->key);
     // Bound completed_contexts: when it exceeds kMaxCompletedContexts
-    // entries, keep only the most recent 64.  Older contexts are safe to free —
+    // entries, keep only the most recent 64.  Older contexts are safe to free:
     // any racing double-done-cb on a previous miss would have already resolved.
     if (ch->completed_contexts.size() > kMaxCompletedContexts) {
       ch->completed_contexts.erase(
@@ -513,6 +513,25 @@ static void miss_done_impl(MissDoneContext *ctx, const char *data,
     }
   }
 
+  // Ends the write-back registered above however this function is left,
+  // including by an exception from a waiter's callback (contained by the
+  // barrier in internal_miss_done): destroy waits for pending_writes to
+  // reach zero.  Destroy waits for pending_writes alone, so wake it
+  // whenever shutting down, not only when nothing is in flight.
+  struct WriteBackDone {
+    CycloneCacheHandle *ch;
+    bool active;
+    ~WriteBackDone() {
+      if (!active) return;
+      if (ch->pending_writes.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        std::lock_guard<std::mutex> lock(ch->in_flight_mu);
+        if (ch->shutting_down) {
+          ch->in_flight_drained.notify_all();
+        }
+      }
+    }
+  } write_back_done{ch, will_write};
+
   // Notify all coalesced waiters FIRST (before cache write).
   for (auto &[cb, ud] : waiters) {
     cb(ud, data, data_len, err);
@@ -522,15 +541,6 @@ static void miss_done_impl(MissDoneContext *ctx, const char *data,
   // Failure to write is non-fatal: waiters already have the data.
   if (will_write) {
     cyclone_cache_write(ch, key.data(), key.size(), data, data_len);
-    // Decrement pending_writes and wake drain if this was the last one.
-    // Destroy waits for pending_writes alone, so wake it whenever shutting
-    // down, not only when nothing is in flight.
-    if (ch->pending_writes.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-      std::lock_guard<std::mutex> lock(ch->in_flight_mu);
-      if (ch->shutting_down) {
-        ch->in_flight_drained.notify_all();
-      }
-    }
   }
 }
 

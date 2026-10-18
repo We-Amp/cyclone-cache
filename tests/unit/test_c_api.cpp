@@ -12,6 +12,7 @@
 #include <cstring>
 #include <filesystem>
 #include <latch>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1937,4 +1938,39 @@ TEST_CASE("C API: destroy waits for a write-back that is under way",
   fetcher.join();
   destroyer.join();
   CHECK(destroyed.load());
+}
+
+TEST_CASE("C API: a throwing read_cb does not leave a write-back pending",
+          "[c_api][miss_callback][shutdown]") {
+  // Callbacks must not throw (see cyclone_c.h), but one written in C++ might.
+  // The bridge contains the exception; it must not also leave its
+  // write-back accounting behind, or destroy waits for it forever.
+  TempCacheDir tmp;
+  CycloneCacheHandle *cache = make_async_cache(tmp.path());
+  ParkedFetch parked;
+  REQUIRE(cyclone_cache_set_miss_handler(cache, park_fetch, &parked) ==
+          CYCLONE_OK);
+
+  auto throwing_read = [](void *, const char *, size_t, CycloneError) {
+    throw std::runtime_error("read_cb failed");
+  };
+  REQUIRE(cyclone_cache_read_async(cache, "throws", 6, throwing_read,
+                                   nullptr) == CYCLONE_OK);
+  REQUIRE(parked.done_cb.load() != nullptr);
+  parked.done_cb.load()(parked.done_ud.load(), "value", 5, CYCLONE_OK);
+
+  std::atomic<bool> destroyed{false};
+  std::thread destroyer([&] {
+    cyclone_cache_destroy(cache);
+    destroyed.store(true);
+  });
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!destroyed.load() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  if (!destroyed.load()) {
+    destroyer.detach();
+    FAIL("destroy is waiting for a write-back that will never finish");
+  }
+  destroyer.join();
 }

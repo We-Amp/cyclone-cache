@@ -454,6 +454,11 @@ typedef struct {
  *   the new handler takes effect for subsequent misses only.
  * - Callbacks (CycloneReadCallback, CycloneMissDoneCallback) may be invoked
  *   from any thread, including the calling thread or internal worker threads.
+ * - Callbacks the application passes in (CycloneReadCallback,
+ *   CycloneMissHandler) must not throw a C++ exception.  The library
+ *   contains one so that it does not cross a C frame, but the operation that
+ *   called the callback is cut short: remaining waiters of that read may go
+ *   unanswered and the fetched value is not stored.
  * - Do not call cyclone_cache_destroy() while other operations are in progress
  *   on other threads; call cyclone_cache_drain_pending() first to ensure
  *   graceful shutdown.
