@@ -1059,6 +1059,11 @@ struct VolumeStats {
   // there and is NOT normal (it was, when the gate was POSIX-only).
   uint64_t reset_gate_degraded = 0;
 
+  // 1 iff mapping the whole volume file failed at open() and this volume
+  // runs on the per-operation mmap/munmap fallback (correct, but a syscall
+  // pair on every read and write).  A GAUGE, cleared on every open().
+  uint64_t whole_file_map_failed = 0;
+
   // 1 iff this process holds no write-lock liveness slot on this
   // multi-process volume (WriterLiveness: all 251 slots taken, byte-range
   // locking unsupported here, the volume file was replaced by name, or the
@@ -1766,6 +1771,8 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // fell back to the historical ungated behaviour.  Surfaced via stats(); see
   // VolumeStats::reset_gate_degraded.  A GAUGE: cleared on every open().
   std::atomic<bool> _reset_gate_degraded{false};
+  // See VolumeStats::whole_file_map_failed.  A GAUGE: cleared on every open().
+  std::atomic<bool> _whole_file_map_failed{false};
   // Monotonic COUNTERS of resets that actually wiped data, split by the gate
   // state they ran under (see ResetProvenance in volume.cpp).  Unlike the gauge
   // above they are NEVER cleared on open() -- a reset that already happened

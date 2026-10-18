@@ -136,6 +136,11 @@ struct CacheStats {
   // IoError before the gate can degrade).
   uint64_t volumes_with_degraded_reset_gate = 0;
 
+  // Volumes whose whole-file mapping failed at open and that run on the
+  // slower per-operation mapping fallback (a gauge).  Nonzero usually means
+  // address-space or memory-map limits; raise them for full speed.
+  uint64_t volumes_without_whole_file_map = 0;
+
   // Directory entries evicted because a bucket was completely full of
   // current-phase entries with no tag collision to displace — the entry
   // nearest the wrap cursor is replaced so the write still lands (see

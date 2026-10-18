@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -1788,6 +1789,7 @@ std::expected<void, CacheError> Volume::open() {
   }
 
   _reset_gate_degraded.store(false, std::memory_order_relaxed);
+  _whole_file_map_failed.store(false, std::memory_order_relaxed);
 
   // the two-stage open above only picks the CREATOR of the file
   // -- it does not order a non-creator against the creator's initialization
@@ -2068,7 +2070,16 @@ std::expected<void, CacheError> Volume::open_locked(bool created_new) {
   // Map the entire volume file persistently.  All subsequent map_region()
   // calls become pointer arithmetic (zero syscalls).  Failure is non-fatal:
   // falls back to per-region mapping (e.g., on 32-bit systems).
-  (void)_mapped_file->map_whole_file(MappedFile::MapMode::ReadWrite);
+  // The fallback is kept, but it costs an mmap/munmap pair per operation, so
+  // it is surfaced: a gauge in stats() and one warning per open.
+  if (auto whole = _mapped_file->map_whole_file(MappedFile::MapMode::ReadWrite);
+      !whole) {
+    _whole_file_map_failed.store(true, std::memory_order_relaxed);
+    std::fprintf(stderr,
+                 "cyclone: could not map volume %s as a whole (%s); falling "
+                 "back to per-operation mappings, which is much slower\n",
+                 _config.path.c_str(), whole.error().message().c_str());
+  }
 
   // Hold the SHARED lifetime lock for the whole life of this open Volume, so
   // any future opener that wants to reset sees us and refuses.  On POSIX this
@@ -4588,6 +4599,8 @@ VolumeStats Volume::stats() const {
   result.stripe_count = _stripes.size();
   result.reset_gate_degraded =
       _reset_gate_degraded.load(std::memory_order_relaxed) ? 1 : 0;
+  result.whole_file_map_failed =
+      _whole_file_map_failed.load(std::memory_order_relaxed) ? 1 : 0;
   result.write_lock_liveness_unregistered =
       _writer_liveness_attached.load(std::memory_order_relaxed) &&
               _writer_liveness.slot_of() < 0

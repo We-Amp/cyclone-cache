@@ -3,6 +3,7 @@
 
 #include "mapped_file.hpp"
 
+#include <atomic>
 #include <cerrno>
 #include <climits>
 
@@ -20,6 +21,10 @@
 #endif
 
 namespace cyclone {
+
+namespace {
+std::atomic<bool> g_fail_whole_file_map{false};
+}  // namespace
 
 #ifdef CYCLONE_USE_POSIX_MMAP
 
@@ -129,6 +134,10 @@ class PosixMappedFile : public MappedFile {
   [[nodiscard]] bool is_open() const override { return _fd >= 0; }
 
   std::expected<void, std::error_code> map_whole_file(MapMode mode) override {
+    if (g_fail_whole_file_map.load(std::memory_order_relaxed)) {
+      return make_unexpected(
+          std::make_error_code(std::errc::not_enough_memory));
+    }
     if (_fd < 0) {
       return make_unexpected(
           std::make_error_code(std::errc::bad_file_descriptor));
@@ -539,6 +548,10 @@ class Win32MappedFile : public MappedFile {
   bool is_open() const override { return _file_handle != INVALID_HANDLE_VALUE; }
 
   std::expected<void, std::error_code> map_whole_file(MapMode mode) override {
+    if (g_fail_whole_file_map.load(std::memory_order_relaxed)) {
+      return make_unexpected(
+          std::make_error_code(std::errc::not_enough_memory));
+    }
     if (_file_handle == INVALID_HANDLE_VALUE) {
       return make_unexpected(
           std::make_error_code(std::errc::bad_file_descriptor));
@@ -734,6 +747,10 @@ class Win32MappedFile : public MappedFile {
 };
 
 #endif  // CYCLONE_USE_WIN32_MMAP
+
+void MappedFile::set_whole_file_map_failure_for_testing(bool fail) noexcept {
+  g_fail_whole_file_map.store(fail, std::memory_order_relaxed);
+}
 
 std::unique_ptr<MappedFile> MappedFile::create() {
 #ifdef CYCLONE_USE_WIN32_MMAP

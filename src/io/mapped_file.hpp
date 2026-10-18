@@ -98,6 +98,11 @@ class MappedFile {
   [[nodiscard]] virtual intptr_t native_fd() const = 0;
 
   static std::unique_ptr<MappedFile> create();
+
+  // Test seam: while set, every map_whole_file() call fails with ENOMEM, as
+  // an address-space-starved process would see.  Process-wide; leave it
+  // false outside tests.
+  static void set_whole_file_map_failure_for_testing(bool fail) noexcept;
 };
 
 }  // namespace cyclone

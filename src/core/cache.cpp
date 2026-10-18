@@ -1233,6 +1233,7 @@ CacheStats Cache::stats() const {
 
     // Volumes whose reset gate degraded on a lock-less filesystem (gauge).
     result.volumes_with_degraded_reset_gate += vs.reset_gate_degraded;
+    result.volumes_without_whole_file_map += vs.whole_file_map_failed;
 
     // Reset provenance (monotonic counters, summed across volumes).
     result.resets_under_degraded_gate += vs.resets_under_degraded_gate;

@@ -8,7 +8,10 @@
 #include <filesystem>
 #include <system_error>
 
+#include "../../src/core/volume.hpp"
 #include "../../src/io/mapped_file.hpp"
+#include "cyclone/key.hpp"
+#include "support/temp_cache.hpp"
 
 #if defined(__linux__)
 #include <fcntl.h>
@@ -355,4 +358,37 @@ TEST_CASE("MappedFile range_resident is true only where it can tell",
   mf->unmap_region(*mapped);
   mf->close();
   remove_temp_file(path);
+}
+
+TEST_CASE(
+    "Volume surfaces a failed whole-file mapping and keeps working on the "
+    "per-operation fallback",
+    "[mapped_file][volume][regression]") {
+  struct Reset {
+    ~Reset() { MappedFile::set_whole_file_map_failure_for_testing(false); }
+  } reset;
+
+  auto open_and_roundtrip = [](bool force_failure) -> uint64_t {
+    MappedFile::set_whole_file_map_failure_for_testing(force_failure);
+    TempCacheDir tmp;
+    VolumeConfig config;
+    config.path = tmp.path();
+    config.size = static_cast<size_t>(10 * 1024 * 1024);
+    Volume volume(config);
+    REQUIRE(volume.open().has_value());
+
+    CacheKey key("whole-file-map-fallback");
+    std::vector<std::byte> payload(256, std::byte{0x5A});
+    auto wh = volume.write_sync(key, payload.size());
+    REQUIRE(wh.has_value());
+    REQUIRE(wh->write_sync(std::span<const std::byte>(payload)).has_value());
+    REQUIRE(wh->close_sync().has_value());
+    auto rh = volume.read_sync(key);
+    REQUIRE(rh.has_value());
+    REQUIRE(rh->content().size() == payload.size());
+    return volume.stats().whole_file_map_failed;
+  };
+
+  REQUIRE(open_and_roundtrip(false) == 0);
+  REQUIRE(open_and_roundtrip(true) == 1);
 }
