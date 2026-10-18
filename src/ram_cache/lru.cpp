@@ -64,6 +64,16 @@ class RamCacheLRU : public RamCache {
 
   mutable std::shared_mutex _mutex;
 
+  // Bumped under the exclusive lock whenever a list node is destroyed
+  // (remove, remove_all, clear, eviction).  get() samples it during its
+  // shared window: if it is unchanged when the opportunistic refresh
+  // acquires the lock, no node died in between and the saved list
+  // iterator is still safe to splice without a second lookup.  Placed
+  // after the mutex so the hit counters and the lock word keep the exact
+  // offsets they had before it existed: concurrent-hit throughput is
+  // sensitive to those two sitting on unchanged cache lines.
+  std::atomic<uint64_t> _generation{0};
+
   void evict_if_needed(size_t required_space);
 };
 
@@ -74,6 +84,8 @@ std::optional<std::vector<std::byte>> RamCacheLRU::get(const CacheKey& key,
                                                        uint32_t* out_stamp) {
   RamCacheKey rk{key, id};
   std::optional<std::vector<std::byte>> result;
+  EntryIter refresh{};
+  uint64_t generation = 0;
 
   {
     // A hit needs only shared access: the body copy is safe because every
@@ -96,6 +108,11 @@ std::optional<std::vector<std::byte>> RamCacheLRU::get(const CacheKey& key,
     if (it->second == _lru.begin()) {
       return std::vector<std::byte>(it->second->data);
     }
+    refresh = it->second;
+    // Sampled during the shared window: insertions and splices never
+    // invalidate list iterators, only destroying the node does, and every
+    // destroyer bumps the generation counter first.
+    generation = _generation.load(std::memory_order_relaxed);
     result.emplace(it->second->data);
   }
 
@@ -103,13 +120,19 @@ std::optional<std::vector<std::byte>> RamCacheLRU::get(const CacheKey& key,
   // a hit never queues behind other hits (or behind a writer) just to
   // reorder the list.  Under sustained contention the hit is served from
   // the entry's current position and eviction order approximates LRU.
-  // Re-find the key under the lock: the entry may have been removed or
-  // evicted between the two lock windows.
+  // If no node was destroyed since the shared window (the generation is
+  // unchanged) the saved iterator is still valid and splices without a
+  // second lookup; otherwise re-find the key: the entry may have been
+  // removed or evicted between the two lock windows.
   if (_mutex.try_lock()) {
     std::unique_lock lock(_mutex, std::adopt_lock);
-    auto it = _entries.find(rk);
-    if (it != _entries.end() && it->second != _lru.begin()) {
-      _lru.splice(_lru.begin(), _lru, it->second);
+    if (_generation.load(std::memory_order_relaxed) == generation) {
+      _lru.splice(_lru.begin(), _lru, refresh);
+    } else {
+      auto it = _entries.find(rk);
+      if (it != _entries.end() && it->second != _lru.begin()) {
+        _lru.splice(_lru.begin(), _lru, it->second);
+      }
     }
   }
 
@@ -178,6 +201,7 @@ bool RamCacheLRU::remove(const CacheKey& key, AlternateId id) {
 
   _bytes_used -= it->second->data.size();
   _lru.erase(it->second);
+  _generation.fetch_add(1, std::memory_order_relaxed);
   _entries.erase(it);
   return true;
 }
@@ -189,6 +213,7 @@ void RamCacheLRU::remove_all(const CacheKey& key) {
     if (it->first.cache_key == key) {
       _bytes_used -= it->second->data.size();
       _lru.erase(it->second);
+      _generation.fetch_add(1, std::memory_order_relaxed);
       it = _entries.erase(it);
     } else {
       ++it;
@@ -200,6 +225,7 @@ void RamCacheLRU::clear() {
   std::unique_lock lock(_mutex);
 
   _lru.clear();
+  _generation.fetch_add(1, std::memory_order_relaxed);
   _entries.clear();
   _bytes_used = 0;
 }
@@ -223,6 +249,7 @@ void RamCacheLRU::evict_if_needed(size_t required_space) {
     _bytes_used -= victim->data.size();
     _entries.erase(victim->key);
     _lru.pop_back();
+    _generation.fetch_add(1, std::memory_order_relaxed);
     ++_evictions;
   }
 }
