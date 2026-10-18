@@ -329,15 +329,13 @@ std::chrono::seconds HttpCacheAlt::age() const {
   return std::chrono::seconds(resident + std::max(apparent, corrected));
 }
 
-std::optional<std::chrono::seconds> HttpCacheAlt::max_age() const {
-  auto cc = get_response_header("cache-control");
-  if (!cc) {
-    return std::nullopt;
-  }
+namespace {
 
-  // Walk the comma separated directives; names are case-insensitive and
-  // matched as whole tokens.
-  std::string_view rest = *cc;
+// Reads a delta-seconds Cache-Control directive such as max-age or s-maxage.
+// Names are case-insensitive and matched as whole tokens.
+std::optional<std::chrono::seconds> cache_control_seconds(
+    std::string_view cache_control, std::string_view directive_name) {
+  std::string_view rest = cache_control;
   while (!rest.empty()) {
     size_t comma = rest.find(',');
     std::string_view directive = trim(rest.substr(0, comma));
@@ -346,7 +344,7 @@ std::optional<std::chrono::seconds> HttpCacheAlt::max_age() const {
 
     size_t eq = directive.find('=');
     if (eq == std::string_view::npos ||
-        !iequals(trim(directive.substr(0, eq)), "max-age")) {
+        !iequals(trim(directive.substr(0, eq)), directive_name)) {
       continue;
     }
 
@@ -370,7 +368,24 @@ std::optional<std::chrono::seconds> HttpCacheAlt::max_age() const {
   return std::nullopt;
 }
 
+}  // namespace
+
+std::optional<std::chrono::seconds> HttpCacheAlt::max_age() const {
+  auto cc = get_response_header("cache-control");
+  if (!cc) {
+    return std::nullopt;
+  }
+  return cache_control_seconds(*cc, "max-age");
+}
+
 std::optional<std::chrono::seconds> HttpCacheAlt::freshness_lifetime() const {
+  // This is a shared cache: s-maxage (RFC 9111 5.2.2.10) overrides max-age
+  // and Expires.
+  if (auto cc = get_response_header("cache-control")) {
+    if (auto sma = cache_control_seconds(*cc, "s-maxage")) {
+      return sma;
+    }
+  }
   if (auto ma = max_age()) {
     return ma;
   }

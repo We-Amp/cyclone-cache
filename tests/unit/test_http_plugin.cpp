@@ -193,6 +193,33 @@ TEST_CASE("HttpCacheAlt age includes the Age header", "[http]") {
   }
 }
 
+TEST_CASE("HttpCacheAlt s-maxage takes precedence", "[http]") {
+  auto now = std::time(nullptr);
+
+  SECTION("s-maxage overrides max-age and Expires") {
+    HttpCacheAlt alt;
+    alt.set_response_time(now - 120);
+    alt.set_response_header("Cache-Control", "max-age=3600, s-maxage=60");
+    alt.set_response_header("Expires", http_date(now + 3600));
+    REQUIRE(alt.freshness_lifetime().has_value());
+    REQUIRE(alt.freshness_lifetime()->count() == 60);
+    REQUIRE_FALSE(alt.is_fresh());
+  }
+  SECTION("longer s-maxage keeps the entry fresh") {
+    HttpCacheAlt alt;
+    alt.set_response_time(now - 120);
+    alt.set_response_header("Cache-Control", "S-MAXAGE=600, max-age=60");
+    REQUIRE(alt.is_fresh());
+  }
+  SECTION("s-maxage alone gives a lifetime") {
+    HttpCacheAlt alt;
+    alt.set_response_time(now);
+    alt.set_response_header("Cache-Control", "s-maxage=60");
+    REQUIRE(alt.freshness_lifetime()->count() == 60);
+    REQUIRE_FALSE(alt.max_age().has_value());
+  }
+}
+
 TEST_CASE("HttpCacheAlt honours Expires", "[http]") {
   auto now = std::time(nullptr);
 

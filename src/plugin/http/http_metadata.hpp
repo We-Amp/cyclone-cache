@@ -48,8 +48,11 @@ class HttpCacheAlt {
 
   [[nodiscard]] std::chrono::seconds age() const;
   [[nodiscard]] std::optional<std::chrono::seconds> max_age() const;
-  // Lifetime from max-age, else Expires, else a heuristic (only with
-  // Last-Modified); nullopt when none applies.
+  // Freshness lifetime for a shared cache: s-maxage, else max-age, else
+  // Expires, else a heuristic (only with Last-Modified and a status that is
+  // cacheable by default); nullopt when none applies. Whether a response may
+  // be stored at all (private, no-store) is the embedder's decision; this
+  // class only answers how long a stored entry stays fresh.
   [[nodiscard]] std::optional<std::chrono::seconds> freshness_lifetime() const;
   [[nodiscard]] bool is_fresh() const;
 
