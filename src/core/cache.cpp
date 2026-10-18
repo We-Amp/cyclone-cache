@@ -23,7 +23,6 @@
 #include "cyclone/plugin/plugin.hpp"
 #include "fork_gate.hpp"
 #include "hit_tracker.hpp"
-#include "thread_util.hpp"
 #include "volume.hpp"
 
 namespace cyclone {
@@ -82,9 +81,8 @@ class DirectorySyncer {
       return;  // Already stopped
     }
 
-    // UNBOUNDED join — deliberately not the bounded-join + leak pattern that
-    // now survives only in Executor::stop() (see thread_util.hpp).  A
-    // leaked-but-still-RUNNING sync thread dereferences the Cache's volume
+    // UNBOUNDED join — deliberately not a bounded-join-then-leak pattern.
+    // A leaked-but-still-RUNNING sync thread dereferences the Cache's volume
     // list and this object's members after teardown frees them: with the
     // previous 5-second deadline, a
     // sync pass stalled in msync/fsync past the deadline was abandoned

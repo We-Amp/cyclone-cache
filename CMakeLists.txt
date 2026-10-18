@@ -88,7 +88,6 @@ set(CYCLONE_LIBRARY_SOURCES
   src/ram_cache/clfus.cpp
   src/ram_cache/lru.cpp
   src/io/mapped_file.cpp
-  src/io/executor.cpp
   src/plugin/plugin_manager.cpp
   src/optimization/work_queue.cpp
   src/optimization/adaptive_pool.cpp

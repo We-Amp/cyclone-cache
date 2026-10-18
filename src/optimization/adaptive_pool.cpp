@@ -67,7 +67,7 @@ void AdaptiveThreadPool::request_stop() {
 }
 
 void AdaptiveThreadPool::join_workers() {
-  // UNBOUNDED join — not the bounded-wait + leak pattern (see thread_util.hpp).
+  // UNBOUNDED join — not a bounded-wait-then-leak pattern.
   // A worker executes cache-touching optimization tasks (task() reads/writes
   // volumes through the engine); a leaked-but-still- running worker abandoned
   // on a timeout would then dereference cache state freed by teardown.  Given

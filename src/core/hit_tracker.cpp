@@ -39,8 +39,8 @@ void HitTracker::stop() {
     return;  // Already stopped
   }
 
-  // UNBOUNDED join — deliberately NOT the bounded-join + leak pattern (see
-  // thread_util.hpp and DirectorySyncer::stop() in cache.cpp).  The flush
+  // UNBOUNDED join — deliberately NOT a bounded-join-then-leak pattern (see
+  // DirectorySyncer::stop() in cache.cpp).  The flush
   // callback iterates the Cache's volume list and writes hit counts into
   // stripes; a leaked-but-still-running flush thread abandoned on a timeout
   // then dereferences volumes freed by Cache teardown — the same

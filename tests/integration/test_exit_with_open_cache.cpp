@@ -29,8 +29,7 @@
 //     OptimizationEngine::monitoring_loop and
 //     AdaptiveThreadPool::worker_loop   (optimization_config.enabled, off by
 //                                        default; min_threads workers)
-//   Executor::global() has no caller, so its leak_thread_on_shutdown path
-//   (thread_util.hpp) never runs.  Nothing is detach()ed.
+//   Nothing is detach()ed.
 //
 //   Function-local / class statics with a non-trivial destructor that a
 //   thread could touch after it is destroyed:

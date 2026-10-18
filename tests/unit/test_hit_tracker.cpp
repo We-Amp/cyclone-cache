@@ -659,12 +659,11 @@ TEST_CASE("HitTracker callback receives correct key and alternate",
   REQUIRE(found_key2_gzip);
 }
 
-// Regression for the staged-teardown fix (leak_thread_on_shutdown UAF
-// class).
+// Regression for the staged-teardown fix (the abandoned-thread UAF class).
 //
 // The old HitTracker::stop() joined the flush thread with a 5 s bounded wait
-// and, on timeout, abandoned the still-running thread via
-// leak_thread_on_shutdown().  When a flush callback stalled (I/O pressure),
+// and, on timeout, abandoned the still-running thread by leaking its
+// std::thread object.  When a flush callback stalled (I/O pressure),
 // stop() returned while the flush thread was still executing the callback,
 // which iterates the Cache's volume list — so the leaked thread went on to
 // dereference volumes the caller then destroyed (heap-use-after-free).

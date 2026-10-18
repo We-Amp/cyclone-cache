@@ -653,9 +653,8 @@ Cyclone in a DLL, `ExitProcess` terminates the other threads before
 `DLL_PROCESS_DETACH` runs the DLL's static destructors; in a statically linked
 executable the UCRT's `exit()` runs the executable's static destructors with
 the other threads alive, and there the safety rests on MSVC's `~mutex` being a
-no-op in release builds (as glibc's is). Nothing is `detach()`ed, and
-`Executor::global()` — the only legitimate `leak_thread_on_shutdown` caller
-(`thread_util.hpp`) — has no caller. The same holds for the embedder's own
+no-op in release builds (as glibc's is). Nothing is `detach()`ed. The same
+holds for the embedder's own
 threads still inside cache calls when the process exits: the only state of a
 dependency they reach is the key hash, and both backends compute it on the
 caller's stack. The OpenSSL backend uses the `SHA256_Init` / `_Update` /
