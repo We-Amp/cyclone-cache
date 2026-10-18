@@ -99,10 +99,12 @@ class MappedFile {
 
   static std::unique_ptr<MappedFile> create();
 
+#ifdef CYCLONE_TEST_SEAMS
   // Test seam: while set, every map_whole_file() call fails with ENOMEM, as
   // an address-space-starved process would see.  Process-wide; leave it
   // false outside tests.
   static void set_whole_file_map_failure_for_testing(bool fail) noexcept;
+#endif
 };
 
 }  // namespace cyclone
