@@ -2055,8 +2055,14 @@ void MmapDirectory::increment_count() {
 }
 
 void MmapDirectory::decrement_count() {
-  std::atomic_ref<uint32_t>(_header->entry_count)
-      .fetch_sub(1, std::memory_order_relaxed);
+  // Saturating: the count is updated after the bucket is released, so a
+  // process that died in between can leave it short of the entries; a
+  // removal must then stop at zero, not wrap to about four billion.
+  std::atomic_ref<uint32_t> count(_header->entry_count);
+  uint32_t current = count.load(std::memory_order_relaxed);
+  while (current != 0 && !count.compare_exchange_weak(
+                             current, current - 1, std::memory_order_relaxed)) {
+  }
 }
 
 uint64_t MmapDirectory::get_shared_write_pos() const {

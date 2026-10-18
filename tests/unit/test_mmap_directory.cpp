@@ -363,6 +363,27 @@ TEST_CASE("MmapDirectory bucket overflow handled gracefully",
   REQUIRE(dir.count() <= kBuckets * MmapDirectory::kEntriesPerBucket);
 }
 
+TEST_CASE("MmapDirectory entry count stops at zero instead of wrapping",
+          "[mmap_directory]") {
+  // The count is updated after the bucket is released, so a process that
+  // died in between left it one short.  The next removal of that entry must
+  // leave the count at zero, not wrap it to about four billion.
+  constexpr size_t kBuckets = 256;
+  std::vector<std::byte> region(MmapDirectory::required_size(kBuckets));
+  auto dir = MmapDirectory::init(std::span<std::byte>(region), kBuckets);
+  REQUIRE(dir.has_value());
+  const CacheKey key("count-one-short");
+  REQUIRE(dir->insert(key, 4096, 512));
+  REQUIRE(dir->count() == 1);
+
+  // The entry is there, the count says it is not.
+  const uint32_t zero = 0;
+  std::memcpy(region.data() + offsetof(MmapDirectory::Header, entry_count),
+              &zero, sizeof(zero));
+  REQUIRE(dir->remove(key));
+  CHECK(dir->count() == 0);
+}
+
 TEST_CASE("MmapDirectory GC phase toggle", "[mmap_directory]") {
   constexpr size_t kBuckets = 256;
   size_t region_size = MmapDirectory::required_size(kBuckets);
