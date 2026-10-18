@@ -76,7 +76,7 @@ class OptimizationEngine : public TaskProvider {
 
   // Shared handle for write-completion reporting (Cache write handles hold a
   // weak reference and may outlive this engine).
-  std::shared_ptr<LoadMonitor> load_monitor_shared() const {
+  const std::shared_ptr<LoadMonitor> &load_monitor_shared() const {
     return _load_monitor;
   }
 

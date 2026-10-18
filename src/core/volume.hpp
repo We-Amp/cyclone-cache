@@ -40,6 +40,7 @@
 #include "hit_tracker.hpp"
 #include "mmap_directory.hpp"
 #include "thread_shard.hpp"
+#include "write_commit_observer.hpp"
 
 namespace cyclone {
 
@@ -1505,6 +1506,12 @@ class Volume : public std::enable_shared_from_this<Volume> {
       const CacheKey &key);
   std::expected<WriteHandle, CacheError> write_alternate_sync(
       const CacheKey &key, AlternateId alternate_id, uint64_t content_length);
+
+  // Attach an observer told about the handle's successful commit.  The
+  // handle must come from write_sync() or write_alternate_sync() of a
+  // Volume.  Stored in the handle itself, so attaching allocates nothing.
+  static void set_commit_observer(WriteHandle &handle,
+                                  std::weak_ptr<WriteCommitObserver> observer);
 
   // Read with alternate selection
   std::expected<ReadHandle, CacheError> read_alternate_sync(

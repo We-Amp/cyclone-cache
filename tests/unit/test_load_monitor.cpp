@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <thread>
+#include <vector>
 
 #include "optimization/load_monitor.hpp"
 
@@ -288,4 +289,44 @@ TEST_CASE("LoadMonitor multiple update cycles", "[load][optimization]") {
 
   // Third cycle should show lower rates since no new ops
   REQUIRE(metrics3.read_ops_per_sec < metrics2.read_ops_per_sec);
+}
+
+// The hot-path counters are sharded per thread; update_metrics() must still
+// report the exact totals recorded from many threads at once, and a commit
+// reported through the write-commit observer counts as a write.
+TEST_CASE("LoadMonitor sums counters recorded from many threads",
+          "[load][optimization]") {
+  OptimizationConfig config = default_config();
+  LoadMonitor monitor(config);
+
+  constexpr int kThreads = 24;  // more threads than counter shards
+  constexpr uint64_t kPerThread = 1000;
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&monitor] {
+      for (uint64_t i = 0; i < kPerThread; ++i) {
+        monitor.record_read_complete(4);
+        WriteCommitObserver &observer = monitor;
+        observer.on_write_committed(2);
+      }
+    });
+  }
+  for (auto &thread : threads) {
+    thread.join();
+  }
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  monitor.update_metrics();
+  auto metrics = monitor.metrics();
+  REQUIRE(metrics.read_ops == kThreads * kPerThread);
+  REQUIRE(metrics.read_bytes == kThreads * kPerThread * 4);
+  REQUIRE(metrics.write_ops == kThreads * kPerThread);
+  REQUIRE(metrics.write_bytes == kThreads * kPerThread * 2);
+
+  monitor.reset();
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  monitor.update_metrics();
+  REQUIRE(monitor.metrics().read_ops == 0);
+  REQUIRE(monitor.metrics().write_ops == 0);
 }

@@ -990,6 +990,8 @@ class VolumeWriteHandleBase : public WriteHandleImpl {
   size_t written = 0;
   bool closed = false;
   bool aborted = false;
+  // Told about a successful commit (see Volume::set_commit_observer).
+  std::weak_ptr<WriteCommitObserver> commit_observer;
 
   ~VolumeWriteHandleBase() override = default;
 
@@ -1068,7 +1070,13 @@ class VolumeWriteHandleBase : public WriteHandleImpl {
       return make_unexpected(CacheError::Closed);
     }
 
-    return do_commit(*vol);
+    auto committed = do_commit(*vol);
+    if (committed) {
+      if (auto observer = commit_observer.lock()) {
+        observer->on_write_committed(written);
+      }
+    }
+    return committed;
   }
 
   void abort() override { aborted = true; }
@@ -5373,6 +5381,16 @@ std::expected<WriteHandle, CacheError> Volume::write_alternate_sync(
   impl->expected_length = content_length;
 
   return WriteHandle(impl);
+}
+
+void Volume::set_commit_observer(WriteHandle& handle,
+                                 std::weak_ptr<WriteCommitObserver> observer) {
+  // Every handle a Volume hands out is a VolumeWriteHandleBase (see
+  // write_sync / write_alternate_sync).
+  if (handle._impl) {
+    static_cast<VolumeWriteHandleBase*>(handle._impl.get())->commit_observer =
+        std::move(observer);
+  }
 }
 
 std::expected<void, CacheError> Volume::commit_alternate_write(

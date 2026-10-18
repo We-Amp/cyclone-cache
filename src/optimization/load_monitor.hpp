@@ -3,11 +3,15 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <mutex>
 
+#include "../core/thread_shard.hpp"
+#include "../core/write_commit_observer.hpp"
 #include "cyclone/config.hpp"
 
 namespace cyclone {
@@ -28,13 +32,32 @@ struct LoadMetrics {
   double write_bytes_per_sec = 0.0;
 };
 
-class LoadMonitor {
+class LoadMonitor final : public WriteCommitObserver {
  public:
   explicit LoadMonitor(const OptimizationConfig &config);
+  ~LoadMonitor() = default;
 
-  // Record completed operations (called from hot paths - atomic only)
-  void record_read_complete(uint64_t bytes);
-  void record_write_complete(uint64_t bytes);
+  LoadMonitor(const LoadMonitor &) = delete;
+  LoadMonitor &operator=(const LoadMonitor &) = delete;
+
+  // Record completed operations.  Called from the cache hot paths: relaxed
+  // increments on this thread's counter shard, so concurrent readers do not
+  // contend on one cache line.  update_metrics() sums the shards.
+  void record_read_complete(uint64_t bytes) {
+    auto &shard = _shards[thread_shard_index(kCounterShards)];
+    shard.read_ops.fetch_add(1, std::memory_order_relaxed);
+    shard.read_bytes.fetch_add(bytes, std::memory_order_relaxed);
+  }
+  void record_write_complete(uint64_t bytes) {
+    auto &shard = _shards[thread_shard_index(kCounterShards)];
+    shard.write_ops.fetch_add(1, std::memory_order_relaxed);
+    shard.write_bytes.fetch_add(bytes, std::memory_order_relaxed);
+  }
+
+  // WriteCommitObserver: a cache write handle committed `bytes`.
+  void on_write_committed(uint64_t bytes) noexcept override {
+    record_write_complete(bytes);
+  }
 
   // Update metrics (call periodically, e.g., every second)
   void update_metrics();
@@ -56,11 +79,17 @@ class LoadMonitor {
  private:
   OptimizationConfig _config;
 
-  // Atomic counters (incremented in hot paths)
-  std::atomic<uint64_t> _read_ops{0};
-  std::atomic<uint64_t> _write_ops{0};
-  std::atomic<uint64_t> _read_bytes{0};
-  std::atomic<uint64_t> _write_bytes{0};
+  // Counters incremented in hot paths, sharded per thread and padded so
+  // each shard sits on its own cache lines.  A power of two (see
+  // thread_shard_index).
+  static constexpr size_t kCounterShards = 16;
+  struct alignas(kShardPad) CounterShard {
+    std::atomic<uint64_t> read_ops{0};
+    std::atomic<uint64_t> write_ops{0};
+    std::atomic<uint64_t> read_bytes{0};
+    std::atomic<uint64_t> write_bytes{0};
+  };
+  std::array<CounterShard, kCounterShards> _shards;
 
   // Previous values for rate calculation
   uint64_t _prev_read_ops{0};
