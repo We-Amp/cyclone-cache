@@ -18,7 +18,7 @@ namespace cyclone {
 struct Document {
   static constexpr uint32_t kMagic = 0x5F129B14;
   static constexpr uint8_t kVersionMajor =
-      8;  // Version 6: hit_count/next_alternate_offset/last_access laid out
+      9;  // Version 6: hit_count/next_alternate_offset/last_access laid out
           // naturally aligned so the in-place header RMW sites can store them
           // via std::atomic_ref (kept in lockstep with
           // VolumeHeader::kFormatVersionMajor; pre-v6 volumes auto-reset)
@@ -32,6 +32,11 @@ struct Document {
           // Pre-v8 documents would fail verification, and the fingerprinted
           // filename (which mixes the format major) makes them invisible
           // anyway -- consumers take a cold cache, never a misparse.
+          // Version 9: the checksum also covers the fixed header: every
+          // field that never changes after the write (see
+          // checksum_header_seed).  A v8 checksum covered header bytes +
+          // content only, so v8 documents would fail verification; the
+          // same fingerprinted-filename separation applies.
   static constexpr uint8_t kVersionMinor = 0;
 
   // Maximum alternates per cache key (bounds chain traversal).  Alias of the
@@ -152,9 +157,25 @@ struct Document {
   }
 
   static uint32_t compute_checksum(std::span<const std::byte> data);
-  [[nodiscard]] bool verify_checksum(std::span<const std::byte> content) const;
+
+  // The document checksum (v9) is the CRC-32C over this document's
+  // canonical fixed header followed by its payload (header bytes +
+  // content).  The canonical header is the 132-byte wire header with the
+  // fields that are written in place after the document is stored set to
+  // zero: write_serial (the pass stamp), the checksum itself, hit_count,
+  // next_alternate_offset and last_access.  Every other field -- magic,
+  // the lengths, both keys, header_len, doc_type, the version, flags,
+  // sync_serial, pin_until, frag_offset, alternate_id and the reserved
+  // bytes -- is covered, so a change to any of them fails verification.
+  // Returns the CRC-32C state after the canonical header, to be continued
+  // over the payload with crc32c_update().
+  [[nodiscard]] uint32_t checksum_header_seed() const;
+  // `payload` is header bytes + content (DocumentReader::payload()).
+  [[nodiscard]] bool verify_checksum(std::span<const std::byte> payload) const;
 
   std::span<std::byte> serialize(std::vector<std::byte> &buffer) const;
+  // The wire header into exactly kHeaderSize bytes at `out`.
+  void serialize_to(std::byte *out) const;
   static Document deserialize(std::span<const std::byte> data);
 };
 

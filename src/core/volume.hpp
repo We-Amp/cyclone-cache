@@ -125,7 +125,15 @@ struct VolumeHeader {
   //   the v7 bump: COLD CACHE on upgrade, and the superseded v7 file stays on
   //   disk until it is reclaimed (CacheConfig::gc_superseded_on_start, or a
   //   manual delete).
-  static constexpr uint16_t kFormatVersionMajor = 8;
+  // Version 9: the document checksum also covers the fixed document header
+  //   (every field that never changes after the write; the fields updated
+  //   in place -- pass stamp, hit count, chain link, access time -- stay
+  //   outside).  No byte of the layout moved, but every pre-v9 checksum
+  //   covers less and would fail verification, so the bump leaves those
+  //   rings behind exactly as v7 and v8 did: COLD CACHE on upgrade, and the
+  //   superseded v8 file stays on disk until it is reclaimed
+  //   (CacheConfig::gc_superseded_on_start, or a manual delete).
+  static constexpr uint16_t kFormatVersionMajor = 9;
   static constexpr uint16_t kFormatVersionMinor = 0;
 
   uint32_t magic = kMagic;
@@ -2168,15 +2176,16 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // IDENTITY.  A slot holds a 64-bit token of the incarnation, computed by
   // checksum_token() from the header the reader is about to trust: the
   // absolute file offset, the pass stamp (write_serial), the full 32-bit
-  // stored CRC, len and header_len, and the first 8 bytes of first_key,
-  // folded through a keyed 128-bit-multiply mixer (wyhash's "mum" step)
-  // under a per-Volume random salt.  A lookup hits only if the stored token
-  // equals the recomputed one, so a different document at the same offset --
-  // rewritten after a wrap, torn by a usurped writer's late pwrite, or read
-  // back unsynced after a crash -- matches a cached verdict only on a 64-bit
-  // token collision (~2^-64), not, as with the former {offset, top 16 bits
-  // of the CRC} key, whenever its CRC matched in 16 bits (2^-16).  See
-  // doc/design/verified-state.md, section 3.3.
+  // stored CRC, len and header_len, the first 8 bytes of first_key, and
+  // the CRC-32C of the canonical fixed header (every field the document
+  // checksum covers, see Document::checksum_header_seed), folded through a
+  // keyed 128-bit-multiply mixer (wyhash's "mum" step) under a per-Volume
+  // random salt.  A lookup hits only if the stored token equals the recomputed
+  // one, so a different document at the same offset -- rewritten after a wrap,
+  // torn by a usurped writer's late pwrite, or read back unsynced after a crash
+  // -- matches a cached verdict only on a 64-bit token collision (~2^-64), not,
+  // as with the former {offset, top 16 bits of the CRC} key, whenever its CRC
+  // matched in 16 bits (2^-16).  See doc/design/verified-state.md, section 3.3.
   //
   // WHAT IT DOES NOT COVER.  The token binds the HEADER fields; it cannot
   // see a payload changed under an intact header (a torn tail).  That is
@@ -2262,13 +2271,19 @@ class Volume : public std::enable_shared_from_this<Volume> {
         (static_cast<uint64_t>(doc.checksum) << 32U) | doc.write_serial;
     const uint64_t lengths =
         (static_cast<uint64_t>(doc.len) << 32U) | doc.header_len;
+    // Every other field the checksum covers (flags, the full keys, the
+    // version, ...), folded in through the canonical header's CRC-32C, so
+    // a cached verdict never vouches for a header that has changed in a
+    // covered field.
+    const uint64_t covered = static_cast<uint64_t>(doc.checksum_header_seed())
+                             << 32U;
     // Two independent multiplies (they issue in parallel), then a third
     // that mixes them; the constants are wyhash's default secrets.
     const uint64_t a =
         fold(offset ^ _checksum_salt[0], key_prefix ^ _checksum_salt[1]);
     const uint64_t b =
         fold(crc_stamp ^ _checksum_salt[2], lengths ^ _checksum_salt[3]);
-    return fold(a ^ uint64_t{0xa0761d6478bd642f},
+    return fold(a ^ covered ^ uint64_t{0xa0761d6478bd642f},
                 b ^ uint64_t{0xe7037ed1a0b428db});
   }
 

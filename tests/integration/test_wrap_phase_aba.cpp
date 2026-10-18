@@ -92,8 +92,10 @@
 #include <span>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
+#include "core/document.hpp"
 #include "core/volume.hpp"
 #include "cyclone/alternate.hpp"
 #include "cyclone/cache.hpp"
@@ -309,17 +311,50 @@ bool write_alternate_entry(Cache &cache, const std::string &key_str,
   return wh->close_sync().has_value();
 }
 
+// The canonical fixed header the stored checksum starts from (format v9),
+// for a document written through the plain write path under `key` with no
+// header bytes: the wire header with the fields written in place after the
+// store (and the checksum itself) set to zero.
+std::vector<std::byte> canonical_header(const CacheKey &key,
+                                        std::span<const std::byte> content) {
+  auto head = DocumentBuilder()
+                  .set_key(key)
+                  .set_type(Document::Type::SingleFrag)
+                  .enable_checksum(false)
+                  .build_head(content);
+  REQUIRE(head.size() == Document::kHeaderSize);
+  const std::pair<size_t, size_t> in_place[] = {
+      {Document::kWriteSerialOffset, 4}, {Document::kChecksumOffset, 4},
+      {Document::kHitCountOffset, 4},    {Document::kNextAlternateOffsetPos, 8},
+      {Document::kLastAccessOffset, 8},
+  };
+  for (const auto &[off, size] : in_place) {
+    std::memset(head.data() + off, 0, size);
+  }
+  return head;
+}
+
+// The checksum the write path stores for `content` under `key`.
+uint32_t stored_crc(const CacheKey &key, std::span<const std::byte> content) {
+  const auto head = canonical_header(key, content);
+  return oracle_crc32c_update(oracle_crc32c_update(0xFFFFFFFFu, head),
+                              content) ^
+         0xFFFFFFFFu;
+}
+
 // Brute-force a kDocSize payload (make_content(index) with a 4-byte tail
-// varied) whose CRC-32C shares `crc`'s top 16 bits but differs from it
-// (~65536 candidates expected).  The stored checksum covers the payload
-// (empty header + content), so the content CRC is exactly what the read
-// path compares.  Cheap: the prefix CRC state is computed once and only the
-// 4-byte tail is re-hashed per candidate.  Returns an empty vector if no
-// candidate is found (callers REQUIRE a non-empty result).
-std::vector<std::byte> forge_top16_collision(uint32_t crc, size_t index) {
+// varied) whose CRC-32C, continued from `prefix`, shares `crc`'s top 16 bits
+// but differs from it (~65536 candidates expected).  With the canonical
+// header of the document that will carry it as `prefix`, that is exactly the
+// stored checksum the read path compares (see stored_crc).  Cheap: the
+// prefix CRC state is computed once and only the 4-byte tail is re-hashed
+// per candidate.  Returns an empty vector if no candidate is found (callers
+// REQUIRE a non-empty result).
+std::vector<std::byte> forge_top16_collision(
+    uint32_t crc, size_t index, std::span<const std::byte> prefix = {}) {
   std::vector<std::byte> content = make_content(index, kDocSize);
   const uint32_t prefix_state = oracle_crc32c_update(
-      0xFFFFFFFFu,
+      oracle_crc32c_update(0xFFFFFFFFu, prefix),
       std::span<const std::byte>(content).first(content.size() - 4));
   for (uint32_t probe = 0; probe < 40'000'000u; ++probe) {
     const std::array<std::byte, 4> tail = {
@@ -580,9 +615,13 @@ TEST_CASE(
   // the replaced key misses cleanly.
   auto content_a = make_content(0, kDocSize);
   uint32_t crc_a = oracle_crc32c(content_a);
-  REQUIRE(crc_a != 0);  // read path consults the cache only when checksum != 0
+  REQUIRE(crc_a != 0);
 
-  // A DIFFERENT payload whose CRC-32C shares A's top 16 bits.
+  // A DIFFERENT payload whose CRC-32C shares A's top 16 bits.  (From format
+  // v9 the stored checksum also covers each document's fixed header, key
+  // included, so the stored checksums no longer collide; G1 below forges a
+  // collision of the stored values.  This case still pins that the reused
+  // offset serves its own bytes and the replaced key misses.)
   std::vector<std::byte> content_b = forge_top16_collision(crc_a, 1);
   REQUIRE_FALSE(content_b.empty());
   REQUIRE((oracle_crc32c(content_b) >> 16) == (crc_a >> 16));
@@ -648,12 +687,38 @@ TEST_CASE(
   // 4. Read it.  Under the former {offset, top16(CRC)} key, A's verdict
   //    vouched for B and the corrupt bytes were SERVED.  Keyed by the full
   //    incarnation token, the CRC pass must run and reject them.
+  // The stored checksum covers the document's fixed header, key included
+  // (format v9), so B's payload is forged against the key of the very
+  // document the wrap lands at X.  That key is predicted by a dry run on a
+  // scratch volume of the same geometry: the flood sequence and the number
+  // of writes to the wrap are deterministic.
   auto content_a = make_content(0, kDocSize);
-  const uint32_t crc_a = oracle_crc32c(content_a);
+  CacheKey key_a("crc-identity-A");
+  const uint32_t crc_a = stored_crc(key_a, content_a);
   REQUIRE(crc_a != 0);
-  const std::vector<std::byte> content_b = forge_top16_collision(crc_a, 1);
+  std::string predicted_key;
+  {
+    std::string dry_path = create_temp_file("crc_identity_top16_dry", kVolMB);
+    auto dry = Cache::create(aba_config());
+    REQUIRE(dry.has_value());
+    VolumeConfig dry_vol;
+    dry_vol.path = dry_path;
+    dry_vol.size = kVolMB * 1024 * 1024;
+    REQUIRE((*dry)->add_volume(dry_vol).has_value());
+    REQUIRE((*dry)->start().has_value());
+    REQUIRE(write_entry(**dry, "crc-identity-A", content_a));
+    size_t dry_idx = 0;
+    predicted_key =
+        flood_until_wrap(**dry, dry_idx, 1, content_a, bucket_of(key_a));
+    (*dry)->stop();
+    remove_cache_files(dry_path);
+  }
+  REQUIRE_FALSE(predicted_key.empty());
+  const CacheKey key_b(predicted_key);
+  const std::vector<std::byte> content_b = forge_top16_collision(
+      crc_a, 1, canonical_header(key_b, make_content(1, kDocSize)));
   REQUIRE_FALSE(content_b.empty());
-  const uint32_t crc_b = oracle_crc32c(content_b);
+  const uint32_t crc_b = stored_crc(key_b, content_b);
   REQUIRE((crc_b >> 16) == (crc_a >> 16));
   REQUIRE(crc_b != crc_a);
 
@@ -670,7 +735,6 @@ TEST_CASE(
 
   CrcVerifyCounter crc_passes;
 
-  CacheKey key_a("crc-identity-A");
   REQUIRE(write_entry(*cache, "crc-identity-A", content_a));
   uint64_t content_off = ReadHandle::kNoFileOffset;
   {
@@ -688,7 +752,7 @@ TEST_CASE(
   size_t idx = 0;
   const std::string reuse_key =
       flood_until_wrap(*cache, idx, 1, content_b, bucket_of(key_a));
-  REQUIRE_FALSE(reuse_key.empty());
+  REQUIRE(reuse_key == predicted_key);
   // The wrap landed a B document at X: its header now carries crc_b.
   REQUIRE(pread_u32(file, doc_x) == Document::kMagic);
   REQUIRE(pread_u32(file, doc_x + Document::kChecksumOffset) == crc_b);

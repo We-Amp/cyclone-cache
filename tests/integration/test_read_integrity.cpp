@@ -70,11 +70,13 @@ uint32_t oracle_crc32c(std::span<const std::byte> data) {
   return crc_update(0xFFFFFFFFU, data) ^ 0xFFFFFFFFU;
 }
 
-// Rewrite the last four bytes of `content` so that its CRC-32C is exactly
-// zero (standard CRC forcing: the table's top bytes are a permutation, so
-// the four table indices are recovered backwards from the target register,
-// then the bytes forwards from the prefix state).
-void force_zero_crc(std::vector<std::byte> &content) {
+// Rewrite the last four bytes of `content` so that the CRC-32C of
+// `prefix` ++ `content` is exactly zero (standard CRC forcing: the table's
+// top bytes are a permutation, so the four table indices are recovered
+// backwards from the target register, then the bytes forwards from the
+// prefix state).
+void force_zero_crc(std::span<const std::byte> prefix,
+                    std::vector<std::byte> &content) {
   REQUIRE(content.size() >= 4);
   const auto &t = crc_table();
   std::array<uint8_t, 256> inv{};
@@ -88,14 +90,38 @@ void force_zero_crc(std::vector<std::byte> &content) {
     reg = (reg ^ t[idx[static_cast<size_t>(k)]]) << 8;
   }
   uint32_t state =
-      crc_update(0xFFFFFFFFU,
+      crc_update(crc_update(0xFFFFFFFFU, prefix),
                  std::span<const std::byte>(content).first(content.size() - 4));
   for (size_t k = 0; k < 4; ++k) {
     const auto b = static_cast<uint8_t>(idx[k] ^ (state & 0xFFU));
     content[content.size() - 4 + k] = static_cast<std::byte>(b);
     state = t[idx[k]] ^ (state >> 8);
   }
-  REQUIRE(oracle_crc32c(content) == 0);
+  REQUIRE((crc_update(crc_update(0xFFFFFFFFU, prefix), content) ^
+           0xFFFFFFFFU) == 0);
+}
+
+// The canonical fixed header the document checksum starts from, for a
+// document written through the plain write path under `key` with no header
+// bytes: the wire header with the fields written in place after the store
+// (and the checksum itself) set to zero.
+std::vector<std::byte> canonical_header(const CacheKey &key,
+                                        std::span<const std::byte> content) {
+  auto head = DocumentBuilder()
+                  .set_key(key)
+                  .set_type(Document::Type::SingleFrag)
+                  .enable_checksum(false)
+                  .build_head(content);
+  REQUIRE(head.size() == Document::kHeaderSize);
+  const std::pair<size_t, size_t> in_place[] = {
+      {Document::kWriteSerialOffset, 4}, {Document::kChecksumOffset, 4},
+      {Document::kHitCountOffset, 4},    {Document::kNextAlternateOffsetPos, 8},
+      {Document::kLastAccessOffset, 8},
+  };
+  for (const auto &[off, size] : in_place) {
+    std::memset(head.data() + off, 0, size);
+  }
+  return head;
 }
 
 std::vector<std::byte> make_content(size_t seed, size_t size) {
@@ -281,7 +307,7 @@ TEST_CASE(
   Cache &cache = *oc.cache;
   const CacheKey key("integrity-genuine-zero-crc");
   auto content = make_content(3, 4096);
-  force_zero_crc(content);
+  force_zero_crc(canonical_header(key, content), content);
   REQUIRE(write_entry(cache, key, content));
   const uint64_t doc = document_offset(cache, key, content);
   REQUIRE(pread_value<uint32_t>(oc.file, doc + Document::kChecksumOffset) == 0);
