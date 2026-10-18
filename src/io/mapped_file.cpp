@@ -659,7 +659,9 @@ class Win32MappedFile : public MappedFile {
     // For synchronous mode, also call FlushFileBuffers to ensure data
     // reaches stable storage.  Skip for async to avoid blocking.
     if (mode == SyncMode::Sync && _file_handle != INVALID_HANDLE_VALUE) {
-      FlushFileBuffers(_file_handle);
+      if (!FlushFileBuffers(_file_handle)) {
+        return std::error_code(GetLastError(), std::system_category());
+      }
     }
     return {};
   }
