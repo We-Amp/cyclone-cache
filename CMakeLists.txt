@@ -264,7 +264,11 @@ if(CYCLONE_BUILD_TESTS)
   # Catch2 exits with 4 when every selected test case was skipped (SKIP()),
   # e.g. the allocation-failure tests under ThreadSanitizer: report that to
   # ctest as skipped, not failed.
-  catch_discover_tests(cyclone-tests PROPERTIES SKIP_RETURN_CODE 4)
+  # A test case that skips itself reports "1 skipped" in its summary; match the
+# summary instead of the exit code, which also equals the number of failed
+# assertions and could otherwise hide a failure with exactly four.
+catch_discover_tests(cyclone-tests PROPERTIES SKIP_REGULAR_EXPRESSION
+                     "test cases: +1 \\| +1 skipped")
 
   # Helper peer for the spawn-based reset-gate tests.  A separate image (never
   # a re-exec of cyclone-tests): Catch2WithMain owns that binary's main(),

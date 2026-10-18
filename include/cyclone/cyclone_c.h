@@ -600,10 +600,11 @@ typedef void (*CycloneMissDoneCallback)(void *, const char *, size_t,
  *   key/key_len:        the cache key that missed
  *   handler_user_data:  opaque pointer registered with set_miss_handler
  *   done_cb:            completion callback the handler MUST call exactly once.
- *                       A second call is ignored while the cache is alive;
- *                       after cyclone_cache_destroy() the first call is
- *                       still safe (see cyclone_cache_drain_pending()), but
- *                       a second call is undefined behaviour.
+ *                       Calling it more than once is undefined behaviour,
+ *                       before and after cyclone_cache_destroy(); after
+ *                       destroy the single call is still safe (see
+ *                       cyclone_cache_drain_pending()). Do not call
+ *                       cyclone_cache_destroy() from inside a callback.
  *   done_user_data:     opaque pointer to pass back to done_cb
  */
 typedef void (*CycloneMissHandler)(const char *, size_t, void *,

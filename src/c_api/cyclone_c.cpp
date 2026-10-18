@@ -711,8 +711,9 @@ static CycloneError read_async_impl(CycloneCacheHandle *cache, const char *key,
   return CYCLONE_OK;
 }
 
-// A non-OK return means read_cb has not been called and will not be: the
-// read was neither answered nor registered.
+// A non-OK return means the read was neither answered nor registered, and
+// read_cb will not be called later. If read_cb itself throws (a contract
+// violation), it has already been called when the error is returned.
 CycloneError cyclone_cache_read_async(CycloneCacheHandle *cache,
                                       const char *key, size_t key_len,
                                       CycloneReadCallback read_cb,
