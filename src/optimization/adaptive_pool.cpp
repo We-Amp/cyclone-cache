@@ -77,18 +77,26 @@ void AdaptiveThreadPool::join_workers() {
   // The fork-inherited case never reaches here — Cache::stop() release()s the
   // owning engine in the child.  Idempotent: a second call finds _workers
   // already empty.
-  std::vector<std::thread> workers_to_join;
+  std::vector<WorkerSlot> workers_to_join;
   {
     std::lock_guard lock(_workers_mutex);
     workers_to_join = std::move(_workers);
     _workers.clear();
-    _finished_workers.clear();
   }
 
   for (auto &worker : workers_to_join) {
-    if (worker.joinable()) {
-      worker.join();
+    if (worker.thread.joinable()) {
+      worker.thread.join();
     }
+  }
+
+  // Workers register their exit while the loop above joins them, so drop the
+  // registrations only now that every one of them has returned.  Clearing
+  // before the join would leave entries naming already-joined workers for the
+  // next reap to find.
+  {
+    std::lock_guard lock(_workers_mutex);
+    _finished_workers.clear();
   }
 
   _live_count.store(0, std::memory_order_release);
@@ -196,7 +204,7 @@ ThreadPoolStats AdaptiveThreadPool::stats() const {
   return result;
 }
 
-void AdaptiveThreadPool::worker_loop(size_t /*worker_id*/) {
+void AdaptiveThreadPool::worker_loop(uint64_t generation) {
   _live_count.fetch_add(1, std::memory_order_relaxed);
 
   while (!_stopping.load(std::memory_order_acquire)) {
@@ -211,7 +219,7 @@ void AdaptiveThreadPool::worker_loop(size_t /*worker_id*/) {
         // _workers; the thread object is joined there, not here.
         {
           std::lock_guard lock(_workers_mutex);
-          _finished_workers.push_back(std::this_thread::get_id());
+          _finished_workers.push_back(generation);
         }
         return;  // Exit this worker
       }
@@ -261,20 +269,22 @@ void AdaptiveThreadPool::worker_loop(size_t /*worker_id*/) {
   _live_count.fetch_sub(1, std::memory_order_relaxed);
   {
     std::lock_guard lock(_workers_mutex);
-    _finished_workers.push_back(std::this_thread::get_id());
+    _finished_workers.push_back(generation);
   }
 }
 
 void AdaptiveThreadPool::reap_finished_workers() {
-  for (const auto id : _finished_workers) {
-    auto it =
-        std::find_if(_workers.begin(), _workers.end(),
-                     [id](const std::thread &t) { return t.get_id() == id; });
+  for (const auto generation : _finished_workers) {
+    auto it = std::find_if(_workers.begin(), _workers.end(),
+                           [generation](const WorkerSlot &w) {
+                             return w.generation == generation;
+                           });
     if (it != _workers.end()) {
-      // The worker pushed its id on the way out of worker_loop and never
-      // touches _workers_mutex afterwards, so this join waits at most for the
-      // last few instructions of the thread; it cannot deadlock here.
-      it->join();
+      // The worker pushed its generation on the way out of worker_loop and
+      // never touches _workers_mutex afterwards, so this join waits at most
+      // for the last few instructions of the thread; it cannot deadlock here.
+      // Generations are never reused, so the entry cannot name a live worker.
+      it->thread.join();
       _workers.erase(it);
     }
   }
@@ -282,8 +292,10 @@ void AdaptiveThreadPool::reap_finished_workers() {
 }
 
 void AdaptiveThreadPool::spawn_worker() {
-  size_t id = _workers.size();
-  _workers.emplace_back([this, id] { worker_loop(id); });
+  const uint64_t generation = _next_generation++;
+  _workers.push_back({generation, std::thread([this, generation] {
+                        worker_loop(generation);
+                      })});
 }
 
 bool AdaptiveThreadPool::should_scale_up() const {

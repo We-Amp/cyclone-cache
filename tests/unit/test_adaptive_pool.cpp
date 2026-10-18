@@ -5,6 +5,8 @@
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <latch>
 #include <mutex>
 #include <queue>
@@ -594,5 +596,78 @@ TEST_CASE("AdaptiveThreadPool::stop() joins an in-flight task (no leak)",
   REQUIRE(stop_returned.load(std::memory_order_acquire));
   REQUIRE(stop_elapsed >= std::chrono::milliseconds(5500));
   REQUIRE_FALSE(pool.is_running());
+  REQUIRE(pool.thread_count() == 0);
+}
+
+// Regression: workers that exited while join_workers() was joining the
+// previous generation registered their exit after the bookkeeping had been
+// cleared.  A later reap matched those stale entries against workers of the
+// next start() (thread ids are reused by the platform) and joined a live
+// worker while holding the workers mutex, which that worker needed in order
+// to register its own exit: the pool deadlocked.  Repeated start/scale/stop
+// cycles must always complete.
+TEST_CASE("AdaptiveThreadPool restart cycles with scaling never deadlock",
+          "[pool][optimization][regression]") {
+  // Provider that hands out a no-op task every 20 ms, so workers cycle
+  // through the loop and observe target changes, until stopped.
+  struct TickingProvider : TaskProvider {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool stopped = false;
+    TaskFunction get_task() override {
+      std::unique_lock lock(mutex);
+      cv.wait_for(lock, std::chrono::milliseconds(20), [&] { return stopped; });
+      if (stopped) {
+        return nullptr;
+      }
+      return [] {};
+    }
+    size_t queue_depth() const override { return 0; }
+  };
+
+  OptimizationConfig config;
+  config.min_threads = 2;
+  config.max_threads = 8;
+
+  TickingProvider provider;
+  AdaptiveThreadPool pool(config, provider);
+
+  std::atomic<int> rounds_done{0};
+  constexpr int kRounds = 30;
+  std::thread driver([&] {
+    for (int round = 0; round < kRounds; ++round) {
+      {
+        std::lock_guard lock(provider.mutex);
+        provider.stopped = false;
+      }
+      pool.start();
+      pool.scale_to(4);
+      pool.scale_to(2);
+      std::this_thread::sleep_for(std::chrono::milliseconds(60));
+      pool.scale_to(6);
+      {
+        std::lock_guard lock(provider.mutex);
+        provider.stopped = true;
+      }
+      provider.cv.notify_all();
+      pool.stop();
+      rounds_done.fetch_add(1, std::memory_order_release);
+    }
+  });
+
+  // Bounded wait: a deadlocked pool can never be unwound, so report and exit
+  // instead of hanging the suite.
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+  while (rounds_done.load(std::memory_order_acquire) < kRounds) {
+    if (std::chrono::steady_clock::now() > deadline) {
+      std::fprintf(stderr, "pool deadlocked after %d of %d rounds\n",
+                   rounds_done.load(), kRounds);
+      std::fflush(stderr);
+      std::_Exit(1);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  driver.join();
+  REQUIRE(rounds_done.load() == kRounds);
   REQUIRE(pool.thread_count() == 0);
 }

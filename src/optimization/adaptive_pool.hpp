@@ -93,7 +93,7 @@ class AdaptiveThreadPool {
   ThreadPoolStats stats() const;
 
  private:
-  void worker_loop(size_t worker_id);
+  void worker_loop(uint64_t generation);
   // Spawn a new worker thread. Requires: _workers_mutex must be held by caller.
   void spawn_worker();
   // Join and erase workers that exited on their own (scale-down
@@ -107,10 +107,19 @@ class AdaptiveThreadPool {
   OptimizationConfig _config;
   TaskProvider &_provider;
 
-  std::vector<std::thread> _workers;
-  // Ids of workers that exited worker_loop on their own but whose entries
-  // have not been reaped from _workers yet (see reap_finished_workers).
-  std::vector<std::thread::id> _finished_workers;
+  // One entry per spawned worker.  Workers are identified by a generation
+  // number that is unique for the lifetime of the pool, never by
+  // std::thread::id: the platform reuses thread ids once a thread is joined,
+  // so an id recorded by an exited worker could alias a live one.
+  struct WorkerSlot {
+    uint64_t generation;
+    std::thread thread;
+  };
+  std::vector<WorkerSlot> _workers;
+  // Generations of workers that exited worker_loop but whose entries have
+  // not been reaped from _workers yet (see reap_finished_workers).
+  std::vector<uint64_t> _finished_workers;
+  uint64_t _next_generation = 0;  // Guarded by _workers_mutex.
   mutable std::mutex _workers_mutex;
 
   std::atomic<bool> _running{false};
