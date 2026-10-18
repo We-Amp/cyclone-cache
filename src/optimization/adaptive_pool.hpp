@@ -95,6 +95,11 @@ class AdaptiveThreadPool {
   void worker_loop(size_t worker_id);
   // Spawn a new worker thread. Requires: _workers_mutex must be held by caller.
   void spawn_worker();
+  // Join and erase workers that exited on their own (scale-down
+  // self-termination).  Keeps _workers bounded to live threads so the spawn
+  // paths can compare against the live count.  Requires: _workers_mutex must
+  // be held by caller.
+  void reap_finished_workers();
   bool should_scale_up() const;
   bool should_scale_down() const;
 
@@ -102,6 +107,9 @@ class AdaptiveThreadPool {
   TaskProvider &_provider;
 
   std::vector<std::thread> _workers;
+  // Ids of workers that exited worker_loop on their own but whose entries
+  // have not been reaped from _workers yet (see reap_finished_workers).
+  std::vector<std::thread::id> _finished_workers;
   mutable std::mutex _workers_mutex;
 
   std::atomic<bool> _running{false};

@@ -262,6 +262,58 @@ TEST_CASE("AdaptiveThreadPool scaling", "[pool][optimization]") {
   pool.stop();
 }
 
+// Regression: after a scale-down the self-terminated workers stayed in the
+// worker list, and both spawn paths compared the list size (the historical
+// maximum) against the new target, so no later scale-up below that watermark
+// ever spawned again: the target rose but the live thread count stayed low.
+// The spawn decision must be based on the live worker count.
+TEST_CASE("AdaptiveThreadPool scales back up after scaling down",
+          "[pool][optimization][regression]") {
+  OptimizationConfig config;
+  config.min_threads = 1;
+  config.max_threads = 4;
+
+  MockTaskProvider provider;
+  AdaptiveThreadPool pool(config, provider);
+  pool.start();
+
+  auto wait_for_threads = [&](size_t expected) {
+    auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (pool.thread_count() != expected &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return pool.thread_count() == expected;
+  };
+
+  REQUIRE(wait_for_threads(1));
+
+  // Scale up to max and let the workers register.
+  pool.scale_to(4);
+  REQUIRE(wait_for_threads(4));
+
+  // Scale down to min.  Parked workers only observe the lowered target when
+  // they cycle through the loop, so feed tasks until the surplus exits.
+  pool.scale_to(1);
+  for (int i = 0; i < 32 && pool.thread_count() > 1; ++i) {
+    provider.add_task([] {});
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  REQUIRE(wait_for_threads(1));
+
+  // Scale back up below the historical maximum: the pool must spawn workers
+  // again rather than comparing against the list of long-dead threads.
+  pool.scale_to(3);
+  const bool recovered = wait_for_threads(3);
+
+  provider.signal_stop();
+  pool.stop();
+
+  REQUIRE(recovered);
+  REQUIRE(pool.stats().current_threads == 0);
+}
+
 TEST_CASE("AdaptiveThreadPool statistics", "[pool][optimization]") {
   OptimizationConfig config = default_config();
   MockTaskProvider provider;

@@ -82,6 +82,7 @@ void AdaptiveThreadPool::join_workers() {
     std::lock_guard lock(_workers_mutex);
     workers_to_join = std::move(_workers);
     _workers.clear();
+    _finished_workers.clear();
   }
 
   for (auto &worker : workers_to_join) {
@@ -139,11 +140,15 @@ void AdaptiveThreadPool::check_scaling() {
       _target_thread_count.store(new_target, std::memory_order_release);
 
       std::lock_guard lock(_workers_mutex);
-      if (_workers.size() < new_target) {
+      reap_finished_workers();
+      // Gate on the LIVE count, not _workers.size(): self-terminated workers
+      // would otherwise keep their entries until shutdown and pin the size at
+      // the historical maximum, blocking every later scale-up below it.
+      if (_live_count.load(std::memory_order_acquire) < new_target) {
         spawn_worker();
         std::lock_guard stats_lock(_stats_mutex);
         ++_stats.scale_up_count;
-        _stats.current_threads = _workers.size();
+        _stats.current_threads = new_target;
       }
     }
   } else if (should_scale_down()) {
@@ -167,8 +172,14 @@ void AdaptiveThreadPool::scale_to(size_t target) {
   _target_thread_count.store(target, std::memory_order_release);
 
   std::lock_guard lock(_workers_mutex);
-  while (_workers.size() < target) {
+  reap_finished_workers();
+  // Gate on the LIVE count (see check_scaling).  Newly spawned workers
+  // increment _live_count only once they are scheduled, so track the spawns
+  // from this call locally instead of re-reading the counter.
+  size_t live = _live_count.load(std::memory_order_acquire);
+  while (live < target) {
     spawn_worker();
+    ++live;
   }
 
   {
@@ -196,6 +207,12 @@ void AdaptiveThreadPool::worker_loop(size_t /*worker_id*/) {
       // Try to be the one to exit
       if (_live_count.compare_exchange_strong(live, live - 1,
                                               std::memory_order_acq_rel)) {
+        // Register the exit so the spawn paths can reap this entry from
+        // _workers; the thread object is joined there, not here.
+        {
+          std::lock_guard lock(_workers_mutex);
+          _finished_workers.push_back(std::this_thread::get_id());
+        }
         return;  // Exit this worker
       }
       // Another thread won the race, continue
@@ -236,6 +253,27 @@ void AdaptiveThreadPool::worker_loop(size_t /*worker_id*/) {
   }
 
   _live_count.fetch_sub(1, std::memory_order_relaxed);
+  {
+    std::lock_guard lock(_workers_mutex);
+    _finished_workers.push_back(std::this_thread::get_id());
+  }
+}
+
+void AdaptiveThreadPool::reap_finished_workers() {
+  for (const auto id : _finished_workers) {
+    auto it = std::find_if(_workers.begin(), _workers.end(),
+                           [id](const std::thread &t) {
+                             return t.get_id() == id;
+                           });
+    if (it != _workers.end()) {
+      // The worker pushed its id on the way out of worker_loop and never
+      // touches _workers_mutex afterwards, so this join waits at most for the
+      // last few instructions of the thread; it cannot deadlock here.
+      it->join();
+      _workers.erase(it);
+    }
+  }
+  _finished_workers.clear();
 }
 
 void AdaptiveThreadPool::spawn_worker() {
