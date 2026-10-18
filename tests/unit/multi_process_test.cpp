@@ -398,6 +398,59 @@ TEST_CASE("Read from non-owned stripe succeeds", "[multiprocess][read]") {
   cleanup_temp_file(cache_path);
 }
 
+TEST_CASE("Hits read from a non-owned stripe are not queued for flush",
+          "[multiprocess][hit_tracking]") {
+  // Only a stripe's owner may update its documents, so a hit-count delta a
+  // non-owning process records can never land: its flush is refused and was
+  // counted as a failure, while the delta occupied the tracker for nothing.
+  std::string cache_path = get_temp_path("hits_nonowned");
+
+  auto make_view = [&](uint32_t process_index) {
+    CacheConfig config;
+    config.set_multi_process(process_index, 2);
+    config.set_enable_checksum(true);
+    config.set_ram_cache_size(0);
+    config.enable_hit_tracking = true;
+    config.hit_flush_interval = std::chrono::milliseconds(50);
+    auto cache = Cache::create(config);
+    REQUIRE(cache.has_value());
+    REQUIRE((*cache)
+                ->add_volume(cache_path, static_cast<size_t>(10 * 1024 * 1024))
+                .has_value());
+    REQUIRE((*cache)->start().has_value());
+    return std::move(*cache);
+  };
+
+  auto owner = make_view(0);  // a 10 MB volume is one stripe, owned by 0
+  auto reader = make_view(1);
+  REQUIRE(owner->stats().stripe_count == 1);
+
+  const CacheKey key("hits-nonowned-key");
+  {
+    auto wh = owner->write_sync(key, 100);
+    REQUIRE(wh.has_value());
+    std::vector<std::byte> data(100, std::byte{0x7E});
+    REQUIRE(wh->write_sync(data).has_value());
+    REQUIRE(wh->close_sync().has_value());
+  }
+  REQUIRE_FALSE(reader->write_sync(CacheKey("probe"), 10).has_value());
+
+  for (int i = 0; i < 20; ++i) {
+    REQUIRE(reader->read_sync(key).has_value());
+    REQUIRE(owner->read_sync(key).has_value());
+  }
+
+  reader->stop();  // final flush
+  owner->stop();
+  const auto reader_stats = reader->stats();
+  const auto owner_stats = owner->stats();
+  CHECK(owner_stats.hit_flush_successes > 0);  // the owner's hits land
+  REQUIRE(reader_stats.hit_flush_failures == 0);
+  REQUIRE(reader_stats.hit_flush_successes == 0);
+
+  cleanup_temp_file(cache_path);
+}
+
 TEST_CASE("Single-process backward compatibility", "[multiprocess][compat]") {
   std::string cache_path = get_temp_path("compat");
 

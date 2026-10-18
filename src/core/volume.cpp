@@ -2978,7 +2978,7 @@ std::expected<ReadHandle, CacheError> Volume::read_sync(const CacheKey& key) {
           impl->header_data = ram_reader.header();
           impl->content_data = ram_reader.content();
 
-          if (_hit_tracker && should_record_hit) {
+          if (_hit_tracker && should_record_hit && stripe->owned) {
             _hit_tracker->record_hit(key);
           }
           return ReadHandle(impl);
@@ -3164,7 +3164,9 @@ std::expected<ReadHandle, CacheError> Volume::read_sync(const CacheKey& key) {
         },
         &rejects);
 
-    if (_hit_tracker && should_record_hit) {
+    // Only the stripe's owner can land a hit-count delta (a non-owner's
+    // flush is refused with NotOwned), so a non-owner records none.
+    if (_hit_tracker && should_record_hit && stripe->owned) {
       _hit_tracker->record_hit(key);
     }
 
@@ -7248,7 +7250,7 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
         },
         &rejects);
 
-    if (_hit_tracker && should_record_hit) {
+    if (_hit_tracker && should_record_hit && stripe->owned) {
       _hit_tracker->record_hit(key, hit_alt_id);
     }
 
