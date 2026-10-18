@@ -219,7 +219,7 @@ FreshnessResult HttpAlternatePlugin::check_freshness(
     return FreshnessResult::MustRevalidate;
   }
 
-  if (alt.is_fresh()) {
+  if (alt.is_fresh(std::chrono::system_clock::to_time_t(ctx.now))) {
     return FreshnessResult::Fresh;
   }
 
@@ -335,7 +335,9 @@ bool is_token_list_header(std::string_view name) {
 }
 
 // Lowercased list elements with whitespace around ';' and '=' removed, as a
-// sorted set.
+// sorted set.  Whitespace and case are also normalised inside quoted parameter
+// strings, which is acceptable for the four negotiation headers this is used
+// for: none of them carries a quoted value whose case or spacing matters.
 std::vector<std::string> canonical_token_set(std::string_view value) {
   std::vector<std::string> tokens;
   size_t pos = 0;

@@ -953,6 +953,16 @@ TEST_CASE("HttpAlternatePlugin Vary compares list headers as token sets",
                              "Accept-Encoding: gzip, br\r\n"));
 }
 
+TEST_CASE("HttpAlternatePlugin Vary token sets keep parameters significant",
+          "[http]") {
+  REQUIRE_FALSE(vary_selects("Accept-Encoding", "Accept-Encoding", "gzip",
+                             "Accept-Encoding: gzip;q=0\r\n"));
+  REQUIRE_FALSE(vary_selects("Accept-Encoding", "Accept-Encoding", "gzip;q=0",
+                             "Accept-Encoding: gzip\r\n"));
+  REQUIRE(vary_selects("Accept-Encoding", "Accept-Encoding", "gzip;q=0",
+                       "Accept-Encoding: GZIP ; Q=0\r\n"));
+}
+
 TEST_CASE("HttpAlternatePlugin Vary keeps case-sensitive values exact",
           "[http]") {
   // Surrounding whitespace is not part of a field value.
