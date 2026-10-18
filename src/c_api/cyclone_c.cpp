@@ -719,27 +719,41 @@ static CycloneError read_async_impl(CycloneCacheHandle *cache, const char *key,
       // stay registered: the error returned below promises that read_cb
       // will not be called, and a registered waiter would be answered
       // later, at drain or destroy, perhaps after the caller freed
-      // read_user_data.  So unregister this read, and answer the reads that
-      // coalesced onto the fetch meanwhile with an error.  The context
-      // stays with the handler, which may still pass it to done; a late
-      // done finds no waiters and answers no one.  If done already ran
-      // (the handler threw after calling it), this read has been answered:
-      // report success, as read_cb has been called.
+      // read_user_data.
+      //
+      // The context is retired as completed, exactly as a done call would
+      // retire it: its completed flag makes any late done call by the
+      // handler a no-op, and it is kept in the completed ring (freed by
+      // drain or destroy) so such a call still lands on live memory.  If
+      // done has already run (the handler threw after calling it), it owns
+      // the context and has answered, or is answering, this read: report
+      // success, as read_cb has been or will be called.
+      std::shared_ptr<CycloneCacheHandle> retired_owner;
       std::vector<std::pair<CycloneReadCallback, void *>> others;
       bool unregistered = false;
       {
         std::lock_guard<std::mutex> lock(cache->in_flight_mu);
-        auto it = cache->in_flight.find(key_str);
-        if (it != cache->in_flight.end()) {
-          auto &waiters = it->second.waiters;
-          for (auto w = waiters.begin(); w != waiters.end(); ++w) {
-            if (w->first == read_cb && w->second == read_user_data) {
-              waiters.erase(w);
-              unregistered = true;
-              break;
-            }
+        bool expected = false;
+        if (raw_ctx->completed.compare_exchange_strong(expected, true)) {
+          retired_owner = std::move(raw_ctx->owner);
+          if (!cache->completed_contexts[cache->completed_next]) {
+            ++cache->completed_count;
           }
-          if (unregistered) {
+          cache->completed_contexts[cache->completed_next].reset(raw_ctx);
+          cache->completed_next =
+              (cache->completed_next + 1) % cache->completed_contexts.size();
+          // Unregister this read; the reads that coalesced onto the fetch
+          // meanwhile are answered with an error below.
+          auto it = cache->in_flight.find(key_str);
+          if (it != cache->in_flight.end()) {
+            auto &waiters = it->second.waiters;
+            for (auto w = waiters.begin(); w != waiters.end(); ++w) {
+              if (w->first == read_cb && w->second == read_user_data) {
+                waiters.erase(w);
+                unregistered = true;
+                break;
+              }
+            }
             others = std::move(waiters);
             cache->in_flight.erase(it);
             if (cache->in_flight.empty()) {
@@ -752,6 +766,7 @@ static CycloneError read_async_impl(CycloneCacheHandle *cache, const char *key,
         cb(ud, nullptr, 0, CYCLONE_INTERNAL_ERROR);
       }
       if (!unregistered) {
+        // Answered already (by done, or by a drain that timed out).
         return CYCLONE_OK;
       }
       throw;
