@@ -590,7 +590,7 @@ TEST_CASE("Volume reset rejects size equal to header", "[edge][volume]") {
 
 TEST_CASE("Volume whose stripe cannot hold its directory is rejected",
           "[edge][volume]") {
-  // A stripe starts with its directory (~160 KiB in memory, ~720 KiB as an
+  // A stripe starts with its directory (~640 KiB in memory, ~720 KiB as an
   // mmap directory).  A volume too small to hold it would seat the data area
   // past the end of the stripe: every write then extends the file and
   // fails.  It must be refused at start() instead, without growing a file.

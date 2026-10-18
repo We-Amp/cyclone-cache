@@ -1756,7 +1756,11 @@ TEST_CASE("Reopen repairs a persisted shared write cursor below the stripe",
   constexpr std::streamoff kSharedWritePosOffset = 64 + 24;
   const std::vector<std::byte> data(512, std::byte{0x5A});
 
-  for (const uint64_t rewound : {uint64_t{0}, uint64_t{32}}) {
+  // Below the data start, past the end of the volume, and far out of bounds:
+  // every refused value must be repaired, never trusted.
+  for (const uint64_t rewound :
+       {uint64_t{0}, uint64_t{32}, uint64_t{kVolumeSize + 8},
+        uint64_t{1} << 40}) {
     INFO("persisted cursor rewound to " << rewound);
     const std::string path = get_temp_path("cursor_rewind");
     cleanup_temp_file(path);

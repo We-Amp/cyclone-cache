@@ -3805,12 +3805,15 @@ StripeSnapshot Volume::snapshot(const Stripe* stripe) const {
   // fully exposed pass.
   snap.frontier = std::min<uint64_t>(snap.gen - (snap.pass * (n + 1)), n);
   snap.phase = (snap.pass & 1U) != 0;
-  // Floor at the stripe start: a shared cursor left below the stripe (a
-  // crash-torn header a shared opener may still see) must not underflow
-  // into a cursor that admits every same-phase entry.  A low cursor only
-  // widens rejection, which is a benign miss.
+  // Clamp to the stripe: a shared cursor left outside it (a crash-torn header
+  // a shared opener may still see) must neither underflow nor run past the
+  // stripe into a cursor that admits every same-phase entry.  A low cursor
+  // only widens rejection, which is a benign miss.
   const uint64_t cursor = stripe->current_write_cursor();
-  snap.cursor_rel = cursor > stripe->offset ? cursor - stripe->offset : 0;
+  snap.cursor_rel =
+      cursor > stripe->offset
+          ? std::min<uint64_t>(cursor - stripe->offset, stripe->size)
+          : 0;
   snap.frontier_rel = stripe->frontier_rel_of(snap.frontier);
 #ifdef CYCLONE_TEST_SEAMS
   reader_seam(ReaderSeam::kSnapshotDone);
