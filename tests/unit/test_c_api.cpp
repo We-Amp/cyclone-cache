@@ -1583,3 +1583,51 @@ TEST_CASE("C API: RAM coherence needs the mmap directory and a RAM tier",
   full.enable_cross_process_ram_coherence = 1;
   REQUIRE(coherence_active_for(full) == 1);
 }
+
+// =============================================================================
+// Read handle lifetime
+// =============================================================================
+
+TEST_CASE("C API: an open read handle does not hold a disk borrow",
+          "[c_api][read]") {
+  // cyclone_cache_read() copies the entry into the handle, and the copy is
+  // what cyclone_cache_read_data() serves.  The handle must not also keep
+  // the disk borrow open: a borrow pins the stripe and defers wraps for as
+  // long as the application keeps the handle.
+  TempCacheDir tmp;
+  std::string cache_path = tmp.path();
+  CycloneCacheConfig config{};
+  config.cache_path = cache_path.c_str();
+  config.cache_size_bytes = static_cast<uint64_t>(10 * 1024 * 1024);
+  config.ram_cache_size_bytes = 0;  // disk only: every hit is a disk hit
+  config.enable_checksum = 1;
+  config.num_segments = 2;
+
+  CycloneCacheHandle *cache = nullptr;
+  REQUIRE(cyclone_cache_create(&config, &cache) == CYCLONE_OK);
+
+  const std::string key = "borrow_key";
+  const std::string data(4096, 'b');
+  REQUIRE(cyclone_cache_write(cache, key.data(), key.size(), data.data(),
+                              data.size()) == CYCLONE_OK);
+
+  CycloneReadHandle *rh = nullptr;
+  REQUIRE(cyclone_cache_read(cache, key.data(), key.size(), &rh) == CYCLONE_OK);
+  REQUIRE(rh != nullptr);
+
+  CycloneCacheStats stats{};
+  REQUIRE(cyclone_cache_stats(cache, &stats) == CYCLONE_OK);
+  REQUIRE(stats.disk_cache_hits >= 1);
+  CHECK(stats.borrows_outstanding == 0);
+
+  // The data stays readable for the life of the handle.
+  const char *read_data = nullptr;
+  size_t read_len = 0;
+  REQUIRE(cyclone_cache_read_data(rh, &read_data, &read_len) == CYCLONE_OK);
+  REQUIRE(std::string(read_data, read_len) == data);
+
+  cyclone_cache_read_close(rh);
+  REQUIRE(cyclone_cache_stats(cache, &stats) == CYCLONE_OK);
+  REQUIRE(stats.borrows_outstanding == 0);
+  cyclone_cache_destroy(cache);
+}

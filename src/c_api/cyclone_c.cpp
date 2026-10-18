@@ -91,8 +91,11 @@ struct CycloneCacheHandle {
   uint32_t max_in_flight = 0;          // 0 = unlimited
 };
 
+// Holds a private copy of the entry only.  The disk borrow taken by the read
+// is released as soon as the copy is made: keeping it for the life of the
+// handle would pin the stripe and defer its wraps while the application
+// holds the handle, for no benefit, since the copy is what is served.
 struct CycloneReadHandle {
-  ReadHandle handle;
   std::vector<char> data_buf;
 };
 
@@ -193,12 +196,12 @@ static CycloneError cache_read_impl(CycloneCacheHandle *cache, const char *key,
   }
 
   auto *rh = new CycloneReadHandle();
-  rh->handle = std::move(*result);
-
-  auto content = rh->handle.content();
+  auto content = result->content();
   rh->data_buf.assign(
       reinterpret_cast<const char *>(content.data()),
       reinterpret_cast<const char *>(content.data()) + content.size());
+  // Release the borrow now; the handle serves the copy.
+  result->close();
   *out = rh;
   return CYCLONE_OK;
 }
