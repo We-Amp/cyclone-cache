@@ -26,8 +26,10 @@ std::expected<void, CacheError> WorkQueue::enqueue(WorkItem item) {
                             _config.priority_aging_interval)
                             .count();
   if (aging_ns > 0) {
-    // Enqueue times are truncated to a fine grain (at most 1 ms), so items
-    // queued back to back tie on the key and fall through to the hit count.
+    // Enqueue times are truncated to a fine grain (at most 1 ms, and never
+    // more than interval/16, which keeps a truncation below one level), so
+    // items queued back to back tie on the key and fall through to the hit
+    // count.
     const int64_t grain = std::clamp<int64_t>(aging_ns / 16, 1, 1'000'000);
     auto enq_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                       item.enqueue_time.time_since_epoch())
