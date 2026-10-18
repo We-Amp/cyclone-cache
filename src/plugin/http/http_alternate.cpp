@@ -335,6 +335,76 @@ bool HttpAlternatePlugin::check_vary_match(
   return true;
 }
 
+namespace {
+
+std::string_view trim_ows(std::string_view s) {
+  while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) {
+    s.remove_prefix(1);
+  }
+  while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) {
+    s.remove_suffix(1);
+  }
+  return s;
+}
+
+bool iequal(std::string_view a, std::string_view b) {
+  if (a.size() != b.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(a[i])) !=
+        std::tolower(static_cast<unsigned char>(b[i]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Splits one list element ("token;param=value;q=0.5") into its token and
+// quality. Whitespace around ';' and '=' is allowed and the parameter name
+// "q" is case-insensitive. A missing or unparsable q means 1.
+struct RangeItem {
+  std::string_view token;
+  float q = 1.0f;
+};
+
+RangeItem parse_range_item(std::string_view item) {
+  RangeItem result;
+  size_t semi = item.find(';');
+  result.token = trim_ows(item.substr(0, semi));
+  while (semi != std::string_view::npos) {
+    size_t next = item.find(';', semi + 1);
+    std::string_view param = item.substr(
+        semi + 1, next == std::string_view::npos ? next : next - semi - 1);
+    size_t eq = param.find('=');
+    if (eq != std::string_view::npos &&
+        iequal(trim_ows(param.substr(0, eq)), "q")) {
+      result.q = parse_q_value(trim_ows(param.substr(eq + 1)));
+    }
+    semi = next;
+  }
+  return result;
+}
+
+// Calls fn(RangeItem) for each comma separated element of a list header.
+template <typename Fn>
+void for_each_range(std::string_view list, Fn &&fn) {
+  size_t pos = 0;
+  while (pos < list.size()) {
+    size_t end = list.find(',', pos);
+    if (end == std::string_view::npos) {
+      end = list.size();
+    }
+    RangeItem item = parse_range_item(list.substr(pos, end - pos));
+    if (!item.token.empty()) {
+      fn(item);
+    }
+    pos = end + 1;
+  }
+}
+
+}  // namespace
+
 float HttpAlternatePlugin::calculate_accept_quality(
     std::string_view accept, std::string_view content_type) {
   if (accept.empty()) {
@@ -346,60 +416,49 @@ float HttpAlternatePlugin::calculate_accept_quality(
     return 0.0f;
   }
 
-  std::string_view type = content_type.substr(0, slash);
+  std::string_view type = trim_ows(content_type.substr(0, slash));
   std::string_view subtype = content_type.substr(slash + 1);
 
   size_t semi = subtype.find(';');
   if (semi != std::string_view::npos) {
     subtype = subtype.substr(0, semi);
   }
+  subtype = trim_ows(subtype);
 
-  float best_quality = 0.0f;
+  // The most specific matching range decides (RFC 9110 12.5.1): an exact
+  // type/subtype beats type/*, which beats */*. Among equally specific
+  // ranges the highest quality is used.
+  int best_specificity = 0;
+  float quality = 0.0f;
 
-  size_t pos = 0;
-  while (pos < accept.size()) {
-    size_t end = accept.find(',', pos);
-    if (end == std::string_view::npos) {
-      end = accept.size();
-    }
-
-    std::string_view media_range = accept.substr(pos, end - pos);
-
-    while (!media_range.empty() && media_range.front() == ' ') {
-      media_range.remove_prefix(1);
-    }
-
-    float q = 1.0f;
-    size_t qpos = media_range.find(";q=");
-    if (qpos != std::string_view::npos) {
-      std::string_view qval = media_range.substr(qpos + 3);
-      q = parse_q_value(qval);
-      media_range = media_range.substr(0, qpos);
-    }
-
-    while (!media_range.empty() && media_range.back() == ' ') {
-      media_range.remove_suffix(1);
-    }
-
-    bool matches = false;
-    if (media_range == "*/*") {
-      matches = true;
-    } else if (media_range.size() > 2 &&
-               media_range.substr(media_range.size() - 2) == "/*") {
-      matches = (media_range.substr(0, media_range.size() - 2) == type);
+  for_each_range(accept, [&](const RangeItem &item) {
+    std::string_view range = item.token;
+    int specificity = 0;
+    if (range == "*/*") {
+      specificity = 1;
+    } else if (range.size() > 2 && range.substr(range.size() - 2) == "/*") {
+      if (iequal(range.substr(0, range.size() - 2), type)) {
+        specificity = 2;
+      }
     } else {
-      matches = (media_range == content_type ||
-                 media_range == std::string(type) + "/" + std::string(subtype));
+      size_t rslash = range.find('/');
+      if (rslash != std::string_view::npos &&
+          iequal(range.substr(0, rslash), type) &&
+          iequal(range.substr(rslash + 1), subtype)) {
+        specificity = 3;
+      }
     }
-
-    if (matches && q > best_quality) {
-      best_quality = q;
+    if (specificity == 0) {
+      return;
     }
+    if (specificity > best_specificity ||
+        (specificity == best_specificity && item.q > quality)) {
+      best_specificity = specificity;
+      quality = item.q;
+    }
+  });
 
-    pos = (end < accept.size()) ? end + 1 : end;
-  }
-
-  return best_quality;
+  return quality;
 }
 
 float HttpAlternatePlugin::calculate_accept_encoding_quality(
@@ -408,39 +467,31 @@ float HttpAlternatePlugin::calculate_accept_encoding_quality(
     return 1.0f;
   }
 
-  size_t pos = 0;
-  while (pos < accept_encoding.size()) {
-    size_t end = accept_encoding.find(',', pos);
-    if (end == std::string_view::npos) {
-      end = accept_encoding.size();
+  // An exact coding beats "*" regardless of order.
+  int best_specificity = 0;
+  float quality = 0.0f;
+
+  for_each_range(accept_encoding, [&](const RangeItem &item) {
+    int specificity = 0;
+    if (iequal(item.token, content_encoding)) {
+      specificity = 2;
+    } else if (item.token == "*") {
+      specificity = 1;
     }
-
-    std::string_view encoding = accept_encoding.substr(pos, end - pos);
-
-    while (!encoding.empty() && encoding.front() == ' ') {
-      encoding.remove_prefix(1);
+    if (specificity == 0) {
+      return;
     }
-
-    float q = 1.0f;
-    size_t qpos = encoding.find(";q=");
-    if (qpos != std::string_view::npos) {
-      std::string_view qval = encoding.substr(qpos + 3);
-      q = parse_q_value(qval);
-      encoding = encoding.substr(0, qpos);
+    if (specificity > best_specificity ||
+        (specificity == best_specificity && item.q > quality)) {
+      best_specificity = specificity;
+      quality = item.q;
     }
+  });
 
-    while (!encoding.empty() && encoding.back() == ' ') {
-      encoding.remove_suffix(1);
-    }
-
-    if (encoding == content_encoding || encoding == "*") {
-      return q;
-    }
-
-    pos = (end < accept_encoding.size()) ? end + 1 : end;
+  if (best_specificity > 0) {
+    return quality;
   }
-
-  return content_encoding == "identity" ? 1.0f : 0.0f;
+  return iequal(content_encoding, "identity") ? 1.0f : 0.0f;
 }
 
 float HttpAlternatePlugin::calculate_accept_language_quality(
@@ -449,46 +500,38 @@ float HttpAlternatePlugin::calculate_accept_language_quality(
     return 1.0f;
   }
 
-  float best_quality = 0.0f;
+  // The longest matching range decides; "*" is the least specific.
+  size_t best_length = 0;
+  bool matched = false;
+  float quality = 0.0f;
 
-  size_t pos = 0;
-  while (pos < accept_language.size()) {
-    size_t end = accept_language.find(',', pos);
-    if (end == std::string_view::npos) {
-      end = accept_language.size();
+  for_each_range(accept_language, [&](const RangeItem &item) {
+    std::string_view lang = item.token;
+    size_t length = 0;
+    bool matches = false;
+    if (lang == "*") {
+      matches = true;
+    } else if (iequal(lang, content_language)) {
+      matches = true;
+      length = lang.size();
+    } else if (content_language.size() > lang.size() &&
+               iequal(content_language.substr(0, lang.size()), lang) &&
+               content_language[lang.size()] == '-') {
+      matches = true;
+      length = lang.size();
     }
-
-    std::string_view lang = accept_language.substr(pos, end - pos);
-
-    while (!lang.empty() && lang.front() == ' ') {
-      lang.remove_prefix(1);
+    if (!matches) {
+      return;
     }
-
-    float q = 1.0f;
-    size_t qpos = lang.find(";q=");
-    if (qpos != std::string_view::npos) {
-      std::string_view qval = lang.substr(qpos + 3);
-      q = parse_q_value(qval);
-      lang = lang.substr(0, qpos);
+    if (!matched || length > best_length ||
+        (length == best_length && item.q > quality)) {
+      matched = true;
+      best_length = length;
+      quality = item.q;
     }
+  });
 
-    while (!lang.empty() && lang.back() == ' ') {
-      lang.remove_suffix(1);
-    }
-
-    bool matches = lang == "*" || lang == content_language ||
-                   (content_language.size() > lang.size() &&
-                    content_language.substr(0, lang.size()) == lang &&
-                    content_language[lang.size()] == '-');
-
-    if (matches && q > best_quality) {
-      best_quality = q;
-    }
-
-    pos = (end < accept_language.size()) ? end + 1 : end;
-  }
-
-  return best_quality;
+  return matched ? quality : 0.0f;
 }
 
 std::shared_ptr<CachePlugin> create_http_alternate_plugin() {

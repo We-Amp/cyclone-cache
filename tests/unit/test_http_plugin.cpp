@@ -4,6 +4,9 @@
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
 #include <cstring>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "cyclone/plugin/alternate.hpp"
 #include "cyclone/plugin/plugin.hpp"
@@ -519,6 +522,76 @@ TEST_CASE("HttpAlternatePlugin does not select unacceptable variants",
     auto r = select("Accept: text/html;q=0.5\r\n", false);
     REQUIRE(r.has_value());
     REQUIRE(*r == 0);
+  }
+}
+
+TEST_CASE("HttpAlternatePlugin ranks negotiation ranges by specificity",
+          "[http][alternate]") {
+  auto plugin = create_http_alternate_plugin();
+
+  // Index of the selected variant among those built from `variant_headers`
+  // (each entry is a list of response header pairs), or -1 for no match.
+  using Pairs = std::vector<std::pair<std::string, std::string>>;
+  auto select = [&](const std::string &request, const std::vector<Pairs> &vs) {
+    std::vector<std::vector<std::byte>> metas;
+    VariantCollection variants;
+    for (const auto &pairs : vs) {
+      HttpCacheAlt alt;
+      for (const auto &[n, v] : pairs) {
+        alt.set_response_header(n, v);
+      }
+      metas.push_back(alt.serialize());
+      variants.add(
+          CacheVariant{CacheKey("v"),
+                       Metadata(std::span<const std::byte>(metas.back())),
+                       0,
+                       {},
+                       {},
+                       0});
+    }
+    LookupContext ctx;
+    ctx.request_headers = std::span<const std::byte>(
+        reinterpret_cast<const std::byte *>(request.data()), request.size());
+    auto r = plugin->select_variant(variants, ctx);
+    return r ? static_cast<int>(*r) : -1;
+  };
+  const Pairs html{{"Content-Type", "text/html"}};
+  const Pairs png{{"Content-Type", "image/png"}};
+
+  SECTION("Accept: specific range beats wildcard regardless of order") {
+    REQUIRE(select("Accept: text/html;q=0, */*\r\n", {html}) == -1);
+    REQUIRE(select("Accept: */*, text/html;q=0\r\n", {html}) == -1);
+    REQUIRE(select("Accept: text/html;q=0, */*\r\n", {html, png}) == 1);
+    REQUIRE(select("Accept: text/*;q=0, text/html\r\n", {html}) == 0);
+    REQUIRE(select("Accept: text/html;q=0.1, text/*;q=0.9, image/png;q=0.5\r\n",
+                   {html, png}) == 1);
+  }
+  SECTION("Accept: whitespace around parameters and an upper case Q") {
+    REQUIRE(select("Accept: text/html ; q=0, */*\r\n", {html}) == -1);
+    REQUIRE(select("Accept: text/html;Q=0, */*\r\n", {html}) == -1);
+    REQUIRE(select("Accept: text/html; q = 0\r\n", {html}) == -1);
+    REQUIRE(select("Accept: text/html;level=1; q=0.5\r\n", {html}) == 0);
+  }
+  SECTION("Accept-Encoding: exact coding beats the wildcard") {
+    const Pairs gzip{{"Content-Type", "text/html"},
+                     {"Content-Encoding", "gzip"}};
+    const Pairs plain{{"Content-Type", "text/html"}};
+    REQUIRE(select("Accept-Encoding: *, gzip;q=0\r\n", {gzip}) == -1);
+    REQUIRE(select("Accept-Encoding: gzip;q=0, *\r\n", {gzip}) == -1);
+    REQUIRE(select("Accept-Encoding: *, gzip;q=0\r\n", {gzip, plain}) == 1);
+    REQUIRE(select("Accept-Encoding: gzip ; q=0.5, *;q=0.1\r\n",
+                   {gzip, plain}) == 0);
+    REQUIRE(select("Accept-Encoding: GZIP;Q=0\r\n", {gzip}) == -1);
+  }
+  SECTION("Accept-Language: the most specific range wins") {
+    const Pairs en{{"Content-Language", "en-US"}};
+    const Pairs fr{{"Content-Language", "fr"}};
+    REQUIRE(select("Accept-Language: *;q=0, en\r\n", {en}) == 0);
+    REQUIRE(select("Accept-Language: *;q=0, en\r\n", {fr}) == -1);
+    REQUIRE(select("Accept-Language: en-US;q=0, en\r\n", {en}) == -1);
+    REQUIRE(select("Accept-Language: en, en-US;q=0\r\n", {en}) == -1);
+    REQUIRE(select("Accept-Language: en;q=0.3, fr;q=0.9\r\n", {en, fr}) == 1);
+    REQUIRE(select("Accept-Language: en ; q=0\r\n", {en}) == -1);
   }
 }
 
