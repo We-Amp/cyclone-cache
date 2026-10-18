@@ -150,8 +150,11 @@ struct InsertChoice {
 // then land beside the key's real entry (the entry it meant to update in
 // place is gone), giving the key two heads -- and the next write of the key
 // elects one and clears the other, silently dropping every alternate only
-// the cleared chain held.  The insert therefore publishes only when the
-// bucket still holds what the writer saw; see publish_view_is_current.
+// the cleared chain held.  A plain write has the same window between its
+// election of the entry to update in place and its insert, and without the
+// check leaves two live entries for the key, the later write shadowed by the
+// earlier one.  The insert therefore publishes only when the bucket still
+// holds what the writer saw; see publish_view_is_current.
 struct PublishView {
   std::span<const uint64_t> seen_offsets;
 };

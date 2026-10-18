@@ -4986,93 +4986,150 @@ std::expected<void, CacheError> Volume::commit_write_impl(
   // entry, and every candidate whose document proves it dead (bad magic, or
   // a pass stamp its class contradicts), is cleared in the insert's own
   // seqlock bracket (rule 2): at most one entry resolves the key afterwards.
-  uint64_t verified_offset = Directory::kNoVerifiedEntry;
-  AdmitClass verified_cls = AdmitClass::kReject;
-  std::array<uint64_t, Directory::kEntriesPerBucket> clear_offsets{};
-  size_t clear_count = 0;
-  auto add_clear = [&](uint64_t off) {
-    for (size_t i = 0; i < clear_count; ++i) {
-      if (clear_offsets[i] == off) {
-        return;
-      }
-    }
-    if (clear_count < clear_offsets.size()) {
-      clear_offsets[clear_count++] = off;
-    }
-  };
-  const StripeSnapshot snap = snapshot(stripe);
-  const bool probe_complete = writer_probe(
-      stripe, key, snap,
-      [&] {
-        verified_offset = Directory::kNoVerifiedEntry;
-        verified_cls = AdmitClass::kReject;
-        clear_count = 0;
-      },
-      [&](const DirEntry& dir_entry, AdmitClass cls) {
-        if (dir_entry.offset() == verified_offset) {
-          return true;  // a retried scan re-yields the elected entry
-        }
-        auto region = _mapped_file->map_region(
-            stripe->offset + dir_entry.offset(), Document::kHeaderSize,
-            MappedFile::MapMode::ReadOnly);
-        if (!region) {
-          // A transient mapping failure proves nothing about the entry: keep it
-          // (review N2).  Only a header that was actually read and failed
-          // validation below is evidence that the entry is dead.
-          return true;
-        }
-        const DocumentReader reader(kSharedMapping, *region);
-        if (!reader.is_valid()) {
-          // Bad magic / length: nothing any key can resolve through it.
-          _mapped_file->unmap_region(*region);
-          if (stripe->in_data_area(dir_entry.offset())) {
-            add_clear(dir_entry.offset());
-          }
-          return true;
-        }
-        CacheKey stored_key = reader.first_key();
-        const bool stamp_ok =
-            stamp_admits(stripe, snap, cls, reader.document());
-        _mapped_file->unmap_region(*region);
-        if (!stamp_ok) {
-          add_clear(dir_entry.offset());  // a stale survivor, whoever's key
-          return true;
-        }
-        if (stored_key != key) {
-          return true;  // A live tag collision: another key's entry, keep it
-        }
-        if (verified_offset == Directory::kNoVerifiedEntry ||
-            (cls == AdmitClass::kCurrent &&
-             verified_cls != AdmitClass::kCurrent)) {
-          if (verified_offset != Directory::kNoVerifiedEntry) {
-            add_clear(verified_offset);  // a retained duplicate loses
-          }
-          verified_offset = dir_entry.offset();
-          verified_cls = cls;
-        } else {
-          add_clear(dir_entry.offset());  // a duplicate
-        }
-        return true;
-      });
-  // A partial election could miss this key's live entry and publish a
-  // second one beside it (the uniqueness rule above): writer_probe recovers
-  // a stuck bucket and re-elects.  If even that fails, publish nothing: the
-  // document stays unreachable, like any fill whose insert never ran.
-  if (!probe_complete) {
-    return make_unexpected(CacheError::Busy);
-  }
-
-  // Update directory — publishes the entry.  MUST stay after the data sync
-  // above; see the ordering-invariant comment there.
+  //
+  // CONDITIONAL publish (see PublishView), as in commit_alternate_write_once.
+  // The election runs under the stripe mutex, which is per process, after
+  // commit_write_slot released the cross-process write lock: another process
+  // can publish or remove this key between the election and the insert.  An
+  // insert against the election as it WAS would then land beside that
+  // process's entry -- two live entries for one key, of which reads stop at
+  // the first and the other stays shadowed until a third write.  So the
+  // insert publishes only into a bucket that still holds what the election
+  // saw; otherwise it publishes nothing and the election runs again against
+  // the bucket as it is now.  The document is already written and durable,
+  // and nothing in it depends on the election, so a new round re-elects and
+  // publishes the same bytes; it does not write again.
+  //
+  // WHY IT TERMINATES (the alternate path's argument): a round is lost only
+  // when another process completed an insert or a removal for this key's
+  // bucket and tag since the round's election, or an entry the election's
+  // snapshot did not admit became admissible.  Every lost round is paid for
+  // by someone else's finished operation, and no lock is held across the
+  // rounds' publishes that another writer would need to finish its own.
+  //
+  // A round after a lost one first checks that no wrap has run since the
+  // first election: the document's bytes belong to the pass they were
+  // written in, and a wrap may already be filling over them.  Publishing
+  // nothing then is the outcome of any fill whose insert never ran.
+  const StripeSnapshot first_snap = snapshot(stripe);
   bool collision_evicted = false;
   bool bucket_full_evicted = false;
-  StripeAdmission admission(*this, *stripe);
-  bool insert_busy = false;
-  if (!stripe->insert(
-          key, relative_offset, doc_size, verified_offset, &collision_evicted,
-          &bucket_full_evicted, &admission,
-          std::span<const uint64_t>(clear_offsets.data(), clear_count),
-          &insert_busy)) {
+  for (bool first_round = true;; first_round = false) {
+    if (!first_round && wrapped_since(stripe, first_snap)) {
+      return make_unexpected(CacheError::Busy);
+    }
+    uint64_t verified_offset = Directory::kNoVerifiedEntry;
+    AdmitClass verified_cls = AdmitClass::kReject;
+    std::array<uint64_t, Directory::kEntriesPerBucket> clear_offsets{};
+    size_t clear_count = 0;
+    // Every same-tag entry the election is handed, this key's and any
+    // colliding foreign key's: what the conditional publish below compares
+    // the bucket against.
+    std::array<uint64_t, Directory::kEntriesPerBucket> seen_offsets{};
+    size_t seen_count = 0;
+    auto add_clear = [&](uint64_t off) {
+      for (size_t i = 0; i < clear_count; ++i) {
+        if (clear_offsets[i] == off) {
+          return;
+        }
+      }
+      if (clear_count < clear_offsets.size()) {
+        clear_offsets[clear_count++] = off;
+      }
+    };
+    const StripeSnapshot snap = snapshot(stripe);
+    const bool probe_complete = writer_probe(
+        stripe, key, snap,
+        [&] {
+          verified_offset = Directory::kNoVerifiedEntry;
+          verified_cls = AdmitClass::kReject;
+          clear_count = 0;
+          seen_count = 0;
+        },
+        [&](const DirEntry& dir_entry, AdmitClass cls) {
+          // Recorded before anything can skip the entry: the publish must
+          // know about every entry this election was shown, usable or not.
+          bool already_seen = false;
+          for (size_t i = 0; i < seen_count; ++i) {
+            if (seen_offsets[i] == dir_entry.offset()) {
+              already_seen = true;
+              break;
+            }
+          }
+          if (!already_seen && seen_count < seen_offsets.size()) {
+            seen_offsets[seen_count++] = dir_entry.offset();
+          }
+          if (dir_entry.offset() == verified_offset) {
+            return true;  // a retried scan re-yields the elected entry
+          }
+          auto region = _mapped_file->map_region(
+              stripe->offset + dir_entry.offset(), Document::kHeaderSize,
+              MappedFile::MapMode::ReadOnly);
+          if (!region) {
+            // A transient mapping failure proves nothing about the entry: keep
+            // it (review N2).  Only a header that was actually read and failed
+            // validation below is evidence that the entry is dead.
+            return true;
+          }
+          const DocumentReader reader(kSharedMapping, *region);
+          if (!reader.is_valid()) {
+            // Bad magic / length: nothing any key can resolve through it.
+            _mapped_file->unmap_region(*region);
+            if (stripe->in_data_area(dir_entry.offset())) {
+              add_clear(dir_entry.offset());
+            }
+            return true;
+          }
+          CacheKey stored_key = reader.first_key();
+          const bool stamp_ok =
+              stamp_admits(stripe, snap, cls, reader.document());
+          _mapped_file->unmap_region(*region);
+          if (!stamp_ok) {
+            add_clear(dir_entry.offset());  // a stale survivor, whoever's key
+            return true;
+          }
+          if (stored_key != key) {
+            return true;  // A live tag collision: another key's entry, keep it
+          }
+          if (verified_offset == Directory::kNoVerifiedEntry ||
+              (cls == AdmitClass::kCurrent &&
+               verified_cls != AdmitClass::kCurrent)) {
+            if (verified_offset != Directory::kNoVerifiedEntry) {
+              add_clear(verified_offset);  // a retained duplicate loses
+            }
+            verified_offset = dir_entry.offset();
+            verified_cls = cls;
+          } else {
+            add_clear(dir_entry.offset());  // a duplicate
+          }
+          return true;
+        });
+    // A partial election could miss this key's live entry and publish a
+    // second one beside it (the uniqueness rule above): writer_probe recovers
+    // a stuck bucket and re-elects.  If even that fails, publish nothing: the
+    // document stays unreachable, like any fill whose insert never ran.
+    if (!probe_complete) {
+      return make_unexpected(CacheError::Busy);
+    }
+    writer_seam(WriterSeam::kBeforePlainPublish);
+
+    // Update directory — publishes the entry.  MUST stay after the data sync
+    // above; see the ordering-invariant comment there.
+    StripeAdmission admission(*this, *stripe);
+    bool insert_busy = false;
+    bool insert_stale = false;
+    const PublishView publish_view{
+        std::span<const uint64_t>(seen_offsets.data(), seen_count)};
+    if (stripe->insert(
+            key, relative_offset, doc_size, verified_offset, &collision_evicted,
+            &bucket_full_evicted, &admission,
+            std::span<const uint64_t>(clear_offsets.data(), clear_count),
+            &insert_busy, &publish_view, &insert_stale)) {
+      break;
+    }
+    if (insert_stale) {
+      continue;  // the bucket changed since the election: elect again
+    }
     // A capped lock wait that gave up published nothing: the document stays
     // unreachable, like any fill whose insert never ran (the Busy above).
     return make_unexpected(insert_busy ? CacheError::Busy

@@ -1322,20 +1322,26 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // shape and cost as s_write_tear_gate_for_test: one predicted-not-taken
   // branch, on the write path only, never on the lock-free read path.
   // Every seam fires with the stripe mutex held and, in multi-process mode,
-  // the cross-process write lock held -- except kAfterPublish, which fires
-  // after commit_write_slot has released that lock with the cursor.
+  // the cross-process write lock held -- except kAfterPublish and
+  // kBeforePlainPublish, which fire after commit_write_slot has released
+  // that lock with the cursor.
   enum class WriterSeam : uint8_t {
-    kAfterIntentSet,   // intent stored, gate loads not yet run
-    kAfterGatePassed,  // gate said "proceed", nothing published yet
-    kWrapAfterCursor,  // wrap only: cursor lowered to the data-area start,
-                       // epoch not yet stored
-    kAfterEpochStore,  // epoch stored, intent not yet cleared
-    kAfterPublish,     // alternate commit only: the new head is in the
-                       // directory (the publish) and the splice has run; the
-                       // RAM-cache invalidation (remove-generation bump +
-                       // eviction) has not.  A reader parked before its RAM
-                       // put with the OLD bytes copied sees the window the
-                       // put's bucket-version re-check exists for.
+    kAfterIntentSet,      // intent stored, gate loads not yet run
+    kAfterGatePassed,     // gate said "proceed", nothing published yet
+    kWrapAfterCursor,     // wrap only: cursor lowered to the data-area start,
+                          // epoch not yet stored
+    kAfterEpochStore,     // epoch stored, intent not yet cleared
+    kAfterPublish,        // alternate commit only: the new head is in the
+                          // directory (the publish) and the splice has run; the
+                          // RAM-cache invalidation (remove-generation bump +
+                          // eviction) has not.  A reader parked before its RAM
+                          // put with the OLD bytes copied sees the window the
+                          // put's bucket-version re-check exists for.
+    kBeforePlainPublish,  // plain commit only: the document is written and
+                          // the key's entries are elected, the directory
+                          // insert (the publish) has not run.  Fires once
+                          // per publish attempt.  Another process can
+                          // publish the same key inside this window.
   };
   using WriterSeamHook = std::function<void(WriterSeam seam)>;
   static inline WriterSeamHook s_writer_seam_for_test{};
