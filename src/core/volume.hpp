@@ -1367,6 +1367,10 @@ class Volume : public std::enable_shared_from_this<Volume> {
     kCrcVerify,     // about to run the CRC-32C pass over a document's
                     // payload: the CRC-validation cache missed for this
                     // incarnation (read_sync and read_alternate_sync)
+    kRamCopy,       // read_alternate_sync: borrow revalidated, about to copy
+                    // the selected document for the RAM tier
+    kRamCopied,     // read_alternate_sync: the RAM-tier copy is taken into
+                    // a private buffer, not yet revalidated or published
   };
   using ReaderSeamHook = std::function<void(ReaderSeam seam)>;
   static inline ReaderSeamHook s_reader_seam_for_test{};

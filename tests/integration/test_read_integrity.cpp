@@ -8,11 +8,15 @@
 
 #include <array>
 #include <catch2/catch_test_macros.hpp>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "core/document.hpp"
@@ -433,6 +437,153 @@ TEST_CASE("Read integrity: no cached CRC verdict survives a close and reopen",
 
   auto rh = cache.read_sync(key);
   CHECK_FALSE(rh.has_value());
+  if (rh.has_value()) {
+    CHECK(same_bytes(rh->content(), content));
+  }
+}
+
+// In-memory directory bucket count (kDirectoryEntriesPerSegment in
+// src/core/volume.cpp), mirrored so the filler keys below never share the
+// read key's bucket.
+constexpr uint32_t kDirectoryBuckets = 16 * 1024;
+
+TEST_CASE(
+    "Read integrity: a RAM-tier copy is published only after it is "
+    "revalidated against a racing wrap",
+    "[integrity][ram]") {
+  CacheConfig config = integrity_config();
+  config.ram_cache_size = size_t{1} * 1024 * 1024;
+  // LRU admits on first sight (CLFUS would defer the first put).
+  config.ram_cache_type = RamCacheType::LRU;
+  // No read leases: the wrap below is never deferred by the reader's borrow.
+  config.read_lease_duration = std::chrono::milliseconds(0);
+  config.lease_wrap_ceiling = std::chrono::milliseconds(0);
+  // Flush mode: a wrap only overwrites, it carries nothing forward.
+  config.wrap_retention = false;
+
+  const CacheKey key("integrity-ram-copy");
+  const auto content = make_content(7, 8192);
+  const uint32_t avoid = key.bucket_hash() % kDirectoryBuckets;
+  const auto filler = make_content(8, 8192);
+  const auto damaged = make_content(9, content.size());
+  size_t filler_index = 0;
+  const auto next_filler = [&] {
+    for (;;) {
+      CacheKey k("integrity-ram-filler-" + std::to_string(filler_index++));
+      if (k.bucket_hash() % kDirectoryBuckets != avoid) {
+        return k;
+      }
+    }
+  };
+
+  // Geometry probe on a scratch volume: how many fillers behind the first
+  // document the first wrap takes.  Every write to the stripe also bumps
+  // its RAM invalidation generation, so the wrap under test must be the
+  // only write that lands while the read below is in flight.
+  size_t fillers_to_wrap = 0;
+  {
+    OpenCache probe(config);
+    REQUIRE(write_alternate(*probe.cache, key, AlternateId::Original, content));
+    while (probe.cache->stats().write_buffer_wraps == 0) {
+      REQUIRE(write_entry(*probe.cache, next_filler(), filler));
+      ++fillers_to_wrap;
+      REQUIRE(fillers_to_wrap < 100000);
+    }
+  }
+  REQUIRE(fillers_to_wrap > 1);
+
+  OpenCache oc(config);
+  Cache &cache = *oc.cache;
+  REQUIRE(cache.stats().stripe_count == 1);
+  // The first document of a fresh single-stripe volume sits at the start of
+  // the data area, where the first wrap lands the next document.
+  REQUIRE(write_alternate(cache, key, AlternateId::Original, content));
+  auto alts = cache.list_alternates_sync(key);
+  REQUIRE(alts.has_value());
+  REQUIRE(alts->size() == 1);
+  const uint64_t doc = (*alts)[0].disk_offset;
+  filler_index = 0;
+  for (size_t i = 0; i + 1 < fillers_to_wrap; ++i) {
+    REQUIRE(write_entry(cache, next_filler(), filler));
+  }
+  REQUIRE(cache.stats().write_buffer_wraps == 0);
+
+  // The wrapping writer stops right after it published the wrap (epoch
+  // stored, intent still set) and the region it is about to fill has
+  // changed under the reader: the moment a racing wrap tears a copy.
+  std::mutex mu;
+  std::condition_variable cv;
+  bool wrap_parked = false;
+  bool release_writer = false;
+  bool in_wrap = false;
+  Volume::s_writer_seam_for_test = [&](Volume::WriterSeam at) {
+    if (at == Volume::WriterSeam::kWrapAfterCursor) {
+      in_wrap = true;
+      return;
+    }
+    if (at != Volume::WriterSeam::kAfterEpochStore || !in_wrap) {
+      return;
+    }
+    in_wrap = false;
+    const int fd = ::open(oc.file.c_str(), O_WRONLY);
+    if (fd >= 0) {
+      (void)!::pwrite(fd, damaged.data(), damaged.size(),
+                      static_cast<off_t>(doc + Document::kHeaderSize));
+      ::close(fd);
+    }
+    std::unique_lock lock(mu);
+    wrap_parked = true;
+    cv.notify_all();
+    cv.wait(lock, [&] { return release_writer; });
+  };
+
+  std::thread writer;
+  bool in_hook = false;
+  int nested_reads = 0;
+  int wrong_serves = 0;
+  Volume::s_reader_seam_for_test = [&](Volume::ReaderSeam at) {
+    if (in_hook) {
+      return;
+    }
+    in_hook = true;
+    if (at == Volume::ReaderSeam::kRamCopy && !writer.joinable()) {
+      writer =
+          std::thread([&] { (void)write_entry(cache, next_filler(), filler); });
+      std::unique_lock lock(mu);
+      cv.wait(lock, [&] { return wrap_parked; });
+    } else if (at == Volume::ReaderSeam::kRamCopied) {
+      // A concurrent reader at this point must not be served the copy
+      // (read_sync consults the RAM tier before the directory).
+      ++nested_reads;
+      auto rh = cache.read_sync(key);
+      if (rh.has_value() && !same_bytes(rh->content(), content)) {
+        ++wrong_serves;
+      }
+    }
+    in_hook = false;
+  };
+
+  {
+    OnlyId want(AlternateId::Original);
+    AlternateSelectionContext ctx;
+    // Whatever this read returns, the RAM tier must not expose or keep the
+    // bytes the wrap changed under it.
+    (void)cache.read_alternate_sync(key, want, ctx);
+  }
+  Volume::s_reader_seam_for_test = nullptr;
+  {
+    std::lock_guard lock(mu);
+    release_writer = true;
+  }
+  cv.notify_all();
+  if (writer.joinable()) {
+    writer.join();
+  }
+  Volume::s_writer_seam_for_test = nullptr;
+
+  REQUIRE(wrap_parked);
+  CHECK(wrong_serves == 0);
+  auto rh = cache.read_sync(key);
   if (rh.has_value()) {
     CHECK(same_bytes(rh->content(), content));
   }

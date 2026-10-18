@@ -7171,26 +7171,53 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
           //    backwards until the eviction).  This is what makes a served
           //    version monotone per reader, not just eventually right.
           //
-          // The post-put re-check below is still required, for two races no
-          // insert-time predicate can exclude:
+          // Two races no insert-time predicate can exclude:
           //  - a wrap racing the copy (possible with leases disabled, or via a
           //    ceiling-forced wrap): a wrap takes NO RAM-cache lock, so it can
-          //    tear the copied bytes after the predicate passed — RAM hits are
+          //    tear the copied bytes after the predicate passed -- RAM hits are
           //    served WITHOUT checksum verification, so a torn entry would be
-          //    served as authoritative until evicted.  Only a revalidation
-          //    AFTER the copy completes catches this;
+          //    served as authoritative until evicted.  So the copy is taken
+          //    into a private buffer and revalidated BEFORE it is published:
+          //    an entry another reader can hit never holds bytes that were not
+          //    revalidated after the copy completed;
           //  - a remove whose generation bump lands inside the put's own
-          //    critical section, after the predicate passed — the
-          //    invalidation's eviction would get the entry anyway; this undo
-          //    just gets it first.
-          // On either race, undo the put.  Only the RAM copy is discarded: the
-          // handle's own borrow was revalidated above and remains lease-
-          // protected (and removes never overwrite document bytes).
+          //    critical section, after the predicate passed -- the
+          //    invalidation's eviction would get the entry anyway; the undo
+          //    after the put just gets it first.
+          // Only the RAM copy is ever discarded: the handle's own borrow was
+          // revalidated above and remains lease-protected (and removes never
+          // overwrite document bytes).
           if (use_ram_cache) {
             size_t doc_len = selected_reader.document().len;
+            std::vector<std::byte> ram_copy;
+            bool copy_intact = false;
             if (doc_len <= selected_mapped->size()) {
+#ifdef CYCLONE_TEST_SEAMS
+              reader_seam(ReaderSeam::kRamCopy);
+#endif
+              const std::span<const std::byte> doc_bytes =
+                  selected_mapped->subspan(0, doc_len);
+              ram_copy.assign(doc_bytes.begin(), doc_bytes.end());
+#ifdef CYCLONE_TEST_SEAMS
+              reader_seam(ReaderSeam::kRamCopied);
+#endif
+              // Read-side acquire fence (see renew_read_lease): the copy above
+              // reads the mmap bytes with plain loads, and NO seq_cst RMW
+              // interposes between that copy and this verdict -- the
+              // acquire_borrow/stamp RMWs ran BEFORE the copy.  Pin the
+              // copy's loads ahead of the epoch and remove-epoch loads: RAM
+              // hits are served WITHOUT checksum verification, so this
+              // revalidation is the only guard against caching (and then
+              // serving) torn bytes.
+              std::atomic_thread_fence(std::memory_order_acquire);
+              copy_intact =
+                  borrow_still_valid(stripe, epoch_start) &&
+                  stripe->remove_epoch.load(std::memory_order_acquire) ==
+                      remove_epoch_start;
+            }
+            if (copy_intact) {
               const bool inserted = _ram_cache->put_if(
-                  key, selected_alt_id, selected_mapped->subspan(0, doc_len),
+                  key, selected_alt_id, ram_copy,
                   [&] {
                     if (stripe->remove_epoch.load(std::memory_order_acquire) !=
                         remove_epoch_start) {
@@ -7226,22 +7253,10 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
                     return true;
                   },
                   /*stamp=*/bucket_version_start);
-              if (inserted) {
-                // Read-side acquire fence (see renew_read_lease): the put above
-                // memcpys the mmap bytes with plain loads, and NO seq_cst RMW
-                // interposes between that copy and this verdict — the
-                // acquire_borrow/stamp RMWs ran BEFORE the copy, and the RAM
-                // cache's lock release is a one-way barrier a later load may
-                // hoist above.  Pin the copy's loads ahead of the epoch and
-                // remove-epoch loads: RAM hits are served WITHOUT checksum
-                // verification, so this revalidation is the only guard against
-                // caching (and then serving) torn bytes.
-                std::atomic_thread_fence(std::memory_order_acquire);
-                if (!borrow_still_valid(stripe, epoch_start) ||
-                    stripe->remove_epoch.load(std::memory_order_acquire) !=
-                        remove_epoch_start) {
-                  _ram_cache->remove(key, selected_alt_id);
-                }
+              if (inserted &&
+                  stripe->remove_epoch.load(std::memory_order_acquire) !=
+                      remove_epoch_start) {
+                _ram_cache->remove(key, selected_alt_id);
               }
             }
           }
