@@ -1486,9 +1486,6 @@ class Volume : public std::enable_shared_from_this<Volume> {
   [[nodiscard]] std::optional<std::pair<dev_t, ino_t>> backing_identity() const;
 #endif
 
-  // Reset/purge the volume - clears all data and writes fresh header
-  std::expected<void, CacheError> reset();
-
   Task<std::expected<ReadHandle, CacheError>> open_read(const CacheKey &key);
   Task<std::expected<WriteHandle, CacheError>> open_write(
       const CacheKey &key, uint64_t content_length);
@@ -2454,6 +2451,10 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // Body of open() that runs under the exclusive cross-process init
   // lock; see volume.cpp.
   std::expected<void, CacheError> open_locked(bool created_new);
+  // Clear all data and write a fresh header.  open_locked() only, before
+  // any stripe or handle exists: it has none of close()'s teardown
+  // handshake, so on an open volume it would rewrite what live handles use.
+  std::expected<void, CacheError> reset();
   // `exclusive` = this opener proved it has no live peer (it holds the
   // exclusive lifetime lock, or created the inode): only then may it touch
   // the shared reader-exclusion state (see repair_wrap_state).

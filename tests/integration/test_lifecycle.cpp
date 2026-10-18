@@ -33,6 +33,27 @@
 using namespace cyclone;
 
 // =============================================================================
+// Volume reset is internal to open()
+// =============================================================================
+
+namespace {
+
+// Detects a reset() callable from outside Volume.
+template <typename V>
+concept CallableReset = requires(V &volume) { volume.reset(); };
+
+}  // namespace
+
+TEST_CASE("Volume::reset() is reachable only through open()", "[lifecycle]") {
+  // reset() zero-fills the stripes in place.  It has none of close()'s
+  // teardown handshake (teardown flag, stripe generation, wait for handle
+  // calls), so on an open volume it would rewrite the bytes and stripe state
+  // that live handles still use.  Only open() runs it, before any handle
+  // exists.
+  STATIC_REQUIRE_FALSE(CallableReset<Volume>);
+}
+
+// =============================================================================
 // Basic Lifecycle Tests
 // =============================================================================
 
