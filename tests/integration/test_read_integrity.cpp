@@ -17,6 +17,7 @@
 #include <span>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "core/document.hpp"
@@ -367,6 +368,48 @@ TEST_CASE(
     }
   }
 }
+// Selects the only alternate and, before returning, rewrites that
+// document's total_len behind the cache's back: the fixed header changes
+// between the chain walk and the read of the selected document.
+class ShapeChangingSelector : public StorageAlternateSelector {
+ public:
+  ShapeChangingSelector(std::string file, uint64_t doc)
+      : _file(std::move(file)), _doc(doc) {}
+  [[nodiscard]] std::optional<size_t> select(
+      std::span<const AlternateInfo> alternates,
+      const AlternateSelectionContext & /*ctx*/) const override {
+    if (alternates.empty()) {
+      return std::nullopt;
+    }
+    pwrite_value<uint64_t>(_file, _doc + kTotalLenOffset, 0);
+    return 0;
+  }
+
+ private:
+  std::string _file;
+  uint64_t _doc;
+};
+
+TEST_CASE(
+    "Read integrity: a selected alternate whose length fields disagree is a "
+    "miss, as in the chain walk",
+    "[integrity][shape]") {
+  OpenCache oc(integrity_config());
+  Cache &cache = *oc.cache;
+  const CacheKey key("integrity-shape-selected");
+  const auto content = make_content(12, 4096);
+  REQUIRE(write_alternate(cache, key, AlternateId::Brotli, content));
+  auto alts = cache.list_alternates_sync(key);
+  REQUIRE(alts.has_value());
+  REQUIRE(alts->size() == 1);
+
+  ShapeChangingSelector selector(oc.file, (*alts)[0].disk_offset);
+  AlternateSelectionContext ctx;
+  auto rh = cache.read_alternate_sync(key, selector, ctx);
+  REQUIRE_FALSE(rh.has_value());
+  CHECK(rh.error() == CacheError::NotFound);
+}
+
 TEST_CASE(
     "Read integrity: payload damage under an unchanged header is found on "
     "the warm path within a bounded number of reads",

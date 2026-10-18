@@ -7055,10 +7055,18 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
           }
 
           DocumentReader selected_reader(*selected_mapped);
-          if (!selected_reader.is_servable()) {
+          if (!selected_reader.is_valid()) {
             _mapped_file->unmap_region(*selected_mapped);
             _mapped_file->unmap_region(*mapped);
             result = make_unexpected(CacheError::Corrupted);
+            return false;
+          }
+          // Length or type fields that disagree: a miss, exactly as the chain
+          // walk above and read_sync treat the same document.
+          if (!selected_reader.is_servable()) {
+            _mapped_file->unmap_region(*selected_mapped);
+            _mapped_file->unmap_region(*mapped);
+            result = make_unexpected(CacheError::NotFound);
             return false;
           }
 
