@@ -774,6 +774,11 @@ class VolumeReadHandleImpl : public ReadHandleImpl {
   // the Volume while it lives.
   std::shared_ptr<VolumeReadAnchor> anchor;
   std::shared_ptr<MappedFile> mapped_file;  // no-anchor path: strong pin
+  // No-anchor path: the stripe generation this handle was read in.  The
+  // raw `stripe` belongs to it; a close() frees that generation and a
+  // later open() builds a new one, so every call through `stripe` passes
+  // it and is refused once it has gone (as a write handle's commit is).
+  uint64_t stripe_generation = Volume::kAnyStripeGeneration;
   std::span<std::byte> mapping;
   Document doc;
   std::vector<std::byte> ram_buffer;  // Owns RAM cache data (spans point here)
@@ -823,7 +828,7 @@ class VolumeReadHandleImpl : public ReadHandleImpl {
     // shared mmap is cleared by the next ceiling-forced wrap's reset).
     if (borrow.active && stripe != nullptr) {
       if (auto vol = volume_weak.lock()) {
-        vol->release_borrow(stripe, borrow);
+        vol->release_borrow(stripe, borrow, nullptr, stripe_generation);
       }
     }
     // The pinned MappedFile owns the mapping whether or not the Volume
@@ -885,7 +890,8 @@ class VolumeReadHandleImpl : public ReadHandleImpl {
     if (!vol) {
       return false;
     }
-    return vol->renew_read_lease(stripe, epoch_start, borrow);
+    return vol->renew_read_lease(stripe, epoch_start, borrow, nullptr,
+                                 stripe_generation);
   }
 
   LeaseRenewal renew_lease_strict() override {
@@ -905,7 +911,8 @@ class VolumeReadHandleImpl : public ReadHandleImpl {
       return LeaseRenewal::kTorn;  // cache gone mid-drain: do not keep
                                    // aliasing.
     }
-    return vol->renew_read_lease_strict(stripe, epoch_start, borrow);
+    return vol->renew_read_lease_strict(stripe, epoch_start, borrow, nullptr,
+                                        stripe_generation);
   }
 
   uint64_t ns_until_forced_wrap() const override {
@@ -919,7 +926,7 @@ class VolumeReadHandleImpl : public ReadHandleImpl {
     if (!vol) {
       return UINT64_MAX;
     }
-    return vol->ns_until_forced_wrap(stripe);
+    return vol->ns_until_forced_wrap(stripe, nullptr, stripe_generation);
   }
 };
 
@@ -3206,6 +3213,7 @@ std::expected<ReadHandle, CacheError> Volume::read_sync(const CacheKey& key) {
           if (!impl->anchor) {
             impl->mapped_file = _mapped_file;
             impl->volume_weak = weak_from_this();  // pin for lease renew
+            impl->stripe_generation = stripe_generation();
           }
           impl->mapping = *mapped;
           impl->doc = reader.document();
@@ -3715,12 +3723,13 @@ BorrowToken Volume::acquire_borrow(Stripe* stripe, uint32_t chunk) const {
 }
 
 void Volume::release_borrow(Stripe* stripe, BorrowToken token,
-                            const std::atomic<bool>* generation_torn) {
+                            const std::atomic<bool>* generation_torn,
+                            uint64_t handle_generation) {
   if (!token.active || !token.counted || stripe == nullptr) {
     return;  // RAM hit, leases disabled, or saturated ride-along.
   }
   const HandleCall call(*this);
-  if (!call.admitted(generation_torn)) {
+  if (!call.admitted(generation_torn, handle_generation)) {
     return;  // close() freed the stripes: leaked-count case, documented.
   }
   if (stripe->use_mmap_directory && stripe->mmap_directory) {
@@ -3913,14 +3922,15 @@ bool Volume::probe_raced_publish(const Stripe* stripe,
 
 bool Volume::renew_read_lease(Stripe* stripe, const BorrowEpoch& epoch_start,
                               const BorrowToken& token,
-                              const std::atomic<bool>* generation_torn) {
+                              const std::atomic<bool>* generation_torn,
+                              uint64_t handle_generation) {
   if (_lease_t_ns == 0) {
     // Leases disabled: no protection to extend.  The embedder treats a
     // false renew as "cannot prove this borrow still safe" and copies.
     return false;
   }
   const HandleCall call(*this);
-  if (!call.admitted(generation_torn)) {
+  if (!call.admitted(generation_torn, handle_generation)) {
     return false;  // close() freed the stripes: nothing left to renew.
   }
   // Read-side acquire fence: order the caller's PRECEDING data reads (the
@@ -3970,7 +3980,7 @@ bool Volume::renew_read_lease(Stripe* stripe, const BorrowEpoch& epoch_start,
 
 LeaseRenewal Volume::renew_read_lease_strict(
     Stripe* stripe, const BorrowEpoch& epoch_start, const BorrowToken& token,
-    const std::atomic<bool>* generation_torn) {
+    const std::atomic<bool>* generation_torn, uint64_t handle_generation) {
   // Lease amendment (2026-07-07): the ALIASED zero-copy path's per-send
   // validation.  Unlike renew_read_lease (epoch-only, safe only for
   // copy-then-verify where the read is observable), an aliased writev's read
@@ -3997,7 +4007,7 @@ LeaseRenewal Volume::renew_read_lease_strict(
   // regardless.  No-op on x86.
   std::atomic_thread_fence(std::memory_order_acquire);
   const HandleCall call(*this);
-  if (!call.admitted(generation_torn)) {
+  if (!call.admitted(generation_torn, handle_generation)) {
     return LeaseRenewal::kTorn;  // Cache stopping mid-drain: do not alias.
   }
   stamp_read_lease(stripe);  // Stamp FIRST — Dekker (matches the borrow).
@@ -4158,13 +4168,14 @@ void Volume::publish_wrap_deferred_deadline(Stripe* stripe,
   }
 }
 
-uint64_t Volume::ns_until_forced_wrap(
-    const Stripe* stripe, const std::atomic<bool>* generation_torn) const {
+uint64_t Volume::ns_until_forced_wrap(const Stripe* stripe,
+                                      const std::atomic<bool>* generation_torn,
+                                      uint64_t handle_generation) const {
   if (_lease_t_ns == 0 || stripe == nullptr) {
     return UINT64_MAX;  // Leases disabled: no ceiling force.
   }
   const HandleCall call(*this);
-  if (!call.admitted(generation_torn)) {
+  if (!call.admitted(generation_torn, handle_generation)) {
     return UINT64_MAX;  // Closing: no ceiling force.
   }
   uint32_t deadline_ms;
@@ -7530,6 +7541,7 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
           if (!impl->anchor) {
             impl->mapped_file = _mapped_file;
             impl->volume_weak = weak_from_this();  // pin for lease renew
+            impl->stripe_generation = stripe_generation();
           }
           impl->mapping = *selected_mapped;
           impl->doc = selected_reader.document();

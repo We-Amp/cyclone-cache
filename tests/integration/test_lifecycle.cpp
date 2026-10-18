@@ -1476,6 +1476,73 @@ TEST_CASE("A read handle on a bare Volume keeps its mapping after close",
   }
 }
 
+TEST_CASE(
+    "A read handle on a bare Volume kept across close() and open() touches "
+    "no stripe",
+    "[lifecycle][read][borrow]") {
+  // Without a Cache there is no anchor and no per-generation latch: the
+  // handle's Stripe* belongs to the stripe generation it was read in, which
+  // close() freed.  After open() the volume is live again, so its calls
+  // must be refused by that generation; an admitted call would fire the
+  // seam below (and run on freed memory).
+  TempCacheDir tmp;
+  VolumeConfig vol_config;
+  vol_config.path = tmp.path();
+  vol_config.size = static_cast<size_t>(8 * 1024 * 1024);
+  auto volume = std::make_shared<Volume>(vol_config);
+  REQUIRE(volume->open().has_value());
+  const std::vector<std::byte> body(4096, std::byte{0x5D});
+  auto put = [&](const CacheKey &key) {
+    auto wh = volume->write_sync(key, body.size());
+    REQUIRE(wh.has_value());
+    REQUIRE(wh->write_sync(std::span<const std::byte>(body)).has_value());
+    REQUIRE(wh->close_sync().has_value());
+  };
+  const CacheKey key("bare-read-handle-across-reopen");
+  put(key);
+  auto read = volume->read_sync(key);
+  REQUIRE(read.has_value());
+  REQUIRE_FALSE(read->is_ram_cache_hit());
+  std::optional<ReadHandle> stale(std::move(*read));
+
+  volume->close();
+  REQUIRE(volume->open().has_value());
+  const CacheKey fresh_key("bare-read-handle-after-reopen");
+  put(fresh_key);
+  auto fresh_read = volume->read_sync(fresh_key);
+  REQUIRE(fresh_read.has_value());
+  std::optional<ReadHandle> fresh(std::move(*fresh_read));
+
+  std::atomic<int> admitted_calls{0};
+  Volume::s_teardown_seam_for_test = [&](Volume::TeardownSeam seam) {
+    if (seam == Volume::TeardownSeam::kHandleCallAdmitted) {
+      admitted_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+  };
+  // Its mapping is still pinned: the bytes stay readable.
+  const auto content = stale->content();
+  const bool same = content.size() == body.size() &&
+                    std::memcmp(content.data(), body.data(), body.size()) == 0;
+  const bool renewed = stale->renew_lease();
+  const LeaseRenewal strict = stale->renew_lease_strict();
+  const uint64_t forced_wrap_ns = stale->ns_until_forced_wrap();
+  stale.reset();
+  const int stale_admitted = admitted_calls.load();
+  const bool fresh_renewed = fresh->renew_lease();
+  fresh.reset();
+  const int fresh_admitted = admitted_calls.load() - stale_admitted;
+  Volume::s_teardown_seam_for_test = nullptr;
+
+  CHECK(same);
+  CHECK_FALSE(renewed);
+  CHECK(strict == LeaseRenewal::kTorn);
+  CHECK(forced_wrap_ns == UINT64_MAX);
+  CHECK(stale_admitted == 0);
+  CHECK(fresh_renewed);
+  CHECK(fresh_admitted == 2);  // The renew and the close
+  volume->close();
+}
+
 TEST_CASE("Concurrent stop with in-flight writes must not crash",
           "[lifecycle][concurrency]") {
   // Writers hold a filled write handle and commit it around the moment the

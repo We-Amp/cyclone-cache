@@ -1681,6 +1681,11 @@ class Volume : public std::enable_shared_from_this<Volume> {
   [[nodiscard]] uint64_t stripe_generation() const noexcept {
     return _stripe_generation.load(std::memory_order_seq_cst);
   }
+  // For the handle calls below: "no stripe generation to check" (a handle
+  // whose anchor's latch carries it instead).  A read handle of a Volume
+  // without a Cache has no anchor and passes the stripe_generation() it
+  // was read in, like a write handle's commit.
+  static constexpr uint64_t kAnyStripeGeneration = UINT64_MAX;
 
   // Re-stamp the read lease on a stripe (CAS-max now + T with the
   // write-avoidance guard).  Called by ReadHandle::renew_lease() for
@@ -1693,7 +1698,8 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // with _teardown; a call that finds either set touches no stripe.
   bool renew_read_lease(Stripe *stripe, const BorrowEpoch &epoch_start,
                         const BorrowToken &token,
-                        const std::atomic<bool> *generation_torn = nullptr);
+                        const std::atomic<bool> *generation_torn = nullptr,
+                        uint64_t handle_generation = kAnyStripeGeneration);
   // Lease amendment (2026-07-07): intent-checked lease renewal for the ALIASED
   // zero-copy serve path.  Stamps the lease FIRST, then Dekker-revalidates
   // (borrow_still_valid: wrap_intent loaded before epoch) so a normal wrap
@@ -1704,12 +1710,13 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // LeaseRenewal for how the embedder must act on each result.
   LeaseRenewal renew_read_lease_strict(
       Stripe *stripe, const BorrowEpoch &epoch_start, const BorrowToken &token,
-      const std::atomic<bool> *generation_torn = nullptr);
+      const std::atomic<bool> *generation_torn = nullptr,
+      uint64_t handle_generation = kAnyStripeGeneration);
   // Lease-protocol STEP-3: ns until a ceiling-forced wrap could overwrite a
   // borrow on this stripe (UINT64_MAX = none deferred / leases off).
   [[nodiscard]] uint64_t ns_until_forced_wrap(
-      const Stripe *stripe,
-      const std::atomic<bool> *generation_torn = nullptr) const;
+      const Stripe *stripe, const std::atomic<bool> *generation_torn = nullptr,
+      uint64_t handle_generation = kAnyStripeGeneration) const;
 
   // drop a live borrow from the stripe's outstanding-borrow
   // slot.  Called by the disk-hit ReadHandle on close/destruction (public
@@ -1718,7 +1725,8 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // ceiling-forced wrap reset the slot is a no-op.  Inert tokens (RAM hit,
   // leases disabled, saturated-slot ride-alongs) are ignored.
   void release_borrow(Stripe *stripe, BorrowToken token,
-                      const std::atomic<bool> *generation_torn = nullptr);
+                      const std::atomic<bool> *generation_torn = nullptr,
+                      uint64_t handle_generation = kAnyStripeGeneration);
 
   // Read-handle anchors (see VolumeReadAnchor above).  The Cache
   // calls make_read_anchors() after open() succeeds (requires this Volume
@@ -1867,6 +1875,21 @@ class Volume : public std::enable_shared_from_this<Volume> {
       teardown_seam(TeardownSeam::kHandleCallAdmitted);
 #endif
       return true;
+    }
+
+    // Both: the anchor's latch (may be null) and, unless it is
+    // kAnyStripeGeneration, the stripe generation (an anchor-less read
+    // handle's, recorded when it was read).
+    [[nodiscard]] bool admitted(const std::atomic<bool> *generation_torn,
+                                uint64_t handle_generation) const noexcept {
+      if (handle_generation != kAnyStripeGeneration) {
+        if (generation_torn != nullptr &&
+            generation_torn->load(std::memory_order_seq_cst)) {
+          return false;
+        }
+        return admitted(handle_generation);
+      }
+      return admitted(generation_torn);
     }
 
     // The same for a write handle's commit.  A write handle has no anchor;
