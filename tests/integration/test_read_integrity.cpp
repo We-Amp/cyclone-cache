@@ -384,7 +384,8 @@ TEST_CASE(
   const std::array<std::byte, 1> flipped = {content[4000] ^ std::byte{0x3C}};
   pwrite_bytes(oc.file, doc + Document::kHeaderSize + 4000, flipped);
 
-  const int limit = static_cast<int>(Volume::kChecksumRevalidateInterval) * 2;
+  Volume::seed_checksum_revalidation_for_test(0x9E3779B97F4A7C15ULL);
+  const int limit = static_cast<int>(Volume::kChecksumRevalidateInterval) * 16;
   int first_miss = -1;
   int served_after_miss = 0;
   for (int i = 0; i < limit; ++i) {
@@ -399,9 +400,9 @@ TEST_CASE(
       ++served_after_miss;
     }
   }
-  // Found within one interval of warm reads...
+  // Found within a bounded number of warm reads (the re-check is a 1-in-
+  // kChecksumRevalidateInterval draw; the seed above fixes the sequence)...
   REQUIRE(first_miss >= 0);
-  CHECK(first_miss <= static_cast<int>(Volume::kChecksumRevalidateInterval));
   // ...and, once found, never served again: the failed pass drops the
   // cached verdict instead of leaving it to vouch for the damaged bytes.
   CHECK(served_after_miss == 0);
@@ -413,6 +414,84 @@ TEST_CASE(
   REQUIRE(rh.has_value());
   REQUIRE(same_bytes(rh->content(), content));
 }
+TEST_CASE(
+    "Read integrity: a thread that also makes cold reads still re-checks a "
+    "damaged warm document",
+    "[integrity][crc_cache]") {
+  OpenCache oc(integrity_config());
+  Cache &cache = *oc.cache;
+  Volume::seed_checksum_revalidation_for_test(0x243F6A8885A308D3ULL);
+  const CacheKey key("integrity-warm-with-cold");
+  const auto content = make_content(10, 4096);
+  REQUIRE(write_entry(cache, key, content));
+  const uint64_t doc = document_offset(cache, key, content);
+  const std::array<std::byte, 1> flipped = {content[300] ^ std::byte{0x42}};
+  pwrite_bytes(oc.file, doc + Document::kHeaderSize + 300, flipped);
+
+  // Every 100th read is the first read of a fresh document: a CRC pass
+  // over another document, which must not postpone the warm re-check.
+  const auto cold = make_content(11, 1024);
+  const int limit = static_cast<int>(Volume::kChecksumRevalidateInterval) * 16;
+  int cold_index = 0;
+  bool found = false;
+  for (int i = 1; i <= limit && !found; ++i) {
+    if (i % 100 == 0) {
+      const CacheKey cold_key("integrity-cold-" + std::to_string(cold_index++));
+      REQUIRE(write_entry(cache, cold_key, cold));
+      REQUIRE(cache.read_sync(cold_key).has_value());
+      continue;
+    }
+    found = !cache.read_sync(key).has_value();
+  }
+  CHECK(found);
+}
+
+TEST_CASE(
+    "Read integrity: a reader cycling over a small set re-checks every "
+    "document in it",
+    "[integrity][crc_cache]") {
+  for (const size_t set_size : {size_t{4}, size_t{8}}) {
+    CAPTURE(set_size);
+    OpenCache oc(integrity_config());
+    Cache &cache = *oc.cache;
+    Volume::seed_checksum_revalidation_for_test(0x13198A2E03707344ULL +
+                                                set_size);
+    std::vector<CacheKey> keys;
+    std::vector<std::vector<std::byte>> contents;
+    std::vector<uint64_t> docs;
+    for (size_t d = 0; d < set_size; ++d) {
+      keys.emplace_back("integrity-cycle-" + std::to_string(set_size) + "-" +
+                        std::to_string(d));
+      contents.push_back(make_content(20 + d, 4096));
+      REQUIRE(write_entry(cache, keys.back(), contents.back()));
+      docs.push_back(document_offset(cache, keys.back(), contents.back()));
+    }
+    const int budget =
+        static_cast<int>(Volume::kChecksumRevalidateInterval * 16 * set_size);
+    for (size_t d = 0; d < set_size; ++d) {
+      CAPTURE(d);
+      const std::array<std::byte, 1> flipped = {contents[d][77] ^
+                                                std::byte{0x24}};
+      pwrite_bytes(oc.file, docs[d] + Document::kHeaderSize + 77, flipped);
+      bool found = false;
+      for (int i = 0; i < budget && !found; ++i) {
+        const size_t k = static_cast<size_t>(i) % set_size;
+        const bool served = cache.read_sync(keys[k]).has_value();
+        if (k == d && !served) {
+          found = true;
+        }
+      }
+      CHECK(found);
+      // Repair it; the next read verifies and caches it again.
+      const std::array<std::byte, 1> original = {contents[d][77]};
+      pwrite_bytes(oc.file, docs[d] + Document::kHeaderSize + 77, original);
+      auto rh = cache.read_sync(keys[d]);
+      REQUIRE(rh.has_value());
+      REQUIRE(same_bytes(rh->content(), contents[d]));
+    }
+  }
+}
+
 TEST_CASE("Read integrity: no cached CRC verdict survives a close and reopen",
           "[integrity][crc_cache]") {
   // Multi-process mode keeps the directory on disk, so the same Volume

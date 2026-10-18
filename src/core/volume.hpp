@@ -2185,10 +2185,10 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // cache hits.  It is not the overwrite guard; never lean on it as one.
   // As a bound on what a payload change the other legs cannot see (media
   // damage, a write behind the cache's back) can cost, a cached verdict is
-  // not trusted forever: every kChecksumRevalidateInterval-th read a thread
-  // would serve from a cached verdict runs the CRC pass anyway, and a pass
-  // that fails drops the verdict, so the damaged incarnation is found and
-  // then never served again.
+  // not trusted forever: about one in kChecksumRevalidateInterval reads a
+  // thread would serve from a cached verdict runs the CRC pass anyway (a
+  // random draw per read), and a pass that fails drops the verdict, so the
+  // damaged incarnation is found and then never served again.
   //
   // Direct-mapped by offset (Fibonacci hashing: the multiply spreads
   // documents of similar size whose offsets differ by a constant stride),
@@ -2206,10 +2206,20 @@ class Volume : public std::enable_shared_from_this<Volume> {
   static constexpr size_t kChecksumCacheSize = 65536;
 
  public:
-  // One in this many reads served from a cached CRC verdict re-runs the
-  // CRC pass (per thread; see WHAT IT DOES NOT COVER above).  The cost is
-  // one CRC pass amortised over this many warm reads.  Public for tests.
+  // About one in this many reads served from a cached CRC verdict re-runs
+  // the CRC pass (a per-read draw; see WHAT IT DOES NOT COVER above).  The cost
+  // is one CRC pass amortised over this many warm reads.  Public for tests.
   static constexpr uint32_t kChecksumRevalidateInterval = 256;
+#ifdef CYCLONE_TEST_SEAMS
+  // Reseed the calling thread's re-check draw so a test sees a fixed
+  // sequence of draws.
+  static void seed_checksum_revalidation_for_test(uint64_t seed) noexcept {
+    t_checksum_revalidate_state = seed != 0 ? seed : 1;
+  }
+  // While set, no warm read draws a re-check: for tests that count the CRC
+  // passes the read path runs.
+  static inline std::atomic<bool> s_checksum_revalidation_off_for_test{false};
+#endif
 
  private:
   static constexpr unsigned kChecksumCacheShift = 64 - 16;  // log2(65536)
@@ -2270,7 +2280,6 @@ class Volume : public std::enable_shared_from_this<Volume> {
   void mark_checksum_validated(uint64_t offset, uint64_t token) {
     (*_checksum_cache)[checksum_cache_index(offset)].store(
         token, std::memory_order_relaxed);
-    t_checksum_revalidate_countdown = kChecksumRevalidateInterval;
   }
   // Drop every cached verdict.  Called whenever the stripes and directory
   // are torn down or rebuilt (open, close, reset): a verdict describes an
@@ -2288,19 +2297,32 @@ class Volume : public std::enable_shared_from_this<Volume> {
     (*_checksum_cache)[checksum_cache_index(offset)].compare_exchange_strong(
         expected, 0, std::memory_order_relaxed);
   }
-  // True on every kChecksumRevalidateInterval-th warm (cached-verdict) read
-  // of the calling thread since its last CRC pass.  Thread-local, so the
-  // warm path stays free of shared writes; counting from the last pass
-  // keeps the schedule deterministic for a single-threaded caller.
+  // True for about one in kChecksumRevalidateInterval warm (cached-verdict)
+  // reads: an independent draw per read from a thread-local xorshift64, so
+  // the warm path stays free of shared writes, and no access pattern (cold
+  // reads in between, a reader cycling over a set whose size divides the
+  // interval) can keep a given document from being drawn.
   static bool checksum_revalidation_due() noexcept {
-    if (--t_checksum_revalidate_countdown != 0) {
+#ifdef CYCLONE_TEST_SEAMS
+    if (s_checksum_revalidation_off_for_test.load(std::memory_order_relaxed)) {
       return false;
     }
-    t_checksum_revalidate_countdown = kChecksumRevalidateInterval;
-    return true;
+#endif
+    uint64_t x = t_checksum_revalidate_state;
+    x ^= x << 13U;
+    x ^= x >> 7U;
+    x ^= x << 17U;
+    t_checksum_revalidate_state = x;
+    static_assert(
+        (kChecksumRevalidateInterval & (kChecksumRevalidateInterval - 1)) == 0,
+        "the draw masks by the interval");
+    return (x >> 32U) % kChecksumRevalidateInterval == 0;
   }
-  static inline thread_local uint32_t t_checksum_revalidate_countdown =
-      kChecksumRevalidateInterval;
+  // Seeded per thread (splitmix64 over a process-wide counter, the state's
+  // own address and the clock); never 0, the xorshift fixed point.
+  static uint64_t checksum_revalidation_seed() noexcept;
+  static inline thread_local uint64_t t_checksum_revalidate_state =
+      checksum_revalidation_seed();
 
   // Large-document readahead (see VolumeConfig::readahead_min_bytes).
   // Called on the disk read path once a document's byte range is known but

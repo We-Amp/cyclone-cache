@@ -339,16 +339,22 @@ std::vector<std::byte> forge_top16_collision(uint32_t crc, size_t index) {
 // Counts the CRC-32C passes the read path actually runs (the kCrcVerify
 // reader seam fires only when the CRC-validation cache MISSED).  Test-seam
 // builds only; install before the reads it observes, from a single thread.
+// It also switches off the random warm-path re-check, so the counts it
+// observes are exact.
 struct CrcVerifyCounter {
   std::atomic<int> passes{0};
   CrcVerifyCounter() {
+    Volume::s_checksum_revalidation_off_for_test.store(true);
     Volume::s_reader_seam_for_test = [this](Volume::ReaderSeam at) {
       if (at == Volume::ReaderSeam::kCrcVerify) {
         passes.fetch_add(1, std::memory_order_relaxed);
       }
     };
   }
-  ~CrcVerifyCounter() { Volume::s_reader_seam_for_test = nullptr; }
+  ~CrcVerifyCounter() {
+    Volume::s_reader_seam_for_test = nullptr;
+    Volume::s_checksum_revalidation_off_for_test.store(false);
+  }
   CrcVerifyCounter(const CrcVerifyCounter &) = delete;
   CrcVerifyCounter &operator=(const CrcVerifyCounter &) = delete;
   int count() const { return passes.load(std::memory_order_relaxed); }

@@ -1713,6 +1713,25 @@ std::array<uint64_t, 4> Volume::make_checksum_salt(const void* self) noexcept {
   return salt;
 }
 
+uint64_t Volume::checksum_revalidation_seed() noexcept {
+  // Same splitmix64 finaliser as make_checksum_salt, over a seed that
+  // differs per thread (a thread-local's address and a process-wide
+  // counter) and per run (the clock).  Only spreads the draws; not secret.
+  static std::atomic<uint64_t> counter{0};
+  thread_local const char tag = 0;
+  uint64_t z =
+      static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&tag)) ^
+      static_cast<uint64_t>(
+          std::chrono::steady_clock::now().time_since_epoch().count()) ^
+      (counter.fetch_add(1, std::memory_order_relaxed) *
+       uint64_t{0xD6E8FEB86659FD93});
+  z += uint64_t{0x9E3779B97F4A7C15};
+  z = (z ^ (z >> 30U)) * uint64_t{0xBF58476D1CE4E5B9};
+  z = (z ^ (z >> 27U)) * uint64_t{0x94D049BB133111EB};
+  z ^= z >> 31U;
+  return z != 0 ? z : 1;
+}
+
 std::expected<void, CacheError> Volume::open() {
   if (_fd >= 0) {
     return make_unexpected(CacheError::AlreadyOpen);
@@ -3092,8 +3111,8 @@ std::expected<ReadHandle, CacheError> Volume::read_sync(const CacheKey& key) {
           // A stored checksum of 0 is not a "no checksum" marker: every
           // writer stores the computed CRC-32C, so a zero is either that
           // genuine value (which verifies) or damage (which must not).
-          // A cached verdict is still re-checked on every
-          // kChecksumRevalidateInterval-th warm read (see _checksum_cache).
+          // A cached verdict is still re-checked on about one in
+          // kChecksumRevalidateInterval warm reads (see _checksum_cache).
           uint64_t token = 0;
           bool cached = false;
           bool crc_pending = false;
