@@ -94,8 +94,8 @@ void AdaptiveThreadPool::join_workers() {
     _finished_workers.clear();
   }
 
-  _live_count.store(0, std::memory_order_release);
-  _active_count.store(0, std::memory_order_release);
+  _hot.live.store(0, std::memory_order_release);
+  _hot.active.store(0, std::memory_order_release);
   _target_thread_count.store(0, std::memory_order_release);
 }
 
@@ -117,11 +117,11 @@ bool AdaptiveThreadPool::is_running() const noexcept {
 }
 
 size_t AdaptiveThreadPool::thread_count() const noexcept {
-  return _live_count.load(std::memory_order_acquire);
+  return _hot.live.load(std::memory_order_acquire);
 }
 
 size_t AdaptiveThreadPool::active_count() const noexcept {
-  return _active_count.load(std::memory_order_acquire);
+  return _hot.active.load(std::memory_order_acquire);
 }
 
 void AdaptiveThreadPool::check_scaling() {
@@ -147,9 +147,9 @@ void AdaptiveThreadPool::check_scaling() {
       // Gate on the LIVE count, not _workers.size(): self-terminated workers
       // would otherwise keep their entries until shutdown and pin the size at
       // the historical maximum, blocking every later scale-up below it.
-      if (_live_count.load(std::memory_order_acquire) < new_target) {
+      if (_hot.live.load(std::memory_order_acquire) < new_target) {
         spawn_worker();
-        _scale_up_count.fetch_add(1, std::memory_order_relaxed);
+        _hot.scale_up_count.fetch_add(1, std::memory_order_relaxed);
       }
     }
   } else if (should_scale_down()) {
@@ -159,7 +159,7 @@ void AdaptiveThreadPool::check_scaling() {
       size_t new_target = std::max(current - 1, min);
       _target_thread_count.store(new_target, std::memory_order_release);
 
-      _scale_down_count.fetch_add(1, std::memory_order_relaxed);
+      _hot.scale_down_count.fetch_add(1, std::memory_order_relaxed);
     }
   }
 }
@@ -175,20 +175,21 @@ void AdaptiveThreadPool::scale_to(size_t target) {
   reap_finished_workers();
   // Gate on the LIVE count (see check_scaling); spawn_worker() counts each
   // new worker as live at once.
-  while (_live_count.load(std::memory_order_acquire) < target) {
+  while (_hot.live.load(std::memory_order_acquire) < target) {
     spawn_worker();
   }
 }
 
 ThreadPoolStats AdaptiveThreadPool::stats() const {
   ThreadPoolStats result;
-  result.current_threads = _live_count.load(std::memory_order_relaxed);
-  result.active_threads = _active_count.load(std::memory_order_relaxed);
-  result.tasks_started = _tasks_started.load(std::memory_order_relaxed);
-  result.tasks_completed = _tasks_completed.load(std::memory_order_relaxed);
-  result.tasks_failed = _tasks_failed.load(std::memory_order_relaxed);
-  result.scale_up_count = _scale_up_count.load(std::memory_order_relaxed);
-  result.scale_down_count = _scale_down_count.load(std::memory_order_relaxed);
+  result.current_threads = _hot.live.load(std::memory_order_relaxed);
+  result.active_threads = _hot.active.load(std::memory_order_relaxed);
+  result.tasks_started = _hot.tasks_started.load(std::memory_order_relaxed);
+  result.tasks_completed = _hot.tasks_completed.load(std::memory_order_relaxed);
+  result.tasks_failed = _hot.tasks_failed.load(std::memory_order_relaxed);
+  result.scale_up_count = _hot.scale_up_count.load(std::memory_order_relaxed);
+  result.scale_down_count =
+      _hot.scale_down_count.load(std::memory_order_relaxed);
   return result;
 }
 
@@ -196,12 +197,12 @@ void AdaptiveThreadPool::worker_loop(uint64_t generation) {
   // spawn_worker() already counted this worker as live.
   while (!_stopping.load(std::memory_order_acquire)) {
     // Check if we should self-terminate (scaling down)
-    size_t live = _live_count.load(std::memory_order_acquire);
+    size_t live = _hot.live.load(std::memory_order_acquire);
     size_t target = _target_thread_count.load(std::memory_order_acquire);
     if (live > target) {
       // Try to be the one to exit
-      if (_live_count.compare_exchange_strong(live, live - 1,
-                                              std::memory_order_acq_rel)) {
+      if (_hot.live.compare_exchange_strong(live, live - 1,
+                                            std::memory_order_acq_rel)) {
         // Register the exit so the spawn paths can reap this entry from
         // _workers; the thread object is joined there, not here.
         {
@@ -248,12 +249,12 @@ void AdaptiveThreadPool::worker_loop(uint64_t generation) {
       break;
     }
 
-    _active_count.fetch_add(1, std::memory_order_relaxed);
-    _tasks_started.fetch_add(1, std::memory_order_relaxed);
+    _hot.active.fetch_add(1, std::memory_order_relaxed);
+    _hot.tasks_started.fetch_add(1, std::memory_order_relaxed);
 
     try {
       task();
-      _tasks_completed.fetch_add(1, std::memory_order_relaxed);
+      _hot.tasks_completed.fetch_add(1, std::memory_order_relaxed);
 #if CYCLONE_OPT_FORCED_UNWIND
     } catch (abi::__forced_unwind &) {
       throw;
@@ -262,13 +263,13 @@ void AdaptiveThreadPool::worker_loop(uint64_t generation) {
       // Tasks run embedder-supplied code (plugin transforms); an exception
       // escaping worker_loop would terminate the host process.  Record the
       // failure and keep serving later tasks.
-      _tasks_failed.fetch_add(1, std::memory_order_relaxed);
+      _hot.tasks_failed.fetch_add(1, std::memory_order_relaxed);
     }
 
-    _active_count.fetch_sub(1, std::memory_order_relaxed);
+    _hot.active.fetch_sub(1, std::memory_order_relaxed);
   }
 
-  _live_count.fetch_sub(1, std::memory_order_relaxed);
+  _hot.live.fetch_sub(1, std::memory_order_relaxed);
   {
     std::lock_guard lock(_workers_mutex);
     _finished_workers.push_back(generation);
@@ -297,21 +298,21 @@ void AdaptiveThreadPool::spawn_worker() {
   const uint64_t generation = _next_generation++;
   // Count the worker as live before it is first scheduled, so the spawn
   // paths (which gate on the live count) never spawn twice for it.
-  _live_count.fetch_add(1, std::memory_order_acq_rel);
+  _hot.live.fetch_add(1, std::memory_order_acq_rel);
   try {
     _workers.push_back({generation, std::thread([this, generation] {
                           worker_loop(generation);
                         })});
   } catch (...) {
     // No worker was started: take the count back.
-    _live_count.fetch_sub(1, std::memory_order_acq_rel);
+    _hot.live.fetch_sub(1, std::memory_order_acq_rel);
     throw;
   }
 }
 
 bool AdaptiveThreadPool::should_scale_up() const {
   size_t depth = _provider.queue_depth();
-  size_t threads = _live_count.load(std::memory_order_relaxed);
+  size_t threads = _hot.live.load(std::memory_order_relaxed);
   size_t threshold = _config.scale_up_threshold;
 
   if (threads == 0) {
@@ -323,7 +324,7 @@ bool AdaptiveThreadPool::should_scale_up() const {
 
 bool AdaptiveThreadPool::should_scale_down() const {
   size_t depth = _provider.queue_depth();
-  size_t threads = _live_count.load(std::memory_order_relaxed);
+  size_t threads = _hot.live.load(std::memory_order_relaxed);
   size_t threshold = _config.scale_down_threshold;
 
   if (threads <= _config.min_threads) {

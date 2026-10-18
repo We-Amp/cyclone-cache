@@ -140,12 +140,17 @@ class OptimizationEngine : public TaskProvider {
 
   // Statistics counters: incremented on the per-task hot path, so relaxed
   // atomics read field by field in stats(), never under a mutex.
-  std::atomic<uint64_t> _queued{0};
-  std::atomic<uint64_t> _completed{0};
-  std::atomic<uint64_t> _cancelled{0};
-  std::atomic<uint64_t> _failed{0};
-  std::atomic<uint64_t> _skipped{0};
-  std::atomic<uint64_t> _duplicates{0};
+  struct alignas(kShardPad) HotCounters {
+    std::atomic<uint64_t> queued{0};
+    std::atomic<uint64_t> completed{0};
+    std::atomic<uint64_t> cancelled{0};
+    std::atomic<uint64_t> failed{0};
+    std::atomic<uint64_t> skipped{0};
+    std::atomic<uint64_t> duplicates{0};
+  };
+  static_assert(alignof(HotCounters) == kShardPad &&
+                sizeof(HotCounters) % kShardPad == 0);
+  HotCounters _stat;
 
   // Cancellation tokens for in-progress work items
   mutable std::mutex _active_work_mutex;

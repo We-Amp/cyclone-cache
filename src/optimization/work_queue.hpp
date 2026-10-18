@@ -16,6 +16,7 @@
 #include <shared_mutex>
 #include <unordered_set>
 
+#include "../core/thread_shard.hpp"
 #include "cyclone/alternate.hpp"
 #include "cyclone/config.hpp"
 #include "cyclone/error.hpp"
@@ -158,12 +159,17 @@ class WorkQueue {
   // by field in stats(), never under a mutex.  The current size and memory
   // gauges are derived on read (from _heap under a shared lock and
   // _memory_usage).
-  std::atomic<uint64_t> _total_enqueued{0};
-  std::atomic<uint64_t> _total_dequeued{0};
-  std::atomic<uint64_t> _total_cancelled{0};
-  std::atomic<uint64_t> _rejected_full{0};
-  std::atomic<uint64_t> _rejected_memory{0};
-  std::atomic<uint64_t> _duplicates{0};
+  struct alignas(kShardPad) HotCounters {
+    std::atomic<uint64_t> total_enqueued{0};
+    std::atomic<uint64_t> total_dequeued{0};
+    std::atomic<uint64_t> total_cancelled{0};
+    std::atomic<uint64_t> rejected_full{0};
+    std::atomic<uint64_t> rejected_memory{0};
+    std::atomic<uint64_t> duplicates{0};
+  };
+  static_assert(alignof(HotCounters) == kShardPad &&
+                sizeof(HotCounters) % kShardPad == 0);
+  HotCounters _stat;
 };
 
 }  // namespace cyclone

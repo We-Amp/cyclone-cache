@@ -24,13 +24,13 @@ std::expected<void, CacheError> WorkQueue::enqueue(WorkItem item) {
 
   // Check for duplicates
   if (_queued_ids.contains(item.id)) {
-    _duplicates.fetch_add(1, std::memory_order_relaxed);
+    _stat.duplicates.fetch_add(1, std::memory_order_relaxed);
     return {};  // Silently succeed for duplicates
   }
 
   // Check queue size limit
   if (_heap.size() >= _config.max_queue_size) {
-    _rejected_full.fetch_add(1, std::memory_order_relaxed);
+    _stat.rejected_full.fetch_add(1, std::memory_order_relaxed);
     return std::unexpected(CacheError::OptimizationQueueFull);
   }
 
@@ -39,7 +39,7 @@ std::expected<void, CacheError> WorkQueue::enqueue(WorkItem item) {
   size_t item_memory = item.estimated_memory;
   if (item_memory > _config.max_memory_bytes - current_memory) {
     // Would overflow or exceed limit
-    _rejected_memory.fetch_add(1, std::memory_order_relaxed);
+    _stat.rejected_memory.fetch_add(1, std::memory_order_relaxed);
     return std::unexpected(CacheError::OptimizationQueueFull);
   }
 
@@ -55,7 +55,7 @@ std::expected<void, CacheError> WorkQueue::enqueue(WorkItem item) {
   std::push_heap(_heap.begin(), _heap.end());
 
   _memory_usage.fetch_add(item_memory, std::memory_order_relaxed);
-  _total_enqueued.fetch_add(1, std::memory_order_relaxed);
+  _stat.total_enqueued.fetch_add(1, std::memory_order_relaxed);
 
   lock.unlock();
   _cv.notify_one();
@@ -84,7 +84,7 @@ std::optional<WorkItem> WorkQueue::dequeue() {
 
   _queued_ids.erase(item.id);
   _memory_usage.fetch_sub(item.estimated_memory, std::memory_order_relaxed);
-  _total_dequeued.fetch_add(1, std::memory_order_relaxed);
+  _stat.total_dequeued.fetch_add(1, std::memory_order_relaxed);
 
   return item;
 }
@@ -102,7 +102,7 @@ std::optional<WorkItem> WorkQueue::try_dequeue() {
 
   _queued_ids.erase(item.id);
   _memory_usage.fetch_sub(item.estimated_memory, std::memory_order_relaxed);
-  _total_dequeued.fetch_add(1, std::memory_order_relaxed);
+  _stat.total_dequeued.fetch_add(1, std::memory_order_relaxed);
 
   return item;
 }
@@ -130,7 +130,7 @@ bool WorkQueue::cancel(const WorkItemId &id) {
 
   rebuild_heap();
 
-  _total_cancelled.fetch_add(1, std::memory_order_relaxed);
+  _stat.total_cancelled.fetch_add(1, std::memory_order_relaxed);
 
   return true;
 }
@@ -157,7 +157,7 @@ size_t WorkQueue::cancel_by_key(const CacheKey &key) {
     _memory_usage.fetch_sub(mem_freed, std::memory_order_relaxed);
     rebuild_heap();
 
-    _total_cancelled.fetch_add(cancelled, std::memory_order_relaxed);
+    _stat.total_cancelled.fetch_add(cancelled, std::memory_order_relaxed);
   }
 
   return cancelled;
@@ -185,7 +185,7 @@ size_t WorkQueue::cancel_deferrable() {
     _memory_usage.fetch_sub(mem_freed, std::memory_order_relaxed);
     rebuild_heap();
 
-    _total_cancelled.fetch_add(cancelled, std::memory_order_relaxed);
+    _stat.total_cancelled.fetch_add(cancelled, std::memory_order_relaxed);
   }
 
   return cancelled;
@@ -229,12 +229,14 @@ WorkQueueStats WorkQueue::stats() const {
   WorkQueueStats result;
   result.current_size = size();
   result.current_memory = _memory_usage.load(std::memory_order_relaxed);
-  result.total_enqueued = _total_enqueued.load(std::memory_order_relaxed);
-  result.total_dequeued = _total_dequeued.load(std::memory_order_relaxed);
-  result.total_cancelled = _total_cancelled.load(std::memory_order_relaxed);
-  result.rejected_full = _rejected_full.load(std::memory_order_relaxed);
-  result.rejected_memory = _rejected_memory.load(std::memory_order_relaxed);
-  result.duplicates = _duplicates.load(std::memory_order_relaxed);
+  result.total_enqueued = _stat.total_enqueued.load(std::memory_order_relaxed);
+  result.total_dequeued = _stat.total_dequeued.load(std::memory_order_relaxed);
+  result.total_cancelled =
+      _stat.total_cancelled.load(std::memory_order_relaxed);
+  result.rejected_full = _stat.rejected_full.load(std::memory_order_relaxed);
+  result.rejected_memory =
+      _stat.rejected_memory.load(std::memory_order_relaxed);
+  result.duplicates = _stat.duplicates.load(std::memory_order_relaxed);
   return result;
 }
 
