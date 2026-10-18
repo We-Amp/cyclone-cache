@@ -281,7 +281,7 @@ struct Cache::Impl {
   // threads) so it can abandon the thread-owning components instead of
   // deadlocking in their destructors. 0 = never started / not applicable (e.g.
   // Windows).
-  long owner_pid{0};
+  std::atomic<long> owner_pid{0};
   // fork_epoch() of the process that start()ed the background threads.
   // While `running`, it differs from the current epoch exactly in a forked
   // child that inherited them (see engine_inherited_across_fork()).  The
@@ -744,7 +744,8 @@ std::expected<void, CacheError> Cache::start() {
 #ifndef _WIN32
   // Record the process that owns the just-started background threads, so a
   // forked child can detect in stop() that it does not own them (see stop()).
-  _impl->owner_pid = static_cast<long>(::getpid());
+  _impl->owner_pid.store(static_cast<long>(::getpid()),
+                         std::memory_order_relaxed);
 #endif
   _impl->owner_epoch.store(fork_epoch(), std::memory_order_release);
 
@@ -776,7 +777,7 @@ void Cache::stop() {
   // would take the gate exclusively.
   //
   // owner_pid is written under the gate in start() and not changed while
-  // the cache runs, so reading it without the gate is safe here.
+  // the cache runs; it is atomic so this gate-free read is race-free.
   //
   // A PID can be reused (a grandchild in a PID namespace may get its
   // ancestor's), so the fork epoch decides as well: it moves in every forked
@@ -785,8 +786,9 @@ void Cache::stop() {
   if (_impl->abandoned_after_fork.load(std::memory_order_acquire)) {
     return;
   }
+  const long owner_pid = _impl->owner_pid.load(std::memory_order_relaxed);
   if (_impl->running &&
-      ((_impl->owner_pid != 0 && _impl->owner_pid != current_pid()) ||
+      ((owner_pid != 0 && owner_pid != current_pid()) ||
        _impl->owner_epoch.load(std::memory_order_acquire) != fork_epoch())) {
     if (_impl->abandoned_after_fork.exchange(true, std::memory_order_acq_rel)) {
       return;  // Another thread of this child got here first.
