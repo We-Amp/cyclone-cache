@@ -497,8 +497,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   so the writers always make progress together. A round lost at the publish
   leaves its written document behind as dead space, so after 32 lost rounds
   in a row a write reports `Busy` and publishes nothing, far above what a
-  burst of sixteen writers of one key takes. A write with a current head that notices the change before writing (the
-  usual case under contention) only walks the chain again; one that notices
+  burst of sixteen writers of one key takes. A write with a current head
+  that notices the change before writing (the usual case under contention)
+  only walks the chain again; one that notices
   it at the publish writes its document a second time. A head removal
   resolves again within its existing bound of eight attempts and then
   reports `Busy`, having removed nothing. `VolumeStats` gains

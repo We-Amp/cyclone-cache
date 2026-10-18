@@ -1134,7 +1134,10 @@ class MmapDirectory {
     uint32_t version = 0;  // the odd version held; 0 (even) = slot unused
     std::chrono::steady_clock::time_point first_seen{};
   };
-  static constexpr size_t kStuckBucketSightings = 4;
+  // Process-local and small: room for the buckets a writer that died in the
+  // middle of several stripes' updates can leave held, so eviction never
+  // drops a record that is about to reach the recovery budget.
+  static constexpr size_t kStuckBucketSightings = 32;
   mutable std::atomic_flag _sightings_busy;
   mutable std::array<StuckBucketSighting, kStuckBucketSightings> _sightings{};
 };
