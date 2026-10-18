@@ -73,25 +73,47 @@ std::optional<std::vector<std::byte>> RamCacheLRU::get(const CacheKey& key,
                                                        AlternateId id,
                                                        uint32_t* out_stamp) {
   RamCacheKey rk{key, id};
-  std::unique_lock lock(_mutex);
+  std::optional<std::vector<std::byte>> result;
 
-  auto it = _entries.find(rk);
-  if (it == _entries.end()) {
-    ++_misses;
-    return std::nullopt;
+  {
+    // A hit needs only shared access: the body copy is safe because every
+    // mutation (put, remove, eviction) holds the lock exclusively.  Taking
+    // the write lock here serialized all hits on this one lock just to
+    // reorder the list.
+    std::shared_lock lock(_mutex);
+    auto it = _entries.find(rk);
+    if (it == _entries.end()) {
+      ++_misses;
+      return std::nullopt;
+    }
+
+    ++_hits;
+
+    if (out_stamp != nullptr) {
+      *out_stamp = it->second->stamp;
+    }
+
+    if (it->second == _lru.begin()) {
+      return std::vector<std::byte>(it->second->data);
+    }
+    result.emplace(it->second->data);
   }
 
-  ++_hits;
-
-  if (it->second != _lru.begin()) {
-    _lru.splice(_lru.begin(), _lru, it->second);
+  // Recency refresh only, and only when the write lock happens to be free:
+  // a hit never queues behind other hits (or behind a writer) just to
+  // reorder the list.  Under sustained contention the hit is served from
+  // the entry's current position and eviction order approximates LRU.
+  // Re-find the key under the lock: the entry may have been removed or
+  // evicted between the two lock windows.
+  if (_mutex.try_lock()) {
+    std::unique_lock lock(_mutex, std::adopt_lock);
+    auto it = _entries.find(rk);
+    if (it != _entries.end() && it->second != _lru.begin()) {
+      _lru.splice(_lru.begin(), _lru, it->second);
+    }
   }
 
-  if (out_stamp != nullptr) {
-    *out_stamp = it->second->stamp;
-  }
-
-  return std::vector<std::byte>(it->second->data);
+  return result;
 }
 
 bool RamCacheLRU::put_if(const CacheKey& key, AlternateId id,

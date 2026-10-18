@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2024-2026 We-Amp B.V.
 
+#include <algorithm>
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
 #include <cstddef>
@@ -280,4 +281,81 @@ TEST_CASE("LRU concurrent get+put data race safety", "[lru][concurrent]") {
 
   REQUIRE(read_count.load() > 0);
   REQUIRE(valid_reads.load() > 0);
+}
+
+TEST_CASE("LRU hits stay consistent while writers churn the cache",
+          "[lru][concurrent]") {
+  // Hits take only shared access; the recency refresh takes the write
+  // lock opportunistically and must re-find the entry under it.  Exercise
+  // exactly that window: readers copy bodies while a writer overwrites,
+  // removes and re-inserts entries.  Every key's body is constant, so any
+  // byte mismatch is a torn copy.
+  auto cache =
+      RamCache::create(RamCacheType::LRU, static_cast<size_t>(256 * 1024));
+
+  constexpr int kKeys = 128;
+  constexpr size_t kBodyBytes = 1024;
+  constexpr int kReaderIterations = 20000;
+  constexpr int kWriterIterations = 5000;
+
+  auto make_key = [](int k) {
+    return CacheKey("lru-churn-" + std::to_string(k));
+  };
+  auto make_body = [&](int k) {
+    return std::vector<std::byte>(kBodyBytes, std::byte(k & 0xFF));
+  };
+  for (int k = 0; k < kKeys; ++k) {
+    cache->put(make_key(k), AlternateId::Original, make_body(k));
+  }
+
+  std::atomic<int> torn{0};
+  std::atomic<uint64_t> served{0};
+
+  auto reader_fn = [&](int seed) {
+    for (int i = 0; i < kReaderIterations; ++i) {
+      int k = (i * 13 + seed * 29) % kKeys;
+      auto body = cache->get(make_key(k));
+      if (!body.has_value()) {
+        continue;  // Removed by the writer at this instant.
+      }
+      ++served;
+      if (std::any_of(body->begin(), body->end(),
+                      [&](std::byte b) { return b != std::byte(k & 0xFF); })) {
+        ++torn;
+      }
+    }
+  };
+
+  auto writer_fn = [&]() {
+    for (int i = 0; i < kWriterIterations; ++i) {
+      int k = i % kKeys;
+      cache->put(make_key(k), AlternateId::Original, make_body(k));
+      if (i % 8 == 0) {
+        cache->remove(make_key(k));
+        cache->put(make_key(k), AlternateId::Original, make_body(k));
+      }
+    }
+  };
+
+  std::vector<std::thread> threads;
+  threads.reserve(4);
+  for (int t = 0; t < 3; ++t) {
+    threads.emplace_back(reader_fn, t);
+  }
+  threads.emplace_back(writer_fn);
+  for (auto& t : threads) {
+    t.join();
+  }
+
+  REQUIRE(torn.load() == 0);
+  REQUIRE(served.load() > 0);
+  REQUIRE(cache->bytes_used() <= cache->max_bytes());
+
+  for (int k = 0; k < kKeys; ++k) {
+    auto body = cache->get(make_key(k));
+    if (body.has_value()) {
+      REQUIRE((*body)[0] == std::byte(k & 0xFF));
+      REQUIRE(body->size() == kBodyBytes);
+    }
+  }
 }
