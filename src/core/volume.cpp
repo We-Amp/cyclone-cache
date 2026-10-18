@@ -4974,6 +4974,14 @@ std::expected<void, CacheError> Volume::commit_write_impl(
   // already-landed pwrite may have torn the usurper's span (detectable-only
   // residual; see commit_write_slot); on fill failure it advances nothing and
   // we surface IoError below.
+  //
+  // The pass the document is written in, taken while the write lock (or,
+  // single-process, the stripe mutex alone) still excludes every wrap: the
+  // one wrap fence of this commit.  From commit_write_slot on, a wrap can
+  // run -- in another process at once, in this one while the mutex is
+  // released for the flush -- and refill the bytes just written; every
+  // publish round below checks it first.
+  const StripeSnapshot snap_at_commit = snapshot(stripe);
   auto committed = commit_write_slot(stripe, slot, fill_ok);
   slot_releaser.disarm();  // lock released (or usurped) by commit_write_slot
   if (!committed) {
@@ -5008,18 +5016,13 @@ std::expected<void, CacheError> Volume::commit_write_impl(
   // sync's job.  See the durability contract on sync_directory().
   if (_config.sync_on_write) {
 #ifndef _WIN32
-    // While the mutex is released a wrap can run: the stripe's tail
-    // may then overwrite the bytes just written, and the election below
-    // could point a newer live entry of this key at them.  Remember the
-    // pass at the commit and give up (Busy: the document stays
-    // unreachable, like any fill whose insert never ran) if it moved.
-    const StripeSnapshot snap_at_commit = snapshot(stripe);
+    // While the mutex is released a wrap can run: the stripe's tail may
+    // then overwrite the bytes just written, and the election below could
+    // point a newer live entry of this key at them.  The first publish
+    // round's wrap fence (snap_at_commit) gives up then.
     lock.unlock();
     fsync_fd();
     lock.lock();
-    if (wrapped_since(stripe, snap_at_commit)) {
-      return make_unexpected(CacheError::Busy);
-    }
 #endif
   }
 
@@ -5071,15 +5074,18 @@ std::expected<void, CacheError> Volume::commit_write_impl(
   // by someone else's finished operation, and no lock is held across the
   // rounds' publishes that another writer would need to finish its own.
   //
-  // A round after a lost one first checks that no wrap has run since the
-  // first election: the document's bytes belong to the pass they were
-  // written in, and a wrap may already be filling over them.  Publishing
-  // nothing then is the outcome of any fill whose insert never ran.
-  const StripeSnapshot first_snap = snapshot(stripe);
+  // EVERY round first checks that no wrap has run since the commit
+  // (snap_at_commit): the document's bytes belong to the pass they were
+  // written in, and a wrap -- during the flush, or between rounds -- may
+  // already be filling over them, after which an election could point a
+  // newer live entry of this key at them.  Publishing nothing (Busy) then
+  // is the outcome of any fill whose insert never ran.  The check runs
+  // under the stripe mutex; one fence covers the commit through the last
+  // publish.
   bool collision_evicted = false;
   bool bucket_full_evicted = false;
-  for (bool first_round = true;; first_round = false) {
-    if (!first_round && wrapped_since(stripe, first_snap)) {
+  for (;;) {
+    if (wrapped_since(stripe, snap_at_commit)) {
       return make_unexpected(CacheError::Busy);
     }
     uint64_t verified_offset = Directory::kNoVerifiedEntry;
