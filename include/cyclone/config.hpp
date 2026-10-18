@@ -274,12 +274,13 @@ struct CacheConfig {
   std::chrono::seconds gc_interval{60};
   double gc_evacuate_threshold = 0.8;
 
-  // Store a CRC-32C with each document (verified on read whenever the
-  // stored CRC is non-zero).  The C API copies
-  // CycloneCacheConfig::enable_checksum here verbatim with no default and no
-  // sentinel mapping, so a zero-initialised C config runs with checksums
-  // DISABLED rather than this default of true -- the one remaining C field
-  // whose zero-init diverges; see CycloneCacheConfig::enable_checksum.
+  // Store a CRC-32C with each document (verified on every read while
+  // verify_checksum_on_read is on, whatever value is stored).  The C API
+  // copies CycloneCacheConfig::enable_checksum here verbatim with no default
+  // and no sentinel mapping, so a zero-initialised C config runs with
+  // checksums DISABLED rather than this default of true -- the one
+  // remaining C field whose zero-init diverges; see
+  // CycloneCacheConfig::enable_checksum.
   bool enable_checksum = true;
   bool verify_checksum_on_read =
       true;  // Verify CRC-32C on every read (disable for perf)
@@ -318,9 +319,9 @@ struct CacheConfig {
   //
   // A document at least this large and below readahead_min_bytes gets the
   // same readahead hint over its own byte range, but only on a read that is
-  // about to run the CRC pass: verify_checksum_on_read is on, the document
-  // carries a checksum, and this incarnation has not been verified in this
-  // process yet (first read after a write, a restart, or an eviction from
+  // about to run the CRC pass: verify_checksum_on_read is on and this
+  // incarnation has not been verified in this process yet (first read
+  // after a write, a restart, or an eviction from
   // the checksum-validation cache).  That is the read that makes Cyclone's
   // first content touch, and the one a cold document takes.  A warm
   // re-read whose checksum is already validated never reaches the hint, so

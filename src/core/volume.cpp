@@ -3082,10 +3082,12 @@ std::expected<ReadHandle, CacheError> Volume::read_sync(const CacheKey& key) {
           // and key-verified above -- already passed in this process (see
           // _checksum_cache).  NOT the overwrite guard: the wrap-epoch
           // revalidation below is.
+          // A stored checksum of 0 is not a "no checksum" marker: every
+          // writer stores the computed CRC-32C, so a zero is either that
+          // genuine value (which verifies) or damage (which must not).
           uint64_t token = 0;
           bool crc_pending = false;
-          if (_config.verify_checksum_on_read &&
-              reader.document().checksum != 0) {
+          if (_config.verify_checksum_on_read) {
             token = checksum_token(doc_offset, reader.document());
             crc_pending = !is_checksum_validated(doc_offset, token);
           }
@@ -5558,8 +5560,7 @@ Volume::CarryPlan Volume::carry_retained_chain(
         reader.is_valid() && doc.len == src.len &&
         doc.doc_type == Document::Type::SingleFrag &&
         doc.alternate_id == src.id && doc.write_serial == want_stamp &&
-        reader.first_key() == key &&
-        (doc.checksum == 0 || doc.verify_checksum(reader.payload()));
+        reader.first_key() == key && doc.verify_checksum(reader.payload());
     if (!ok) {
       plan.bytes.resize(start);
       ++plan.dropped;
@@ -7054,8 +7055,8 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
           // key-verified above -- already passed in this process.
           uint64_t token = 0;
           bool crc_pending = false;
-          if (_config.verify_checksum_on_read &&
-              selected_reader.document().checksum != 0) {
+          // A stored zero is verified like any other value (see read_sync).
+          if (_config.verify_checksum_on_read) {
             token = checksum_token(selected_offset, selected_reader.document());
             crc_pending = !is_checksum_validated(selected_offset, token);
           }

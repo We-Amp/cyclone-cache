@@ -1,0 +1,288 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2024-2026 We-Amp B.V.
+
+// Read-path document integrity.  Each case writes a document through the
+// public API, then changes its bytes in the volume file behind the cache's
+// back (the way a torn write, a late write or media damage would land them)
+// and checks that the read path never serves the changed document as valid.
+
+#include <array>
+#include <catch2/catch_test_macros.hpp>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <span>
+#include <string>
+#include <vector>
+
+#include "core/document.hpp"
+#include "cyclone/alternate.hpp"
+#include "cyclone/cache.hpp"
+#include "cyclone/config.hpp"
+#include "cyclone/key.hpp"
+#include "support/temp_cache.hpp"
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
+using namespace cyclone;
+
+#ifndef _WIN32
+namespace {
+
+constexpr size_t kVolBytes = size_t{4} * 1024 * 1024;
+
+// CRC-32C written out independently of the library (see crc32c.hpp for the
+// convention), so the checksums planted below do not come from the code
+// under test.
+const std::array<uint32_t, 256> &crc_table() {
+  static const std::array<uint32_t, 256> table = [] {
+    std::array<uint32_t, 256> t{};
+    for (uint32_t n = 0; n < 256; ++n) {
+      uint32_t c = n;
+      for (int k = 0; k < 8; ++k) {
+        c = ((c & 1U) != 0U) ? (0x82f63b78U ^ (c >> 1)) : (c >> 1);
+      }
+      t[n] = c;
+    }
+    return t;
+  }();
+  return table;
+}
+
+uint32_t crc_update(uint32_t state, std::span<const std::byte> data) {
+  const auto &t = crc_table();
+  for (std::byte b : data) {
+    state = t[(state ^ static_cast<uint8_t>(b)) & 0xFFU] ^ (state >> 8);
+  }
+  return state;
+}
+
+uint32_t oracle_crc32c(std::span<const std::byte> data) {
+  return crc_update(0xFFFFFFFFU, data) ^ 0xFFFFFFFFU;
+}
+
+// Rewrite the last four bytes of `content` so that its CRC-32C is exactly
+// zero (standard CRC forcing: the table's top bytes are a permutation, so
+// the four table indices are recovered backwards from the target register,
+// then the bytes forwards from the prefix state).
+void force_zero_crc(std::vector<std::byte> &content) {
+  REQUIRE(content.size() >= 4);
+  const auto &t = crc_table();
+  std::array<uint8_t, 256> inv{};
+  for (uint32_t i = 0; i < 256; ++i) {
+    inv[t[i] >> 24] = static_cast<uint8_t>(i);
+  }
+  std::array<uint8_t, 4> idx{};
+  uint32_t reg = 0xFFFFFFFFU;  // register value whose final xor is 0
+  for (int k = 3; k >= 0; --k) {
+    idx[static_cast<size_t>(k)] = inv[reg >> 24];
+    reg = (reg ^ t[idx[static_cast<size_t>(k)]]) << 8;
+  }
+  uint32_t state =
+      crc_update(0xFFFFFFFFU,
+                 std::span<const std::byte>(content).first(content.size() - 4));
+  for (size_t k = 0; k < 4; ++k) {
+    const auto b = static_cast<uint8_t>(idx[k] ^ (state & 0xFFU));
+    content[content.size() - 4 + k] = static_cast<std::byte>(b);
+    state = t[idx[k]] ^ (state >> 8);
+  }
+  REQUIRE(oracle_crc32c(content) == 0);
+}
+
+std::vector<std::byte> make_content(size_t seed, size_t size) {
+  std::vector<std::byte> content(size);
+  for (size_t j = 0; j < size; ++j) {
+    content[j] = static_cast<std::byte>((seed * 131 + j * 7 + 1) & 0xFF);
+  }
+  return content;
+}
+
+bool same_bytes(std::span<const std::byte> got,
+                std::span<const std::byte> want) {
+  return got.size() == want.size() &&
+         std::memcmp(got.data(), want.data(), got.size()) == 0;
+}
+
+bool write_entry(Cache &cache, const CacheKey &key,
+                 std::span<const std::byte> content) {
+  auto wh = cache.write_sync(key, content.size());
+  if (!wh.has_value() || !wh->write_sync(content).has_value()) {
+    return false;
+  }
+  return wh->close_sync().has_value();
+}
+
+bool write_alternate(Cache &cache, const CacheKey &key, AlternateId id,
+                     std::span<const std::byte> content) {
+  auto wh = cache.write_alternate_sync(key, id, content.size());
+  if (!wh.has_value() || !wh->write_sync(content).has_value()) {
+    return false;
+  }
+  return wh->close_sync().has_value();
+}
+
+void pwrite_bytes(const std::string &path, uint64_t offset,
+                  std::span<const std::byte> bytes) {
+  const int fd = ::open(path.c_str(), O_WRONLY);
+  REQUIRE(fd >= 0);
+  const ssize_t n =
+      ::pwrite(fd, bytes.data(), bytes.size(), static_cast<off_t>(offset));
+  ::close(fd);
+  REQUIRE(n == static_cast<ssize_t>(bytes.size()));
+}
+
+template <typename T>
+void pwrite_value(const std::string &path, uint64_t offset, T value) {
+  pwrite_bytes(path, offset, std::as_bytes(std::span<const T, 1>(&value, 1)));
+}
+
+template <typename T>
+T pread_value(const std::string &path, uint64_t offset) {
+  const int fd = ::open(path.c_str(), O_RDONLY);
+  REQUIRE(fd >= 0);
+  T value{};
+  const ssize_t n =
+      ::pread(fd, &value, sizeof(value), static_cast<off_t>(offset));
+  ::close(fd);
+  REQUIRE(n == static_cast<ssize_t>(sizeof(value)));
+  return value;
+}
+
+CacheConfig integrity_config() {
+  CacheConfig config;
+  config.ram_cache_size = 0;  // every read is a disk (mmap) read
+  config.enable_checksum = true;
+  config.verify_checksum_on_read = true;
+  return config;
+}
+
+struct OpenCache {
+  TempCacheDir dir{"integrity"};
+  std::unique_ptr<Cache> cache;
+  std::string file;
+
+  explicit OpenCache(const CacheConfig &config) {
+    auto created = Cache::create(config);
+    REQUIRE(created.has_value());
+    cache = std::move(*created);
+    VolumeConfig vol;
+    vol.path = dir.path();
+    vol.size = kVolBytes;
+    REQUIRE(cache->add_volume(vol).has_value());
+    REQUIRE(cache->start().has_value());
+    file = cache->volume_files().at(0).file_path;
+  }
+  ~OpenCache() {
+    if (cache) {
+      cache->stop();
+    }
+  }
+  OpenCache(const OpenCache &) = delete;
+  OpenCache &operator=(const OpenCache &) = delete;
+};
+
+// File offset of the document `key` resolves to (documents written here
+// carry no header bytes, so the content starts right after the fixed one).
+uint64_t document_offset(Cache &cache, const CacheKey &key,
+                         std::span<const std::byte> content) {
+  auto rh = cache.read_sync(key);
+  REQUIRE(rh.has_value());
+  REQUIRE(same_bytes(rh->content(), content));
+  const uint64_t content_off = rh->content_file_offset();
+  REQUIRE(content_off != ReadHandle::kNoFileOffset);
+  return content_off - Document::kHeaderSize;
+}
+
+class OnlyId : public StorageAlternateSelector {
+ public:
+  explicit OnlyId(AlternateId want) : _want(want) {}
+  [[nodiscard]] std::optional<size_t> select(
+      std::span<const AlternateInfo> alternates,
+      const AlternateSelectionContext & /*ctx*/) const override {
+    for (size_t i = 0; i < alternates.size(); ++i) {
+      if (alternates[i].id == _want) {
+        return i;
+      }
+    }
+    return std::nullopt;
+  }
+
+ private:
+  AlternateId _want;
+};
+
+}  // namespace
+
+TEST_CASE(
+    "Read integrity: a stored checksum of zero does not switch off "
+    "verification",
+    "[integrity][checksum]") {
+  OpenCache oc(integrity_config());
+  Cache &cache = *oc.cache;
+
+  SECTION("read_sync") {
+    const CacheKey key("integrity-zero-crc");
+    const auto content = make_content(1, 8192);
+    REQUIRE(write_entry(cache, key, content));
+    const uint64_t doc = document_offset(cache, key, content);
+
+    // Zero the checksum field and damage one payload byte.
+    pwrite_value<uint32_t>(oc.file, doc + Document::kChecksumOffset, 0);
+    const std::array<std::byte, 1> flipped = {content[100] ^ std::byte{0x5A}};
+    pwrite_bytes(oc.file, doc + Document::kHeaderSize + 100, flipped);
+
+    auto rh = cache.read_sync(key);
+    CHECK_FALSE(rh.has_value());
+    if (rh.has_value()) {
+      CHECK(same_bytes(rh->content(), content));
+    }
+  }
+
+  SECTION("read_alternate_sync") {
+    const CacheKey key("integrity-zero-crc-alt");
+    const auto content = make_content(2, 8192);
+    REQUIRE(write_alternate(cache, key, AlternateId::Brotli, content));
+    auto alts = cache.list_alternates_sync(key);
+    REQUIRE(alts.has_value());
+    REQUIRE(alts->size() == 1);
+    const uint64_t doc = (*alts)[0].disk_offset;
+    REQUIRE(pread_value<uint32_t>(oc.file, doc) == Document::kMagic);
+
+    pwrite_value<uint32_t>(oc.file, doc + Document::kChecksumOffset, 0);
+    const std::array<std::byte, 1> flipped = {content[100] ^ std::byte{0x5A}};
+    pwrite_bytes(oc.file, doc + Document::kHeaderSize + 100, flipped);
+
+    OnlyId want(AlternateId::Brotli);
+    AlternateSelectionContext ctx;
+    auto rh = cache.read_alternate_sync(key, want, ctx);
+    CHECK_FALSE(rh.has_value());
+    if (rh.has_value()) {
+      CHECK(same_bytes(rh->content(), content));
+    }
+  }
+}
+
+TEST_CASE(
+    "Read integrity: a document whose CRC-32C is genuinely zero is served",
+    "[integrity][checksum]") {
+  // Compatibility pin: every writer stores the computed CRC, so a stored
+  // zero is either that genuine value or damage.  The genuine case must
+  // keep verifying and serving.
+  OpenCache oc(integrity_config());
+  Cache &cache = *oc.cache;
+  const CacheKey key("integrity-genuine-zero-crc");
+  auto content = make_content(3, 4096);
+  force_zero_crc(content);
+  REQUIRE(write_entry(cache, key, content));
+  const uint64_t doc = document_offset(cache, key, content);
+  REQUIRE(pread_value<uint32_t>(oc.file, doc + Document::kChecksumOffset) == 0);
+  for (int i = 0; i < 3; ++i) {
+    auto rh = cache.read_sync(key);
+    REQUIRE(rh.has_value());
+    REQUIRE(same_bytes(rh->content(), content));
+  }
+}
+#endif  // !_WIN32

@@ -122,9 +122,10 @@ typedef struct {
                                     zero, and remapping it would silently
                                     change every config that passes 0 today. */
   int enable_checksum;           /* Non-zero: store a CRC-32C with each
-                                    document (verified on read whenever the
-                                    stored CRC is non-zero).  Copied verbatim to
-                                    CacheConfig::enable_checksum, whose C++
+                                    document (verified on every read
+                                    while read verification is on).  Copied
+                                    verbatim to CacheConfig::enable_checksum,
+                                    whose C++
                                     default is TRUE -- so a zero-initialised
                                     config runs with checksums DISABLED, the one
                                     remaining field where C zero-init diverges

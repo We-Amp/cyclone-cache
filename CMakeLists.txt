@@ -206,6 +206,7 @@ if(CYCLONE_BUILD_TESTS)
     tests/integration/test_lease_pinning.cpp
     tests/integration/test_tag_collision.cpp
     tests/integration/test_wrap_phase_aba.cpp
+    tests/integration/test_read_integrity.cpp
     tests/integration/test_alternate_chain_bound.cpp
     tests/integration/test_ram_alternate_invalidation.cpp
     tests/integration/test_ram_coherence_cross_process.cpp
