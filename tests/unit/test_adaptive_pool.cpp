@@ -39,6 +39,11 @@ class MockTaskProvider : public TaskProvider {
     _cv.notify_all();
   }
 
+  void reset() {
+    std::lock_guard lock(_mutex);
+    _stopped = false;
+  }
+
   TaskFunction get_task() override {
     std::unique_lock lock(_mutex);
     _cv.wait(lock, [this] { return !_tasks.empty() || _stopped; });
@@ -716,3 +721,27 @@ TEST_CASE("AdaptiveThreadPool lets a thread cancellation unwind a worker",
   REQUIRE(WEXITSTATUS(status) == 0);
 }
 #endif
+
+// A worker counts as live from the moment it is spawned, not from when it is
+// first scheduled: otherwise the spawn paths, which gate on the live count,
+// could spawn again for a worker that simply had not run yet, and
+// thread_count() lagged behind a scale_to() that had already returned.
+TEST_CASE("AdaptiveThreadPool counts a worker as live when it is spawned",
+          "[pool][optimization][regression]") {
+  OptimizationConfig config;
+  config.min_threads = 1;
+  config.max_threads = 8;
+  MockTaskProvider provider;
+  AdaptiveThreadPool pool(config, provider);
+
+  for (int round = 0; round < 20; ++round) {
+    pool.start();
+    REQUIRE(pool.thread_count() == 1);
+    pool.scale_to(8);
+    REQUIRE(pool.thread_count() == 8);
+    provider.signal_stop();
+    pool.stop();
+    REQUIRE(pool.thread_count() == 0);
+    provider.reset();
+  }
+}

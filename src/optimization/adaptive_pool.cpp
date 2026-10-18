@@ -41,16 +41,6 @@ void AdaptiveThreadPool::start() {
     spawn_worker();
   }
 
-  // Wait for workers to register (with timeout)
-  auto start_time = std::chrono::steady_clock::now();
-  while (_live_count.load(std::memory_order_acquire) < initial) {
-    if (std::chrono::steady_clock::now() - start_time >
-        std::chrono::seconds(5)) {
-      break;  // Timeout
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
-
   {
     std::lock_guard stats_lock(_stats_mutex);
     _stats.current_threads = _workers.size();
@@ -166,7 +156,6 @@ void AdaptiveThreadPool::check_scaling() {
         spawn_worker();
         std::lock_guard stats_lock(_stats_mutex);
         ++_stats.scale_up_count;
-        _stats.current_threads = new_target;
       }
     }
   } else if (should_scale_down()) {
@@ -191,13 +180,10 @@ void AdaptiveThreadPool::scale_to(size_t target) {
 
   std::lock_guard lock(_workers_mutex);
   reap_finished_workers();
-  // Gate on the LIVE count (see check_scaling).  Newly spawned workers
-  // increment _live_count only once they are scheduled, so track the spawns
-  // from this call locally instead of re-reading the counter.
-  size_t live = _live_count.load(std::memory_order_acquire);
-  while (live < target) {
+  // Gate on the LIVE count (see check_scaling); spawn_worker() counts each
+  // new worker as live at once.
+  while (_live_count.load(std::memory_order_acquire) < target) {
     spawn_worker();
-    ++live;
   }
 
   {
@@ -215,8 +201,7 @@ ThreadPoolStats AdaptiveThreadPool::stats() const {
 }
 
 void AdaptiveThreadPool::worker_loop(uint64_t generation) {
-  _live_count.fetch_add(1, std::memory_order_relaxed);
-
+  // spawn_worker() already counted this worker as live.
   while (!_stopping.load(std::memory_order_acquire)) {
     // Check if we should self-terminate (scaling down)
     size_t live = _live_count.load(std::memory_order_acquire);
@@ -307,9 +292,18 @@ void AdaptiveThreadPool::reap_finished_workers() {
 
 void AdaptiveThreadPool::spawn_worker() {
   const uint64_t generation = _next_generation++;
-  _workers.push_back({generation, std::thread([this, generation] {
-                        worker_loop(generation);
-                      })});
+  // Count the worker as live before it is first scheduled, so the spawn
+  // paths (which gate on the live count) never spawn twice for it.
+  _live_count.fetch_add(1, std::memory_order_acq_rel);
+  try {
+    _workers.push_back({generation, std::thread([this, generation] {
+                          worker_loop(generation);
+                        })});
+  } catch (...) {
+    // No worker was started: take the count back.
+    _live_count.fetch_sub(1, std::memory_order_acq_rel);
+    throw;
+  }
 }
 
 bool AdaptiveThreadPool::should_scale_up() const {

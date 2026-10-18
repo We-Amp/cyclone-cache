@@ -94,7 +94,8 @@ class AdaptiveThreadPool {
 
  private:
   void worker_loop(uint64_t generation);
-  // Spawn a new worker thread. Requires: _workers_mutex must be held by caller.
+  // Spawn a new worker thread and count it as live.  Requires: _workers_mutex
+  // must be held by caller.
   void spawn_worker();
   // Join and erase workers that exited on their own (scale-down
   // self-termination).  Keeps _workers bounded to live threads so the spawn
