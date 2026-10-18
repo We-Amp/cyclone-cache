@@ -178,6 +178,13 @@ class PosixMappedFile : public MappedFile {
       return std::span<std::byte>(_persistent_base + offset, length);
     }
 
+    // Slow path: the same bounds as the fast path, against the file size.
+    // Mapping a range past the end of the file succeeds, but the first touch
+    // of a page wholly beyond the end raises a bus error, so refuse it here.
+    if (offset > _file_size || length > _file_size - offset) {
+      return make_unexpected(std::make_error_code(std::errc::invalid_argument));
+    }
+
     int prot = PROT_READ;
     int flags = MAP_SHARED;
 
@@ -580,6 +587,12 @@ class Win32MappedFile : public MappedFile {
             std::make_error_code(std::errc::invalid_argument));
       }
       return std::span<std::byte>(_persistent_base + offset, length);
+    }
+
+    // Slow path: the same bounds as the fast path, against the file size.
+    // Keeps both platforms refusing the same ranges.
+    if (offset > _file_size || length > _file_size - offset) {
+      return make_unexpected(std::make_error_code(std::errc::invalid_argument));
     }
 
     DWORD protect =

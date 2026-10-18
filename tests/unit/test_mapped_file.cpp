@@ -2,6 +2,7 @@
 // Copyright (c) 2024-2026 We-Amp B.V.
 
 #include <catch2/catch_test_macros.hpp>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -72,6 +73,44 @@ TEST_CASE("MappedFile map region", "[mapped_file]") {
 
   auto unmap_result = mf->unmap_region(*region);
   REQUIRE_FALSE(unmap_result);
+
+  mf->close();
+  remove_temp_file(path);
+}
+
+TEST_CASE("MappedFile map_region refuses a range past the end of the file",
+          "[mapped_file][error]") {
+  // Without a persistent mapping, map_region() maps each region on demand.
+  // A range that reaches past the end of the file must be refused up front,
+  // as the persistent-mapping path does: mapping it would succeed, and the
+  // first touch of a page wholly beyond the end of the file would raise a
+  // bus error instead of returning an error.
+  auto path = create_temp_file(4096);
+  auto mf = MappedFile::create();
+  REQUIRE(mf->open(path.string(), MappedFile::OpenMode::ReadOnly));
+  REQUIRE(mf->persistent_base() == nullptr);
+
+  constexpr auto kMode = MappedFile::MapMode::ReadOnly;
+  // Whole file and an exact tail still map.
+  auto whole = mf->map_region(0, 4096, kMode);
+  REQUIRE(whole.has_value());
+  REQUIRE_FALSE(mf->unmap_region(*whole));
+  auto tail = mf->map_region(4000, 96, kMode);
+  REQUIRE(tail.has_value());
+  REQUIRE_FALSE(mf->unmap_region(*tail));
+
+  // Starts inside, ends past the end.
+  auto straddle = mf->map_region(4000, 8192, kMode);
+  REQUIRE_FALSE(straddle.has_value());
+  REQUIRE(straddle.error() == std::errc::invalid_argument);
+  // Starts past the end.
+  auto beyond = mf->map_region(65536, 16, kMode);
+  REQUIRE_FALSE(beyond.has_value());
+  REQUIRE(beyond.error() == std::errc::invalid_argument);
+  // offset + length would wrap around.
+  auto wrap = mf->map_region(16, SIZE_MAX - 8, kMode);
+  REQUIRE_FALSE(wrap.has_value());
+  REQUIRE(wrap.error() == std::errc::invalid_argument);
 
   mf->close();
   remove_temp_file(path);
