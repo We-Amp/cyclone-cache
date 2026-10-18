@@ -613,6 +613,34 @@ TEST_CASE("HttpAlternatePlugin check_freshness", "[http]") {
   REQUIRE(result == FreshnessResult::Fresh);
 }
 
+TEST_CASE("HttpAlternatePlugin no-cache forces revalidation of fresh entries",
+          "[http]") {
+  auto plugin = create_http_alternate_plugin();
+  FreshnessContext fctx;
+
+  auto check = [&](const char *cache_control) {
+    HttpCacheAlt alt;
+    alt.set_response_time(std::time(nullptr));
+    alt.set_response_header("Cache-Control", cache_control);
+    auto meta = alt.serialize();
+    CacheVariant variant{CacheKey("nc"),
+                         Metadata(std::span<const std::byte>(meta)),
+                         0,
+                         {},
+                         {},
+                         0};
+    return plugin->check_freshness(variant, fctx);
+  };
+
+  REQUIRE(check("max-age=3600") == FreshnessResult::Fresh);
+  REQUIRE(check("max-age=3600, no-cache") == FreshnessResult::MustRevalidate);
+  REQUIRE(check("No-Cache, max-age=3600") == FreshnessResult::MustRevalidate);
+  // must-revalidate only matters once the entry is stale.
+  REQUIRE(check("max-age=3600, must-revalidate") == FreshnessResult::Fresh);
+  REQUIRE(check("max-age=0, must-revalidate") ==
+          FreshnessResult::MustRevalidate);
+}
+
 TEST_CASE("HttpAlternatePlugin check_freshness force revalidate", "[http]") {
   auto plugin = create_http_alternate_plugin();
 

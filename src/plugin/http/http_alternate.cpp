@@ -195,20 +195,29 @@ FreshnessResult HttpAlternatePlugin::check_freshness(
   }
   const HttpCacheAlt &alt = *parsed;
 
-  if (alt.is_fresh()) {
-    return FreshnessResult::Fresh;
-  }
-
-  auto cc = alt.get_response_header("Cache-Control");
-  if (cc) {
+  bool no_cache = false;
+  bool must_revalidate = false;
+  if (auto cc = alt.get_response_header("Cache-Control")) {
     std::string lowered(*cc);
     for (char &c : lowered) {
       c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     }
-    if (lowered.find("must-revalidate") != std::string::npos ||
-        lowered.find("no-cache") != std::string::npos) {
-      return FreshnessResult::MustRevalidate;
-    }
+    no_cache = lowered.find("no-cache") != std::string::npos;
+    must_revalidate = lowered.find("must-revalidate") != std::string::npos;
+  }
+
+  // no-cache requires validation before every reuse, even while the entry is
+  // still fresh (RFC 9111 5.2.2.4).
+  if (no_cache) {
+    return FreshnessResult::MustRevalidate;
+  }
+
+  if (alt.is_fresh()) {
+    return FreshnessResult::Fresh;
+  }
+
+  if (must_revalidate) {
+    return FreshnessResult::MustRevalidate;
   }
 
   return FreshnessResult::Stale;
