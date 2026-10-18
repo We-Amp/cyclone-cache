@@ -234,9 +234,17 @@ class DocumentBuilder {
   int64_t _last_access = 0;
 };
 
+// Tag for a reader over bytes that live in a shared file mapping.
+struct SharedMappingTag {};
+inline constexpr SharedMappingTag kSharedMapping{};
+
 class DocumentReader {
  public:
   explicit DocumentReader(std::span<const std::byte> data);
+  // Bytes inside a shared mapping: documents start 8-aligned there, which the
+  // atomic loads of the live-mutated header fields rely on (a misaligned base
+  // would silently fall back to a racy plain read).  Checked in debug builds.
+  DocumentReader(SharedMappingTag, std::span<const std::byte> data);
 
   [[nodiscard]] bool is_valid() const { return _valid; }
   // is_valid() plus Document::has_volume_shape(): what every read path that

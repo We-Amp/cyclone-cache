@@ -5,6 +5,7 @@
 
 #include <array>
 #include <atomic>
+#include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -322,6 +323,12 @@ std::vector<std::byte> DocumentBuilder::serialize_head(
 }
 
 // DocumentReader
+
+DocumentReader::DocumentReader(SharedMappingTag,
+                               std::span<const std::byte> data)
+    : DocumentReader(
+          (assert(reinterpret_cast<std::uintptr_t>(data.data()) % 8 == 0),
+           data)) {}
 
 DocumentReader::DocumentReader(std::span<const std::byte> data) : _data(data) {
   if (data.size() >= Document::kHeaderSize) {

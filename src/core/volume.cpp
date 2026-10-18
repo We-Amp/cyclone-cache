@@ -737,7 +737,7 @@ static std::optional<MappedDocument> map_document(MappedFile& mf,
       mf.map_region(abs_offset, initial_size, MappedFile::MapMode::ReadOnly);
   if (!mapped) return std::nullopt;
 
-  DocumentReader reader(*mapped);
+  DocumentReader reader(kSharedMapping, *mapped);
   if (!reader.is_valid()) {
     mf.unmap_region(*mapped);
     return std::nullopt;
@@ -753,7 +753,7 @@ static std::optional<MappedDocument> map_document(MappedFile& mf,
     mapped =
         mf.map_region(abs_offset, full_size, MappedFile::MapMode::ReadOnly);
     if (!mapped) return std::nullopt;
-    reader = DocumentReader(*mapped);
+    reader = DocumentReader(kSharedMapping, *mapped);
     if (!reader.is_valid()) {
       mf.unmap_region(*mapped);
       return std::nullopt;
@@ -3047,7 +3047,7 @@ std::expected<ReadHandle, CacheError> Volume::read_sync(const CacheKey& key) {
             return true;  // Continue to next candidate
           }
 
-          DocumentReader reader(*mapped);
+          DocumentReader reader(kSharedMapping, *mapped);
           if (!reader.is_valid()) {
             _mapped_file->unmap_region(*mapped);
             return true;  // Continue to next candidate
@@ -3070,7 +3070,7 @@ std::expected<ReadHandle, CacheError> Volume::read_sync(const CacheKey& key) {
             if (!mapped) {
               return true;
             }
-            reader = DocumentReader(*mapped);
+            reader = DocumentReader(kSharedMapping, *mapped);
             if (!reader.is_valid()) {
               _mapped_file->unmap_region(*mapped);
               return true;
@@ -3350,7 +3350,7 @@ std::expected<void, CacheError> Volume::remove_sync(const CacheKey& key) {
       continue;
     }
 
-    DocumentReader reader(*mapped);
+    DocumentReader reader(kSharedMapping, *mapped);
     if (!reader.is_valid()) {
       _mapped_file->unmap_region(*mapped);
       continue;
@@ -3371,7 +3371,7 @@ std::expected<void, CacheError> Volume::remove_sync(const CacheKey& key) {
       if (!mapped) {
         continue;
       }
-      reader = DocumentReader(*mapped);
+      reader = DocumentReader(kSharedMapping, *mapped);
       if (!reader.is_valid()) {
         _mapped_file->unmap_region(*mapped);
         continue;
@@ -5008,7 +5008,7 @@ std::expected<void, CacheError> Volume::commit_write_impl(
           // validation below is evidence that the entry is dead.
           return true;
         }
-        const DocumentReader reader(*region);
+        const DocumentReader reader(kSharedMapping, *region);
         if (!reader.is_valid()) {
           // Bad magic / length: nothing any key can resolve through it.
           _mapped_file->unmap_region(*region);
@@ -6650,7 +6650,7 @@ Volume::list_alternates_sync(const CacheKey& key) {
             return true;  // Continue to next candidate
           }
 
-          DocumentReader reader(*mapped);
+          DocumentReader reader(kSharedMapping, *mapped);
           if (!reader.is_valid()) {
             _mapped_file->unmap_region(*mapped);
             return true;  // Continue to next candidate
@@ -6669,7 +6669,7 @@ Volume::list_alternates_sync(const CacheKey& key) {
             if (!mapped) {
               return true;
             }
-            reader = DocumentReader(*mapped);
+            reader = DocumentReader(kSharedMapping, *mapped);
             if (!reader.is_valid()) {
               _mapped_file->unmap_region(*mapped);
               return true;
@@ -6880,7 +6880,7 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
             return true;
           }
 
-          DocumentReader reader(*mapped);
+          DocumentReader reader(kSharedMapping, *mapped);
           if (!reader.is_valid()) {
             _mapped_file->unmap_region(*mapped);
             return true;
@@ -6900,7 +6900,7 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
             if (!mapped) {
               return true;
             }
-            reader = DocumentReader(*mapped);
+            reader = DocumentReader(kSharedMapping, *mapped);
             if (!reader.is_valid()) {
               _mapped_file->unmap_region(*mapped);
               return true;
@@ -7072,7 +7072,7 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
             return false;
           }
 
-          DocumentReader selected_reader(*selected_mapped);
+          DocumentReader selected_reader(kSharedMapping, *selected_mapped);
           if (!selected_reader.is_valid()) {
             _mapped_file->unmap_region(*selected_mapped);
             _mapped_file->unmap_region(*mapped);
@@ -7564,7 +7564,7 @@ std::expected<void, CacheError> Volume::remove_alternate_sync(
             return true;
           }
 
-          DocumentReader reader(*mapped);
+          DocumentReader reader(kSharedMapping, *mapped);
           if (!reader.is_valid()) {
             _mapped_file->unmap_region(*mapped);
             return true;
@@ -7693,7 +7693,7 @@ std::expected<void, CacheError> Volume::remove_alternate_sync(
         if (!next_mapped) {
           return make_unexpected(CacheError::IoError);
         }
-        DocumentReader next_reader(*next_mapped);
+        DocumentReader next_reader(kSharedMapping, *next_mapped);
         if (!next_reader.is_valid()) {
           _mapped_file->unmap_region(*next_mapped);
           return make_unexpected(CacheError::Corrupted);
@@ -7842,7 +7842,7 @@ std::expected<void, CacheError> Volume::update_hit_count_sync(
           return true;  // Continue to next candidate
         }
 
-        DocumentReader reader(*mapped);
+        DocumentReader reader(kSharedMapping, *mapped);
         if (!reader.is_valid()) {
           _mapped_file->unmap_region(*mapped);
           return true;  // Continue to next candidate
