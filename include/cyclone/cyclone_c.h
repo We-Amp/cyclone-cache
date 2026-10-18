@@ -455,6 +455,10 @@ typedef struct {
  * - Do not call cyclone_cache_destroy() while other operations are in progress
  *   on other threads; call cyclone_cache_drain_pending() first to ensure
  *   graceful shutdown.
+ * - No function declared here, and no done callback passed to a miss
+ *   handler, lets a C++ exception escape.  A failure inside the library that
+ *   raises one (memory exhaustion, in practice) is reported as
+ *   CYCLONE_INTERNAL_ERROR, or 0 from the functions returning int.
  *
  * fork() (POSIX)
  *
@@ -621,6 +625,9 @@ typedef void (*CycloneReadCallback)(void *, const char *, size_t, CycloneError);
  *   when the stored entry could not be read.  With a miss handler set, those
  *   cases take the miss path like any other non-hit.
  * - Cache shutting down: invokes read_cb with CYCLONE_NOT_INITIALIZED.
+ * Returns CYCLONE_OK when read_cb has been or will be called.  Any other
+ * return (CYCLONE_INVALID_ARGUMENT, CYCLONE_INTERNAL_ERROR) means read_cb
+ * has not been called and will not be.
  */
 CycloneError cyclone_cache_read_async(CycloneCacheHandle *cache,
                                       const char *key, size_t key_len,

@@ -11,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -30,6 +31,28 @@ static Tier to_cpp_tier(CycloneTier tier) {
   return tier == CYCLONE_TIER_SMALL ? Tier::kSmall : Tier::kDefault;
 }
 
+// Exception barrier.  Every exported function is called from C frames, which
+// an exception cannot cross: one would end the process.  Each body runs
+// through guarded(), which turns any exception (in practice std::bad_alloc)
+// into `on_exception`.
+template <typename Fn>
+static std::invoke_result_t<Fn> guarded(std::invoke_result_t<Fn> on_exception,
+                                        Fn &&fn) noexcept {
+  try {
+    return std::forward<Fn>(fn)();
+  } catch (...) {
+    return on_exception;
+  }
+}
+
+template <typename Fn>
+static void guarded_void(Fn &&fn) noexcept {
+  try {
+    std::forward<Fn>(fn)();
+  } catch (...) {  // NOLINT(bugprone-empty-catch): nothing to report to
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Opaque handle definitions
 // ---------------------------------------------------------------------------
@@ -46,6 +69,10 @@ struct MissDoneContext {
   std::string key;
   std::atomic<bool> completed{false};  // Prevents double-completion
 };
+
+// completed_contexts is pruned when it exceeds this many entries, so it
+// holds at most one more; that capacity is reserved up front.
+constexpr size_t kMaxCompletedContexts = 128;
 
 struct CycloneCacheHandle {
   std::unique_ptr<Cache> cache;
@@ -77,8 +104,8 @@ struct CycloneReadHandle {
 
 extern "C" {
 
-CycloneError cyclone_cache_create(const CycloneCacheConfig *config,
-                                  CycloneCacheHandle **out) {
+static CycloneError cache_create_impl(const CycloneCacheConfig *config,
+                                      CycloneCacheHandle **out) {
   if ((config == nullptr) || (out == nullptr) ||
       (config->cache_path == nullptr)) {
     return CYCLONE_INVALID_ARGUMENT;
@@ -136,6 +163,7 @@ CycloneError cyclone_cache_create(const CycloneCacheConfig *config,
   }
 
   auto *h = new CycloneCacheHandle();
+  h->completed_contexts.reserve(kMaxCompletedContexts + 1);
   h->cache = std::move(*cache_result);
   h->max_in_flight = config->max_in_flight_requests > 0
                          ? config->max_in_flight_requests
@@ -144,17 +172,25 @@ CycloneError cyclone_cache_create(const CycloneCacheConfig *config,
   return CYCLONE_OK;
 }
 
+CycloneError cyclone_cache_create(const CycloneCacheConfig *config,
+                                  CycloneCacheHandle **out) {
+  return guarded(CYCLONE_INTERNAL_ERROR,
+                 [&] { return cache_create_impl(config, out); });
+}
+
 void cyclone_cache_destroy(CycloneCacheHandle *cache) {
   if (cache == nullptr) return;
-  // Drain in-flight requests with a 30-second timeout
-  cyclone_cache_drain_pending(cache, 30000);
-  delete cache;
+  guarded_void([&] {
+    // Drain in-flight requests with a 30-second timeout
+    cyclone_cache_drain_pending(cache, 30000);
+    delete cache;
+  });
 }
 
 // Shared implementations for the tier-less functions and their _tier
 // variants (the tier-less functions are exactly the CYCLONE_TIER_DEFAULT
 // case).
-static CycloneError cache_read_impl(CycloneCacheHandle *cache, const char *key,
+static CycloneError cache_read_body(CycloneCacheHandle *cache, const char *key,
                                     size_t key_len, Tier tier,
                                     CycloneReadHandle **out) {
   if ((cache == nullptr) || (key == nullptr) || (out == nullptr) ||
@@ -178,7 +214,7 @@ static CycloneError cache_read_impl(CycloneCacheHandle *cache, const char *key,
   return CYCLONE_OK;
 }
 
-static CycloneError cache_write_impl(CycloneCacheHandle *cache, const char *key,
+static CycloneError cache_write_body(CycloneCacheHandle *cache, const char *key,
                                      size_t key_len, const char *data,
                                      size_t data_len, Tier tier) {
   if ((cache == nullptr) || (key == nullptr) || key_len == 0)
@@ -208,7 +244,7 @@ static CycloneError cache_write_impl(CycloneCacheHandle *cache, const char *key,
   return CYCLONE_OK;
 }
 
-static CycloneError cache_delete_impl(CycloneCacheHandle *cache,
+static CycloneError cache_delete_body(CycloneCacheHandle *cache,
                                       const char *key, size_t key_len,
                                       Tier tier) {
   if ((cache == nullptr) || (key == nullptr) || key_len == 0)
@@ -219,7 +255,7 @@ static CycloneError cache_delete_impl(CycloneCacheHandle *cache,
   return CYCLONE_OK;
 }
 
-static CycloneError cache_exists_impl(CycloneCacheHandle *cache,
+static CycloneError cache_exists_body(CycloneCacheHandle *cache,
                                       const char *key, size_t key_len,
                                       Tier tier) {
   if ((cache == nullptr) || (key == nullptr) || key_len == 0)
@@ -228,6 +264,36 @@ static CycloneError cache_exists_impl(CycloneCacheHandle *cache,
   auto result = cache->cache->exists_sync(ck, tier);
   if (!result) return to_c_error(result.error());
   return result.value() ? CYCLONE_OK : CYCLONE_NOT_FOUND;
+}
+
+static CycloneError cache_read_impl(CycloneCacheHandle *cache, const char *key,
+                                    size_t key_len, Tier tier,
+                                    CycloneReadHandle **out) {
+  return guarded(CYCLONE_INTERNAL_ERROR, [&] {
+    return cache_read_body(cache, key, key_len, tier, out);
+  });
+}
+
+static CycloneError cache_write_impl(CycloneCacheHandle *cache, const char *key,
+                                     size_t key_len, const char *data,
+                                     size_t data_len, Tier tier) {
+  return guarded(CYCLONE_INTERNAL_ERROR, [&] {
+    return cache_write_body(cache, key, key_len, data, data_len, tier);
+  });
+}
+
+static CycloneError cache_delete_impl(CycloneCacheHandle *cache,
+                                      const char *key, size_t key_len,
+                                      Tier tier) {
+  return guarded(CYCLONE_INTERNAL_ERROR,
+                 [&] { return cache_delete_body(cache, key, key_len, tier); });
+}
+
+static CycloneError cache_exists_impl(CycloneCacheHandle *cache,
+                                      const char *key, size_t key_len,
+                                      Tier tier) {
+  return guarded(CYCLONE_INTERNAL_ERROR,
+                 [&] { return cache_exists_body(cache, key, key_len, tier); });
 }
 
 CycloneError cyclone_cache_read(CycloneCacheHandle *cache, const char *key,
@@ -244,7 +310,9 @@ CycloneError cyclone_cache_read_data(CycloneReadHandle *handle,
   return CYCLONE_OK;
 }
 
-void cyclone_cache_read_close(CycloneReadHandle *handle) { delete handle; }
+void cyclone_cache_read_close(CycloneReadHandle *handle) {
+  guarded_void([&] { delete handle; });
+}
 
 CycloneError cyclone_cache_write(CycloneCacheHandle *cache, const char *key,
                                  size_t key_len, const char *data,
@@ -290,17 +358,19 @@ CycloneError cyclone_cache_exists_tier(CycloneCacheHandle *cache,
 
 int cyclone_cache_small_tier_active(CycloneCacheHandle *cache) {
   if (cache == nullptr) return 0;
-  return cache->cache->small_tier_active() ? 1 : 0;
+  return guarded(0, [&] { return cache->cache->small_tier_active() ? 1 : 0; });
 }
 
 int cyclone_cache_cross_process_ram_coherence_active(
     CycloneCacheHandle *cache) {
   if (cache == nullptr) return 0;
-  return cache->cache->cross_process_ram_coherence_active() ? 1 : 0;
+  return guarded(0, [&] {
+    return cache->cache->cross_process_ram_coherence_active() ? 1 : 0;
+  });
 }
 
-CycloneError cyclone_cache_stats(CycloneCacheHandle *cache,
-                                 CycloneCacheStats *out) {
+static CycloneError cache_stats_impl(CycloneCacheHandle *cache,
+                                     CycloneCacheStats *out) {
   if ((cache == nullptr) || (out == nullptr)) return CYCLONE_INVALID_ARGUMENT;
   auto s = cache->cache->stats();
   out->ram_cache_hits = s.ram_cache_hits;
@@ -344,15 +414,18 @@ CycloneError cyclone_cache_stats(CycloneCacheHandle *cache,
   return CYCLONE_OK;
 }
 
+CycloneError cyclone_cache_stats(CycloneCacheHandle *cache,
+                                 CycloneCacheStats *out) {
+  return guarded(CYCLONE_INTERNAL_ERROR,
+                 [&] { return cache_stats_impl(cache, out); });
+}
+
 // ---------------------------------------------------------------------------
 // Miss callback hook
 // ---------------------------------------------------------------------------
 
-// Internal done callback invoked by the miss handler when the fetch completes.
-static void internal_miss_done(void *user_data, const char *data,
-                               size_t data_len, CycloneError err) {
-  auto *ctx = static_cast<MissDoneContext *>(user_data);
-
+static void miss_done_impl(MissDoneContext *ctx, const char *data,
+                           size_t data_len, CycloneError err) {
   // Prevent double-completion: if handler calls done_cb twice, ignore second
   // call.
   bool expected = false;
@@ -366,8 +439,14 @@ static void internal_miss_done(void *user_data, const char *data,
   // We notify BEFORE writing to cache so disk I/O doesn't block callbacks.
   // Move ctx to the completed list so it stays alive for any erroneous
   // second done_cb call (the atomic guard above will safely reject it).
+  //
+  // Nothing up to the waiter notification may throw: a failure there would
+  // leave the waiters unanswered and the key in flight for good.  The key is
+  // therefore moved, not copied, out of ctx (ctx may be freed by a later
+  // completion once the lock is released), and completed_contexts never
+  // grows past the capacity reserved at create.
   std::vector<std::pair<CycloneReadCallback, void *>> waiters;
-  std::string key_copy = ctx->key;
+  std::string key;
   bool will_write = (err == CYCLONE_OK && (data != nullptr) && data_len > 0);
   {
     std::lock_guard<std::mutex> lock(ch->in_flight_mu);
@@ -376,17 +455,19 @@ static void internal_miss_done(void *user_data, const char *data,
       waiters = std::move(it->second.waiters);
       ch->in_flight.erase(it);
     }
-    // Bound completed_contexts: when it exceeds 128 entries, keep only the
-    // most recent 64.  Older contexts are safe to free — any racing
-    // double-done-cb on a previous miss would have already resolved.
-    if (ch->completed_contexts.size() > 128) {
+    key = std::move(ctx->key);
+    // Bound completed_contexts: when it exceeds kMaxCompletedContexts
+    // entries, keep only the most recent 64.  Older contexts are safe to free —
+    // any racing double-done-cb on a previous miss would have already resolved.
+    if (ch->completed_contexts.size() > kMaxCompletedContexts) {
       ch->completed_contexts.erase(
           ch->completed_contexts.begin(),
           ch->completed_contexts.begin() +
               static_cast<ptrdiff_t>(ch->completed_contexts.size() - 64));
     }
     // Defer ctx deletion: move to completed list so a double done_cb
-    // call can still safely read the atomic completed flag.
+    // call can still safely read the atomic completed flag.  Capacity for
+    // the bound above is reserved at create, so this never allocates.
     ch->completed_contexts.emplace_back(ctx);
     // Track the upcoming cache write so drain knows we're not done yet.
     if (will_write) {
@@ -406,7 +487,7 @@ static void internal_miss_done(void *user_data, const char *data,
   // THEN store in cache (non-blocking for waiters).
   // Failure to write is non-fatal: waiters already have the data.
   if (will_write) {
-    cyclone_cache_write(ch, key_copy.data(), key_copy.size(), data, data_len);
+    cyclone_cache_write(ch, key.data(), key.size(), data, data_len);
     // Decrement pending_writes and wake drain if this was the last one.
     if (ch->pending_writes.fetch_sub(1, std::memory_order_acq_rel) == 1) {
       std::lock_guard<std::mutex> lock(ch->in_flight_mu);
@@ -417,20 +498,32 @@ static void internal_miss_done(void *user_data, const char *data,
   }
 }
 
+// Internal done callback invoked by the miss handler when the fetch completes.
+// It runs on the miss handler's stack, which belongs to the embedder, so no
+// exception may leave it.
+static void internal_miss_done(void *user_data, const char *data,
+                               size_t data_len, CycloneError err) {
+  guarded_void([&] {
+    miss_done_impl(static_cast<MissDoneContext *>(user_data), data, data_len,
+                   err);
+  });
+}
+
 CycloneError cyclone_cache_set_miss_handler(CycloneCacheHandle *cache,
                                             CycloneMissHandler handler,
                                             void *handler_user_data) {
   if (cache == nullptr) return CYCLONE_INVALID_ARGUMENT;
-  std::lock_guard<std::mutex> lock(cache->in_flight_mu);
-  cache->miss_handler = handler;
-  cache->miss_handler_user_data = handler_user_data;
-  return CYCLONE_OK;
+  return guarded(CYCLONE_INTERNAL_ERROR, [&] {
+    std::lock_guard<std::mutex> lock(cache->in_flight_mu);
+    cache->miss_handler = handler;
+    cache->miss_handler_user_data = handler_user_data;
+    return CYCLONE_OK;
+  });
 }
 
-CycloneError cyclone_cache_read_async(CycloneCacheHandle *cache,
-                                      const char *key, size_t key_len,
-                                      CycloneReadCallback read_cb,
-                                      void *read_user_data) {
+static CycloneError read_async_impl(CycloneCacheHandle *cache, const char *key,
+                                    size_t key_len, CycloneReadCallback read_cb,
+                                    void *read_user_data) {
   if ((cache == nullptr) || (key == nullptr) || (read_cb == nullptr) ||
       key_len == 0)
     return CYCLONE_INVALID_ARGUMENT;
@@ -492,8 +585,14 @@ CycloneError cyclone_cache_read_async(CycloneCacheHandle *cache,
   // the bucket stays busy until the owner next writes, removes or updates
   // hit counts in it.
 
-  // Coalescing logic.
+  // Coalescing logic.  Everything that can fail is allocated before the
+  // read is registered: once a waiter is registered and the fetch marked as
+  // started, a failure would leave the waiter unanswered and the key in
+  // flight for good.  The context is unused when the read coalesces.
   std::string key_str(key, key_len);
+  auto ctx = std::make_unique<MissDoneContext>();
+  ctx->cache_handle = cache;
+  ctx->key = key_str;
   bool should_invoke_handler = false;
   // A rejection decided under the lock is reported after it is released:
   // read_cb may call back into this cache, and in_flight_mu is not
@@ -513,8 +612,14 @@ CycloneError cyclone_cache_read_async(CycloneCacheHandle *cache,
           cache->in_flight.size() >= cache->max_in_flight) {
         rejected = CYCLONE_NO_SPACE;
       } else {
-        auto &entry = cache->in_flight[key_str];
-        entry.waiters.emplace_back(read_cb, read_user_data);
+        auto [entry_it, inserted] = cache->in_flight.try_emplace(key_str);
+        auto &entry = entry_it->second;
+        try {
+          entry.waiters.emplace_back(read_cb, read_user_data);
+        } catch (...) {
+          if (inserted) cache->in_flight.erase(entry_it);
+          throw;
+        }
 
         if (!entry.fetch_in_progress) {
           entry.fetch_in_progress = true;
@@ -529,22 +634,28 @@ CycloneError cyclone_cache_read_async(CycloneCacheHandle *cache,
   }
 
   if (should_invoke_handler) {
-    auto ctx = std::make_unique<MissDoneContext>();
-    ctx->cache_handle = cache;
-    ctx->key = key_str;
-
     // Release ownership: the handler takes the raw pointer and must
     // eventually pass it to internal_miss_done (which transfers it
-    // into completed_contexts).  Using unique_ptr above ensures no
-    // leak if key assignment throws std::bad_alloc.
+    // into completed_contexts).
     handler(key, key_len, handler_ud, internal_miss_done, ctx.release());
   }
 
   return CYCLONE_OK;
 }
 
-CycloneError cyclone_cache_drain_pending(CycloneCacheHandle *cache,
-                                         uint32_t timeout_ms) {
+// A non-OK return means read_cb has not been called and will not be: the
+// read was neither answered nor registered.
+CycloneError cyclone_cache_read_async(CycloneCacheHandle *cache,
+                                      const char *key, size_t key_len,
+                                      CycloneReadCallback read_cb,
+                                      void *read_user_data) {
+  return guarded(CYCLONE_INTERNAL_ERROR, [&] {
+    return read_async_impl(cache, key, key_len, read_cb, read_user_data);
+  });
+}
+
+static CycloneError drain_pending_impl(CycloneCacheHandle *cache,
+                                       uint32_t timeout_ms) {
   if (cache == nullptr) return CYCLONE_INVALID_ARGUMENT;
 
   cache->shutting_down.store(true, std::memory_order_release);
@@ -579,6 +690,12 @@ CycloneError cyclone_cache_drain_pending(CycloneCacheHandle *cache,
   }
 
   return CYCLONE_OK;
+}
+
+CycloneError cyclone_cache_drain_pending(CycloneCacheHandle *cache,
+                                         uint32_t timeout_ms) {
+  return guarded(CYCLONE_INTERNAL_ERROR,
+                 [&] { return drain_pending_impl(cache, timeout_ms); });
 }
 
 }  // extern "C"

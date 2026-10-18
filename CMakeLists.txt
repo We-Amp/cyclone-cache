@@ -188,6 +188,7 @@ if(CYCLONE_BUILD_TESTS)
     tests/integration/test_lifecycle.cpp
     tests/integration/test_optimization.cpp
     tests/unit/test_c_api.cpp
+    tests/unit/test_c_api_alloc_failure.cpp
     tests/unit/multi_process_test.cpp
     tests/unit/test_mmap_directory.cpp
     tests/integration/test_handle.cpp
