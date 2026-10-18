@@ -326,9 +326,16 @@ std::vector<std::byte> DocumentBuilder::serialize_head(
 
 DocumentReader::DocumentReader(SharedMappingTag,
                                std::span<const std::byte> data)
-    : DocumentReader(
-          (assert(reinterpret_cast<std::uintptr_t>(data.data()) % 8 == 0),
-           data)) {}
+    : _data(data) {
+  // Documents start 8-aligned in a shared mapping, which the atomic loads of
+  // the live-mutated header fields require.  A misaligned base can only come
+  // from a corrupt offset: leave the reader invalid so the caller takes its
+  // normal invalid-document path.
+  if (reinterpret_cast<std::uintptr_t>(data.data()) % 8 != 0) {
+    return;
+  }
+  *this = DocumentReader(data);
+}
 
 DocumentReader::DocumentReader(std::span<const std::byte> data) : _data(data) {
   if (data.size() >= Document::kHeaderSize) {

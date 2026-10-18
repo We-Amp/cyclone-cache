@@ -243,7 +243,8 @@ class DocumentReader {
   explicit DocumentReader(std::span<const std::byte> data);
   // Bytes inside a shared mapping: documents start 8-aligned there, which the
   // atomic loads of the live-mutated header fields rely on (a misaligned base
-  // would silently fall back to a racy plain read).  Checked in debug builds.
+  // would silently fall back to a racy plain read).  A misaligned base yields
+  // an invalid reader in every build.
   DocumentReader(SharedMappingTag, std::span<const std::byte> data);
 
   [[nodiscard]] bool is_valid() const { return _valid; }

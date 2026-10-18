@@ -40,6 +40,33 @@ TEST_CASE("Document serialization round-trip", "[document]") {
   REQUIRE(reader.content().size() == content.size());
 }
 
+TEST_CASE("Shared-mapping reader is invalid on a misaligned base",
+          "[document]") {
+  CacheKey key("test-key");
+  std::vector<std::byte> content(100, std::byte{0x5a});
+  auto doc = DocumentBuilder()
+                 .set_key(key)
+                 .set_content(content)
+                 .set_type(Document::Type::SingleFrag)
+                 .build();
+
+  // The same bytes at an 8-aligned and at a misaligned address.
+  alignas(8) std::vector<std::byte> storage(doc.size() + 16);
+  std::byte *aligned = storage.data();
+  while (reinterpret_cast<std::uintptr_t>(aligned) % 8 != 0) ++aligned;
+  std::copy(doc.begin(), doc.end(), aligned + 1);
+  std::copy(doc.begin(), doc.end(), aligned + 8);
+
+  DocumentReader ok(kSharedMapping,
+                    std::span<const std::byte>(aligned + 8, doc.size()));
+  REQUIRE(ok.is_valid());
+
+  DocumentReader misaligned(
+      kSharedMapping, std::span<const std::byte>(aligned + 1, doc.size()));
+  REQUIRE_FALSE(misaligned.is_valid());
+  REQUIRE(misaligned.content().empty());
+}
+
 TEST_CASE("Document checksum", "[document]") {
   std::vector<std::byte> data = {std::byte{0x00}, std::byte{0x11},
                                  std::byte{0x22}, std::byte{0x33}};
