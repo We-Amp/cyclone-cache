@@ -714,8 +714,7 @@ TEST_CASE("HttpAlternatePlugin no-cache forces revalidation of fresh entries",
           FreshnessResult::MustRevalidate);
   // A shared cache treats s-maxage and proxy-revalidate like must-revalidate
   // once the entry is stale.
-  REQUIRE(check("max-age=3600, s-maxage=0") ==
-          FreshnessResult::MustRevalidate);
+  REQUIRE(check("max-age=3600, s-maxage=0") == FreshnessResult::MustRevalidate);
   REQUIRE(check("max-age=0, proxy-revalidate") ==
           FreshnessResult::MustRevalidate);
   REQUIRE(check("max-age=0") == FreshnessResult::Stale);
