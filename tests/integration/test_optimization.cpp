@@ -563,7 +563,8 @@ TEST_CASE("OptimizationEngine load monitor integration",
   config.optimization_config.set_enabled(true)
       .set_min_threads(1)
       .set_load_high_watermark(0.9)
-      .set_load_low_watermark(0.5);
+      .set_load_low_watermark(0.5)
+      .set_scale_check_interval(std::chrono::milliseconds(20));
 
   auto cache_result = Cache::create(config);
   REQUIRE(cache_result.has_value());
@@ -578,14 +579,26 @@ TEST_CASE("OptimizationEngine load monitor integration",
   // Access load monitor
   auto &load_monitor = engine->load_monitor();
 
-  // Record some operations
+  // Record some operations.  The engine's monitor thread is the only caller
+  // of update_metrics() (a second caller would race on its previous-sample
+  // state), and each update publishes the operations of one interval, so
+  // watch the published metrics until each operation has been seen.
   load_monitor.record_read_complete(1_KB);
   load_monitor.record_write_complete(2_KB);
-  load_monitor.update_metrics();
 
-  auto metrics = load_monitor.metrics();
-  REQUIRE(metrics.read_ops == 1);
-  REQUIRE(metrics.write_ops == 1);
+  bool saw_read = false;
+  bool saw_write = false;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while ((!saw_read || !saw_write) &&
+         std::chrono::steady_clock::now() < deadline) {
+    const auto metrics = load_monitor.metrics();
+    saw_read = saw_read || metrics.read_ops == 1;
+    saw_write = saw_write || metrics.write_ops == 1;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  REQUIRE(saw_read);
+  REQUIRE(saw_write);
 
   cache->stop();
 }
