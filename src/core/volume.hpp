@@ -1470,9 +1470,12 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // latency dominate the write path on any filesystem and measure where on
   // that path the flush runs.
   static inline std::atomic<uint32_t> s_fsync_pause_us_for_test{0};
-  // When set, called (on the flushing thread, with no volume lock held)
-  // right before the real flush, so a test can run other writes, even wrap
-  // the stripe, while a commit sits in its unlocked durability flush.
+  // When set, called on the flushing thread right before the real flush,
+  // so a test can run other writes, even wrap the stripe, while a commit
+  // sits in its durability flush.  A plain commit holds no volume lock
+  // there; an alternate commit holds its stripe mutex (but not the write
+  // lock), so the hook's writes must go through another Volume of the
+  // file, as another process's would.
   static inline std::atomic<const std::function<void()> *>
       s_fsync_hook_for_test{nullptr};
 #endif

@@ -389,12 +389,14 @@ bool Directory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
     // and the choice need no bracket of their own; the mutation below is
     // published through one odd->even bracket.
     admission->refresh();
-    // The conditional publish (see PublishView).  The stripe mutex is held
-    // from the writer's election to this insert (it is released only around
-    // the sync_on_write flush, before the election, and a wrap that ran
-    // meanwhile makes the commit give up), so the view cannot have moved
-    // here; the check is kept so both directory kinds answer the same
-    // question the same way.
+    // The conditional publish (see PublishView).  For an alternate write
+    // the stripe mutex is held from the election to this insert, so the
+    // view cannot have moved.  A plain write releases the mutex around its
+    // sync_on_write flush, which runs before its election, and between its
+    // lost publish rounds, so its election always sees the bucket as it is
+    // here.  The head-removal republish holds the mutex throughout.  The
+    // check is kept so both directory kinds answer the same question the
+    // same way.
     if (view != nullptr &&
         !publish_view_is_current(bucket, kEntriesPerBucket, tag,
                                  verified_offset, kMatchAnyTag,

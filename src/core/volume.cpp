@@ -6581,24 +6581,30 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
   }
 
   // Durability flush (sync_on_write): POSIX only (Windows flushed the fill
-  // region in the fill block above).  Outside both the cross-process write
-  // lock and the stripe mutex, exactly as in commit_write -- see the full
-  // comment there.  ORDERING INVARIANT (power loss), unchanged: it must
-  // complete before the directory insert below -- an entry that survives a
-  // power loss must always point at durable data -- while the cursor
-  // advance above needs only the completed pwrite.  See the durability
-  // contract on sync_directory().
+  // region in the fill block above).  Outside the cross-process write lock,
+  // as in commit_write, but -- unlike commit_write -- UNDER the stripe
+  // mutex.  This commit's new head link and its post-publish splices were
+  // planned from the chain under this mutex, and a removal of another
+  // alternate of the key in this process changes only a link inside that
+  // chain, which the conditional publish (it sees the bucket) cannot
+  // detect: with the mutex released here, such a removal could complete in
+  // the window and the publish below would link the removed alternate back
+  // in after the removal returned success.  Holding the mutex makes this
+  // process's removals wait.  ORDERING INVARIANT (power loss), unchanged:
+  // the flush must complete before the directory insert below -- an entry
+  // that survives a power loss must always point at durable data -- while
+  // the cursor advance above needs only the completed pwrite.  See the
+  // durability contract on sync_directory().
   if (_config.sync_on_write) {
 #ifndef _WIN32
-    // While the mutex is released a wrap can run: the stripe's tail
-    // may then overwrite the bytes just written, and the election below
-    // could point a newer live entry of this key at them.  Remember the
-    // pass at the commit and give up (Busy: the document stays
-    // unreachable, like any fill whose insert never ran) if it moved.
+    // Another process can still wrap the stripe while this flush runs (the
+    // write lock is released): its tail may then overwrite the bytes just
+    // written, and the publish below could point a newer live entry of this
+    // key at them.  Remember the pass at the commit and give up (Busy: the
+    // document stays unreachable, like any fill whose insert never ran) if
+    // it moved.
     const StripeSnapshot snap_at_commit = snapshot(stripe);
-    lock.unlock();
     fsync_fd();
-    lock.lock();
     if (wrapped_since(stripe, snap_at_commit)) {
       return make_unexpected(CacheError::Busy);
     }
