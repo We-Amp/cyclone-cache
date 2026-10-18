@@ -310,6 +310,36 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Seqlock read wait: MmapDirectory::probe rescans with the phase current "
+    "at each retry",
+    "[mmap_directory][concurrent][regression]") {
+  // A retry that follows a phase flip must filter by the new phase, as
+  // probe_each does, or an entry stamped with it is skipped: a false miss.
+  BudgetOverride budget(kUnboundedBudgetUs);
+  MappedDir d;
+  const CacheKey key("phase-flip-during-retry");
+  // The entry carries the phase the directory is about to flip to.
+  const bool before = d.dir.current_phase();
+  d.dir.set_current_phase(!before);
+  REQUIRE(d.dir.insert(key, 4096, 512));
+  d.dir.set_current_phase(before);
+  REQUIRE_FALSE(d.dir.probe(key).has_value());
+
+  const uint64_t baseline = SeqlockReadWait::s_timed_waits_for_test.load();
+  d.begin(key);
+  std::optional<DirEntry> found;
+  std::thread reader([&] { found = d.dir.probe(key); });
+  const bool reached = wait_for_timed_phase(baseline);
+  d.dir.toggle_phase();  // flips while the probe waits out the writer
+  d.end(key);
+  reader.join();
+
+  REQUIRE(reached);
+  REQUIRE(found.has_value());
+  CHECK(found->offset() == 4096);
+}
+
+TEST_CASE(
     "Seqlock read wait: every lock-free reader waits out a parked writer "
     "instead of reporting a false miss",
     "[concurrent][lockfree][regression]") {

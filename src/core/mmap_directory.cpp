@@ -1014,12 +1014,15 @@ std::optional<DirEntry> MmapDirectory::probe(const CacheKey &key) const {
 
   uint32_t bucket_idx = key.bucket_hash() % _num_buckets;
   uint16_t target_tag = key.tag();
-  bool cur_phase = current_phase();
 
   // Retry loop for torn read detection, bounded like probe_each_impl;
   // `continue` lands on wait.retry().
   SeqlockReadWait wait;
   do {
+    // Inside the loop, as in probe_each_impl: a retry after a concurrent
+    // toggle_phase() must filter by the new phase (else a spurious miss).
+    bool cur_phase = current_phase();
+
     // Wait for an even version before starting the scan.
     const uint32_t version_before =
         wait.even_version([&] { return load_version(bucket_idx); });
