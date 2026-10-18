@@ -243,7 +243,7 @@ std::optional<std::vector<std::byte>> RamCacheCLFUS::Segment::get(
     return std::nullopt;
   }
 
-  ++entry.hits;
+  saturating_increment(entry.hits);
   ++_hits;
 
   if (out_stamp != nullptr) {
@@ -298,7 +298,7 @@ bool RamCacheCLFUS::Segment::put(const RamCacheKey& rk,
       entry.data = std::move(body);
       entry.stamp = stamp;
       _bytes_used += entry.data.size();
-      ++entry.hits;
+      saturating_increment(entry.hits);
       return true;
     } else {
       if (entry.value() > _average_value ||
@@ -306,7 +306,7 @@ bool RamCacheCLFUS::Segment::put(const RamCacheKey& rk,
         promote_from_history(existing->second, data, stamp);
         return true;
       }
-      ++entry.hits;
+      saturating_increment(entry.hits);
       return false;
     }
   }
@@ -446,7 +446,7 @@ void RamCacheCLFUS::Segment::promote_from_history(
   entry.data = std::move(body);
   entry.stamp = stamp;
   entry.in_cache = true;
-  ++entry.hits;
+  saturating_increment(entry.hits);
   _bytes_used += data.size();
 }
 

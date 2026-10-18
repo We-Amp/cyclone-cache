@@ -491,3 +491,15 @@ TEST_CASE("CLFUS concurrent get+put data race safety", "[clfus][concurrent]") {
   REQUIRE(read_count.load() > 0);
   REQUIRE(valid_reads.load() > 0);
 }
+
+TEST_CASE("RAM cache hit counters saturate instead of wrapping", "[clfus]") {
+  std::atomic<uint32_t> counter{0};
+  saturating_increment(counter);
+  REQUIRE(counter.load() == 1);
+
+  counter.store(UINT32_MAX - 1);
+  saturating_increment(counter);
+  REQUIRE(counter.load() == UINT32_MAX);
+  saturating_increment(counter);
+  REQUIRE(counter.load() == UINT32_MAX);
+}
