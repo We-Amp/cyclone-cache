@@ -8,6 +8,7 @@
 #include <latch>
 #include <mutex>
 #include <queue>
+#include <stdexcept>
 #include <thread>
 
 #include "optimization/adaptive_pool.hpp"
@@ -312,6 +313,40 @@ TEST_CASE("AdaptiveThreadPool scales back up after scaling down",
 
   REQUIRE(recovered);
   REQUIRE(pool.stats().current_threads == 0);
+}
+
+// Regression: a task that threw an exception propagated out of worker_loop
+// and terminated the process.  The pool must guard the call, record the
+// failure, and keep the worker alive for later tasks.
+TEST_CASE("AdaptiveThreadPool survives a throwing task",
+          "[pool][optimization][regression]") {
+  OptimizationConfig config = default_config();
+  config.min_threads = 1;
+  config.max_threads = 1;
+  MockTaskProvider provider;
+  AdaptiveThreadPool pool(config, provider);
+  pool.start();
+
+  std::latch next_ran(1);
+  provider.add_task([] { throw std::runtime_error("task failure"); });
+  provider.add_task([&] { next_ran.count_down(); });
+
+  // The worker survived the throw and ran the next task.
+  next_ran.wait();
+  REQUIRE(pool.thread_count() == 1);
+
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (pool.stats().tasks_failed != 1 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+
+  auto stats = pool.stats();
+  REQUIRE(stats.tasks_failed == 1);
+  REQUIRE(stats.tasks_completed == 1);
+
+  provider.signal_stop();
+  pool.stop();
 }
 
 TEST_CASE("AdaptiveThreadPool statistics", "[pool][optimization]") {

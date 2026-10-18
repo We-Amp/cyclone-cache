@@ -177,33 +177,42 @@ void OptimizationEngine::on_write_complete(const CacheKey &key,
 
   // Ask each plugin what optimizations to queue
   for (const auto &plugin : current_plugins) {
-    auto plan = plugin->plan_optimization(key, header, content_length,
-                                          written_alternate, hit_count);
+    // plan_optimization()/estimate_memory() are embedder-supplied code running
+    // on the caller's own thread: an exception must not escape into the
+    // caller's write path.  Record the failure and move to the next plugin.
+    try {
+      auto plan = plugin->plan_optimization(key, header, content_length,
+                                            written_alternate, hit_count);
 
-    for (const auto &target : plan.targets) {
-      WorkItem item;
-      item.id.key = key;
-      item.id.target_alternate = target.target_alternate;
-      item.plugin_id = plugin->info().plugin_id;
-      item.priority = target.priority;
-      item.hit_count = hit_count;
-      item.content_length = content_length;
-      // Get memory estimate and clamp to reasonable bounds (1KB - 1GB)
-      constexpr size_t kMinMemoryEstimate = 1024;
-      constexpr size_t kMaxMemoryEstimate = 1024ULL * 1024 * 1024;
-      size_t mem_estimate = target.estimated_memory > 0
-                                ? target.estimated_memory
-                                : plugin->estimate_memory(
-                                      content_length, target.target_alternate);
-      item.estimated_memory =
-          std::clamp(mem_estimate, kMinMemoryEstimate, kMaxMemoryEstimate);
-      item.deferrable = target.deferrable;
+      for (const auto &target : plan.targets) {
+        WorkItem item;
+        item.id.key = key;
+        item.id.target_alternate = target.target_alternate;
+        item.plugin_id = plugin->info().plugin_id;
+        item.priority = target.priority;
+        item.hit_count = hit_count;
+        item.content_length = content_length;
+        // Get memory estimate and clamp to reasonable bounds (1KB - 1GB)
+        constexpr size_t kMinMemoryEstimate = 1024;
+        constexpr size_t kMaxMemoryEstimate = 1024ULL * 1024 * 1024;
+        size_t mem_estimate =
+            target.estimated_memory > 0
+                ? target.estimated_memory
+                : plugin->estimate_memory(content_length,
+                                          target.target_alternate);
+        item.estimated_memory =
+            std::clamp(mem_estimate, kMinMemoryEstimate, kMaxMemoryEstimate);
+        item.deferrable = target.deferrable;
 
-      auto result = _work_queue.enqueue(item);
-      if (result.has_value()) {
-        std::lock_guard stats_lock(_stats_mutex);
-        ++_stats.queued;
+        auto result = _work_queue.enqueue(item);
+        if (result.has_value()) {
+          std::lock_guard stats_lock(_stats_mutex);
+          ++_stats.queued;
+        }
       }
+    } catch (...) {
+      std::lock_guard stats_lock(_stats_mutex);
+      ++_stats.failed;
     }
   }
 }
@@ -280,132 +289,153 @@ void OptimizationEngine::process_work_item(WorkItem item) {
     }
   }
 
-  // Find the plugin that queued this work item
-  std::shared_ptr<OptimizationPlugin> plugin;
-  {
-    std::shared_lock lock(_plugins_mutex);
-    for (const auto &p : _plugins) {
-      if (p->info().plugin_id == item.plugin_id) {
-        plugin = p;
-        break;
+  // Everything below runs embedder-supplied plugin code (transform,
+  // on_cancelled) and cache operations that may throw (allocation failure).
+  // An exception escaping the worker would terminate the host process, and an
+  // unwind without the token erase would refuse every later item for this
+  // id, so the whole body is guarded and the failure is recorded.
+  try {
+    // Find the plugin that queued this work item
+    std::shared_ptr<OptimizationPlugin> plugin;
+    {
+      std::shared_lock lock(_plugins_mutex);
+      for (const auto &p : _plugins) {
+        if (p->info().plugin_id == item.plugin_id) {
+          plugin = p;
+          break;
+        }
       }
     }
-  }
 
-  if (!plugin) {
-    std::lock_guard lock(_active_work_mutex);
-    _active_work.erase(item.id);
-    return;
-  }
+    if (!plugin) {
+      std::lock_guard lock(_active_work_mutex);
+      _active_work.erase(item.id);
+      return;
+    }
 
-  // Read source content from cache.
-  // Note: If the original content was evicted while this work item was queued,
-  // the read will fail. This is expected behavior - we simply increment the
-  // 'failed' stat and move on. The optimization can be re-queued on next
-  // access.
-  //
-  // The handle stays open across transform() (its spans are the plugin's
-  // input) and is closed after the write, as before.  Holding or closing it
-  // outside a pass is fine: a read handle is a lease, not a lock.
-  std::optional<ReadHandle> source;
-  bool read_pass_entered = false;
-  {
-    ForkGatedPass pass(_running);
-    if (pass) {
-      read_pass_entered = true;
-      auto read_result = _cache->read_sync(item.id.key);
-      if (read_result) {
-        source.emplace(std::move(*read_result));
+    // Read source content from cache.
+    // Note: If the original content was evicted while this work item was
+    // queued, the read will fail. This is expected behavior - we simply
+    // increment the 'failed' stat and move on. The optimization can be
+    // re-queued on next access.
+    //
+    // The handle stays open across transform() (its spans are the plugin's
+    // input) and is closed after the write, as before.  Holding or closing it
+    // outside a pass is fine: a read handle is a lease, not a lock.
+    std::optional<ReadHandle> source;
+    bool read_pass_entered = false;
+    {
+      ForkGatedPass pass(_running);
+      if (pass) {
+        read_pass_entered = true;
+        auto read_result = _cache->read_sync(item.id.key);
+        if (read_result) {
+          source.emplace(std::move(*read_result));
+        }
       }
     }
-  }
-  if (!source) {
-    if (read_pass_entered) {
-      std::lock_guard stats_lock(_stats_mutex);
-      ++_stats.failed;
+    if (!source) {
+      if (read_pass_entered) {
+        std::lock_guard stats_lock(_stats_mutex);
+        ++_stats.failed;
+      }
+      std::lock_guard lock(_active_work_mutex);
+      _active_work.erase(item.id);
+      return;
     }
-    std::lock_guard lock(_active_work_mutex);
-    _active_work.erase(item.id);
-    return;
-  }
 
-  auto &handle = *source;
+    auto &handle = *source;
 
-  // Get header and content
-  auto header_data = handle.header();
-  auto content_data = handle.content();
+    // Get header and content
+    auto header_data = handle.header();
+    auto content_data = handle.content();
 
-  // Create optimization context
-  OptimizationContext ctx(item.id.key, header_data, content_data,
-                          item.hit_count, _cache, *cancelled);
+    // Create optimization context
+    OptimizationContext ctx(item.id.key, header_data, content_data,
+                            item.hit_count, _cache, *cancelled);
 
-  // Perform transformation
-  auto transform_result = plugin->transform(item.id.target_alternate, ctx);
+    // Perform transformation
+    auto transform_result = plugin->transform(item.id.target_alternate, ctx);
 
-  // Remove from active work
-  {
-    std::lock_guard lock(_active_work_mutex);
-    _active_work.erase(item.id);
-  }
+    // Remove from active work
+    {
+      std::lock_guard lock(_active_work_mutex);
+      _active_work.erase(item.id);
+    }
 
-  if (!transform_result) {
-    if (transform_result.error() == CacheError::OptimizationCancelled) {
+    if (!transform_result) {
+      if (transform_result.error() == CacheError::OptimizationCancelled) {
+        plugin->on_cancelled(item.id.key, item.id.target_alternate);
+        std::lock_guard stats_lock(_stats_mutex);
+        ++_stats.cancelled;
+      } else {
+        std::lock_guard stats_lock(_stats_mutex);
+        ++_stats.failed;
+      }
+      return;
+    }
+
+    // Write the new alternate to cache: the second pass, to the end of the
+    // function.
+    ForkGatedPass write_pass(_running);
+    if (!write_pass) {
+      // No pass is open here, so calling the plugin is allowed.
       plugin->on_cancelled(item.id.key, item.id.target_alternate);
       std::lock_guard stats_lock(_stats_mutex);
       ++_stats.cancelled;
-    } else {
+      return;
+    }
+
+    auto write_result = _cache->write_alternate_sync(
+        item.id.key, transform_result->alternate_id,
+        transform_result->content.size());
+
+    if (!write_result) {
       std::lock_guard stats_lock(_stats_mutex);
       ++_stats.failed;
+      return;
     }
-    return;
-  }
 
-  // Write the new alternate to cache: the second pass, to the end of the
-  // function.
-  ForkGatedPass write_pass(_running);
-  if (!write_pass) {
-    // No pass is open here, so calling the plugin is allowed.
-    plugin->on_cancelled(item.id.key, item.id.target_alternate);
+    auto &write_handle = *write_result;
+
+    // Write header
+    write_handle.set_header(transform_result->header);
+
+    // Write content
+    auto write_content_result =
+        write_handle.write_sync(transform_result->content);
+    if (!write_content_result) {
+      write_handle.abort();
+      std::lock_guard stats_lock(_stats_mutex);
+      ++_stats.failed;
+      return;
+    }
+
+    // Close/commit
+    auto close_result = write_handle.close_sync();
+    if (!close_result) {
+      std::lock_guard stats_lock(_stats_mutex);
+      ++_stats.failed;
+      return;
+    }
+
     std::lock_guard stats_lock(_stats_mutex);
-    ++_stats.cancelled;
-    return;
-  }
-
-  auto write_result =
-      _cache->write_alternate_sync(item.id.key, transform_result->alternate_id,
-                                   transform_result->content.size());
-
-  if (!write_result) {
-    std::lock_guard stats_lock(_stats_mutex);
-    ++_stats.failed;
-    return;
-  }
-
-  auto &write_handle = *write_result;
-
-  // Write header
-  write_handle.set_header(transform_result->header);
-
-  // Write content
-  auto write_content_result =
-      write_handle.write_sync(transform_result->content);
-  if (!write_content_result) {
-    write_handle.abort();
-    std::lock_guard stats_lock(_stats_mutex);
-    ++_stats.failed;
-    return;
-  }
-
-  // Close/commit
-  auto close_result = write_handle.close_sync();
-  if (!close_result) {
+    ++_stats.completed;
+  } catch (...) {
+    // Count the item as failed and drop it like any failed transform.  Erase
+    // the token only if it is still this instance's: the write phase runs
+    // after the token was already erased, and a later same-id instance may
+    // hold a fresh one.
+    {
+      std::lock_guard lock(_active_work_mutex);
+      auto it = _active_work.find(item.id);
+      if (it != _active_work.end() && it->second == cancelled) {
+        _active_work.erase(it);
+      }
+    }
     std::lock_guard stats_lock(_stats_mutex);
     ++_stats.failed;
-    return;
   }
-
-  std::lock_guard stats_lock(_stats_mutex);
-  ++_stats.completed;
 }
 
 void OptimizationEngine::monitoring_loop() {

@@ -7,6 +7,7 @@
 #include <cstring>
 #include <filesystem>
 #include <latch>
+#include <stdexcept>
 #include <thread>
 
 #include "cyclone/cache.hpp"
@@ -171,6 +172,67 @@ class CountingBlockingPlugin : public OptimizationPlugin {
   std::atomic<int> entries{0};
   std::atomic<int> cancel_calls{0};
   std::atomic<bool> released{false};
+};
+
+// Plugin whose transform() throws (for the exception-guard regression test).
+class TransformThrowingPlugin : public OptimizationPlugin {
+ public:
+  [[nodiscard]] PluginInfo info() const override {
+    return {"transform-throwing", "1.0.0", 104};
+  }
+
+  OptimizationPlan plan_optimization(const CacheKey & /*key*/,
+                                     std::span<const std::byte> /*header*/,
+                                     uint64_t /*content_length*/,
+                                     AlternateId written_alternate,
+                                     uint32_t /*hit_count*/) override {
+    OptimizationPlan plan;
+    if (written_alternate == AlternateId::Original) {
+      plan.add(AlternateId::Gzip, 5, true, 1_KB);
+    }
+    return plan;
+  }
+
+  std::expected<TransformResult, CacheError> transform(
+      AlternateId /*target_alternate*/,
+      const OptimizationContext & /*ctx*/) override {
+    attempts.fetch_add(1, std::memory_order_acq_rel);
+    throw std::runtime_error("transform failure");
+  }
+
+  void on_cancelled(const CacheKey & /*key*/, AlternateId /*target*/) override {
+  }
+
+  std::atomic<int> attempts{0};
+};
+
+// Plugin whose plan_optimization() throws on the caller's thread (for the
+// exception-guard regression test).
+class PlanThrowingPlugin : public OptimizationPlugin {
+ public:
+  [[nodiscard]] PluginInfo info() const override {
+    return {"plan-throwing", "1.0.0", 105};
+  }
+
+  OptimizationPlan plan_optimization(const CacheKey & /*key*/,
+                                     std::span<const std::byte> /*header*/,
+                                     uint64_t /*content_length*/,
+                                     AlternateId /*written_alternate*/,
+                                     uint32_t /*hit_count*/) override {
+    attempts.fetch_add(1, std::memory_order_acq_rel);
+    throw std::runtime_error("planning failure");
+  }
+
+  std::expected<TransformResult, CacheError> transform(
+      AlternateId /*target_alternate*/,
+      const OptimizationContext & /*ctx*/) override {
+    return std::unexpected(CacheError::TransformFailed);
+  }
+
+  void on_cancelled(const CacheKey & /*key*/, AlternateId /*target*/) override {
+  }
+
+  std::atomic<int> attempts{0};
 };
 
 std::string temp_cache_path() {
@@ -761,4 +823,109 @@ TEST_CASE("OptimizationEngine refuses duplicate in-flight work items",
 
   REQUIRE(entries_while_running == 1);
   REQUIRE(reran);
+}
+
+// Regression: an exception escaping a plugin's transform() propagated out of
+// the pool's worker loop and terminated the process.  The engine must guard
+// the call, record the failure, and keep the worker alive for later work.
+TEST_CASE("OptimizationEngine survives a throwing plugin transform",
+          "[optimization][integration][regression]") {
+  auto cache_path = temp_cache_path();
+
+  CacheConfig config;
+  config.optimization_config.set_enabled(true)
+      .set_min_threads(1)
+      .set_min_hits_before_optimize(0);
+
+  auto cache_result = Cache::create(config);
+  REQUIRE(cache_result.has_value());
+  auto &cache = *cache_result;
+
+  REQUIRE(cache->add_volume(cache_path + "/vol1", 10_MB).has_value());
+  REQUIRE(cache->start().has_value());
+
+  auto *engine = cache->optimization_engine();
+  REQUIRE(engine != nullptr);
+  auto plugin = std::make_shared<TransformThrowingPlugin>();
+  engine->register_plugin(plugin);
+
+  auto trigger = [&](const char *url) {
+    auto key = CacheKey::from_url(url);
+    std::vector<std::byte> content(100, std::byte{0x42});
+    auto write_result = cache->write_sync(key, content.size());
+    REQUIRE(write_result.has_value());
+    REQUIRE(write_result->write_sync(content).has_value());
+    REQUIRE(write_result->close_sync().has_value());
+    std::vector<std::byte> header = {std::byte{0x01}};
+    engine->on_write_complete(key, header, content.size(),
+                              AlternateId::Original, 10);
+  };
+
+  trigger("http://test.com/throw-1");
+
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (plugin->attempts.load(std::memory_order_acquire) < 1 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  REQUIRE(plugin->attempts.load(std::memory_order_acquire) >= 1);
+
+  // The failure is recorded and the engine and its worker stay alive.
+  deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (engine->stats().failed < 1 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  auto stats = engine->stats();
+  REQUIRE(stats.failed >= 1);
+  REQUIRE(engine->is_running());
+  REQUIRE(stats.pool_stats.current_threads >= 1);
+
+  // Later work is still processed (and also fails) on the surviving worker.
+  trigger("http://test.com/throw-2");
+  deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (plugin->attempts.load(std::memory_order_acquire) < 2 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  REQUIRE(plugin->attempts.load(std::memory_order_acquire) >= 2);
+
+  cache->stop();
+  cleanup_temp(cache_path);
+}
+
+// Regression: plan_optimization() runs on the embedder's own thread inside
+// on_write_complete(), so a throwing plugin used to fault the caller's write
+// path.  The engine must guard the call and record the failure.
+TEST_CASE("OptimizationEngine guards exceptions from plugin planning",
+          "[optimization][integration][regression]") {
+  auto cache_path = temp_cache_path();
+
+  CacheConfig config;
+  config.optimization_config.set_enabled(true)
+      .set_min_threads(1)
+      .set_min_hits_before_optimize(0);
+
+  auto cache_result = Cache::create(config);
+  REQUIRE(cache_result.has_value());
+  auto &cache = *cache_result;
+
+  REQUIRE(cache->add_volume(cache_path + "/vol1", 10_MB).has_value());
+  REQUIRE(cache->start().has_value());
+
+  auto *engine = cache->optimization_engine();
+  REQUIRE(engine != nullptr);
+  auto plugin = std::make_shared<PlanThrowingPlugin>();
+  engine->register_plugin(plugin);
+
+  auto key = CacheKey::from_url("http://test.com/plan-throws");
+  std::vector<std::byte> header = {std::byte{0x01}};
+  engine->on_write_complete(key, header, 100, AlternateId::Original, 10);
+
+  REQUIRE(plugin->attempts.load(std::memory_order_acquire) == 1);
+  REQUIRE(engine->stats().failed >= 1);
+  REQUIRE(engine->is_running());
+
+  cache->stop();
+  cleanup_temp(cache_path);
 }

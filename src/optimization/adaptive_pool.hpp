@@ -22,6 +22,7 @@ struct ThreadPoolStats {
   size_t active_threads = 0;
   uint64_t tasks_started = 0;
   uint64_t tasks_completed = 0;
+  uint64_t tasks_failed = 0;  // Tasks that threw an exception
   uint64_t scale_up_count = 0;
   uint64_t scale_down_count = 0;
 };

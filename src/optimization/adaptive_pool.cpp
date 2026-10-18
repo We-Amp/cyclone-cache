@@ -243,12 +243,18 @@ void AdaptiveThreadPool::worker_loop(size_t /*worker_id*/) {
       ++_stats.tasks_started;
     }
 
-    task();
-
-    {
+    try {
+      task();
       std::lock_guard stats_lock(_stats_mutex);
       ++_stats.tasks_completed;
+    } catch (...) {
+      // Tasks run embedder-supplied code (plugin transforms); an exception
+      // escaping worker_loop would terminate the host process.  Record the
+      // failure and keep serving later tasks.
+      std::lock_guard stats_lock(_stats_mutex);
+      ++_stats.tasks_failed;
     }
+
     _active_count.fetch_sub(1, std::memory_order_relaxed);
   }
 
