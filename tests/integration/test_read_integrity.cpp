@@ -409,4 +409,32 @@ TEST_CASE(
   REQUIRE(rh.has_value());
   REQUIRE(same_bytes(rh->content(), content));
 }
+TEST_CASE("Read integrity: no cached CRC verdict survives a close and reopen",
+          "[integrity][crc_cache]") {
+  // Multi-process mode keeps the directory on disk, so the same Volume
+  // objects find the document again at the same offset after stop/start.
+  CacheConfig config = integrity_config();
+  config.multi_process_config.enabled = true;
+  config.multi_process_config.process_index = 0;
+  config.multi_process_config.total_processes = 1;
+  OpenCache oc(config);
+  Cache &cache = *oc.cache;
+  const CacheKey key("integrity-reopen");
+  const auto content = make_content(6, 8192);
+  REQUIRE(write_entry(cache, key, content));
+  // Verified once and cached by this Volume.
+  const uint64_t doc = document_offset(cache, key, content);
+
+  cache.stop();
+  // While closed, the payload changes under an unchanged header.
+  const std::array<std::byte, 1> flipped = {content[2000] ^ std::byte{0x11}};
+  pwrite_bytes(oc.file, doc + Document::kHeaderSize + 2000, flipped);
+  REQUIRE(cache.start().has_value());
+
+  auto rh = cache.read_sync(key);
+  CHECK_FALSE(rh.has_value());
+  if (rh.has_value()) {
+    CHECK(same_bytes(rh->content(), content));
+  }
+}
 #endif  // !_WIN32

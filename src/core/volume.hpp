@@ -2268,6 +2268,15 @@ class Volume : public std::enable_shared_from_this<Volume> {
         token, std::memory_order_relaxed);
     t_checksum_revalidate_countdown = kChecksumRevalidateInterval;
   }
+  // Drop every cached verdict.  Called whenever the stripes and directory
+  // are torn down or rebuilt (open, close, reset): a verdict describes an
+  // incarnation this Volume read through its current mapping, and must not
+  // vouch for whatever the same offsets hold after a reopen or a reset.
+  void clear_checksum_cache() noexcept {
+    for (auto &slot : *_checksum_cache) {
+      slot.store(0, std::memory_order_relaxed);
+    }
+  }
   // A CRC pass over this incarnation failed: drop its cached verdict (if the
   // slot still holds it), so the damaged bytes are not vouched for again.
   void forget_checksum_validated(uint64_t offset, uint64_t token) {

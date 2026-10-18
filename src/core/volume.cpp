@@ -1725,6 +1725,7 @@ std::expected<void, CacheError> Volume::open() {
     return make_unexpected(CacheError::InvalidArgument);
   }
   _teardown.store(false, std::memory_order_seq_cst);  // (Re)opening.
+  clear_checksum_cache();  // no verdict from an earlier open carries over
 
   // Two-stage open to prevent TOCTOU race when multiple processes initialize
   // the same volume file concurrently.  O_EXCL ensures only one process
@@ -2157,6 +2158,7 @@ void Volume::close() {
   wait_for_handle_calls();
   _stripes.clear();
   _mapped_file.reset();
+  clear_checksum_cache();
   // After the stripes (nothing can take the write lock any more), before the
   // fd (Windows registers on it).
   _writer_liveness.detach();
@@ -2245,8 +2247,10 @@ std::expected<void, CacheError> Volume::reset() {
     return make_unexpected(CacheError::InvalidArgument);
   }
 
-  // Clear stripes (they'll be reinitialized by init_stripes)
+  // Clear stripes (they'll be reinitialized by init_stripes), and with them
+  // every cached CRC verdict.
   _stripes.clear();
+  clear_checksum_cache();
 
   // Zero-fill EVERY stripe's directory region.
   //
