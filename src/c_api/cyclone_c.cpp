@@ -16,6 +16,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(__GLIBCXX__) && __has_include(<cxxabi.h>)
+#include <cxxabi.h>
+#endif
+
 #include "c_error_map.hpp"
 #include "cyclone/cache.hpp"
 
@@ -35,20 +39,38 @@ static Tier to_cpp_tier(CycloneTier tier) {
 // an exception cannot cross: one would end the process.  Each body runs
 // through guarded(), which turns any exception (in practice std::bad_alloc)
 // into `on_exception`.
+//
+// Thread cancellation on glibc is a forced unwind (abi::__forced_unwind),
+// which must not be swallowed: the runtime aborts the process if it is.  It
+// is rethrown, which is also why the barriers are not noexcept.
+#if defined(__GLIBCXX__) && __has_include(<cxxabi.h>)
+#define CYCLONE_C_API_FORCED_UNWIND 1
+#else
+#define CYCLONE_C_API_FORCED_UNWIND 0
+#endif
+
 template <typename Fn>
 static std::invoke_result_t<Fn> guarded(std::invoke_result_t<Fn> on_exception,
-                                        Fn &&fn) noexcept {
+                                        Fn &&fn) {
   try {
     return std::forward<Fn>(fn)();
+#if CYCLONE_C_API_FORCED_UNWIND
+  } catch (abi::__forced_unwind &) {
+    throw;
+#endif
   } catch (...) {
     return on_exception;
   }
 }
 
 template <typename Fn>
-static void guarded_void(Fn &&fn) noexcept {
+static void guarded_void(Fn &&fn) {
   try {
     std::forward<Fn>(fn)();
+#if CYCLONE_C_API_FORCED_UNWIND
+  } catch (abi::__forced_unwind &) {
+    throw;
+#endif
   } catch (...) {  // NOLINT(bugprone-empty-catch): nothing to report to
   }
 }

@@ -17,6 +17,10 @@
 #include <thread>
 #include <vector>
 
+#if defined(__linux__)
+#include <pthread.h>
+#endif
+
 #include "c_api/c_error_map.hpp"
 #include "cyclone/config.hpp"
 #include "cyclone/cyclone_c.h"
@@ -1974,3 +1978,37 @@ TEST_CASE("C API: a throwing read_cb does not leave a write-back pending",
   }
   destroyer.join();
 }
+
+#if defined(__GLIBC__) && defined(__GLIBCXX__)
+TEST_CASE("C API: a thread cancelled inside drain_pending unwinds cleanly",
+          "[c_api][shutdown]") {
+  // glibc implements thread cancellation as a forced unwind.  The bridge's
+  // exception barrier must let it pass: swallowing it aborts the process.
+  // drain_pending() waits on a condition variable, a cancellation point.
+  TempCacheDir tmp;
+  CycloneCacheHandle *cache = make_async_cache(tmp.path());
+  ParkedFetch parked;
+  REQUIRE(cyclone_cache_set_miss_handler(cache, park_fetch, &parked) ==
+          CYCLONE_OK);
+  CountingWaiter waiter;
+  REQUIRE(cyclone_cache_read_async(cache, "held", 4, count_read, &waiter) ==
+          CYCLONE_OK);
+  REQUIRE(parked.done_cb.load() != nullptr);
+
+  std::atomic<bool> returned{false};
+  std::thread drainer([&] {
+    cyclone_cache_drain_pending(cache, 60000);
+    returned.store(true);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  REQUIRE(pthread_cancel(drainer.native_handle()) == 0);
+  drainer.join();
+  CHECK_FALSE(returned.load());
+
+  // The bridge lock was released by the unwind: the fetch completes and the
+  // cache shuts down normally.
+  parked.done_cb.load()(parked.done_ud.load(), "value", 5, CYCLONE_OK);
+  CHECK(waiter.calls.load() == 1);
+  cyclone_cache_destroy(cache);
+}
+#endif
