@@ -850,6 +850,11 @@ class MmapDirectory {
   static inline std::atomic<uint64_t> s_bucket_recoveries_for_test{0};
   static inline std::atomic<uint64_t> s_phase_lock_recoveries_for_test{0};
 
+  /// Called by init() with the region once everything but the publish of
+  /// the header's magic is written, so a test can open the region there.
+  /// Set and cleared while no init() runs.
+  static inline void (*s_init_before_publish_for_test)(
+      std::span<std::byte> region) = nullptr;
   /// Take / release the phase lock as insert() does, so a test can park a
   /// live holder inside it.
   [[nodiscard]] PhaseLockToken acquire_phase_lock_for_test() {

@@ -2,6 +2,7 @@
 // Copyright (c) 2024-2026 We-Amp B.V.
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -100,6 +101,43 @@ TEST_CASE("MmapDirectory init fails with insufficient region",
   auto dir = MmapDirectory::init(std::span<std::byte>(region), kBuckets);
 
   REQUIRE_FALSE(dir.has_value());
+}
+
+namespace {
+
+// What an open() of the region found while init() was still writing it.
+bool g_opened_mid_init = false;
+
+void open_mid_init(std::span<std::byte> region) {
+  g_opened_mid_init = MmapDirectory::open(region).has_value();
+}
+
+}  // namespace
+
+TEST_CASE("MmapDirectory init publishes the header magic last",
+          "[mmap_directory]") {
+  // An open() that lands while init() is still writing (a peer, or the
+  // next opener after a crash in init) must not accept the region: its
+  // bucket versions and entries are not all written yet.  That holds over
+  // recycled memory too, which starts with an old directory's valid magic.
+  constexpr size_t kBuckets = 256;
+  std::vector<std::byte> region(MmapDirectory::required_size(kBuckets),
+                                std::byte{0});
+  const bool recycled = GENERATE(false, true);
+  CAPTURE(recycled);
+  if (recycled) {
+    REQUIRE(MmapDirectory::init(std::span<std::byte>(region), kBuckets));
+  }
+
+  g_opened_mid_init = true;
+  MmapDirectory::s_init_before_publish_for_test = &open_mid_init;
+  auto dir = MmapDirectory::init(std::span<std::byte>(region), kBuckets);
+  MmapDirectory::s_init_before_publish_for_test = nullptr;
+
+  REQUIRE(dir.has_value());
+  CHECK_FALSE(g_opened_mid_init);
+  // Published once init() returned.
+  CHECK(MmapDirectory::open(std::span<std::byte>(region)).has_value());
 }
 
 TEST_CASE("MmapDirectory open existing directory", "[mmap_directory]") {

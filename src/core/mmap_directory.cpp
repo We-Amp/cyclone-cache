@@ -857,9 +857,15 @@ std::optional<MmapDirectory> MmapDirectory::init(std::span<std::byte> region,
   const size_t entries_off = entries_offset(num_buckets);
   const size_t retention_off = retention_offset(num_buckets);
 
-  // Initialize header
+  // Initialize header.  The magic is what open() validates, so it is
+  // cleared first and published last, after everything else is written: an
+  // open() that lands in between (a peer, or the next opener after a crash
+  // in here) rejects the region instead of accepting unwritten bucket
+  // versions and entries -- over recycled memory too, which starts with an
+  // old directory's valid magic.
   auto *header = reinterpret_cast<Header *>(region.data());
-  header->magic = kMagic;
+  std::atomic_ref<uint32_t>(header->magic).store(0, std::memory_order_relaxed);
+  std::atomic_thread_fence(std::memory_order_release);
   header->version = kVersion;
   header->reserved = 0;
   header->num_buckets = static_cast<uint32_t>(num_buckets);
@@ -897,8 +903,16 @@ std::optional<MmapDirectory> MmapDirectory::init(std::span<std::byte> region,
       reinterpret_cast<RetentionRegion *>(region.data() + retention_off);
   std::memset(retention, 0, sizeof(RetentionRegion));
 
-  // Ensure all writes are visible
+#ifdef CYCLONE_TEST_SEAMS
+  if (s_init_before_publish_for_test != nullptr) {
+    s_init_before_publish_for_test(region);
+  }
+#endif
+
+  // Ensure all writes are visible before the magic that validates them.
   std::atomic_thread_fence(std::memory_order_release);
+  std::atomic_ref<uint32_t>(header->magic)
+      .store(kMagic, std::memory_order_release);
 
   return MmapDirectory(header, versions, entries, retention, num_buckets);
 }
@@ -910,8 +924,9 @@ std::optional<MmapDirectory> MmapDirectory::open(std::span<std::byte> region) {
 
   auto *header = reinterpret_cast<Header *>(region.data());
 
-  // Validate magic and version
-  if (header->magic != kMagic) {
+  // Validate magic and version.  Acquire: pairs with init()'s publish.
+  if (std::atomic_ref<uint32_t>(header->magic)
+          .load(std::memory_order_acquire) != kMagic) {
     return std::nullopt;
   }
   if (header->version != kVersion) {
