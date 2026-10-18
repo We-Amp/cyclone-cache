@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -189,7 +190,10 @@ struct OptimizationConfig {
     return *this;
   }
   OptimizationConfig &set_scale_check_interval(std::chrono::milliseconds val) {
-    scale_check_interval = val;
+    // A non-positive interval would spin the monitoring thread in a
+    // sleep_for(0) loop; clamp to a positive minimum.  is_valid() still
+    // rejects a non-positive value set through the public field.
+    scale_check_interval = std::max(val, std::chrono::milliseconds{1});
     return *this;
   }
   OptimizationConfig &set_max_cpu_usage(double val) {
@@ -257,6 +261,28 @@ struct OptimizationConfig {
       return hw > 2 ? hw / 2 : 1;
     }
     return max_threads;
+  }
+
+  // Validation, checked by OptimizationEngine::start() (Cache::start()
+  // reports a failure as InvalidConfiguration).  A non-positive
+  // scale_check_interval would spin the monitoring thread in a
+  // sleep_for(0) loop, and min_threads above the effective maximum breaks
+  // the pool's clamping.  With load shedding enabled, a non-positive (or
+  // NaN) baseline cannot be measured against; without shedding such a
+  // baseline stays allowed and is treated as "no contribution" (see
+  // LoadMonitor::update_metrics()).
+  [[nodiscard]] bool is_valid() const {
+    if (scale_check_interval.count() <= 0) {
+      return false;
+    }
+    if (min_threads > effective_max_threads()) {
+      return false;
+    }
+    if (enable_load_shedding && (!(baseline_ops_per_sec > 0.0) ||
+                                 !(baseline_bytes_per_sec > 0.0))) {
+      return false;
+    }
+    return true;
   }
 };
 

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <expected>
 #include <memory>
 #include <shared_mutex>
 #include <thread>
@@ -11,6 +12,7 @@
 
 #include "adaptive_pool.hpp"
 #include "cyclone/config.hpp"
+#include "cyclone/error.hpp"
 #include "cyclone/plugin/optimization.hpp"
 #include "load_monitor.hpp"
 #include "work_queue.hpp"
@@ -43,7 +45,9 @@ class OptimizationEngine : public TaskProvider {
   OptimizationEngine &operator=(const OptimizationEngine &) = delete;
 
   // Lifecycle
-  void start();
+  // start() refuses an invalid config (see OptimizationConfig::is_valid())
+  // with InvalidConfiguration instead of running degraded.
+  std::expected<void, CacheError> start();
   void stop();
 
   // Two-phase stop. request_stop() quiesces intake — stops the

@@ -46,13 +46,20 @@ OptimizationEngine::OptimizationEngine(const OptimizationConfig &config,
 
 OptimizationEngine::~OptimizationEngine() { stop(); }
 
-void OptimizationEngine::start() {
+std::expected<void, CacheError> OptimizationEngine::start() {
   if (!_config.enabled) {
-    return;
+    return {};
+  }
+
+  // Refuse a config that would run degraded: a non-positive
+  // scale_check_interval spins the monitoring thread in a sleep_for(0)
+  // loop, and load shedding cannot measure against a missing baseline.
+  if (!_config.is_valid()) {
+    return std::unexpected(CacheError::InvalidConfiguration);
   }
 
   if (_running.exchange(true, std::memory_order_acq_rel)) {
-    return;  // Already running
+    return {};  // Already running
   }
 
   // Before any worker exists: their cache work is fork-gated (see
@@ -71,6 +78,7 @@ void OptimizationEngine::start() {
 
   // Start background monitoring thread
   _monitoring_thread = std::thread([this] { monitoring_loop(); });
+  return {};
 }
 
 void OptimizationEngine::stop() {

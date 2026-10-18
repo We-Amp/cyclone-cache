@@ -613,6 +613,14 @@ std::expected<void, CacheError> Cache::start() {
     }
   }
 
+  // Validate the optimization engine's config up front as well, before any
+  // volume is opened or background thread started (OptimizationEngine::
+  // start() re-checks it; see OptimizationConfig::is_valid()).
+  if (_impl->optimization_engine &&
+      !_impl->config.optimization_config.is_valid()) {
+    return make_unexpected(CacheError::InvalidConfiguration);
+  }
+
   for (auto &volume : _impl->volumes) {
     auto result = volume->open();
     if (!result) {
@@ -736,7 +744,12 @@ std::expected<void, CacheError> Cache::start() {
 
   // Start optimization engine
   if (_impl->optimization_engine) {
-    _impl->optimization_engine->start();
+    // The config was validated above, so this cannot fail; propagate anyway
+    // rather than leave the cache half-started if it ever does.
+    auto engine_started = _impl->optimization_engine->start();
+    if (!engine_started) {
+      return engine_started;
+    }
   }
 
 #ifndef _WIN32

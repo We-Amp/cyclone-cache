@@ -357,6 +357,64 @@ TEST_CASE("OptimizationEngine disabled when not enabled",
   cache->stop();
 }
 
+// Regression: a zero scale_check_interval used to spin the monitoring
+// thread at 100% CPU in a sleep_for(0) loop, and load shedding with a zero
+// baseline could never be measured.  start() must refuse such a config with
+// a clear error instead of degrading the host.
+TEST_CASE("OptimizationEngine refuses an invalid config at start",
+          "[optimization][integration][regression]") {
+  TempCacheDir temp_dir("opt");
+  const std::string cache_path = temp_dir.dir().string();
+
+  auto start_with = [&](OptimizationConfig opt) {
+    CacheConfig config;
+    config.optimization_config = std::move(opt);
+    auto cache_result = Cache::create(config);
+    REQUIRE(cache_result.has_value());
+    auto &cache = *cache_result;
+    REQUIRE(cache->add_volume(cache_path + "/vol1", 10_MB).has_value());
+    return cache->start();
+  };
+
+  SECTION("zero scale check interval") {
+    OptimizationConfig opt;
+    opt.set_enabled(true).set_min_threads(1);
+    // Field assignment bypasses the clamped setter.
+    opt.scale_check_interval = std::chrono::milliseconds(0);
+
+    auto start_result = start_with(std::move(opt));
+    REQUIRE_FALSE(start_result.has_value());
+    REQUIRE(start_result.error() == CacheError::InvalidConfiguration);
+  }
+
+  SECTION("load shedding with a zero baseline") {
+    OptimizationConfig opt;
+    opt.set_enabled(true).set_min_threads(1).set_enable_load_shedding(true);
+    opt.baseline_ops_per_sec = 0.0;
+
+    auto start_result = start_with(std::move(opt));
+    REQUIRE_FALSE(start_result.has_value());
+    REQUIRE(start_result.error() == CacheError::InvalidConfiguration);
+  }
+
+  SECTION("min_threads above the effective maximum") {
+    OptimizationConfig opt;
+    opt.set_enabled(true).set_min_threads(4).set_max_threads(2);
+
+    auto start_result = start_with(std::move(opt));
+    REQUIRE_FALSE(start_result.has_value());
+    REQUIRE(start_result.error() == CacheError::InvalidConfiguration);
+  }
+
+  SECTION("a valid config still starts") {
+    OptimizationConfig opt;
+    opt.set_enabled(true).set_min_threads(1);
+
+    auto start_result = start_with(std::move(opt));
+    REQUIRE(start_result.has_value());
+  }
+}
+
 TEST_CASE("OptimizationEngine plugin registration",
           "[optimization][integration]") {
   TempCacheDir temp_dir("opt");
