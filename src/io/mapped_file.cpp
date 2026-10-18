@@ -99,10 +99,11 @@ class PosixMappedFile : public MappedFile {
 
     struct stat st;
     if (fstat(_fd, &st) < 0) {
+      const int saved_errno = errno;
       ::close(_fd);
       _fd = -1;
       return make_unexpected(
-          std::make_error_code(static_cast<std::errc>(errno)));
+          std::make_error_code(static_cast<std::errc>(saved_errno)));
     }
 
     _file_size = st.st_size;
@@ -504,10 +505,11 @@ class Win32MappedFile : public MappedFile {
 
     LARGE_INTEGER size;
     if (!GetFileSizeEx(_file_handle, &size)) {
+      const DWORD saved_error = GetLastError();
       CloseHandle(_file_handle);
       _file_handle = INVALID_HANDLE_VALUE;
       return make_unexpected(
-          std::error_code(GetLastError(), std::system_category()));
+          std::error_code(saved_error, std::system_category()));
     }
 
     _file_size = size.QuadPart;
