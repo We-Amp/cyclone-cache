@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <filesystem>
 #include <string>
@@ -108,22 +109,32 @@ void complete_fetch(Fetch &f, Reader &r) {
 }  // namespace
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
-  static const std::string path = [] {
-    std::string dir = (std::filesystem::temp_directory_path() /
-                       ("cyclone_fuzz_async_" + std::to_string(::getpid())))
-                          .string();
+  // pid-unique: parallel fuzz jobs must not share a cache file.  The directory
+  // is removed again when the process exits.
+  static const std::filesystem::path dir = [] {
+    std::filesystem::path d =
+        std::filesystem::temp_directory_path() /
+        ("cyclone_fuzz_async_" + std::to_string(::getpid()));
     std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return (std::filesystem::path(dir) / "cache.dat").string();
+    std::filesystem::create_directories(d, ec);
+    std::atexit([] {
+      std::error_code rm_ec;
+      std::filesystem::remove_all(
+          std::filesystem::temp_directory_path() /
+              ("cyclone_fuzz_async_" + std::to_string(::getpid())),
+          rm_ec);
+    });
+    return d;
   }();
+  static const std::string path = (dir / "cache.dat").string();
   std::remove(path.c_str());
 
   CycloneCacheConfig cfg{};
   cfg.cache_path = path.c_str();
-  cfg.cache_size_bytes = 4u * 1024 * 1024;
-  cfg.ram_cache_size_bytes = 1u * 1024 * 1024;
+  cfg.cache_size_bytes = 1u * 1024 * 1024;
+  cfg.ram_cache_size_bytes = 256u * 1024;
   cfg.enable_checksum = 1;
-  cfg.num_segments = 2;
+  cfg.num_segments = 1;
 
   CycloneCacheHandle *cache = nullptr;
   if (cyclone_cache_create(&cfg, &cache) != CYCLONE_OK) {

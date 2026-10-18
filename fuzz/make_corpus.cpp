@@ -212,9 +212,8 @@ void gen_http_seeds(const fs::path &root) {
   std::string headers =
       "Accept-Encoding: gzip, br\r\nAccept: text/html;q=0.8\r\n";
   std::vector<std::byte> input;
-  size_t split = blob.size();
-  input.push_back(static_cast<std::byte>((split >> 8) & 0xFF));
-  input.push_back(static_cast<std::byte>(split & 0xFF));
+  input.push_back(static_cast<std::byte>(blob.size() & 0xFF));
+  input.push_back(static_cast<std::byte>(0));
   input.insert(input.end(), blob.begin(), blob.end());
   for (char c : headers) input.push_back(static_cast<std::byte>(c));
   write_seed(root / "fuzz_http_alternate", "vary_accept.bin", input);

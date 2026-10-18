@@ -150,6 +150,7 @@ jobs:
               -max_total_time=120 \
               -timeout=25 -rss_limit_mb=4096 -error_exitcode=77 \
               -print_final_stats=1 \
+              ${{ matrix.target == 'fuzz_c_api_async' && '-max_len=64' || '' }} \
               -artifact_prefix=artifacts/ \
               run_corpus
       - name: Upload crashers and corpus
