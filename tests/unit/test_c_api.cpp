@@ -292,6 +292,79 @@ TEST_CASE("C API: A waiter observes the fetched value already stored",
   cyclone_cache_destroy(cache);
 }
 
+size_t cyclone_test_completed_context_count(CycloneCacheHandle *cache);
+
+TEST_CASE("C API: Completed miss contexts stay bounded and are reclaimed",
+          "[c_api][miss_callback]") {
+  TempCacheDir tmp;
+  std::string cache_path = tmp.path();
+  CycloneCacheConfig config{};
+  config.cache_path = cache_path.c_str();
+  config.cache_size_bytes = static_cast<uint64_t>(10 * 1024 * 1024);
+  config.ram_cache_size_bytes = static_cast<uint64_t>(1 * 1024 * 1024);
+  config.enable_checksum = 1;
+  config.num_segments = 2;
+
+  CycloneCacheHandle *cache = nullptr;
+  REQUIRE(cyclone_cache_create(&config, &cache) == CYCLONE_OK);
+
+  struct Saved {
+    CycloneMissDoneCallback first_cb = nullptr;
+    void *first_ud = nullptr;
+    CycloneMissDoneCallback held_cb = nullptr;
+    void *held_ud = nullptr;
+  } saved;
+
+  auto miss_handler = [](const char *key, size_t key_len, void *ud,
+                         CycloneMissDoneCallback done_cb, void *done_ud) {
+    auto *s = static_cast<Saved *>(ud);
+    std::string k(key, key_len);
+    if (k == "held") {
+      // Left outstanding on purpose.
+      s->held_cb = done_cb;
+      s->held_ud = done_ud;
+      return;
+    }
+    if (k == "stray") {
+      s->first_cb = done_cb;
+      s->first_ud = done_ud;
+    }
+    const char value[] = "v";
+    done_cb(done_ud, value, 1, CYCLONE_OK);
+  };
+  REQUIRE(cyclone_cache_set_miss_handler(cache, miss_handler, &saved) ==
+          CYCLONE_OK);
+
+  auto noop = [](void *, const char *, size_t, CycloneError) {};
+  auto miss = [&](const std::string &key) {
+    REQUIRE(cyclone_cache_read_async(cache, key.data(), key.size(), noop,
+                                     nullptr) == CYCLONE_OK);
+  };
+
+  // A completed miss is remembered, so a stray second completion of it
+  // lands on live memory and is ignored; the number remembered is capped.
+  miss("held");
+  miss("stray");
+  const char again[] = "again";
+  for (int i = 0; i < 3000; ++i) {
+    miss("many_misses_" + std::to_string(i));
+    REQUIRE(cyclone_test_completed_context_count(cache) <= 1024);
+    if (i == 100) {
+      // Still within the ring: ignored.
+      saved.first_cb(saved.first_ud, again, sizeof(again) - 1, CYCLONE_OK);
+    }
+  }
+  REQUIRE(cyclone_test_completed_context_count(cache) == 1024);
+
+  // The last outstanding fetch completes; draining releases the list.
+  const char value[] = "v";
+  saved.held_cb(saved.held_ud, value, 1, CYCLONE_OK);
+  REQUIRE(cyclone_cache_drain_pending(cache, 1000) == CYCLONE_OK);
+  REQUIRE(cyclone_test_completed_context_count(cache) == 0);
+
+  cyclone_cache_destroy(cache);
+}
+
 TEST_CASE("C API: Miss handler error propagation", "[c_api][miss_callback]") {
   TempCacheDir tmp;
   std::string cache_path = tmp.path();

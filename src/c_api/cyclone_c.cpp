@@ -3,6 +3,7 @@
 
 #include "cyclone/cyclone_c.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -95,10 +96,6 @@ struct MissDoneContext {
   std::atomic<bool> completed{false};  // Prevents double-completion
 };
 
-// completed_contexts is pruned when it exceeds this many entries, so it
-// holds at most one more; that capacity is reserved up front.
-constexpr size_t kMaxCompletedContexts = 128;
-
 // Shared ownership: `self` is the reference the application's handle stands
 // for, released by cyclone_cache_destroy(); every miss context with a fetch
 // outstanding holds another.  The memory is freed when the last one goes.
@@ -111,8 +108,23 @@ struct CycloneCacheHandle : std::enable_shared_from_this<CycloneCacheHandle> {
   std::mutex in_flight_mu;
   std::condition_variable in_flight_drained;
   std::unordered_map<std::string, InFlightEntry> in_flight;
-  std::vector<std::unique_ptr<MissDoneContext>>
-      completed_contexts;  // deferred cleanup
+  // Recently completed contexts, kept so a stray second done_cb (undefined
+  // behaviour per the header) lands on live memory.  A fixed ring: adding
+  // never allocates, and the oldest entry is freed once it is full.  Emptied
+  // by drain.  Guarded by in_flight_mu.
+  static constexpr size_t kMaxCompletedContexts = 1024;
+  std::array<std::unique_ptr<MissDoneContext>, kMaxCompletedContexts>
+      completed_contexts;
+  size_t completed_next = 0;
+  size_t completed_count = 0;
+
+  // Frees every remembered context.  Called by drain, once nothing is
+  // outstanding; the handle's destruction frees whatever remains.
+  void reclaim_completed_locked() {
+    for (auto &c : completed_contexts) c.reset();
+    completed_next = 0;
+    completed_count = 0;
+  }
   CycloneMissHandler miss_handler = nullptr;
   void *miss_handler_user_data = nullptr;
   std::atomic<bool> shutting_down{false};
@@ -196,7 +208,6 @@ static CycloneError cache_create_impl(const CycloneCacheConfig *config,
   }
 
   auto owner = std::make_shared<CycloneCacheHandle>();
-  owner->completed_contexts.reserve(kMaxCompletedContexts + 1);
   owner->cache = std::move(*cache_result);
   owner->max_in_flight = config->max_in_flight_requests > 0
                              ? config->max_in_flight_requests
@@ -494,9 +505,8 @@ static void miss_done_impl(MissDoneContext *ctx, const char *data,
   //
   // Nothing up to the waiter notification may throw: a failure there would
   // leave the waiters unanswered and the key in flight for good.  The key is
-  // therefore moved, not copied, out of ctx (ctx may be freed by a later
-  // completion once the lock is released), and completed_contexts never
-  // grows past the capacity reserved at create.
+  // therefore moved, not copied, out of ctx, and completed_contexts is a
+  // fixed ring that is filled without allocating.
   std::vector<std::pair<CycloneReadCallback, void *>> waiters;
   std::string key;
   bool will_write = (err == CYCLONE_OK && (data != nullptr) && data_len > 0);
@@ -508,19 +518,13 @@ static void miss_done_impl(MissDoneContext *ctx, const char *data,
       ch->in_flight.erase(it);
     }
     key = std::move(ctx->key);
-    // Bound completed_contexts: when it exceeds kMaxCompletedContexts
-    // entries, keep only the most recent 64.  Older contexts are safe to free:
-    // any racing double-done-cb on a previous miss would have already resolved.
-    if (ch->completed_contexts.size() > kMaxCompletedContexts) {
-      ch->completed_contexts.erase(
-          ch->completed_contexts.begin(),
-          ch->completed_contexts.begin() +
-              static_cast<ptrdiff_t>(ch->completed_contexts.size() - 64));
-    }
-    // Defer ctx deletion: move to completed list so a double done_cb
-    // call can still safely read the atomic completed flag.  Capacity for
-    // the bound above is reserved at create, so this never allocates.
-    ch->completed_contexts.emplace_back(ctx);
+    // Keep ctx alive for a while so an erroneous second done_cb call can
+    // still safely read the atomic completed flag.  The ring never allocates
+    // (nothing here can throw); a full ring frees its oldest entry.
+    if (!ch->completed_contexts[ch->completed_next]) ++ch->completed_count;
+    ch->completed_contexts[ch->completed_next].reset(ctx);
+    ch->completed_next =
+        (ch->completed_next + 1) % ch->completed_contexts.size();
     // After destroy the Cache is closed: answer the waiters, write nothing.
     if (ch->closed) {
       will_write = false;
@@ -737,6 +741,7 @@ static CycloneError drain_pending_impl(CycloneCacheHandle *cache,
   };
 
   if (is_idle()) {
+    cache->reclaim_completed_locked();
     return CYCLONE_OK;
   }
 
@@ -758,6 +763,7 @@ static CycloneError drain_pending_impl(CycloneCacheHandle *cache,
     return CYCLONE_TIMEOUT;
   }
 
+  if (is_idle()) cache->reclaim_completed_locked();
   return CYCLONE_OK;
 }
 
@@ -768,3 +774,10 @@ CycloneError cyclone_cache_drain_pending(CycloneCacheHandle *cache,
 }
 
 }  // extern "C"
+
+// Test hook (not part of the public header): number of completed miss
+// contexts currently remembered.
+size_t cyclone_test_completed_context_count(CycloneCacheHandle *cache) {
+  std::lock_guard<std::mutex> lock(cache->in_flight_mu);
+  return cache->completed_count;
+}
