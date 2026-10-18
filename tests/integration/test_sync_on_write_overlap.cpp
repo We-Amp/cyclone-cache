@@ -128,15 +128,15 @@ TEST_CASE(
   // Every commit landed and serves its bytes back (the flush still
   // completes before each directory insert).
   for (int i = 0; i < kDocs; ++i) {
-    auto rh = volume->read_sync(CacheKey("sync-write-seq-" + std::to_string(i)));
+    auto rh =
+        volume->read_sync(CacheKey("sync-write-seq-" + std::to_string(i)));
     REQUIRE(rh.has_value());
     REQUIRE(rh->content().size() == kDocBytes);
   }
   for (int t = 0; t < kThreads; ++t) {
     for (int i = 0; i < kPerThread; ++i) {
-      auto rh = volume->read_sync(CacheKey("sync-write-par-" +
-                                           std::to_string(t) + "-" +
-                                           std::to_string(i)));
+      auto rh = volume->read_sync(CacheKey(
+          "sync-write-par-" + std::to_string(t) + "-" + std::to_string(i)));
       REQUIRE(rh.has_value());
       REQUIRE(rh->content().size() == kDocBytes);
     }
