@@ -5940,7 +5940,7 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
     struct HeadCandidate {
       uint64_t rel;
       AdmitClass cls;
-      bool live;  // key matches AND stamp matches the class
+      bool live;        // key matches AND stamp matches the class
       uint16_t serial;  // the entry's fill serial
     };
     std::array<HeadCandidate, Directory::kEntriesPerBucket> heads{};
