@@ -962,4 +962,49 @@ TEST_CASE(
     cache->stop();
   }
 }
+
+// The selected alternate is mapped from its content length plus a fixed
+// allowance for the fixed header and the stored header bytes.  A document
+// whose header bytes exceed that allowance must still be read whole: the
+// mapping follows the document's own length, as read_sync does.
+TEST_CASE(
+    "Read integrity: an alternate whose header bytes exceed the map "
+    "allowance reads whole",
+    "[integrity][alternate]") {
+  for (const bool verify : {true, false}) {
+    CAPTURE(verify);
+    CacheConfig config = integrity_config();
+    config.verify_checksum_on_read = verify;
+    OpenCache oc(config);
+    Cache &cache = *oc.cache;
+
+    const CacheKey key("integrity-large-header-alt");
+    const auto header = make_content(7, size_t{96} * 1024);
+    const auto content = make_content(8, 4096);
+    {
+      auto wh =
+          cache.write_alternate_sync(key, AlternateId::Brotli, content.size());
+      REQUIRE(wh.has_value());
+      wh->set_header(header);
+      REQUIRE(wh->write_sync(content).has_value());
+      REQUIRE(wh->close_sync().has_value());
+    }
+
+    // read_sync resolves the same document whole.
+    {
+      auto rh = cache.read_sync(key);
+      REQUIRE(rh.has_value());
+      CHECK(same_bytes(rh->header(), header));
+      CHECK(same_bytes(rh->content(), content));
+    }
+
+    OnlyId want(AlternateId::Brotli);
+    AlternateSelectionContext ctx;
+    auto rh = cache.read_alternate_sync(key, want, ctx);
+    REQUIRE(rh.has_value());
+    CHECK(rh->content_length() == content.size());
+    CHECK(same_bytes(rh->header(), header));
+    CHECK(same_bytes(rh->content(), content));
+  }
+}
 #endif  // !_WIN32

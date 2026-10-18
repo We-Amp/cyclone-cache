@@ -7122,6 +7122,36 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
             result = make_unexpected(CacheError::Corrupted);
             return false;
           }
+          // The allowance above covers the fixed header and up to 64 KiB of
+          // header bytes; a document with more is longer than the mapping.
+          // Map it again at its own length, as read_sync does, bounded by
+          // the stripe.  Without this the payload is clamped to the short
+          // mapping: the checksum fails on every attempt, or, unverified,
+          // the header and content come back truncated.
+          if (selected_reader.document().len > map_size) {
+            const uint64_t doc_len = selected_reader.document().len;
+            _mapped_file->unmap_region(*selected_mapped);
+            if (doc_len > stripe->size) {
+              _mapped_file->unmap_region(*mapped);
+              result = make_unexpected(CacheError::Corrupted);
+              return false;
+            }
+            map_size = doc_len;
+            selected_mapped = _mapped_file->map_region(
+                selected_offset, map_size, MappedFile::MapMode::ReadOnly);
+            if (!selected_mapped) {
+              result = make_unexpected(CacheError::IoError);
+              _mapped_file->unmap_region(*mapped);
+              return false;
+            }
+            selected_reader = DocumentReader(*selected_mapped);
+            if (!selected_reader.is_valid()) {
+              _mapped_file->unmap_region(*selected_mapped);
+              _mapped_file->unmap_region(*mapped);
+              result = make_unexpected(CacheError::Corrupted);
+              return false;
+            }
+          }
           // Length or type fields that disagree: a miss, exactly as the chain
           // walk above and read_sync treat the same document.
           if (!selected_reader.is_servable()) {
