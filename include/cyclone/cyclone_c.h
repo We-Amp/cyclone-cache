@@ -51,12 +51,24 @@ enum {
                                       never renumber. */
   CYCLONE_OBJECT_TOO_LARGE,        /* Write content exceeds the configured
                                       max_object_size */
-  CYCLONE_BUSY /* Transient contention; retry.  From a read or exists: a
+  CYCLONE_BUSY, /* Transient contention; retry.  From a read or exists: a
                   writer held the key's directory bucket for the whole wait
                   budget (5 ms), so whether the key is present is UNKNOWN --
                   not a miss.  From a write, delete or hit-count update: a
                   contended or raced lock (previously reported as
                   CYCLONE_INTERNAL_ERROR). */
+
+  /* The codes below were previously reported as CYCLONE_INTERNAL_ERROR.  A
+     caller should treat a code it does not recognise as a failure. */
+
+  /* An operation gave up after its time budget. */
+  CYCLONE_TIMEOUT,
+  /* Multi-process mode: the write was refused because another process owns
+     the key's stripe.  Expected, not a failure: the owning process writes
+     the key. */
+  CYCLONE_NOT_OWNED,
+  /* The cache file was written in a format this library cannot open. */
+  CYCLONE_INCOMPATIBLE_VERSION
 };
 
 /* --------------------------------------------------------------------------
@@ -605,8 +617,9 @@ typedef void (*CycloneReadCallback)(void *, const char *, size_t, CycloneError);
  *     - When fetch completes: stores result, invokes read_cb for ALL waiters
  * - Cache miss + no miss handler: invokes read_cb with CYCLONE_NOT_FOUND,
  *   or with CYCLONE_BUSY when the read could not tell whether the key is
- *   present (see CYCLONE_BUSY).  With a miss handler set, that case takes
- *   the miss path like any other non-hit.
+ *   present (see CYCLONE_BUSY), or with CYCLONE_IO_ERROR / CYCLONE_CORRUPTED
+ *   when the stored entry could not be read.  With a miss handler set, those
+ *   cases take the miss path like any other non-hit.
  * - Cache shutting down: invokes read_cb with CYCLONE_NOT_INITIALIZED.
  */
 CycloneError cyclone_cache_read_async(CycloneCacheHandle *cache,

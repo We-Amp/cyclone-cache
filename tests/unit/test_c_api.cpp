@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2024-2026 We-Amp B.V.
 
+#include <algorithm>
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -14,6 +16,7 @@
 #include <thread>
 #include <vector>
 
+#include "c_api/c_error_map.hpp"
 #include "cyclone/config.hpp"
 #include "cyclone/cyclone_c.h"
 #include "support/temp_cache.hpp"
@@ -1629,5 +1632,115 @@ TEST_CASE("C API: an open read handle does not hold a disk borrow",
   cyclone_cache_read_close(rh);
   REQUIRE(cyclone_cache_stats(cache, &stats) == CYCLONE_OK);
   REQUIRE(stats.borrows_outstanding == 0);
+  cyclone_cache_destroy(cache);
+}
+
+// =============================================================================
+// Error mapping
+// =============================================================================
+
+TEST_CASE("C API: library errors map to distinct C codes", "[c_api][error]") {
+  using cyclone::CacheError;
+  using cyclone::c_api_detail::to_c_error;
+  // Routine outcomes must not surface as CYCLONE_INTERNAL_ERROR, which the
+  // header reserves for conditions that should not occur in normal use.
+  CHECK(to_c_error(CacheError::Success) == CYCLONE_OK);
+  CHECK(to_c_error(CacheError::NotFound) == CYCLONE_NOT_FOUND);
+  CHECK(to_c_error(CacheError::Exists) == CYCLONE_EXISTS);
+  CHECK(to_c_error(CacheError::NoSpace) == CYCLONE_NO_SPACE);
+  CHECK(to_c_error(CacheError::IoError) == CYCLONE_IO_ERROR);
+  CHECK(to_c_error(CacheError::Corrupted) == CYCLONE_CORRUPTED);
+  CHECK(to_c_error(CacheError::ChainCorrupted) == CYCLONE_CORRUPTED);
+  CHECK(to_c_error(CacheError::InvalidKey) == CYCLONE_INVALID_KEY);
+  CHECK(to_c_error(CacheError::InvalidArgument) == CYCLONE_INVALID_ARGUMENT);
+  CHECK(to_c_error(CacheError::InvalidConfiguration) ==
+        CYCLONE_INVALID_ARGUMENT);
+  CHECK(to_c_error(CacheError::NotInitialized) == CYCLONE_NOT_INITIALIZED);
+  CHECK(to_c_error(CacheError::Closed) == CYCLONE_NOT_INITIALIZED);
+  CHECK(to_c_error(CacheError::Busy) == CYCLONE_BUSY);
+  CHECK(to_c_error(CacheError::Timeout) == CYCLONE_TIMEOUT);
+  CHECK(to_c_error(CacheError::NotOwned) == CYCLONE_NOT_OWNED);
+  CHECK(to_c_error(CacheError::IncompatibleVersion) ==
+        CYCLONE_INCOMPATIBLE_VERSION);
+  CHECK(to_c_error(CacheError::AlternateNotFound) == CYCLONE_NOT_FOUND);
+  CHECK(to_c_error(CacheError::ResetRefusedLivePeer) ==
+        CYCLONE_RESET_REFUSED_LIVE_PEER);
+  CHECK(to_c_error(CacheError::ObjectTooLarge) == CYCLONE_OBJECT_TOO_LARGE);
+  CHECK(to_c_error(CacheError::InternalError) == CYCLONE_INTERNAL_ERROR);
+  // A value outside the enumeration still maps to the catch-all.
+  CHECK(to_c_error(static_cast<CacheError>(0xFF)) == CYCLONE_INTERNAL_ERROR);
+
+  // The appended codes keep the existing values and extend the tail.
+  STATIC_REQUIRE(CYCLONE_BUSY == 12);
+  STATIC_REQUIRE(CYCLONE_TIMEOUT == CYCLONE_BUSY + 1);
+  STATIC_REQUIRE(CYCLONE_NOT_OWNED == CYCLONE_TIMEOUT + 1);
+  STATIC_REQUIRE(CYCLONE_INCOMPATIBLE_VERSION == CYCLONE_NOT_OWNED + 1);
+}
+
+TEST_CASE("C API: read_async without a miss handler reports corruption",
+          "[c_api][miss_callback][error]") {
+  // A disk failure or a corrupted entry is not a clean miss: without a miss
+  // handler, read_async must report it as such, as the synchronous read
+  // does, rather than as CYCLONE_NOT_FOUND.
+  TempCacheDir tmp;
+  std::string cache_path = tmp.path();
+  CycloneCacheConfig config{};
+  config.cache_path = cache_path.c_str();
+  config.cache_size_bytes = static_cast<uint64_t>(10 * 1024 * 1024);
+  config.ram_cache_size_bytes = 0;  // disk only
+  config.enable_checksum = 1;
+  config.num_segments = 2;
+
+  CycloneCacheHandle *cache = nullptr;
+  REQUIRE(cyclone_cache_create(&config, &cache) == CYCLONE_OK);
+
+  const std::string key = "corrupt_me";
+  std::string data(8192, '\0');
+  for (size_t i = 0; i < data.size(); ++i) {
+    data[i] = static_cast<char>('a' + (i * 7 + i / 13) % 26);
+  }
+  REQUIRE(cyclone_cache_write(cache, key.data(), key.size(), data.data(),
+                              data.size()) == CYCLONE_OK);
+
+  // Flip one byte of the stored content in place.  The volume is a shared
+  // mapping of the file, so the change is visible to the next read.
+  bool flipped = false;
+  for (const auto &entry : std::filesystem::directory_iterator(tmp.dir())) {
+    if (!entry.is_regular_file()) continue;
+    std::FILE *f = std::fopen(entry.path().string().c_str(), "r+b");
+    REQUIRE(f != nullptr);
+    std::vector<char> file(static_cast<size_t>(entry.file_size()));
+    REQUIRE(std::fread(file.data(), 1, file.size(), f) == file.size());
+    auto it = std::search(file.begin(), file.end(), data.begin(), data.end());
+    if (it != file.end()) {
+      auto pos = static_cast<long>(it - file.begin()) + 100;
+      REQUIRE(std::fseek(f, pos, SEEK_SET) == 0);
+      char flipped_byte = static_cast<char>(data[100] ^ 0x5A);
+      REQUIRE(std::fwrite(&flipped_byte, 1, 1, f) == 1);
+      flipped = true;
+    }
+    std::fclose(f);
+    if (flipped) break;
+  }
+  REQUIRE(flipped);
+
+  CycloneReadHandle *rh = nullptr;
+  REQUIRE(cyclone_cache_read(cache, key.data(), key.size(), &rh) ==
+          CYCLONE_CORRUPTED);
+
+  struct Context {
+    std::atomic<bool> called{false};
+    CycloneError err = CYCLONE_OK;
+  } ctx;
+  auto callback = [](void *ud, const char *, size_t, CycloneError err) {
+    auto *c = static_cast<Context *>(ud);
+    c->err = err;
+    c->called.store(true);
+  };
+  REQUIRE(cyclone_cache_read_async(cache, key.data(), key.size(), callback,
+                                   &ctx) == CYCLONE_OK);
+  REQUIRE(ctx.called.load());
+  CHECK(ctx.err == CYCLONE_CORRUPTED);
+
   cyclone_cache_destroy(cache);
 }

@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "c_error_map.hpp"
 #include "cyclone/cache.hpp"
 
 using namespace cyclone;
@@ -23,36 +24,7 @@ using namespace cyclone;
 // Helpers
 // ---------------------------------------------------------------------------
 
-static CycloneError to_c_error(CacheError e) {
-  switch (e) {
-    case CacheError::Success:
-      return CYCLONE_OK;
-    case CacheError::NotFound:
-      return CYCLONE_NOT_FOUND;
-    case CacheError::Exists:
-      return CYCLONE_EXISTS;
-    case CacheError::NoSpace:
-      return CYCLONE_NO_SPACE;
-    case CacheError::IoError:
-      return CYCLONE_IO_ERROR;
-    case CacheError::Corrupted:
-      return CYCLONE_CORRUPTED;
-    case CacheError::InvalidKey:
-      return CYCLONE_INVALID_KEY;
-    case CacheError::InvalidArgument:
-      return CYCLONE_INVALID_ARGUMENT;
-    case CacheError::NotInitialized:
-      return CYCLONE_NOT_INITIALIZED;
-    case CacheError::ResetRefusedLivePeer:
-      return CYCLONE_RESET_REFUSED_LIVE_PEER;
-    case CacheError::ObjectTooLarge:
-      return CYCLONE_OBJECT_TOO_LARGE;
-    case CacheError::Busy:
-      return CYCLONE_BUSY;
-    default:
-      return CYCLONE_INTERNAL_ERROR;
-  }
-}
+using cyclone::c_api_detail::to_c_error;
 
 static Tier to_cpp_tier(CycloneTier tier) {
   return tier == CYCLONE_TIER_SMALL ? Tier::kSmall : Tier::kDefault;
@@ -495,10 +467,20 @@ CycloneError cyclone_cache_read_async(CycloneCacheHandle *cache,
 
   if (handler == nullptr) {
     // Busy means the key's presence is unknown (a writer held its directory
-    // bucket past the wait budget): say so rather than report a miss.
-    read_cb(
-        read_user_data, nullptr, 0,
-        result.error() == CacheError::Busy ? CYCLONE_BUSY : CYCLONE_NOT_FOUND);
+    // bucket past the wait budget): say so rather than report a miss.  A
+    // disk failure or a corrupted entry is not a miss either: report it as
+    // the synchronous read does.
+    CycloneError miss_err = CYCLONE_NOT_FOUND;
+    switch (result.error()) {
+      case CacheError::Busy:
+      case CacheError::IoError:
+      case CacheError::Corrupted:
+        miss_err = to_c_error(result.error());
+        break;
+      default:
+        break;
+    }
+    read_cb(read_user_data, nullptr, 0, miss_err);
     return CYCLONE_OK;
   }
   // With a miss handler, Busy takes the miss path like every other non-hit:

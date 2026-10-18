@@ -1512,7 +1512,10 @@ enum {
     CYCLONE_INTERNAL_ERROR,
     CYCLONE_RESET_REFUSED_LIVE_PEER,  /* a live peer holds the cache */
     CYCLONE_OBJECT_TOO_LARGE,         /* write exceeds max_object_size */
-    CYCLONE_BUSY                      /* transient contention; retry */
+    CYCLONE_BUSY,                     /* transient contention; retry */
+    CYCLONE_TIMEOUT,                  /* gave up after its time budget */
+    CYCLONE_NOT_OWNED,                /* another process owns the stripe */
+    CYCLONE_INCOMPATIBLE_VERSION      /* cache file format not supported */
 };
 
 typedef uint8_t CycloneTier;
@@ -1535,6 +1538,15 @@ that owns the key's stripe, the write releases a bucket whose holder is stuck
 and then stores the value. In any other process the write fails with
 `NotOwned` before it reaches the directory, so the bucket stays busy until
 its owner next writes, removes or updates hit counts in it.
+
+`CYCLONE_TIMEOUT`, `CYCLONE_NOT_OWNED` and `CYCLONE_INCOMPATIBLE_VERSION`
+carry `CacheError::Timeout`, `NotOwned` and `IncompatibleVersion`, which were
+previously reported as `CYCLONE_INTERNAL_ERROR`. `CacheError::Closed` (the
+cache is stopping) is reported as `CYCLONE_NOT_INITIALIZED`, and
+`ChainCorrupted` as `CYCLONE_CORRUPTED`. Treat a code you do not recognise as
+a failure: later releases may append more. Without a miss handler,
+`cyclone_cache_read_async` reports `CYCLONE_IO_ERROR` and `CYCLONE_CORRUPTED`
+to `read_cb` as the synchronous read does, rather than as a miss.
 
 ### Core Functions
 
