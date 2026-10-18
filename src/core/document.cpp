@@ -129,7 +129,8 @@ void Document::serialize_to(std::byte *out) const {
 uint32_t Document::checksum_header_seed() const {
   std::array<std::byte, kHeaderSize> canonical;
   serialize_to(canonical.data());
-  // The fields written in place after the store, and the checksum itself.
+  // The fields stamped after the checksum is computed (the pass stamp) or
+  // updated in place, and the checksum itself.
   constexpr std::pair<size_t, size_t> kInPlace[] = {
       {kWriteSerialOffset, sizeof(uint32_t)},
       {kChecksumOffset, sizeof(uint32_t)},

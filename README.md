@@ -762,8 +762,9 @@ next_alternate_offset (8 B) · last_access · alternate_id · reserved
 ```
 
 The checksum covers the fixed header as well as the header bytes and
-content: every field except the ones written in place after the store
-(write_serial, hit_count, next_alternate_offset, last_access) and the
+content: every field except the ones stamped after the checksum is
+computed or updated in place (write_serial, hit_count,
+next_alternate_offset, last_access) and the
 checksum itself.
 
 ## Performance

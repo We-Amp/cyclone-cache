@@ -18,7 +18,7 @@ as a C++ API and a C ABI.
 | **Volume** | A single cache file on disk, divided into stripes for parallel access. | `src/core/volume.hpp`, "Volumes and Stripes" |
 | **VolumeHeader** | 64-byte header at offset 0; magic `0x43594C4E` ("CYLN") + format major/minor. Format major is **v9**. | `src/core/volume.hpp` (`VolumeHeader`) |
 | **Directory entry** | Compact 10-byte key→offset record. Bitfields: `tag` (12-bit collision tag), `phase` (1-bit phase GC), `head` (1-bit, first fragment), `pinned` (1-bit, reserved for do-not-evict — not enforced by eviction today), 40-bit `offset` (byte offset within the stripe; 1 TiB/stripe), `next` (bucket chain). Carries **no key material**. | `src/core/directory.hpp` (`DirEntry`) |
-| **Document / fragment** | On-disk record (132-byte header, format major **v9**). The format reserves `FirstFrag`/`MiddleFrag`/`LastFrag` types, but the implementation writes only `SingleFrag` documents today — a document must fit in one stripe's data area (write fails with `NoSpace` otherwise) and under `max_object_size` (`ObjectTooLarge`). | `src/core/document.hpp` (`Document`) |
+| **Document / fragment** | On-disk record (132-byte header, format major **v9**). The format reserves `FirstFrag`/`MiddleFrag`/`LastFrag` types, but the implementation writes only `SingleFrag` documents today: a document must fit in one stripe's data area (write fails with `NoSpace` otherwise) and under `max_object_size` (`ObjectTooLarge`). | `src/core/document.hpp` (`Document`) |
 | **bucket_hash / tag** | Within a stripe, `bucket_hash()` selects the directory bucket; `tag()` is the 12-bit collision tag. | `key.hpp` |
 | **Alternate / AlternateId** | A content variant under one key (Original, Brotli, Gzip, WebP, AVIF, JpegXL, Custom…). `AlternateId` normalizes UA capabilities into discrete classes. | `alternate.hpp` |
 | **Alternate chain** | Singly-linked list of alternates via `next_alternate_offset`. Directory points to the **head** (newest); **tail** is typically Original (oldest). Max 64 per key. | "Alternate Chains" |
@@ -265,8 +265,8 @@ Document Header (132 bytes)
 **Document checksum.** `checksum` is a CRC-32**C** (Castagnoli) over the
 document's *canonical fixed header* followed by header_data + content
 (`Document::checksum_header_seed`, `Document::verify_checksum`). The canonical
-header is the 132-byte wire header with the fields that are written in place
-after the store set to zero: `write_serial` (the pass stamp), `checksum`
+header is the 132-byte wire header with the fields stamped after the checksum
+is computed or updated in place set to zero: `write_serial` (the pass stamp), `checksum`
 itself, `hit_count`, `next_alternate_offset` and `last_access`. Every other
 header field is covered: `magic`, `len`, `total_len`, both keys,
 `header_len`, `doc_type`, both version bytes, `flags`, `sync_serial`,
