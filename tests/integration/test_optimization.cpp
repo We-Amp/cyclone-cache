@@ -123,6 +123,56 @@ class BlockingOptimizationPlugin : public OptimizationPlugin {
   std::atomic<bool> released{false};
 };
 
+// Plugin that blocks inside transform until released, counting entries (for
+// the duplicate in-flight work item test).
+class CountingBlockingPlugin : public OptimizationPlugin {
+ public:
+  [[nodiscard]] PluginInfo info() const override {
+    return {"counting-blocking", "1.0.0", 103};
+  }
+
+  OptimizationPlan plan_optimization(const CacheKey & /*key*/,
+                                     std::span<const std::byte> /*header*/,
+                                     uint64_t /*content_length*/,
+                                     AlternateId written_alternate,
+                                     uint32_t /*hit_count*/) override {
+    OptimizationPlan plan;
+    if (written_alternate == AlternateId::Original) {
+      plan.add(AlternateId::Gzip, 5, true, 1_KB);
+    }
+    return plan;
+  }
+
+  std::expected<TransformResult, CacheError> transform(
+      AlternateId target_alternate, const OptimizationContext &ctx) override {
+    entries.fetch_add(1, std::memory_order_acq_rel);
+
+    // Wait until released or cancelled
+    while (!released.load(std::memory_order_acquire)) {
+      if (ctx.is_cancelled()) {
+        return std::unexpected(CacheError::OptimizationCancelled);
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    TransformResult result;
+    result.alternate_id = target_alternate;
+    result.header = std::vector<std::byte>(ctx.source_header().begin(),
+                                           ctx.source_header().end());
+    result.content = std::vector<std::byte>(ctx.source_content().begin(),
+                                            ctx.source_content().end());
+    return result;
+  }
+
+  void on_cancelled(const CacheKey & /*key*/, AlternateId /*target*/) override {
+    ++cancel_calls;
+  }
+
+  std::atomic<int> entries{0};
+  std::atomic<int> cancel_calls{0};
+  std::atomic<bool> released{false};
+};
+
 std::string temp_cache_path() {
   auto path = fs::temp_directory_path() / "cyclone_opt_test";
   fs::create_directories(path);
@@ -628,4 +678,87 @@ TEST_CASE("OptimizationEngine stop/start cycle resumes work",
 
   cache->stop();
   cleanup_temp(cache_path);
+}
+
+// Regression: dequeue() erases an item's id from the queue's dedup set, so a
+// same-id item can be enqueued again while the first instance is still
+// running.  Registering the second instance used to overwrite the first
+// one's cancellation token, so request_stop() could no longer signal the
+// running instance and two workers ran the same transform, racing the same
+// alternate write.  A duplicate of an in-flight item must be refused, and a
+// later item for the same id must still run once the first completes.
+TEST_CASE("OptimizationEngine refuses duplicate in-flight work items",
+          "[optimization][integration][regression]") {
+  auto cache_path = temp_cache_path();
+
+  CacheConfig config;
+  config.optimization_config.set_enabled(true)
+      .set_min_threads(2)
+      .set_max_threads(2)
+      .set_min_hits_before_optimize(0);
+
+  auto cache_result = Cache::create(config);
+  REQUIRE(cache_result.has_value());
+  auto &cache = *cache_result;
+
+  REQUIRE(cache->add_volume(cache_path + "/vol1", 10_MB).has_value());
+  REQUIRE(cache->start().has_value());
+
+  auto *engine = cache->optimization_engine();
+  REQUIRE(engine != nullptr);
+  auto plugin = std::make_shared<CountingBlockingPlugin>();
+  engine->register_plugin(plugin);
+
+  auto key = CacheKey::from_url("http://test.com/duplicate-in-flight");
+  std::vector<std::byte> content(100, std::byte{0x42});
+  auto write_result = cache->write_sync(key, content.size());
+  REQUIRE(write_result.has_value());
+  REQUIRE(write_result->write_sync(content).has_value());
+  REQUIRE(write_result->close_sync().has_value());
+
+  std::vector<std::byte> header = {std::byte{0x01}};
+
+  auto wait_for_entries = [&](int expected) {
+    auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (plugin->entries.load(std::memory_order_acquire) < expected &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return plugin->entries.load(std::memory_order_acquire) >= expected;
+  };
+
+  // First instance: picked up by worker 1 and blocked inside transform.
+  engine->on_write_complete(key, header, content.size(), AlternateId::Original,
+                            10);
+  REQUIRE(wait_for_entries(1));
+
+  // Duplicate: re-enqueued (the running instance is no longer in the queue's
+  // dedup set) and picked up by worker 2, which must refuse it.
+  engine->on_write_complete(key, header, content.size(), AlternateId::Original,
+                            10);
+
+  // Give worker 2 ample time to (incorrectly) enter transform.
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  const int entries_while_running =
+      plugin->entries.load(std::memory_order_acquire);
+
+  // Release worker 1 and let the write complete.
+  plugin->released.store(true, std::memory_order_release);
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (engine->stats().completed < 1 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+
+  // Once the first instance is done, the same id must be runnable again.
+  engine->on_write_complete(key, header, content.size(), AlternateId::Original,
+                            10);
+  const bool reran = wait_for_entries(entries_while_running + 1);
+
+  cache->stop();
+  cleanup_temp(cache_path);
+
+  REQUIRE(entries_while_running == 1);
+  REQUIRE(reran);
 }

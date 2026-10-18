@@ -268,7 +268,16 @@ void OptimizationEngine::process_work_item(WorkItem item) {
   auto cancelled = std::make_shared<std::atomic<bool>>(false);
   {
     std::lock_guard lock(_active_work_mutex);
-    _active_work[item.id] = cancelled;
+    // dequeue() erased this id from the queue's dedup set, so the same id can
+    // be re-enqueued and picked up by another worker while this instance is
+    // still running.  Refuse the duplicate: overwriting the existing entry
+    // would evict the running instance's token (request_stop() could no
+    // longer signal it) and both instances would race the same alternate
+    // write.  The next on_write_complete() re-queues the id once this
+    // instance has finished.
+    if (!_active_work.try_emplace(item.id, cancelled).second) {
+      return;
+    }
   }
 
   // Find the plugin that queued this work item
