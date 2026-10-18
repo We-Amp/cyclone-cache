@@ -849,3 +849,120 @@ TEST_CASE(
   // One head per key: the observer's volume holds exactly these keys.
   CHECK(observer.volume->stats().entry_count == static_cast<uint64_t>(rounds));
 }
+
+namespace {
+
+// Fills the stripe through `view` until it has wrapped once more.  Never
+// asserts (may run inside a seam on a writer thread).
+bool wrap_stripe(Volume &view) {
+  const std::string filler(60000, 'f');
+  const uint64_t before = view.stats().wrap_count;
+  for (int i = 0; i < 2000 && view.stats().wrap_count == before; ++i) {
+    const auto bytes = std::as_bytes(std::span(filler.data(), filler.size()));
+    auto wh = view.write_sync(CacheKey("wrap-filler-" + std::to_string(i)),
+                              bytes.size());
+    if (wh.has_value() && wh->write_sync(bytes).has_value()) {
+      (void)wh->close_sync();
+    }
+  }
+  return view.stats().wrap_count > before;
+}
+
+size_t current_entries(Volume &volume, const CacheKey &key) {
+  MmapDirectory *dir = volume.mmap_directory_for_test(key);
+  REQUIRE(dir != nullptr);
+  size_t count = 0;
+  REQUIRE(dir->probe_each(key, [&](const DirEntry & /*entry*/) {
+    ++count;
+    return true;
+  }));
+  return count;
+}
+
+}  // namespace
+
+TEST_CASE(
+    "An alternate write whose stripe another process wrapped after its "
+    "commit publishes nothing",
+    "[alternate][multiprocess][publishrace][wrap]") {
+  // The write's bytes belong to the pass they were written in.  Once the
+  // write lock is released another process can wrap the stripe before the
+  // publish; updating the key's head in place to those bytes would then
+  // leave the key pointing at a position the new pass has not reached
+  // (a miss for every alternate of the chain) or, later, at the new pass's
+  // bytes there.  The write must give up instead.
+  const TempCacheDir dir("altwrapfence");
+  ProcessView writer;
+  ProcessView peer;
+  REQUIRE(writer.open(dir.path()));
+  REQUIRE(peer.open(dir.path()));
+  const CacheKey key("http://example.test/wrap/fence.css");
+  REQUIRE(write_alternate(*writer.volume, key, kOriginal, "the original") ==
+          CacheError::Success);
+
+  std::atomic<bool> fired{false};
+  std::atomic<bool> wrapped{false};
+  Volume::s_writer_seam_for_test = [&](Volume::WriterSeam at) {
+    if (at != Volume::WriterSeam::kBeforeAlternatePublish ||
+        fired.exchange(true)) {
+      return;
+    }
+    wrapped.store(wrap_stripe(*peer.volume));
+  };
+  const CacheError result =
+      write_alternate(*writer.volume, key, kOptimized, "the optimized copy");
+  Volume::s_writer_seam_for_test = {};
+  REQUIRE(fired.load());
+  REQUIRE(wrapped.load());
+
+  // Either the write published nothing, or what it published is served.
+  CAPTURE(static_cast<int>(result));
+  if (result == CacheError::Success) {
+    CHECK(read_by_id(*writer.volume, key, kOptimized) ==
+          std::optional<std::string>("the optimized copy"));
+  } else {
+    CHECK(result == CacheError::Busy);
+    // Nothing of the new pass names the bytes of the previous one.
+    CHECK(current_entries(*writer.volume, key) == 0);
+  }
+}
+
+TEST_CASE(
+    "A head removal whose stripe another process wrapped before the "
+    "republish publishes no entry into the new pass",
+    "[alternate][multiprocess][publishrace][wrap]") {
+  // Removing a head republishes its successor in the head's place.  If
+  // another process wrapped the stripe in between, the successor's bytes
+  // belong to the previous pass: an entry of the new pass naming them would
+  // point ahead of the cursor, and once the cursor passes them, at the new
+  // pass's bytes.  The removal must resolve again instead.
+  const TempCacheDir dir("altwrapremove");
+  ProcessView writer;
+  ProcessView peer;
+  REQUIRE(writer.open(dir.path()));
+  REQUIRE(peer.open(dir.path()));
+  const CacheKey key("http://example.test/wrap/remove.css");
+  REQUIRE(write_alternate(*writer.volume, key, kOriginal, "the original") ==
+          CacheError::Success);
+  REQUIRE(write_alternate(*writer.volume, key, kOptimized,
+                          "the optimized copy") == CacheError::Success);
+
+  std::atomic<bool> fired{false};
+  std::atomic<bool> wrapped{false};
+  HookGuard guard;
+  Volume::s_remove_republish_gate_for_test = [&] {
+    if (fired.exchange(true)) {
+      return;
+    }
+    wrapped.store(wrap_stripe(*peer.volume));
+  };
+  const auto removed = writer.volume->remove_alternate_sync(key, kOptimized);
+  Volume::s_remove_republish_gate_for_test = {};
+  REQUIRE(fired.load());
+  REQUIRE(wrapped.load());
+  CAPTURE(removed.has_value() ? 0 : static_cast<int>(removed.error()));
+
+  // No entry of the new pass names the previous pass's successor.
+  CHECK(current_entries(*writer.volume, key) == 0);
+  CHECK_FALSE(read_by_id(*writer.volume, key, kOptimized).has_value());
+}

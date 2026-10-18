@@ -167,6 +167,8 @@ const char *seam_name(Seam s) {
       return "after-epoch-store";
     case Seam::kAfterPublish:
       return "after-publish";
+    case Seam::kBeforeAlternatePublish:
+      return "before-alternate-publish";
     case Seam::kBeforePlainPublish:
       return "before-plain-publish";
   }

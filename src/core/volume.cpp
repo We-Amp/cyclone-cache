@@ -6571,6 +6571,11 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
   // F6: advance the guard-visible cursor + release the write lock now that
   // the fill is complete (Busy on a mid-pwrite usurp -> skip the insert;
   // IoError on fill failure).
+  //
+  // The pass the document is written in, taken while the write lock (or,
+  // single-process, the stripe mutex alone) still excludes every wrap: the
+  // wrap fence checked right before the publish below, as in commit_write.
+  const StripeSnapshot snap_at_commit = snapshot(stripe);
   auto committed = commit_write_slot(stripe, slot, fill_ok);
   slot_releaser.disarm();  // lock released (or usurped) by commit_write_slot
   if (!committed) {
@@ -6598,16 +6603,9 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
   if (_config.sync_on_write) {
 #ifndef _WIN32
     // Another process can still wrap the stripe while this flush runs (the
-    // write lock is released): its tail may then overwrite the bytes just
-    // written, and the publish below could point a newer live entry of this
-    // key at them.  Remember the pass at the commit and give up (Busy: the
-    // document stays unreachable, like any fill whose insert never ran) if
-    // it moved.
-    const StripeSnapshot snap_at_commit = snapshot(stripe);
+    // write lock is released); the wrap fence before the publish below
+    // covers it.
     fsync_fd();
-    if (wrapped_since(stripe, snap_at_commit)) {
-      return make_unexpected(CacheError::Busy);
-    }
 #endif
   }
 
@@ -6622,6 +6620,20 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
   const uint64_t relative_offset = write_offset - stripe->offset + head_pos;
   if (relative_offset + doc_size > stripe->size) {
     return make_unexpected(CacheError::InternalError);
+  }
+  writer_seam(WriterSeam::kBeforeAlternatePublish);
+  // The wrap fence (snap_at_commit), with or without sync_on_write.  From
+  // commit_write_slot on another process can wrap the stripe: its tail may
+  // then overwrite the bytes just written, and updating the key's head in
+  // place to them would leave the key pointing ahead of the new pass's
+  // cursor (every alternate of the chain a miss) or, later, at that pass's
+  // bytes.  Give up (Busy: the document stays unreachable, like any fill
+  // whose insert never ran; the chain stays as it was).  Checked under the
+  // stripe mutex, so no wrap of this process can follow it before the
+  // insert; a peer's still can, the residual the insert's admission and
+  // every read's checks resolve to a miss.
+  if (wrapped_since(stripe, snap_at_commit)) {
+    return make_unexpected(CacheError::Busy);
   }
 
   // Update directory to point to new head — publishes the entry.  MUST stay
@@ -8052,6 +8064,15 @@ std::expected<void, CacheError> Volume::remove_alternate_sync(
           s_remove_republish_gate_for_test();
         }
 #endif
+
+        // A wrap by another process since this attempt's snapshot hands the
+        // successor's bytes to the new pass: an entry of the new pass naming
+        // them would point ahead of its cursor and, later, at its bytes.
+        // Publish nothing and resolve again under a fresh snapshot.
+        if (wrapped_since(stripe, snap)) {
+          _alternate_publish_retries.fetch_add(1, std::memory_order_relaxed);
+          continue;
+        }
 
         // head_relative_offset was verified by full first_key comparison
         // above — repoint exactly that entry, never a same-tag collider.
