@@ -123,7 +123,7 @@ void OptimizationEngine::join_threads() {
   // join_workers() is genuinely terminal and reaps any worker the monitor just
   // spawned (teardown review).
   //
-  // UNBOUNDED joins — not a bounded-join-then-leak pattern. A leaked worker
+  // UNBOUNDED joins: not a bounded-join-then-leak pattern. A leaked worker
   // would dereference cache state freed by
   // teardown; a leaked monitor would dereference this engine's own members
   // after ~OptimizationEngine frees them.  The monitor loop re-checks

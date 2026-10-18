@@ -81,7 +81,7 @@ class DirectorySyncer {
       return;  // Already stopped
     }
 
-    // UNBOUNDED join — deliberately not a bounded-join-then-leak pattern.
+    // UNBOUNDED join: deliberately not a bounded-join-then-leak pattern.
     // A leaked-but-still-RUNNING sync thread dereferences the Cache's volume
     // list and this object's members after teardown frees them: with the
     // previous 5-second deadline, a
