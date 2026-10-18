@@ -240,6 +240,22 @@ void AdaptiveThreadPool::worker_loop(uint64_t generation) {
       break;  // Provider signaled shutdown
     }
 
+    // get_task() blocks, so a pause()/request_stop() that landed while this
+    // worker was parked in it is only visible now.  Re-check both before
+    // running the task: a pause (e.g. load shedding) must not execute one
+    // task per parked worker, and a task dequeued into a stop is dropped
+    // like the items still queued.
+    if (_paused.load(std::memory_order_acquire)) {
+      std::unique_lock lock(_pause_mutex);
+      _pause_cv.wait(lock, [this] {
+        return !_paused.load(std::memory_order_acquire) ||
+               _stopping.load(std::memory_order_acquire);
+      });
+    }
+    if (_stopping.load(std::memory_order_acquire)) {
+      break;
+    }
+
     _active_count.fetch_add(1, std::memory_order_relaxed);
     {
       std::lock_guard stats_lock(_stats_mutex);

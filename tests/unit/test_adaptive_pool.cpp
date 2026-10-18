@@ -46,7 +46,9 @@ class MockTaskProvider : public TaskProvider {
 
   TaskFunction get_task() override {
     std::unique_lock lock(_mutex);
+    _waiting_count.fetch_add(1, std::memory_order_release);
     _cv.wait(lock, [this] { return !_tasks.empty() || _stopped; });
+    _waiting_count.fetch_sub(1, std::memory_order_release);
 
     if (_stopped && _tasks.empty()) {
       return nullptr;
@@ -62,11 +64,17 @@ class MockTaskProvider : public TaskProvider {
     return _tasks.size();
   }
 
+  // Number of workers currently parked inside get_task().
+  size_t waiting_count() const {
+    return _waiting_count.load(std::memory_order_acquire);
+  }
+
  private:
   mutable std::mutex _mutex;
   std::condition_variable _cv;
   std::queue<TaskFunction> _tasks;
   bool _stopped = false;
+  std::atomic<size_t> _waiting_count{0};
 };
 
 OptimizationConfig default_config() {
@@ -210,6 +218,52 @@ TEST_CASE("AdaptiveThreadPool pause and resume", "[pool][optimization]") {
 
   provider.signal_stop();
   pool.stop();
+}
+
+// Regression: pause()/stop() were only checked BEFORE the blocking
+// get_task(), so when a pause landed while a worker was parked inside
+// get_task(), the worker still executed one full task per enqueued item
+// before noticing (e.g. every load-shedding event ran one task per parked
+// worker).  The worker must re-check the flags after get_task() returns.
+TEST_CASE("AdaptiveThreadPool pause reaches a worker parked in get_task",
+          "[pool][optimization][regression]") {
+  OptimizationConfig config = default_config();
+  config.min_threads = 1;
+  config.max_threads = 1;
+  MockTaskProvider provider;
+  AdaptiveThreadPool pool(config, provider);
+  pool.start();
+
+  // Wait until the single worker is parked inside get_task().
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (provider.waiting_count() != 1 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  REQUIRE(provider.waiting_count() == 1);
+
+  // The pause lands while the worker is parked; the enqueued task must not
+  // run until resume().
+  pool.pause();
+  std::atomic<bool> task_ran{false};
+  provider.add_task([&] { task_ran.store(true, std::memory_order_release); });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  const bool ran_while_paused = task_ran.load(std::memory_order_acquire);
+
+  pool.resume();
+  deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!task_ran.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const bool ran_after_resume = task_ran.load(std::memory_order_acquire);
+
+  provider.signal_stop();
+  pool.stop();
+
+  REQUIRE_FALSE(ran_while_paused);
+  REQUIRE(ran_after_resume);
 }
 
 TEST_CASE("AdaptiveThreadPool scaling", "[pool][optimization]") {
@@ -532,12 +586,11 @@ TEST_CASE("AdaptiveThreadPool stop is safe after threads exit early",
   REQUIRE(pool.thread_count() == 0);
 }
 
-// Regression for the staged-teardown fix (leak_thread_on_shutdown UAF
-// class).
+// Regression for the staged-teardown fix (the abandoned-thread UAF class).
 //
 // The old AdaptiveThreadPool::stop() waited up to 5 s for _live_count to reach
-// zero and, on timeout, abandoned the still-running workers via
-// leak_thread_on_shutdown().  A pool worker executes cache-touching
+// zero and, on timeout, abandoned the still-running workers by leaking their
+// std::thread objects.  A pool worker executes cache-touching
 // optimization tasks; a leaked worker abandoned mid-task then dereferences
 // cache state that teardown frees.  The fix joins unconditionally: stop() must
 // not return until every worker that is mid-task has returned.
