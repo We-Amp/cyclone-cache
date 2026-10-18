@@ -88,6 +88,12 @@ class OptimizationEngine : public TaskProvider {
   void resume();
   bool is_paused() const noexcept;
 
+  // True while load shedding holds the pool paused (only ever with
+  // OptimizationConfig::enable_load_shedding set).
+  bool is_load_shedding() const noexcept {
+    return _load_shedding.load(std::memory_order_acquire);
+  }
+
   // Get combined statistics
   OptimizationStats stats() const;
 

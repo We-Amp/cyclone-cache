@@ -677,6 +677,14 @@ cache.optimization_engine()->on_write_complete(key, header_bytes, content.size()
                                                AlternateId::Original, hit_count);
 ```
 
+Load shedding (pause the pool and drop deferrable queued work while the cache
+is busy) is opt-in through `set_enable_load_shedding(true)`. The load estimate
+is `0.3 * ops/baseline_ops_per_sec + 0.7 * bytes/baseline_bytes_per_sec` (each
+term capped at 1) over the cache's completed reads and writes; with the default
+baselines (100k ops/s, 500 MiB/s) about 100k reads/s of 4 KiB objects already
+score 0.86, past the default high watermark of 0.8, so set both baselines to
+what the host sustains at full load before enabling it.
+
 See [doc/plugin-development.md](doc/plugin-development.md).
 
 ## C ABI

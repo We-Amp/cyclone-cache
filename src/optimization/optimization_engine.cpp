@@ -475,8 +475,10 @@ void OptimizationEngine::monitoring_loop() {
     // Update load metrics
     _load_monitor->update_metrics();
 
-    // Check for load shedding
-    if (_load_monitor->is_above_high_watermark()) {
+    // Check for load shedding (opt-in: see
+    // OptimizationConfig::enable_load_shedding)
+    if (_config.enable_load_shedding &&
+        _load_monitor->is_above_high_watermark()) {
       _in_cooldown = false;  // Reset cooldown if load goes back up
       if (!_load_shedding.exchange(true, std::memory_order_acq_rel)) {
         // Just crossed above high watermark

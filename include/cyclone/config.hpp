@@ -131,13 +131,23 @@ struct OptimizationConfig {
   size_t max_queue_size = 10000;
   size_t max_memory_bytes = 256_MB;
 
-  // Load shedding watermarks
+  // Load shedding: pause the pool and cancel deferrable queued work while
+  // the estimated load is above load_high_watermark, and resume once it has
+  // stayed below load_low_watermark for load_shedding_cooldown.  Off by
+  // default.  The estimate is
+  //   0.3 * min(1, ops_per_sec / baseline_ops_per_sec)
+  //   + 0.7 * min(1, bytes_per_sec / baseline_bytes_per_sec)
+  // over the cache's completed reads and writes, so with the default
+  // baselines (100k ops/s, 500 MiB/s) about 100k reads/s of 4 KiB objects
+  // already score 0.86, past the default high watermark.  Before enabling,
+  // set the baselines to what this host sustains at full load.
+  bool enable_load_shedding = false;
   double load_high_watermark = 0.8;  // Pause when load exceeds this
   double load_low_watermark = 0.5;   // Resume when load drops below this
   std::chrono::milliseconds load_shedding_cooldown{
       5000};  // Wait this long after load drops before resuming
 
-  // LoadMonitor baseline capacities for load estimation
+  // LoadMonitor baseline capacities for load estimation (see above)
   double baseline_ops_per_sec = 100000.0;  // Ops/sec at 100% CPU
   double baseline_bytes_per_sec = 500_MB;  // Bytes/sec at 100% I/O
 
@@ -220,6 +230,10 @@ struct OptimizationConfig {
   }
   OptimizationConfig &set_min_hits_before_optimize(uint32_t val) {
     min_hits_before_optimize = val;
+    return *this;
+  }
+  OptimizationConfig &set_enable_load_shedding(bool val) {
+    enable_load_shedding = val;
     return *this;
   }
   OptimizationConfig &set_load_shedding_cooldown(

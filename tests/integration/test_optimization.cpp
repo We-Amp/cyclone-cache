@@ -1127,3 +1127,61 @@ TEST_CASE("OptimizationEngine lets a thread cancellation unwind a transform",
   REQUIRE(WEXITSTATUS(status) == 0);
 }
 #endif
+
+// Load shedding is opt-in: with the default config the engine keeps working
+// however high the load estimate climbs, and with enable_load_shedding set it
+// pauses once the estimate crosses the high watermark.
+TEST_CASE("OptimizationEngine load shedding is opt-in",
+          "[optimization][integration]") {
+  REQUIRE_FALSE(OptimizationConfig{}.enable_load_shedding);
+
+  for (const bool shedding : {false, true}) {
+    INFO("enable_load_shedding=" << shedding);
+    {
+      auto cache_path = temp_cache_path();
+      CacheConfig config;
+      // Baselines of one op and one byte per second: any traffic saturates
+      // the load estimate.
+      config.optimization_config.set_enabled(true)
+          .set_min_threads(1)
+          .set_baseline_ops_per_sec(1.0)
+          .set_baseline_bytes_per_sec(1.0)
+          .set_scale_check_interval(std::chrono::milliseconds(20))
+          .set_enable_load_shedding(shedding);
+
+      auto cache_result = Cache::create(config);
+      REQUIRE(cache_result.has_value());
+      auto &cache = *cache_result;
+      REQUIRE(cache->add_volume(cache_path + "/vol1", 10_MB).has_value());
+      REQUIRE(cache->start().has_value());
+      auto *engine = cache->optimization_engine();
+      REQUIRE(engine != nullptr);
+
+      bool saw_high_load = false;
+      bool saw_shedding = false;
+      auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::milliseconds(800);
+      while (std::chrono::steady_clock::now() < deadline) {
+        engine->load_monitor().record_read_complete(4_KB);
+        saw_high_load =
+            saw_high_load || engine->load_monitor().current_load() >
+                                 config.optimization_config.load_high_watermark;
+        saw_shedding = saw_shedding || engine->is_load_shedding();
+        if (shedding && saw_shedding) {
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      }
+
+      cache->stop();
+      cleanup_temp(cache_path);
+
+      // Shedding stays inert even though the estimate is past the
+      // watermark; when enabled it engages.
+      if (!shedding) {
+        REQUIRE(saw_high_load);
+      }
+      REQUIRE(saw_shedding == shedding);
+    }
+  }
+}
