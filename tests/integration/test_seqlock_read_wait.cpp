@@ -701,8 +701,15 @@ void directory_fast_phase_bounded_under_oversubscription() {
   REQUIRE_FALSE(complete);
   REQUIRE(seen == 0);
   // The budget is 5 ms; the bound allows for one scheduling quantum of
-  // slack per phase.  The unbounded fast phase spent 100x that.
-  REQUIRE(waited < std::chrono::milliseconds(60));
+  // slack per phase.  The unbounded fast phase spent 100x that.  Windows
+  // schedules and sleeps on a timer tick of about 15.6 ms, so its quantum
+  // of slack per phase is several times larger.
+#ifdef _WIN32
+  constexpr auto kBound = std::chrono::milliseconds(200);
+#else
+  constexpr auto kBound = std::chrono::milliseconds(60);
+#endif
+  REQUIRE(waited < kBound);
 }
 
 TEST_CASE(
