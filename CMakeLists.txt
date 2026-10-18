@@ -38,6 +38,13 @@ option(CYCLONE_ENABLE_ASAN "Enable AddressSanitizer" OFF)
 # valid across both.
 option(CYCLONE_USE_BUNDLED_SHA256 "Hash keys with the bundled SHA-256 (no crypto library); OFF uses OpenSSL's libcrypto" ON)
 
+# MSVC's default /EHsc assumes extern "C" functions never throw, which would
+# let an exception from an application callback pass through the C API's
+# exception barrier. /EHs keeps the barrier effective.
+if(MSVC)
+  string(REPLACE "/EHsc" "/EHs" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+endif()
+
 if(CYCLONE_ENABLE_ASAN AND NOT MSVC)
   add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
   add_link_options(-fsanitize=address)
@@ -265,14 +272,13 @@ if(CYCLONE_BUILD_TESTS)
                                               cyclone-c-header-check)
   target_include_directories(cyclone-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
                                                    ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-  # Catch2 exits with 4 when every selected test case was skipped (SKIP()),
-  # e.g. the allocation-failure tests under ThreadSanitizer: report that to
-  # ctest as skipped, not failed.
-  # A test case that skips itself reports "1 skipped" in its summary; match the
-# summary instead of the exit code, which also equals the number of failed
-# assertions and could otherwise hide a failure with exactly four.
-catch_discover_tests(cyclone-tests PROPERTIES SKIP_REGULAR_EXPRESSION
-                     "test cases: +1 \\| +1 skipped")
+  # A test case that skips itself (SKIP(), e.g. the allocation-failure tests
+  # under ThreadSanitizer) reports "1 skipped" in its summary: report that to
+  # ctest as skipped by matching the summary, not the exit code, which also
+  # equals the number of failed assertions. The separator is matched as [^ ]
+  # because a literal pipe breaks the post-build command on Windows.
+  catch_discover_tests(cyclone-tests PROPERTIES SKIP_REGULAR_EXPRESSION
+                     "test cases: +1 [^ ] +1 skipped")
 
   # Helper peer for the spawn-based reset-gate tests.  A separate image (never
   # a re-exec of cyclone-tests): Catch2WithMain owns that binary's main(),
