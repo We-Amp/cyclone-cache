@@ -66,20 +66,11 @@ struct WorkItem {
     return (static_cast<uint64_t>(priority) << 32) | hit_count;
   }
 
-  // effective_priority() with the time spent waiting folded in: one priority
-  // level per `aging` interval, so old low priority work eventually outranks
-  // newer high priority work.  `aging` must be positive.
-  [[nodiscard]] uint64_t aged_priority(
-      std::chrono::steady_clock::time_point now,
-      std::chrono::milliseconds aging) const {
-    uint64_t steps = 0;
-    if (now > enqueue_time) {
-      steps = static_cast<uint64_t>((now - enqueue_time) / aging);
-    }
-    uint64_t level =
-        std::min<uint64_t>(static_cast<uint64_t>(priority) + steps, UINT32_MAX);
-    return (level << 32) | hit_count;
-  }
+  // Heap ordering key set by WorkQueue::enqueue() (larger dequeues first).
+  // With aging it is priority * interval - enqueue_time: every item gains
+  // one priority level per interval, so the difference of two items' aged
+  // priorities never changes and a fixed key gives the aged order.
+  double order_key = 0.0;
 
   // Comparison for priority queue (max heap by effective priority)
   bool operator<(const WorkItem &other) const {
@@ -155,8 +146,13 @@ class WorkQueue {
 
  private:
   void rebuild_heap();
-  // Remove and return the best item.  Requires: _mutex held, _heap non-empty.
-  WorkItem pop_best_locked();
+  // Heap order: larger order_key first, ties by effective priority.
+  static bool heap_less(const WorkItem &a, const WorkItem &b) {
+    if (a.order_key != b.order_key) {
+      return a.order_key < b.order_key;
+    }
+    return a.effective_priority() < b.effective_priority();
+  }
 
   OptimizationConfig _config;
 
