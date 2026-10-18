@@ -51,7 +51,9 @@ class HttpCacheAlt {
   [[nodiscard]] bool is_fresh() const;
 
   [[nodiscard]] std::vector<std::byte> serialize() const;
-  static HttpCacheAlt deserialize(std::span<const std::byte> data);
+  // Returns nullopt unless the whole input is a well-formed serialized blob.
+  [[nodiscard]] static std::optional<HttpCacheAlt> deserialize(
+      std::span<const std::byte> data);
 
  private:
   std::string _request_method;

@@ -97,76 +97,85 @@ std::vector<std::byte> HttpCacheAlt::serialize() const {
   return result;
 }
 
-HttpCacheAlt HttpCacheAlt::deserialize(std::span<const std::byte> data) {
+std::optional<HttpCacheAlt> HttpCacheAlt::deserialize(
+    std::span<const std::byte> data) {
   HttpCacheAlt alt;
   size_t offset = 0;
 
-  auto read_string = [&data, &offset]() -> std::string {
-    if (offset + sizeof(uint32_t) > data.size()) {
-      return {};
+  // Every reader returns false on truncated input; the caller abandons the
+  // whole parse so no later field is read from a desynchronised offset.
+  auto read_u32 = [&data, &offset](uint32_t &out) -> bool {
+    if (data.size() - offset < sizeof(out)) {
+      return false;
     }
-    uint32_t len;
-    std::memcpy(&len, data.data() + offset, sizeof(len));
-    offset += sizeof(len);
-
-    if (offset + len > data.size()) {
-      return {};
-    }
-    std::string result(len, '\0');
-    std::memcpy(result.data(), data.data() + offset, len);
-    offset += len;
-    return result;
+    std::memcpy(&out, data.data() + offset, sizeof(out));
+    offset += sizeof(out);
+    return true;
   };
 
-  auto read_headers = [&]() -> std::map<std::string, std::string> {
-    std::map<std::string, std::string> headers;
-    if (offset + sizeof(uint32_t) > data.size()) {
-      return headers;
+  auto read_string = [&](std::string &out) -> bool {
+    uint32_t len = 0;
+    if (!read_u32(len)) {
+      return false;
     }
-    uint32_t count;
-    std::memcpy(&count, data.data() + offset, sizeof(count));
-    offset += sizeof(count);
+    if (len > data.size() - offset) {
+      return false;
+    }
+    out.assign(reinterpret_cast<const char *>(data.data() + offset), len);
+    offset += len;
+    return true;
+  };
+
+  auto read_headers = [&](std::map<std::string, std::string> &headers) -> bool {
+    uint32_t count = 0;
+    if (!read_u32(count)) {
+      return false;
+    }
 
     // Sanity bound: an HTTP message rarely has >100 headers.
-    // Also bail early if we've exhausted the buffer.
     constexpr uint32_t kMaxHeaders = 1000;
     if (count > kMaxHeaders) {
-      count = kMaxHeaders;
+      return false;
     }
 
     for (uint32_t i = 0; i < count; ++i) {
-      if (offset >= data.size()) {
-        break;  // Buffer exhausted — stop parsing
+      std::string name;
+      std::string value;
+      if (!read_string(name) || !read_string(value)) {
+        return false;
       }
-      std::string name = read_string();
-      std::string value = read_string();
       if (!name.empty()) {
-        headers[lower_name(name)] = value;
+        headers[lower_name(name)] = std::move(value);
       }
     }
-    return headers;
+    return true;
   };
 
-  alt._request_method = read_string();
-  alt._request_url = read_string();
-  alt._request_headers = read_headers();
-
-  if (offset + sizeof(alt._status_code) <= data.size()) {
-    std::memcpy(&alt._status_code, data.data() + offset,
-                sizeof(alt._status_code));
-    offset += sizeof(alt._status_code);
+  if (!read_string(alt._request_method) || !read_string(alt._request_url) ||
+      !read_headers(alt._request_headers)) {
+    return std::nullopt;
   }
 
-  alt._response_headers = read_headers();
-
-  if (offset + sizeof(alt._request_time) + sizeof(alt._response_time) <=
-      data.size()) {
-    std::memcpy(&alt._request_time, data.data() + offset,
-                sizeof(alt._request_time));
-    offset += sizeof(alt._request_time);
-    std::memcpy(&alt._response_time, data.data() + offset,
-                sizeof(alt._response_time));
+  if (data.size() - offset < sizeof(alt._status_code)) {
+    return std::nullopt;
   }
+  std::memcpy(&alt._status_code, data.data() + offset,
+              sizeof(alt._status_code));
+  offset += sizeof(alt._status_code);
+
+  if (!read_headers(alt._response_headers)) {
+    return std::nullopt;
+  }
+
+  if (data.size() - offset !=
+      sizeof(alt._request_time) + sizeof(alt._response_time)) {
+    return std::nullopt;
+  }
+  std::memcpy(&alt._request_time, data.data() + offset,
+              sizeof(alt._request_time));
+  offset += sizeof(alt._request_time);
+  std::memcpy(&alt._response_time, data.data() + offset,
+              sizeof(alt._response_time));
 
   return alt;
 }

@@ -123,7 +123,11 @@ std::optional<size_t> HttpAlternatePlugin::select_variant(
       continue;
     }
 
-    HttpCacheAlt alt = HttpCacheAlt::deserialize(meta_opt);
+    auto parsed = HttpCacheAlt::deserialize(meta_opt);
+    if (!parsed) {
+      continue;
+    }
+    const HttpCacheAlt &alt = *parsed;
 
     if (!check_vary_match(alt, ctx.request_headers)) {
       continue;
@@ -181,7 +185,11 @@ FreshnessResult HttpAlternatePlugin::check_freshness(
     return FreshnessResult::Error;
   }
 
-  HttpCacheAlt alt = HttpCacheAlt::deserialize(meta_opt);
+  auto parsed = HttpCacheAlt::deserialize(meta_opt);
+  if (!parsed) {
+    return FreshnessResult::Error;
+  }
+  const HttpCacheAlt &alt = *parsed;
 
   if (alt.is_fresh()) {
     return FreshnessResult::Fresh;

@@ -36,7 +36,10 @@ TEST_CASE("HttpCacheAlt serialization round-trip", "[http]") {
   auto data = alt.serialize();
   REQUIRE(!data.empty());
 
-  auto restored = HttpCacheAlt::deserialize(std::span<const std::byte>(data));
+  auto restored_opt =
+      HttpCacheAlt::deserialize(std::span<const std::byte>(data));
+  REQUIRE(restored_opt.has_value());
+  const auto &restored = *restored_opt;
 
   REQUIRE(restored.request_method() == "GET");
   REQUIRE(restored.request_url() == "http://example.com/path");
@@ -103,7 +106,10 @@ TEST_CASE("HttpCacheAlt header names are case-insensitive", "[http]") {
           "max-age=60");
 
   auto data = alt.serialize();
-  auto restored = HttpCacheAlt::deserialize(std::span<const std::byte>(data));
+  auto restored_opt =
+      HttpCacheAlt::deserialize(std::span<const std::byte>(data));
+  REQUIRE(restored_opt.has_value());
+  const auto &restored = *restored_opt;
   REQUIRE(restored.get_response_header("CACHE-CONTROL").value_or("") ==
           "max-age=60");
   REQUIRE(restored.get_request_header("Accept-Encoding").value_or("") ==
@@ -137,6 +143,70 @@ TEST_CASE("HttpAlternatePlugin Vary matches names regardless of case",
   ctx.request_headers = std::span<const std::byte>(
       reinterpret_cast<const std::byte *>(other.data()), other.size());
   REQUIRE_FALSE(plugin->select_variant(variants, ctx).has_value());
+}
+
+TEST_CASE("HttpCacheAlt deserialize rejects truncated input", "[http]") {
+  HttpCacheAlt alt;
+  alt.set_request_method("GET");
+  alt.set_request_url("http://example.com/path");
+  alt.set_request_header("Accept", "text/html");
+  alt.set_status_code(200);
+  alt.set_response_header("Cache-Control", "max-age=3600");
+  alt.set_response_time(std::time(nullptr));
+  auto data = alt.serialize();
+
+  REQUIRE(
+      HttpCacheAlt::deserialize(std::span<const std::byte>(data)).has_value());
+
+  // Every strict prefix of a valid blob must be rejected as a whole.
+  for (size_t n = 0; n < data.size(); ++n) {
+    auto prefix =
+        HttpCacheAlt::deserialize(std::span<const std::byte>(data.data(), n));
+    INFO("prefix length " << n);
+    REQUIRE_FALSE(prefix.has_value());
+  }
+
+  // Trailing bytes are not part of a well-formed blob either.
+  auto longer = data;
+  longer.push_back(std::byte{0});
+  REQUIRE_FALSE(HttpCacheAlt::deserialize(std::span<const std::byte>(longer))
+                    .has_value());
+}
+
+TEST_CASE("HttpAlternatePlugin ignores variants with undecodable metadata",
+          "[http]") {
+  auto plugin = create_http_alternate_plugin();
+
+  HttpCacheAlt alt;
+  alt.set_response_header("Content-Type", "text/html");
+  alt.set_response_header("Cache-Control", "max-age=3600");
+  alt.set_response_time(std::time(nullptr));
+  auto good = alt.serialize();
+  auto bad = good;
+  bad.resize(bad.size() - 3);
+
+  VariantCollection variants;
+  variants.add(CacheVariant{CacheKey("bad"),
+                            Metadata(std::span<const std::byte>(bad)),
+                            0,
+                            {},
+                            {},
+                            0});
+  variants.add(CacheVariant{CacheKey("good"),
+                            Metadata(std::span<const std::byte>(good)),
+                            0,
+                            {},
+                            {},
+                            0});
+
+  LookupContext ctx;
+  auto picked = plugin->select_variant(variants, ctx);
+  REQUIRE(picked.has_value());
+  REQUIRE(*picked == 1);
+
+  FreshnessContext fctx;
+  REQUIRE(plugin->check_freshness(variants[0], fctx) == FreshnessResult::Error);
+  REQUIRE(plugin->check_freshness(variants[1], fctx) == FreshnessResult::Fresh);
 }
 
 TEST_CASE("HttpAlternatePlugin info", "[http]") {
@@ -802,6 +872,7 @@ TEST_CASE("Crafted header count must not cause CPU DoS in deserialize",
 
   auto start = std::chrono::steady_clock::now();
   auto alt = HttpCacheAlt::deserialize(std::span<const std::byte>(crafted));
+  REQUIRE_FALSE(alt.has_value());
   auto elapsed = std::chrono::steady_clock::now() - start;
 
   // Must complete in well under 1 second (was previously ~seconds with 4B
