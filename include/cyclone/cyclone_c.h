@@ -61,7 +61,9 @@ enum {
   /* The codes below were previously reported as CYCLONE_INTERNAL_ERROR.  A
      caller should treat a code it does not recognise as a failure. */
 
-  /* An operation gave up after its time budget. */
+  /* An operation gave up after its time budget.  From
+     cyclone_cache_drain_pending(): fetches were still outstanding at the
+     deadline. */
   CYCLONE_TIMEOUT,
   /* Multi-process mode: the write was refused because another process owns
      the key's stripe.  Expected, not a failure: the owning process writes
@@ -638,7 +640,15 @@ CycloneError cyclone_cache_read_async(CycloneCacheHandle *cache,
  * Drain all in-flight miss handler invocations. Blocks until all pending
  * fetches complete or timeout_ms elapses. After this call, new read_async
  * calls return CYCLONE_NOT_INITIALIZED.
- * Called automatically by cyclone_cache_destroy().
+ * Returns CYCLONE_OK when everything completed, or CYCLONE_TIMEOUT when the
+ * deadline passed first: the reads still waiting were then answered with
+ * CYCLONE_NOT_INITIALIZED, and the miss handler's fetches may still call
+ * their done callback later.  That late call is safe, also after
+ * cyclone_cache_destroy(): it answers no one again, and after a destroy it
+ * stores nothing.
+ * Called automatically by cyclone_cache_destroy(), which then waits for
+ * any write-back of a fetched value already under way before closing the
+ * cache.
  */
 CycloneError cyclone_cache_drain_pending(CycloneCacheHandle *cache,
                                          uint32_t timeout_ms);

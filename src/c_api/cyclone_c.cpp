@@ -64,8 +64,11 @@ struct InFlightEntry {
 
 // Context passed to the miss handler's done_cb, heap-allocated per miss.
 // Must outlive all potential done_cb calls (including erroneous double calls).
+// It holds a reference to the cache handle, so a fetch that completes after
+// cyclone_cache_destroy() still finds the bridge state it touches; the first
+// done_cb call takes that reference over and drops it on return.
 struct MissDoneContext {
-  struct CycloneCacheHandle *cache_handle;
+  std::shared_ptr<struct CycloneCacheHandle> owner;
   std::string key;
   std::atomic<bool> completed{false};  // Prevents double-completion
 };
@@ -74,8 +77,13 @@ struct MissDoneContext {
 // holds at most one more; that capacity is reserved up front.
 constexpr size_t kMaxCompletedContexts = 128;
 
-struct CycloneCacheHandle {
+// Shared ownership: `self` is the reference the application's handle stands
+// for, released by cyclone_cache_destroy(); every miss context with a fetch
+// outstanding holds another.  The memory is freed when the last one goes.
+// The Cache itself is closed by destroy, never later.
+struct CycloneCacheHandle : std::enable_shared_from_this<CycloneCacheHandle> {
   std::unique_ptr<Cache> cache;
+  std::shared_ptr<CycloneCacheHandle> self;
 
   // Miss callback state
   std::mutex in_flight_mu;
@@ -88,6 +96,9 @@ struct CycloneCacheHandle {
   std::atomic<bool> shutting_down{false};
   std::atomic<int> pending_writes{0};  // tracks post-drain cache writes
   uint32_t max_in_flight = 0;          // 0 = unlimited
+  // Set by destroy under in_flight_mu: no write-back may start, because the
+  // Cache is about to be closed.
+  bool closed = false;
 };
 
 // Holds a private copy of the entry only.  The disk borrow taken by the read
@@ -162,12 +173,14 @@ static CycloneError cache_create_impl(const CycloneCacheConfig *config,
     return to_c_error(start_result.error());
   }
 
-  auto *h = new CycloneCacheHandle();
-  h->completed_contexts.reserve(kMaxCompletedContexts + 1);
-  h->cache = std::move(*cache_result);
-  h->max_in_flight = config->max_in_flight_requests > 0
-                         ? config->max_in_flight_requests
-                         : 10000;  // Default limit
+  auto owner = std::make_shared<CycloneCacheHandle>();
+  owner->completed_contexts.reserve(kMaxCompletedContexts + 1);
+  owner->cache = std::move(*cache_result);
+  owner->max_in_flight = config->max_in_flight_requests > 0
+                             ? config->max_in_flight_requests
+                             : 10000;  // Default limit
+  CycloneCacheHandle *h = owner.get();
+  h->self = std::move(owner);
   *out = h;
   return CYCLONE_OK;
 }
@@ -181,9 +194,23 @@ CycloneError cyclone_cache_create(const CycloneCacheConfig *config,
 void cyclone_cache_destroy(CycloneCacheHandle *cache) {
   if (cache == nullptr) return;
   guarded_void([&] {
-    // Drain in-flight requests with a 30-second timeout
+    // Hold the application's reference until this returns; afterwards only
+    // fetches still outstanding keep the handle's memory alive.
+    std::shared_ptr<CycloneCacheHandle> owner = std::move(cache->self);
+    // Drain in-flight requests with a 30-second timeout.  On a timeout the
+    // waiters have been failed, but a fetch may still complete later; its
+    // done callback finds the handle alive and closed, and writes nothing.
     cyclone_cache_drain_pending(cache, 30000);
-    delete cache;
+    {
+      // Refuse new write-backs and wait for any already under way: they use
+      // the Cache, which is closed next.
+      std::unique_lock<std::mutex> lock(cache->in_flight_mu);
+      cache->closed = true;
+      cache->in_flight_drained.wait(lock, [&] {
+        return cache->pending_writes.load(std::memory_order_acquire) == 0;
+      });
+    }
+    cache->cache.reset();
   });
 }
 
@@ -433,7 +460,10 @@ static void miss_done_impl(MissDoneContext *ctx, const char *data,
     return;  // Already completed, ignore this call
   }
 
-  auto *ch = ctx->cache_handle;
+  // Take over the context's reference: the handle stays alive until this
+  // returns, even if it was destroyed while the fetch was outstanding.
+  std::shared_ptr<CycloneCacheHandle> owner = std::move(ctx->owner);
+  auto *ch = owner.get();
 
   // Collect waiters under lock, then notify outside lock.
   // We notify BEFORE writing to cache so disk I/O doesn't block callbacks.
@@ -469,6 +499,10 @@ static void miss_done_impl(MissDoneContext *ctx, const char *data,
     // call can still safely read the atomic completed flag.  Capacity for
     // the bound above is reserved at create, so this never allocates.
     ch->completed_contexts.emplace_back(ctx);
+    // After destroy the Cache is closed: answer the waiters, write nothing.
+    if (ch->closed) {
+      will_write = false;
+    }
     // Track the upcoming cache write so drain knows we're not done yet.
     if (will_write) {
       ch->pending_writes.fetch_add(1, std::memory_order_release);
@@ -489,9 +523,11 @@ static void miss_done_impl(MissDoneContext *ctx, const char *data,
   if (will_write) {
     cyclone_cache_write(ch, key.data(), key.size(), data, data_len);
     // Decrement pending_writes and wake drain if this was the last one.
+    // Destroy waits for pending_writes alone, so wake it whenever shutting
+    // down, not only when nothing is in flight.
     if (ch->pending_writes.fetch_sub(1, std::memory_order_acq_rel) == 1) {
       std::lock_guard<std::mutex> lock(ch->in_flight_mu);
-      if (ch->shutting_down && ch->in_flight.empty()) {
+      if (ch->shutting_down) {
         ch->in_flight_drained.notify_all();
       }
     }
@@ -591,7 +627,7 @@ static CycloneError read_async_impl(CycloneCacheHandle *cache, const char *key,
   // flight for good.  The context is unused when the read coalesces.
   std::string key_str(key, key_len);
   auto ctx = std::make_unique<MissDoneContext>();
-  ctx->cache_handle = cache;
+  ctx->owner = cache->shared_from_this();
   ctx->key = key_str;
   bool should_invoke_handler = false;
   // A rejection decided under the lock is reported after it is released:
@@ -673,20 +709,19 @@ static CycloneError drain_pending_impl(CycloneCacheHandle *cache,
   auto deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 
-  while (!is_idle()) {
-    if (cache->in_flight_drained.wait_until(lock, deadline) ==
-        std::cv_status::timeout) {
-      // Timed out: notify remaining waiters with NOT_INITIALIZED and clear.
-      auto remaining = std::move(cache->in_flight);
-      cache->in_flight.clear();
-      lock.unlock();
-      for (auto &[k, entry] : remaining) {
-        for (auto &[cb, ud] : entry.waiters) {
-          cb(ud, nullptr, 0, CYCLONE_NOT_INITIALIZED);
-        }
+  if (!cache->in_flight_drained.wait_until(lock, deadline, is_idle)) {
+    // Timed out: notify remaining waiters with NOT_INITIALIZED and clear.
+    // The fetches themselves may still complete later; that is safe (see
+    // MissDoneContext), and the caller learns of them from the result.
+    auto remaining = std::move(cache->in_flight);
+    cache->in_flight.clear();
+    lock.unlock();
+    for (auto &[k, entry] : remaining) {
+      for (auto &[cb, ud] : entry.waiters) {
+        cb(ud, nullptr, 0, CYCLONE_NOT_INITIALIZED);
       }
-      return CYCLONE_OK;
     }
+    return CYCLONE_TIMEOUT;
   }
 
   return CYCLONE_OK;

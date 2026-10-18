@@ -1820,3 +1820,121 @@ TEST_CASE("C API: read_cb rejected by the in-flight limit may re-enter",
   parked.done_cb(parked.done_ud, "v", 1, CYCLONE_OK);
   cyclone_cache_destroy(cache);
 }
+
+// =============================================================================
+// Drain timeout and destroy with fetches outstanding
+// =============================================================================
+
+namespace {
+struct ParkedFetch {
+  std::atomic<CycloneMissDoneCallback> done_cb{nullptr};
+  std::atomic<void *> done_ud{nullptr};
+};
+
+void park_fetch(const char *, size_t, void *ud, CycloneMissDoneCallback cb,
+                void *done_ud) {
+  auto *p = static_cast<ParkedFetch *>(ud);
+  p->done_ud.store(done_ud);
+  p->done_cb.store(cb);
+}
+
+struct CountingWaiter {
+  std::atomic<int> calls{0};
+  std::atomic<CycloneError> err{CYCLONE_INTERNAL_ERROR};
+};
+
+void count_read(void *ud, const char *, size_t, CycloneError err) {
+  auto *w = static_cast<CountingWaiter *>(ud);
+  w->err.store(err);
+  w->calls.fetch_add(1);
+}
+
+CycloneCacheHandle *make_async_cache(const std::string &path) {
+  CycloneCacheConfig config{};
+  config.cache_path = path.c_str();
+  config.cache_size_bytes = static_cast<uint64_t>(10 * 1024 * 1024);
+  config.ram_cache_size_bytes = static_cast<uint64_t>(1 * 1024 * 1024);
+  config.enable_checksum = 1;
+  config.num_segments = 2;
+  CycloneCacheHandle *cache = nullptr;
+  REQUIRE(cyclone_cache_create(&config, &cache) == CYCLONE_OK);
+  return cache;
+}
+}  // namespace
+
+TEST_CASE("C API: drain timeout is reported and a late fetch is safe",
+          "[c_api][miss_callback][shutdown]") {
+  // A fetch that outlives drain_pending() must not be reported as drained,
+  // and its done callback may still arrive after cyclone_cache_destroy():
+  // the bridge must keep what that callback touches alive.
+  TempCacheDir tmp;
+  CycloneCacheHandle *cache = make_async_cache(tmp.path());
+  ParkedFetch parked;
+  REQUIRE(cyclone_cache_set_miss_handler(cache, park_fetch, &parked) ==
+          CYCLONE_OK);
+
+  CountingWaiter waiter;
+  REQUIRE(cyclone_cache_read_async(cache, "late", 4, count_read, &waiter) ==
+          CYCLONE_OK);
+  REQUIRE(parked.done_cb.load() != nullptr);
+
+  CHECK(cyclone_cache_drain_pending(cache, 20) == CYCLONE_TIMEOUT);
+  // The waiter was failed by the drain.
+  CHECK(waiter.calls.load() == 1);
+  CHECK(waiter.err.load() == CYCLONE_NOT_INITIALIZED);
+
+  cyclone_cache_destroy(cache);
+
+  // The fetch completes after the destroy.  It must neither touch freed
+  // memory nor answer the waiter a second time.
+  parked.done_cb.load()(parked.done_ud.load(), "value", 5, CYCLONE_OK);
+  CHECK(waiter.calls.load() == 1);
+}
+
+TEST_CASE("C API: destroy waits for a write-back that is under way",
+          "[c_api][miss_callback][shutdown]") {
+  // The done callback answers the waiters first and then writes the value
+  // back into the cache.  A destroy that runs while that write-back is
+  // pending must wait for it rather than free the cache under it.
+  TempCacheDir tmp;
+  CycloneCacheHandle *cache = make_async_cache(tmp.path());
+  ParkedFetch parked;
+  REQUIRE(cyclone_cache_set_miss_handler(cache, park_fetch, &parked) ==
+          CYCLONE_OK);
+
+  // A waiter that blocks inside read_cb, which runs after the write-back is
+  // registered and before it starts.
+  struct Blocking {
+    std::latch entered{1};
+    std::latch release{1};
+  } blocking;
+  auto block_read = [](void *ud, const char *, size_t, CycloneError) {
+    auto *b = static_cast<Blocking *>(ud);
+    b->entered.count_down();
+    b->release.wait();
+  };
+  REQUIRE(cyclone_cache_read_async(cache, "slow", 4, block_read, &blocking) ==
+          CYCLONE_OK);
+  REQUIRE(parked.done_cb.load() != nullptr);
+
+  std::thread fetcher([&] {
+    parked.done_cb.load()(parked.done_ud.load(), "value", 5, CYCLONE_OK);
+  });
+  blocking.entered.wait();
+
+  // The write-back is pending, so the drain times out.
+  CHECK(cyclone_cache_drain_pending(cache, 20) == CYCLONE_TIMEOUT);
+
+  std::atomic<bool> destroyed{false};
+  std::thread destroyer([&] {
+    cyclone_cache_destroy(cache);
+    destroyed.store(true);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  CHECK_FALSE(destroyed.load());
+
+  blocking.release.count_down();
+  fetcher.join();
+  destroyer.join();
+  CHECK(destroyed.load());
+}

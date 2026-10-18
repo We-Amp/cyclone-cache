@@ -1641,10 +1641,19 @@ CycloneError cyclone_cache_read_async(CycloneCacheHandle *cache,
                                       CycloneReadCallback read_cb,
                                       void *read_user_data);
 
-// Drain pending async operations (called automatically by destroy)
+// Drain pending async operations (called automatically by destroy).
+// CYCLONE_TIMEOUT: fetches were still outstanding at the deadline.
 CycloneError cyclone_cache_drain_pending(CycloneCacheHandle *cache,
                                          uint32_t timeout_ms);
 ```
+
+`cyclone_cache_drain_pending` returns `CYCLONE_TIMEOUT` when fetches were
+still outstanding at the deadline; the reads waiting on them have then been
+answered with `CYCLONE_NOT_INITIALIZED`. A miss handler may still call such a
+fetch's done callback afterwards, also after `cyclone_cache_destroy`: the call
+is safe, answers no one a second time and, after a destroy, stores nothing.
+`cyclone_cache_destroy` waits for a write-back of a fetched value that is
+already under way before it closes the cache.
 
 #### Example: Fetch-on-Miss with Coalescing
 
