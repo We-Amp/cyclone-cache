@@ -5420,29 +5420,39 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
   //     ask for another: its head is retained or gone, and a carry never
   //     refuses its own links.
   //
-  // (2) STALE-PUBLISH retries, as many as it takes.  An attempt resolves the
-  //     key's chain under the stripe mutex, which is per process, and
-  //     publishes after its data is written.  Another process can publish
-  //     or remove the same key in between.  The attempt notices -- right
-  //     after it holds the write lock, before it writes, or else at the
-  //     publish itself (PublishView) -- publishes nothing, and is run again
-  //     from the top: a fresh snapshot, a fresh walk, a fresh slot.
+  // (2) STALE-PUBLISH retries, up to kMaxStalePublishRetries.  An attempt
+  //     resolves the key's chain under the stripe mutex, which is per
+  //     process, and publishes after its data is written.  Another process
+  //     can publish or remove the same key in between.  The attempt notices
+  //     -- right after it holds the write lock, before it writes, or else
+  //     at the publish itself (PublishView) -- publishes nothing, and is run
+  //     again from the top: a fresh snapshot, a fresh walk, a fresh slot.
   //
-  //     WHY THERE IS NO BOUND.  A write goes stale once per other directory
-  //     change to its key that lands in its window, so any fixed number of
-  //     attempts is wrong for some number of concurrent writers, and giving
-  //     up would turn "another process was faster" into a failed write.
-  //     WHY IT TERMINATES.  A round is lost only when another process
-  //     COMPLETED an insert or a removal for this key's bucket and tag
-  //     since the round's probe, or when an entry the probe's snapshot did
-  //     not admit became admissible -- at most the bucket's three other
-  //     slots, each of which is in the next round's view.  Every lost round
-  //     is therefore paid for by someone else's finished operation: the
-  //     system as a whole always progresses, and with a finite set of
-  //     writers each of them publishes.  The loop holds no lock between
-  //     rounds (the stripe mutex and the write lock are released when an
-  //     attempt returns), so a waiting writer is never the reason another
-  //     one cannot finish.
+  //     WHY THERE IS A BOUND.  A round lost at the publish has already
+  //     written its whole document, which nothing will point at: dead
+  //     space until the next wrap.  A writer that kept losing on one hot
+  //     key would keep adding such documents, moving the wrap closer and
+  //     evicting unrelated entries early.  So the retries back off (the
+  //     first runs at once, later ones after a jittered, growing sleep, so
+  //     that writers of one key stop meeting in lockstep), and past the
+  //     bound the write reports Busy and publishes nothing, like a capped
+  //     lock wait: the key holds what the faster writers published, and
+  //     the caller may write again.  A writer goes stale once per other
+  //     directory change to its key that lands in its window, so the bound
+  //     is far above what ordinary contention takes (in a burst of sixteen
+  //     writers of one key, each loses at most the fifteen others' publishes
+  //     plus the three-slot admission changes argued below).
+  //     WHY IT TERMINATES EVEN WITHOUT THE BOUND.  A round is lost only
+  //     when another process COMPLETED an insert or a removal for this
+  //     key's bucket and tag since the round's probe, or when an entry the
+  //     probe's snapshot did not admit became admissible -- at most the
+  //     bucket's three other slots, each of which is in the next round's
+  //     view.  Every lost round is therefore paid for by someone else's
+  //     finished operation: the system as a whole always progresses, and
+  //     with a finite set of writers each of them publishes.  The loop
+  //     holds no lock between rounds (the stripe mutex and the write lock
+  //     are released when an attempt returns), so a waiting writer, asleep
+  //     or not, is never the reason another one cannot finish.
   //
   //     KNOWN LIMIT (wrap retention, rare).  A round that carries a
   //     RETAINED chain forward copies it before its allocation, and that
@@ -5466,6 +5476,7 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
   //     retained one is orphaned) instead of carrying it forward.  That is
   //     the pre-existing outcome for a write that wraps twice.
   bool allow_restart = true;
+  unsigned stale_retries = 0;
   WrittenRange written;
   std::expected<void, CacheError> result;
   for (;;) {
@@ -5480,7 +5491,26 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
       continue;
     }
     if (stale_publish) {
+      if (stale_retries == kMaxStalePublishRetries) {
+        result = make_unexpected(CacheError::Busy);  // Nothing published
+        break;
+      }
+      ++stale_retries;
       _alternate_publish_retries.fetch_add(1, std::memory_order_relaxed);
+      if (stale_retries > 1) {
+        // A uniform draw below a ceiling that doubles from 2 us to 256 us.
+        // No lock is held here (see above).
+        thread_local uint64_t t_backoff_state = checksum_revalidation_seed();
+        uint64_t x = t_backoff_state;
+        x ^= x << 13U;
+        x ^= x >> 7U;
+        x ^= x << 17U;
+        t_backoff_state = x;
+        const uint64_t ceiling_us = uint64_t{1}
+                                    << std::min(stale_retries - 1, 8U);
+        wait_detail::sleep_for(
+            std::chrono::microseconds((x >> 32U) % (ceiling_us + 1)));
+      }
       continue;
     }
     break;

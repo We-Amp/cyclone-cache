@@ -121,8 +121,9 @@ CacheError write_alternate(Volume &volume, const CacheKey &key, AlternateId id,
 // writers kept held for the whole read budget, which is likelier the fewer
 // cores the machine has.  Such a write stored nothing and said so, and a
 // caller simply writes again -- so does this, a bounded number of times,
-// counting each Busy in `busy`.  A lost publish race is never reported as
-// Busy; the forced-order cases above pin that with a plain write.
+// counting each Busy in `busy`.  A lost publish race is reported as Busy
+// only after Volume::kMaxStalePublishRetries lost rounds in a row; the
+// forced-order cases above pin both sides of that with a plain write.
 CacheError write_alternate_again_when_busy(Volume &volume, const CacheKey &key,
                                            AlternateId id,
                                            std::string_view text,
@@ -411,8 +412,9 @@ TEST_CASE(
     "A write that loses the publish race many times in a row still "
     "lands",
     "[alternate][multiprocess][publishrace]") {
-  // There is no number of lost rounds after which a write gives up.  Twelve
-  // attempts of one write in a row find the key's head changed under them:
+  // Below the bound (Volume::kMaxStalePublishRetries) a write does not give
+  // up on lost rounds.  Twelve attempts of one write in a row find the
+  // key's head changed under them:
   // while the writer sits in the hook (chain resolved, slot reserved, write
   // lock held) the other process removes the current head, which needs only
   // the directory's own locks.  The thirteenth attempt is left alone and
@@ -465,6 +467,64 @@ TEST_CASE(
   INFO("the key lists: " << printed(ids));
   CHECK(ids == (std::vector<int>{0x08, 0x10}));
   CHECK(list_ids(*optimizer.volume, key) == (std::vector<int>{0x08, 0x10}));
+}
+
+TEST_CASE(
+    "A write that keeps losing the publish race gives up as Busy and "
+    "publishes nothing",
+    "[alternate][multiprocess][publishrace]") {
+  // Every lost round has already written a whole document that nothing
+  // will point at.  A writer that lost round after round on one hot key
+  // used to go on writing such documents for as long as it kept losing,
+  // filling the stripe toward its next wrap.  The rounds are bounded: past
+  // the bound the write reports Busy, publishes nothing, and leaves the key
+  // exactly as the other process left it.
+  const TempCacheDir dir("publishrace");
+  ProcessView server;
+  ProcessView optimizer;
+  REQUIRE(server.open(dir.path()));
+  REQUIRE(optimizer.open(dir.path()));
+
+  const CacheKey key("http://example.test/styles/site.css");
+  constexpr int kBound = static_cast<int>(Volume::kMaxStalePublishRetries);
+  // More heads to remove than the write has rounds.
+  const int removable = kBound + 8;
+  for (int i = 0; i <= removable; ++i) {
+    REQUIRE(
+        write_alternate(*server.volume, key, static_cast<AlternateId>(0x10 + i),
+                        std::string(600, static_cast<char>('a' + i % 26))) ==
+        CacheError::Success);
+  }
+
+  std::atomic<int> hook_calls{0};
+  std::atomic<int> failed_removes{0};
+  HookGuard guard;
+  Volume::s_write_tear_gate_for_test = [&](uint64_t, uint64_t) {
+    const int call = hook_calls.fetch_add(1);
+    if (call >= removable) {
+      return;
+    }
+    const auto head = static_cast<AlternateId>(0x10 + removable - call);
+    if (!server.volume->remove_alternate_sync(key, head).has_value()) {
+      failed_removes.fetch_add(1);
+    }
+  };
+  const CacheError result = write_alternate(*optimizer.volume, key, kOptimized,
+                                            std::string(3899, 'm'));
+  Volume::s_write_tear_gate_for_test = {};
+
+  CHECK(result == CacheError::Busy);
+  // The first attempt and the bounded number of retries, no more.
+  CHECK(hook_calls.load() == kBound + 1);
+  CHECK(failed_removes.load() == 0);
+  CHECK(optimizer.volume->stats().alternate_publish_retries ==
+        static_cast<uint64_t>(kBound));
+  // Nothing published: what is left is what the removals left, one head.
+  const std::vector<int> ids = list_ids(*server.volume, key);
+  INFO("the key lists: " << printed(ids));
+  CHECK_FALSE(contains(ids, 0x08));
+  CHECK(ids.size() == static_cast<size_t>(removable - kBound));
+  CHECK(server.volume->stats().entry_count == 1);
 }
 
 TEST_CASE(
