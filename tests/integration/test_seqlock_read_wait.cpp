@@ -310,6 +310,72 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Seqlock read wait: readers recover a shared bucket held past the "
+    "writer budget",
+    "[mmap_directory][concurrent][regression]") {
+  // A process that dies inside a bucket update leaves the bucket odd.  Only
+  // a writer of that bucket used to recover it, so a peer that only reads
+  // reported Busy for its keys for as long as no write came.  A reader now
+  // recovers a bucket it found held by the SAME holder (the same odd
+  // version) for the writers' bucket budget, and never sooner.
+  BudgetOverride budget(kShortBudgetUs);
+  constexpr auto kWriterBudget = std::chrono::milliseconds(50);
+  MmapDirectory::s_bucket_writer_budget_us_for_test.store(
+      std::chrono::microseconds(kWriterBudget).count());
+  struct RestoreWriterBudget {
+    ~RestoreWriterBudget() {
+      MmapDirectory::s_bucket_writer_budget_us_for_test.store(0);
+    }
+  } restore;
+
+  MappedDir d;
+  const CacheKey key("dead-holder-bucket");
+  REQUIRE(d.dir.insert(key, 4096, 512));
+  const auto answers = [&] {
+    size_t seen = 0;
+    const bool complete = d.dir.probe_each(key, [&](const DirEntry &) {
+      ++seen;
+      return false;
+    });
+    return complete && seen == 1;
+  };
+  const uint64_t recoveries =
+      MmapDirectory::s_bucket_recoveries_for_test.load();
+
+  SECTION("one holder past the budget") {
+    d.begin(key);  // never released: the holder died
+    // Inside the budget: unknown, as before, and the bucket is left alone.
+    CHECK_FALSE(answers());
+    CHECK_FALSE(answers());
+    CHECK(MmapDirectory::s_bucket_recoveries_for_test.load() == recoveries);
+
+    std::this_thread::sleep_for(kWriterBudget + std::chrono::milliseconds(20));
+    CHECK(answers());
+    CHECK(MmapDirectory::s_bucket_recoveries_for_test.load() == recoveries + 1);
+
+    // The usurped holder's late release is token-checked: a no-op.
+    d.end(key);
+    CHECK(answers());
+    REQUIRE(d.dir.insert(key, 8192, 512));
+    const auto entry = d.dir.probe(key);
+    REQUIRE(entry.has_value());
+    CHECK(entry->offset() == 8192);
+  }
+
+  SECTION("holders that change are each given the whole budget") {
+    d.begin(key);
+    CHECK_FALSE(answers());
+    d.end(key);
+    std::this_thread::sleep_for(kWriterBudget + std::chrono::milliseconds(20));
+    d.begin(key);  // a new holder, at a new odd version
+    CHECK_FALSE(answers());
+    CHECK(MmapDirectory::s_bucket_recoveries_for_test.load() == recoveries);
+    d.end(key);
+    CHECK(answers());
+  }
+}
+
+TEST_CASE(
     "Seqlock read wait: MmapDirectory::probe rescans with the phase current "
     "at each retry",
     "[mmap_directory][concurrent][regression]") {

@@ -755,6 +755,16 @@ once more. Releases are token-checked: `release_writer` moves the version from
 exactly its own odd value to the next even one, so a usurped live holder's
 late release is a no-op and cannot turn the bucket odd again.
 
+A reader does not wait for that write, which on a peer that only reads may
+never come. Each process remembers, for the few buckets its readers found odd
+past their whole budget, the odd version and when it first saw it. A version
+only grows, so the same odd value seen again is one unbroken hold; once a
+reader finds the same holder there for the writers' bucket budget
+(`kBucketWriterBudget`, 250 ms), it recovers the bucket with the same CAS a
+waiting writer uses and makes one more attempt. Each probe still waits at most
+the 5 ms read budget; a holder that changes in the meantime starts the count
+over.
+
 ### Read anchors (keeping the mapping alive without a global RMW)
 
 A disk-hit `ReadHandle` aliases live mmap bytes, so the Volume and MappedFile must

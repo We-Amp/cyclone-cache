@@ -1027,6 +1027,7 @@ MmapDirectory &MmapDirectory::operator=(MmapDirectory &&other) noexcept {
     _retention = other._retention;
     _num_buckets = other._num_buckets;
     _liveness = other._liveness;
+    _sightings = {};  // They named buckets of the region left behind
 
     other._header = nullptr;
     other._versions = nullptr;
@@ -2062,6 +2063,55 @@ bool MmapDirectory::acquire_writer_slow(size_t bucket_idx, uint32_t &token,
     }
     // CAS failed (concurrent modification), retry.
   }
+}
+
+bool MmapDirectory::reader_recover_stuck_bucket(size_t bucket_idx,
+                                                uint32_t version) const {
+  if (_sightings_busy.test_and_set(std::memory_order_acquire)) {
+    return false;  // Another reader is recording: try again next probe
+  }
+  const auto now = std::chrono::steady_clock::now();
+  StuckBucketSighting *sighting = nullptr;
+  StuckBucketSighting *victim = &_sightings[0];
+  for (StuckBucketSighting &s : _sightings) {
+    if (s.version != 0 && s.bucket == bucket_idx) {
+      sighting = &s;
+      break;
+    }
+    if (victim->version != 0 &&
+        (s.version == 0 || s.first_seen < victim->first_seen)) {
+      victim = &s;  // A free slot, else the oldest sighting
+    }
+  }
+  bool recover = false;
+  if (sighting == nullptr) {
+    *victim = {bucket_idx, version, now};
+  } else if (sighting->version != version) {
+    *sighting = {bucket_idx, version, now};  // Another holder: start over
+  } else if (now - sighting->first_seen >= bucket_writer_budget()) {
+    *sighting = {};
+    recover = true;
+  }
+  _sightings_busy.clear(std::memory_order_release);
+  if (!recover) {
+    return false;
+  }
+  // The same holder kept the bucket for the writers' whole budget: recover
+  // it as acquire_writer_slow does, from exactly that odd version (a CAS,
+  // so a release or a new holder in the meantime is never overwritten),
+  // with the same contained exposure to a usurped holder that is still
+  // running (see the AUDIT note there).  Its token-checked release is then
+  // a no-op.
+  uint32_t expected = version;
+  if (std::atomic_ref<uint32_t>(_versions[bucket_idx])
+          .compare_exchange_strong(expected, version + 1,
+                                   std::memory_order_acq_rel,
+                                   std::memory_order_acquire)) {
+#ifdef CYCLONE_TEST_SEAMS
+    s_bucket_recoveries_for_test.fetch_add(1, std::memory_order_relaxed);
+#endif
+  }
+  return true;
 }
 
 void MmapDirectory::release_writer(size_t bucket_idx, uint32_t token) {

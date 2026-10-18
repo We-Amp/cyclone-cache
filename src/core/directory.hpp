@@ -261,7 +261,9 @@ class SleepBackoff {
 // nanoseconds of its own work, so the budget is only spent while a writer
 // waits to be scheduled again, or on a bucket whose holder is stuck (a
 // process that died mid-update); the next write to the bucket by its owner
-// releases that one (Volume::writer_probe).
+// releases that one (Volume::writer_probe), and so does a reader that keeps
+// finding the same holder there for the writers' bucket budget, 250 ms
+// (MmapDirectory::reader_recover_stuck_bucket).
 #if defined(_MSC_VER)
 #define CYCLONE_SEQLOCK_COLD __declspec(noinline)
 #else

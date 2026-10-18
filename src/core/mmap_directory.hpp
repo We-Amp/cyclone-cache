@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -1075,6 +1076,15 @@ class MmapDirectory {
   /// acquire_writer's contended path, out of line.
   bool acquire_writer_slow(size_t bucket_idx, uint32_t &token, bool capped);
 
+  /// A reader's probe of `bucket_idx` spent its whole read budget with the
+  /// bucket odd at `version`.  Remembers when this process first saw that
+  /// holder; once the same odd version has been seen for
+  /// kBucketWriterBudget, recovers the bucket exactly as a waiting writer
+  /// does (CAS from that odd version to the next even one).  True when the
+  /// bucket is no longer held at `version` (recovered, or released
+  /// meanwhile): the probe may scan again.  Cold path, never blocks.
+  bool reader_recover_stuck_bucket(size_t bucket_idx, uint32_t version) const;
+
   /// Release writer lock: CAS token+1 (odd) -> token+2 (even).  A no-op if
   /// the bucket was force-released from under us (see acquire_writer), so a
   /// late release can never flip the parity back to odd.
@@ -1112,6 +1122,21 @@ class MmapDirectory {
   RetentionRegion *_retention;  // after the entries (see RetentionRegion)
   size_t _num_buckets;
   WriterLiveness *_liveness = nullptr;  // see set_liveness
+
+  // Process-local (never in the shared region): the buckets readers found
+  // held past their whole read budget, with when this process first saw
+  // each holder (see reader_recover_stuck_bucket).  A holder is its odd
+  // version: versions only grow, so the same odd value seen twice is one
+  // unbroken hold.  Guarded by a try-only flag, so a reader never waits on
+  // it (and a forked child that inherited it set merely stops recording).
+  struct StuckBucketSighting {
+    size_t bucket = 0;
+    uint32_t version = 0;  // the odd version held; 0 (even) = slot unused
+    std::chrono::steady_clock::time_point first_seen{};
+  };
+  static constexpr size_t kStuckBucketSightings = 4;
+  mutable std::atomic_flag _sightings_busy;
+  mutable std::array<StuckBucketSighting, kStuckBucketSightings> _sightings{};
 };
 
 // Template implementation
@@ -1128,7 +1153,22 @@ bool MmapDirectory::probe_each_impl(const CacheKey &key,
   // Retry loop for torn read detection, bounded by SeqlockReadWait.  Every
   // failed attempt, including each `continue` below, goes through
   // wait.retry() in the loop condition.
+  //
+  // A budget spent on a bucket that stayed odd may be a holder that died
+  // mid-update: past the writers' bucket budget for that same holder, the
+  // reader recovers the bucket and makes one more attempt (see
+  // reader_recover_stuck_bucket), instead of reporting Busy until a writer
+  // of this bucket happens along.
   SeqlockReadWait wait;
+  uint32_t last_version = 0;
+  bool recovery_tried = false;
+  const auto recover = [&] {
+    if (recovery_tried || (last_version & 1) == 0) {
+      return false;
+    }
+    recovery_tried = true;
+    return reader_recover_stuck_bucket(bucket_idx, last_version);
+  };
   do {
     // Capture the phase INSIDE the retry loop: a retry triggered by a
     // concurrent toggle_phase() must rescan with the new phase, or
@@ -1141,6 +1181,7 @@ bool MmapDirectory::probe_each_impl(const CacheKey &key,
     // wasting a full retry attempt on a guaranteed-inconsistent read.
     const uint32_t version_before =
         wait.even_version([&] { return load_version(bucket_idx); });
+    last_version = version_before;
     if ((version_before & 1) != 0) {
       continue;  // Writer still active: retry (wait.retry() paces it)
     }
@@ -1189,7 +1230,7 @@ bool MmapDirectory::probe_each_impl(const CacheKey &key,
       return true;  // Consistent read achieved
     }
     // Version changed - retry
-  } while (wait.retry());
+  } while (wait.retry() || recover());
   return false;  // A writer held the bucket past the budget: unknown
 }
 
