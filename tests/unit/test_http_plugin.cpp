@@ -237,17 +237,39 @@ TEST_CASE("HttpCacheAlt heuristic freshness needs Last-Modified", "[http]") {
 
   SECTION("recent response of an old resource is fresh") {
     HttpCacheAlt alt;
+    alt.set_status_code(200);
     alt.set_response_time(now);
     alt.set_response_header("Last-Modified", http_date(now - 100 * kDay));
     REQUIRE(alt.is_fresh());
   }
   SECTION("response older than a tenth of the resource age is stale") {
     HttpCacheAlt alt;
+    alt.set_status_code(200);
     alt.set_response_time(now - 20 * kDay);
     alt.set_response_header("Date", http_date(now - 20 * kDay));
     alt.set_response_header("Last-Modified", http_date(now - 120 * kDay));
     // Resource was 100 days old at response time: heuristic life is 10 days.
     REQUIRE_FALSE(alt.is_fresh());
+  }
+  SECTION("only statuses cacheable by default get a heuristic") {
+    for (uint16_t code :
+         {200, 203, 204, 206, 300, 301, 308, 404, 405, 410, 414, 501}) {
+      HttpCacheAlt alt;
+      alt.set_status_code(code);
+      alt.set_response_time(now);
+      alt.set_response_header("Last-Modified", http_date(now - 100 * kDay));
+      INFO("status " << code);
+      REQUIRE(alt.freshness_lifetime().has_value());
+    }
+    for (uint16_t code : {0, 201, 202, 302, 303, 307, 400, 403, 500, 503}) {
+      HttpCacheAlt alt;
+      alt.set_status_code(code);
+      alt.set_response_time(now);
+      alt.set_response_header("Last-Modified", http_date(now - 100 * kDay));
+      INFO("status " << code);
+      REQUIRE_FALSE(alt.freshness_lifetime().has_value());
+      REQUIRE_FALSE(alt.is_fresh());
+    }
   }
   SECTION("no Last-Modified gives no heuristic") {
     HttpCacheAlt alt;

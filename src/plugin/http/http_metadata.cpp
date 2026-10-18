@@ -104,6 +104,28 @@ std::optional<int64_t> parse_http_date(std::string_view v) {
   return days * 86400 + hour * 3600 + minute * 60 + second;
 }
 
+// Statuses that may be cached without explicit freshness information
+// (RFC 9110 15.1); heuristic freshness applies only to these.
+bool cacheable_by_default(uint16_t status) {
+  switch (status) {
+    case 200:
+    case 203:
+    case 204:
+    case 206:
+    case 300:
+    case 301:
+    case 308:
+    case 404:
+    case 405:
+    case 410:
+    case 414:
+    case 501:
+      return true;
+    default:
+      return false;
+  }
+}
+
 }  // namespace
 
 HttpCacheAlt::HttpCacheAlt() = default;
@@ -372,7 +394,8 @@ std::optional<std::chrono::seconds> HttpCacheAlt::freshness_lifetime() const {
 
   // Heuristic freshness (RFC 9111 4.2.2): a tenth of the time since the
   // resource was last modified, and only when Last-Modified is known.
-  if (auto lm = get_response_header("last-modified")) {
+  if (auto lm = get_response_header("last-modified");
+      lm && cacheable_by_default(_status_code)) {
     if (auto parsed = parse_http_date(*lm); parsed && *parsed < base) {
       int64_t life =
           std::min<int64_t>((base - *parsed) / 10, kMaxLifetimeSeconds);
