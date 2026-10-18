@@ -2496,6 +2496,13 @@ std::expected<void, CacheError> Volume::init_stripes(bool exclusive) {
       // peer's borrow or in-flight wrap would be torn out from under it.
       if (exclusive) {
         stripe->mmap_directory->reset_reader_state_exclusive();
+        // The readers' positional guard reads the SHARED cursor, so a
+        // persisted value the check above refused (crash-torn, misaligned,
+        // out of bounds) is repaired there too, not only in write_pos.
+        const uint64_t seated = stripe->write_pos.load();
+        if (saved_write_pos != seated) {
+          stripe->mmap_directory->set_shared_write_pos(seated);
+        }
         repair_wrap_state(stripe.get());
       }
     } else {
@@ -3762,7 +3769,12 @@ StripeSnapshot Volume::snapshot(const Stripe* stripe) const {
   // fully exposed pass.
   snap.frontier = std::min<uint64_t>(snap.gen - (snap.pass * (n + 1)), n);
   snap.phase = (snap.pass & 1U) != 0;
-  snap.cursor_rel = stripe->current_write_cursor() - stripe->offset;
+  // Floor at the stripe start: a shared cursor left below the stripe (a
+  // crash-torn header a shared opener may still see) must not underflow
+  // into a cursor that admits every same-phase entry.  A low cursor only
+  // widens rejection, which is a benign miss.
+  const uint64_t cursor = stripe->current_write_cursor();
+  snap.cursor_rel = cursor > stripe->offset ? cursor - stripe->offset : 0;
   snap.frontier_rel = stripe->frontier_rel_of(snap.frontier);
 #ifdef CYCLONE_TEST_SEAMS
   reader_seam(ReaderSeam::kSnapshotDone);
