@@ -221,7 +221,7 @@ holder's budget plus the 2 ms confirmation:
 | Lock | Longest capped wait |
 |------|---------------------|
 | Bucket seqlock | About 0.5 s. |
-| Phase lock | About 1.25 s. An insert takes the bucket and only tries the phase lock while it holds it; when the phase lock is busy it releases the bucket, waits for the phase lock holding nothing (this wait, up to about 1.25 s), and retries a bounded number of times. A wedged bucket or phase lock therefore never keeps another bucket, or readers of this one, waiting behind a held bucket. |
+| Phase lock | About 1.25 s. An insert takes the bucket and only tries the phase lock while it holds it; when the phase lock is busy it releases the bucket, waits for the phase lock holding nothing (this wait, up to about 1.25 s), and retries a bounded number of times. A wedged bucket or phase lock therefore never keeps another bucket, or readers of this one, waiting behind a held bucket. One insert as a whole: about one recovery plus short waits, under 2 s (a bucket wait of up to about 0.5 s, then at most one phase-lock wait that runs to its budget, about 1.25 s, since that wait recovers a wedged holder and later holders keep the lock only for a bracket). Its hard ceiling, if every one of its waits ran to its cap, is about 7.5 s: 5 bucket waits and 4 phase-lock waits (`kInsertPhaseAttempts`). It then reports Busy and publishes nothing. |
 | Write lock | About 0.3 s behind a dead holder. About 5.25 s behind a live holder it cannot prove dead, the pathological case the escalation exists for. |
 
 Three waits stay uncapped, because giving up there would leave work half
