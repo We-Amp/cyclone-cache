@@ -139,6 +139,18 @@ struct Document {
     return len - kHeaderSize - header_len;
   }
 
+  // The shape every document a volume writes has: one complete fragment
+  // whose total_len is exactly its content size.  len, total_len, header_len
+  // and doc_type sit in the fixed header, outside the checksum, so a read
+  // that serves a document checks this identity as well as the CRC: a
+  // document whose fields disagree reads as corrupt (a miss), whatever its
+  // payload's checksum says.
+  [[nodiscard]] bool has_volume_shape() const {
+    return doc_type == Type::SingleFrag && frag_offset == 0 &&
+           len >= kHeaderSize && header_len <= len - kHeaderSize &&
+           total_len == uint64_t{len} - kHeaderSize - header_len;
+  }
+
   static uint32_t compute_checksum(std::span<const std::byte> data);
   [[nodiscard]] bool verify_checksum(std::span<const std::byte> content) const;
 
@@ -206,6 +218,11 @@ class DocumentReader {
   explicit DocumentReader(std::span<const std::byte> data);
 
   [[nodiscard]] bool is_valid() const { return _valid; }
+  // is_valid() plus Document::has_volume_shape(): what every read path that
+  // serves or enumerates a stored document requires.
+  [[nodiscard]] bool is_servable() const {
+    return _valid && _doc.has_volume_shape();
+  }
   [[nodiscard]] const Document &document() const { return _doc; }
 
   [[nodiscard]] std::span<const std::byte> header() const;

@@ -2969,7 +2969,7 @@ std::expected<ReadHandle, CacheError> Volume::read_sync(const CacheKey& key) {
         auto impl = std::make_shared<VolumeReadHandleImpl>();
         impl->ram_buffer = std::move(*ram_data);
         DocumentReader ram_reader(impl->ram_buffer);
-        if (ram_reader.is_valid()) {
+        if (ram_reader.is_servable()) {
           bump_reads();
           should_record_hit = true;
 
@@ -3046,9 +3046,12 @@ std::expected<ReadHandle, CacheError> Volume::read_sync(const CacheKey& key) {
             }
           }
 
-          // Verify the key matches
+          // Verify the key matches, and that the fixed header's length and
+          // type fields agree with each other: they sit outside the CRC, so
+          // a document whose fields disagree is corrupt whatever the
+          // checksum pass below would say about its payload.
           CacheKey stored_key = reader.first_key();
-          if (stored_key != key) {
+          if (stored_key != key || !reader.is_servable()) {
             _mapped_file->unmap_region(*mapped);
             return true;  // Continue to next candidate
           }
@@ -5557,8 +5560,7 @@ Volume::CarryPlan Volume::carry_retained_chain(
         std::span<const std::byte>(plan.bytes.data() + start, src.len));
     const Document& doc = reader.document();
     const bool ok =
-        reader.is_valid() && doc.len == src.len &&
-        doc.doc_type == Document::Type::SingleFrag &&
+        reader.is_servable() && doc.len == src.len &&
         doc.alternate_id == src.id && doc.write_serial == want_stamp &&
         reader.first_key() == key && doc.verify_checksum(reader.payload());
     if (!ok) {
@@ -6656,7 +6658,7 @@ Volume::list_alternates_sync(const CacheKey& key) {
 
             // Cross-key escape guard — see the identical check in
             // read_alternate_sync's walk.  Same for the pass stamp.
-            if (doc->reader.first_key() != key ||
+            if (doc->reader.first_key() != key || !doc->reader.is_servable() ||
                 !stamp_admits(stripe, snap, node_cls, doc->reader.document())) {
               _mapped_file->unmap_region(doc->region);
               chain_incomplete = true;
@@ -6899,7 +6901,7 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
             // document of a DIFFERENT key.  Never accept a node that does not
             // belong to this key — without this check such a walk could
             // enumerate (and later serve) another key's content.
-            if (doc->reader.first_key() != key ||
+            if (doc->reader.first_key() != key || !doc->reader.is_servable() ||
                 !stamp_admits(stripe, snap, node_cls, doc->reader.document())) {
               _mapped_file->unmap_region(doc->region);
               chain_incomplete = true;
@@ -6984,7 +6986,7 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
               auto impl = std::make_shared<VolumeReadHandleImpl>();
               impl->ram_buffer = std::move(*ram_data);
               DocumentReader ram_reader(impl->ram_buffer);
-              if (ram_reader.is_valid()) {
+              if (ram_reader.is_servable()) {
                 bump_reads();
                 should_record_hit = true;
                 hit_alt_id = selected_alt_id;
@@ -7023,7 +7025,7 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
           }
 
           DocumentReader selected_reader(*selected_mapped);
-          if (!selected_reader.is_valid()) {
+          if (!selected_reader.is_servable()) {
             _mapped_file->unmap_region(*selected_mapped);
             _mapped_file->unmap_region(*mapped);
             result = make_unexpected(CacheError::Corrupted);

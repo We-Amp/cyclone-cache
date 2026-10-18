@@ -285,4 +285,81 @@ TEST_CASE(
     REQUIRE(same_bytes(rh->content(), content));
   }
 }
+// Wire offsets of the length and type fields in the fixed document header
+// (see the field table in src/core/document.cpp).
+constexpr uint64_t kTotalLenOffset = 8;
+constexpr uint64_t kHeaderLenOffset = 80;
+constexpr uint64_t kDocTypeOffset = 84;
+
+TEST_CASE(
+    "Read integrity: a document whose length fields disagree is a miss, "
+    "never served",
+    "[integrity][shape]") {
+  OpenCache oc(integrity_config());
+  Cache &cache = *oc.cache;
+  const auto content = make_content(4, 8192);
+
+  // Each mutation leaves the payload, and so its CRC-32C, intact: only the
+  // fixed header's view of it changes.
+  struct Mutation {
+    const char *name;
+    uint64_t offset;
+    std::vector<std::byte> bytes;
+  };
+  const auto u64 = [](uint64_t v) {
+    std::vector<std::byte> out(sizeof(v));
+    std::memcpy(out.data(), &v, sizeof(v));
+    return out;
+  };
+  const auto u32 = [](uint32_t v) {
+    std::vector<std::byte> out(sizeof(v));
+    std::memcpy(out.data(), &v, sizeof(v));
+    return out;
+  };
+  const std::vector<Mutation> mutations = {
+      {"total_len zero", kTotalLenOffset, u64(0)},
+      {"total_len larger", kTotalLenOffset, u64(content.size() + 1)},
+      {"header_len shifts the content window", kHeaderLenOffset, u32(16)},
+      {"not a single fragment",
+       kDocTypeOffset,
+       {static_cast<std::byte>(Document::Type::FirstFrag)}},
+  };
+
+  size_t n = 0;
+  for (const auto &m : mutations) {
+    CAPTURE(m.name);
+    const CacheKey key("integrity-shape-" + std::to_string(n));
+    const CacheKey alt_key("integrity-shape-alt-" + std::to_string(n));
+    ++n;
+    REQUIRE(write_entry(cache, key, content));
+    REQUIRE(write_alternate(cache, alt_key, AlternateId::Gzip, content));
+    const uint64_t doc = document_offset(cache, key, content);
+    auto alts = cache.list_alternates_sync(alt_key);
+    REQUIRE(alts.has_value());
+    REQUIRE(alts->size() == 1);
+    const uint64_t alt_doc = (*alts)[0].disk_offset;
+
+    pwrite_bytes(oc.file, doc + m.offset, m.bytes);
+    pwrite_bytes(oc.file, alt_doc + m.offset, m.bytes);
+
+    {
+      auto rh = cache.read_sync(key);
+      CHECK_FALSE(rh.has_value());
+      if (rh.has_value()) {
+        CHECK(rh->content_length() == content.size());
+        CHECK(same_bytes(rh->content(), content));
+      }
+    }
+    {
+      OnlyId want(AlternateId::Gzip);
+      AlternateSelectionContext ctx;
+      auto rh = cache.read_alternate_sync(alt_key, want, ctx);
+      CHECK_FALSE(rh.has_value());
+      if (rh.has_value()) {
+        CHECK(rh->content_length() == content.size());
+        CHECK(same_bytes(rh->content(), content));
+      }
+    }
+  }
+}
 #endif  // !_WIN32
