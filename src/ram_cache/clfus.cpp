@@ -406,16 +406,24 @@ void RamCacheCLFUS::Segment::evict_if_needed(size_t required_space) {
 
 void RamCacheCLFUS::Segment::promote_from_history(
     EntryIter it, std::span<const std::byte> data, uint32_t stamp) {
+  // Splice the node out of history before making room: evict_if_needed()
+  // trims _history_lru from the back, and `it` can name that back node, so
+  // the eviction triggered by this very promotion would otherwise free the
+  // node the caller still holds.
+  EntryList rescued;
+  rescued.splice(rescued.begin(), _history_lru, it);
+
   evict_if_needed(data.size());
 
-  auto& entry = *it;
+  // Back on the segment's active list from here on.
+  _active_lru.splice(_active_lru.begin(), rescued, rescued.begin());
+  auto& entry = *_active_lru.begin();
+  _entry_map[entry.key] = _active_lru.begin();
+
   entry.data.assign(data.begin(), data.end());
   entry.stamp = stamp;
   entry.in_cache = true;
   ++entry.hits;
-
-  _active_lru.splice(_active_lru.begin(), _history_lru, it);
-  _entry_map[entry.key] = _active_lru.begin();
   _bytes_used += data.size();
 }
 

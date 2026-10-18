@@ -337,6 +337,41 @@ TEST_CASE("CLFUS eviction preserves high-hit entries", "[clfus]") {
   REQUIRE(stats.evictions > 0);
 }
 
+TEST_CASE("CLFUS promoting the oldest history entry under eviction pressure",
+          "[clfus]") {
+  // One segment (cache below the per-segment budget floor), history at its
+  // cap, and the first-evicted key still at the history tail.  Promoting
+  // that tail key evicts an active entry to make room, and that eviction
+  // trims the history tail: the very node the promotion is holding.  The
+  // promotion must not touch freed nodes (heap-use-after-free under
+  // sanitizers, list corruption otherwise).
+  constexpr size_t kEntryBytes = 100;
+  constexpr int kHistoryCap = 1024;
+  auto cache = RamCache::create(RamCacheType::CLFUS, kEntryBytes * kHistoryCap);
+
+  // Fill past capacity: kHistoryCap evictions fill history to its cap,
+  // leaving the first key ("hist-0") at the tail.
+  for (int i = 0; i < 2 * kHistoryCap; ++i) {
+    CacheKey key("hist-" + std::to_string(i));
+    std::vector<std::byte> data(kEntryBytes, std::byte(i & 0xFF));
+    cache->put(key, AlternateId::Original, data);
+    cache->put(key, AlternateId::Original, data);
+  }
+  REQUIRE(cache->stats().evictions >= kHistoryCap);
+
+  // Re-reference the history tail.  The value of a history entry beats the
+  // average of evicted entries, so this takes the promotion path.
+  CacheKey tail("hist-0");
+  std::vector<std::byte> fresh(kEntryBytes, std::byte{0x5A});
+  REQUIRE(cache->put(tail, AlternateId::Original, fresh));
+
+  auto result = cache->get(tail, AlternateId::Original);
+  REQUIRE(result.has_value());
+  REQUIRE(result->size() == kEntryBytes);
+  REQUIRE((*result)[0] == std::byte{0x5A});
+  REQUIRE(cache->bytes_used() <= cache->max_bytes());
+}
+
 TEST_CASE("CLFUS concurrent get+put data race safety", "[clfus][concurrent]") {
   auto cache =
       RamCache::create(RamCacheType::CLFUS, static_cast<size_t>(1024 * 1024));
