@@ -203,7 +203,12 @@ FreshnessResult HttpAlternatePlugin::check_freshness(
       c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     }
     no_cache = lowered.find("no-cache") != std::string::npos;
-    must_revalidate = lowered.find("must-revalidate") != std::string::npos;
+    // A shared cache also may not serve a stale entry without validation when
+    // the response carries proxy-revalidate or s-maxage (RFC 9111 5.2.2.8,
+    // 5.2.2.10).
+    must_revalidate = lowered.find("must-revalidate") != std::string::npos ||
+                      lowered.find("proxy-revalidate") != std::string::npos ||
+                      lowered.find("s-maxage") != std::string::npos;
   }
 
   // no-cache requires validation before every reuse, even while the entry is
