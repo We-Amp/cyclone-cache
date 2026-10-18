@@ -269,18 +269,42 @@ std::chrono::seconds HttpCacheAlt::age() const {
   if (now_time_t < _response_time) {
     return std::chrono::seconds(0);
   }
-  int64_t result = static_cast<int64_t>(now_time_t - _response_time);
-  // Time the response had already spent before we received it (RFC 9111
-  // 4.2.3 apparent age): how far our receive time is past the origin's Date.
+  int64_t resident = static_cast<int64_t>(now_time_t - _response_time);
+
+  // RFC 9111 4.2.3: corrected_initial_age is the larger of the apparent age
+  // (receive time past the origin's Date) and the Age header corrected by
+  // the response delay.
+  int64_t apparent = 0;
   if (auto date = get_response_header("date")) {
     if (auto parsed = parse_http_date(*date)) {
-      int64_t apparent = static_cast<int64_t>(_response_time) - *parsed;
-      if (apparent > 0) {
-        result += apparent;
-      }
+      apparent =
+          std::max<int64_t>(0, static_cast<int64_t>(_response_time) - *parsed);
     }
   }
-  return std::chrono::seconds(result);
+  int64_t corrected = 0;
+  if (auto age_hdr = get_response_header("age")) {
+    std::string_view v = trim(*age_hdr);
+    bool valid = !v.empty();
+    int64_t value = 0;
+    for (char c : v) {
+      if (c < '0' || c > '9') {
+        valid = false;
+        break;
+      }
+      value = value * 10 + (c - '0');
+      if (value > kMaxLifetimeSeconds * 100) {
+        value = kMaxLifetimeSeconds * 100;
+      }
+    }
+    if (valid) {
+      int64_t delay = 0;
+      if (_request_time > 0 && _request_time <= _response_time) {
+        delay = static_cast<int64_t>(_response_time - _request_time);
+      }
+      corrected = value + delay;
+    }
+  }
+  return std::chrono::seconds(resident + std::max(apparent, corrected));
 }
 
 std::optional<std::chrono::seconds> HttpCacheAlt::max_age() const {

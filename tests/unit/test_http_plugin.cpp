@@ -146,6 +146,53 @@ TEST_CASE("HttpCacheAlt max-age directive parsing", "[http]") {
   }
 }
 
+TEST_CASE("HttpCacheAlt age includes the Age header", "[http]") {
+  auto now = std::time(nullptr);
+
+  SECTION("Age beyond max-age is stale") {
+    HttpCacheAlt alt;
+    alt.set_response_time(now);
+    alt.set_response_header("Cache-Control", "max-age=60");
+    alt.set_response_header("Age", "3600");
+    REQUIRE(alt.age().count() >= 3600);
+    REQUIRE_FALSE(alt.is_fresh());
+  }
+  SECTION("small Age stays fresh") {
+    HttpCacheAlt alt;
+    alt.set_response_time(now);
+    alt.set_response_header("Cache-Control", "max-age=600");
+    alt.set_response_header("Age", "10");
+    REQUIRE(alt.is_fresh());
+  }
+  SECTION("invalid Age is ignored") {
+    HttpCacheAlt alt;
+    alt.set_response_time(now);
+    alt.set_response_header("Cache-Control", "max-age=600");
+    alt.set_response_header("Age", "-5");
+    REQUIRE(alt.age().count() < 5);
+    alt.set_response_header("Age", "abc");
+    REQUIRE(alt.age().count() < 5);
+    REQUIRE(alt.is_fresh());
+  }
+  SECTION("response delay is added to Age") {
+    HttpCacheAlt alt;
+    alt.set_request_time(now - 100);
+    alt.set_response_time(now);
+    alt.set_response_header("Cache-Control", "max-age=600");
+    alt.set_response_header("Age", "550");
+    // 550 + 100 seconds of response delay exceeds the 600 second lifetime.
+    REQUIRE_FALSE(alt.is_fresh());
+  }
+  SECTION("larger of apparent age and corrected Age wins") {
+    HttpCacheAlt alt;
+    alt.set_response_time(now);
+    alt.set_response_header("Date", http_date(now - 1000));
+    alt.set_response_header("Age", "5");
+    alt.set_response_header("Cache-Control", "max-age=600");
+    REQUIRE(alt.age().count() >= 1000);
+  }
+}
+
 TEST_CASE("HttpCacheAlt honours Expires", "[http]") {
   auto now = std::time(nullptr);
 
