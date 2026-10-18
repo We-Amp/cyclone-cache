@@ -261,7 +261,10 @@ if(CYCLONE_BUILD_TESTS)
                                               cyclone-c-header-check)
   target_include_directories(cyclone-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
                                                    ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-  catch_discover_tests(cyclone-tests)
+  # Catch2 exits with 4 when every selected test case was skipped (SKIP()),
+  # e.g. the allocation-failure tests under ThreadSanitizer: report that to
+  # ctest as skipped, not failed.
+  catch_discover_tests(cyclone-tests PROPERTIES SKIP_RETURN_CODE 4)
 
   # Helper peer for the spawn-based reset-gate tests.  A separate image (never
   # a re-exec of cyclone-tests): Catch2WithMain owns that binary's main(),
