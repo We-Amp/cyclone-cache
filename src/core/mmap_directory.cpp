@@ -624,13 +624,28 @@ uint32_t WriterLiveness::current_pid() {
 #endif
 }
 
-void WriterLiveness::attach(int probe_fd, const std::string &path) {
-  install_fork_handlers();
+bool WriterLiveness::attach(int probe_fd, const std::string &path) {
+  bool handlers = install_fork_handlers();
+#ifdef CYCLONE_TEST_SEAMS
+  if (s_fork_handlers_fail_for_test.load(std::memory_order_relaxed)) {
+    handlers = false;
+  }
+#endif
   detach();
   std::lock_guard<std::mutex> lock(liveness_mutex());
   _probe_fd = probe_fd;
   _path = path;
-  (void)claim_locked(g_fork_epoch.load(std::memory_order_relaxed));
+  const uint32_t epoch = g_fork_epoch.load(std::memory_order_relaxed);
+  if (!handlers) {
+    // The fork epoch only moves in a child through the handlers: without
+    // them a forked child would take this claim for its own, and its death
+    // would look alive while this process lives.  Claim nothing, now or
+    // later (a failed outcome for this epoch is never retried by
+    // slot_for); probing peers still works.
+    _state.store(uint64_t{epoch} | kFailed, std::memory_order_release);
+    return false;
+  }
+  return claim_locked(epoch);
 }
 
 void WriterLiveness::detach() {

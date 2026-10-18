@@ -1058,7 +1058,8 @@ struct VolumeStats {
 
   // 1 iff this process holds no write-lock liveness slot on this
   // multi-process volume (WriterLiveness: all 251 slots taken, byte-range
-  // locking unsupported here, or the volume file was replaced by name).  Its
+  // locking unsupported here, the volume file was replaced by name, or the
+  // fork handlers could not be registered, out of memory).  Its
   // write-lock holds then carry no slot: if it dies holding the lock, peers
   // recover it only by the last-resort escalation (5 s) instead of within
   // about 50 ms.  A GAUGE.

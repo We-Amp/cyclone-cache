@@ -140,6 +140,48 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Write-lock liveness: without its fork handlers a process claims no "
+    "slot and says so",
+    "[writelock][multiprocess][liveness]") {
+  // The fork handlers are how a forked child learns that it is one.  Without
+  // them a child would take its parent's claim for its own, and its death
+  // would look alive for as long as the parent lives.  So a process whose
+  // handlers could not be registered claims no slot (a holder without one
+  // is recovered by the escalation), and its volume reports it unregistered.
+  TempCacheDir tmp("wll_nofork");
+  const std::string path = tmp.path();
+  cyclone::VolumeConfig vc;
+  vc.path = path;
+  vc.size = size_t{16} << 20;
+  cyclone::MultiProcessConfig mp;
+  mp.set_enabled(true).set_process_index(0).set_total_processes(1);
+
+  WriterLiveness::s_fork_handlers_fail_for_test.store(true);
+  auto volume = std::make_unique<cyclone::Volume>(vc, mp);
+  const bool opened = volume->open().has_value();
+  const int fd = open_rw(path);
+  WriterLiveness bare;
+  if (fd >= 0) {
+    bare.attach(fd, path);
+  }
+  WriterLiveness::s_fork_handlers_fail_for_test.store(false);
+  REQUIRE(opened);
+  REQUIRE(fd >= 0);
+  CHECK(bare.slot_of() == WriterLiveness::kNoSlot);
+  // Nor later, on the first write-lock acquisition.
+  CHECK(bare.slot_for() == WriterLiveness::kNoSlot);
+  CHECK(volume->stats().write_lock_liveness_unregistered == 1);
+  bare.detach();
+
+  // The next open, with the handlers in place, claims one.
+  volume->close();
+  REQUIRE(volume->open().has_value());
+  CHECK(volume->stats().write_lock_liveness_unregistered == 0);
+  volume->close();
+  close_fd(fd);
+}
+
+TEST_CASE(
     "Write-lock liveness: slots are exclusive and bounded; with none left a "
     "process holds none",
     "[writelock][liveness]") {

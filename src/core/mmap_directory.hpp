@@ -238,8 +238,12 @@ class WriterLiveness {
   /// `path` names it.  On POSIX a claim opens its own descriptor of `path`
   /// (checked to be the same inode as `probe_fd`), so that a forked child,
   /// which shares the parent's descriptors, can claim a slot of its own
-  /// whose lock dies with the child.  Claims a slot for this process at once.
-  void attach(int probe_fd, const std::string &path);
+  /// whose lock dies with the child.  Claims a slot for this process at once,
+  /// unless the fork handlers (install_fork_handlers) could not be
+  /// registered: a forked child could not tell its parent's claim from its
+  /// own, so then no slot is claimed in this attachment.  Returns whether
+  /// this process now holds a slot.
+  bool attach(int probe_fd, const std::string &path);
 
   /// Release this process's slot and forget the file.  The caller must not
   /// use a directory whose liveness this is afterwards.
@@ -272,6 +276,8 @@ class WriterLiveness {
   static inline std::atomic<uint32_t> s_pid_override_for_test{0};
   /// When true, every claim fails (locking unavailable).
   static inline std::atomic<bool> s_claims_fail_for_test{false};
+  /// When true, attach() finds the fork handlers not registered.
+  static inline std::atomic<bool> s_fork_handlers_fail_for_test{false};
   /// Nonzero: only slots [0, n) are claimable, starting at slot 0.
   static inline std::atomic<unsigned> s_slots_for_test{0};
 #endif

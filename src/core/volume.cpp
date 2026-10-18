@@ -2474,9 +2474,13 @@ std::expected<void, CacheError> Volume::init_stripes(bool exclusive) {
   // Claim this process's write-lock liveness slot on the volume file (issue
   // #32) before any stripe can take the write lock, so a peer can tell our
   // death from a stall in any PID namespace.  Idempotent across reset().
+  // Attached even when no slot could be claimed (no locks here, all taken,
+  // or no fork handlers): the attachment still probes peers, and stats()
+  // reports the missing slot (write_lock_liveness_unregistered).  The next
+  // open() attaches, and so tries to claim, again.
   if (use_mmap_dir &&
       !_writer_liveness_attached.load(std::memory_order_relaxed)) {
-    _writer_liveness.attach(_fd, _config.path);
+    (void)_writer_liveness.attach(_fd, _config.path);
     _writer_liveness_attached.store(true, std::memory_order_relaxed);
   }
 
