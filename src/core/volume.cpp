@@ -5008,9 +5008,18 @@ std::expected<void, CacheError> Volume::commit_write_impl(
   // sync's job.  See the durability contract on sync_directory().
   if (_config.sync_on_write) {
 #ifndef _WIN32
+    // While the mutex is released a wrap can run: the stripe's tail
+    // may then overwrite the bytes just written, and the election below
+    // could point a newer live entry of this key at them.  Remember the
+    // pass at the commit and give up (Busy: the document stays
+    // unreachable, like any fill whose insert never ran) if it moved.
+    const StripeSnapshot snap_at_commit = snapshot(stripe);
     lock.unlock();
     fsync_fd();
     lock.lock();
+    if (wrapped_since(stripe, snap_at_commit)) {
+      return make_unexpected(CacheError::Busy);
+    }
 #endif
   }
 
@@ -6554,9 +6563,18 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
   // contract on sync_directory().
   if (_config.sync_on_write) {
 #ifndef _WIN32
+    // While the mutex is released a wrap can run: the stripe's tail
+    // may then overwrite the bytes just written, and the election below
+    // could point a newer live entry of this key at them.  Remember the
+    // pass at the commit and give up (Busy: the document stays
+    // unreachable, like any fill whose insert never ran) if it moved.
+    const StripeSnapshot snap_at_commit = snapshot(stripe);
     lock.unlock();
     fsync_fd();
     lock.lock();
+    if (wrapped_since(stripe, snap_at_commit)) {
+      return make_unexpected(CacheError::Busy);
+    }
 #endif
   }
 
@@ -8257,6 +8275,10 @@ int Volume::fsync_fd() const {
       s_fsync_pause_us_for_test.load(std::memory_order_relaxed);
   if (pause_us != 0) {
     std::this_thread::sleep_for(std::chrono::microseconds(pause_us));
+  }
+  if (const auto* hook =
+          s_fsync_hook_for_test.load(std::memory_order_acquire)) {
+    (*hook)();
   }
 #endif
   _fsyncs.fetch_add(1, std::memory_order_relaxed);

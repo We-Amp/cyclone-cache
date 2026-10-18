@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -22,6 +23,7 @@
 #include <vector>
 
 #include "core/volume.hpp"
+#include "cyclone/alternate.hpp"
 #include "cyclone/config.hpp"
 #include "cyclone/error.hpp"
 #include "cyclone/key.hpp"
@@ -141,4 +143,101 @@ TEST_CASE(
       REQUIRE(rh->content().size() == kDocBytes);
     }
   }
+}
+
+TEST_CASE(
+    "sync_on_write: a stripe wrap during the unlocked flush does not let the "
+    "commit overwrite a newer write of the same key",
+    "[volume][regression]") {
+  TempCacheDir tmp("syncwrap");
+  auto volume = open_volume(tmp.path());
+  const CacheKey key("sync-write-wrap-key");
+  const auto older = make_content(std::byte{0x11});
+  const auto newer = make_content(std::byte{0x22});
+  const std::vector<std::byte> filler(size_t{1024}, std::byte{0x33});
+
+  // While the first commit sits in its flush (stripe mutex released), the
+  // stripe wraps over the first commit's bytes and a newer write of the same
+  // key lands.
+  std::atomic<bool> fired{false};
+  std::function<void()> hook = [&] {
+    if (fired.exchange(true)) {
+      return;
+    }
+    const uint64_t wraps_before = volume->stats().wrap_count;
+    for (int i = 0; i < 20000 && volume->stats().wrap_count == wraps_before;
+         ++i) {
+      REQUIRE(write_doc(*volume,
+                        CacheKey("sync-write-wrap-fill-" + std::to_string(i)),
+                        filler));
+    }
+    REQUIRE(volume->stats().wrap_count > wraps_before);
+    REQUIRE(write_doc(*volume, key, newer));
+  };
+  Volume::s_fsync_hook_for_test.store(&hook);
+  struct Clear {
+    ~Clear() { Volume::s_fsync_hook_for_test.store(nullptr); }
+  } clear;
+
+  // The first commit may report success or Busy; what it must never do is
+  // point the key at its own, now overwritten, bytes.
+  (void)write_doc(*volume, key, older);
+  Volume::s_fsync_hook_for_test.store(nullptr);
+
+  auto rh = volume->read_sync(key);
+  REQUIRE(rh.has_value());
+  REQUIRE(rh->content().size() == kDocBytes);
+  REQUIRE(rh->content()[0] == std::byte{0x22});
+}
+
+TEST_CASE(
+    "sync_on_write: a stripe wrap during the unlocked flush of an alternate "
+    "commit does not let it overwrite a newer write of the same alternate",
+    "[volume][regression]") {
+  TempCacheDir tmp("syncwrapalt");
+  auto volume = open_volume(tmp.path());
+  const CacheKey key("sync-write-wrap-alt-key");
+  const auto older = make_content(std::byte{0x11});
+  const auto newer = make_content(std::byte{0x22});
+  const std::vector<std::byte> filler(size_t{1024}, std::byte{0x33});
+  auto write_alt = [&](std::span<const std::byte> content) {
+    auto wh =
+        volume->write_alternate_sync(key, AlternateId::Brotli, content.size());
+    if (!wh) {
+      return false;
+    }
+    return wh->write_sync(content).has_value() && wh->close_sync().has_value();
+  };
+  REQUIRE(write_doc(*volume, key, make_content(std::byte{0x01})));
+
+  std::atomic<bool> fired{false};
+  std::function<void()> hook = [&] {
+    if (fired.exchange(true)) {
+      return;
+    }
+    const uint64_t wraps_before = volume->stats().wrap_count;
+    for (int i = 0; i < 20000 && volume->stats().wrap_count == wraps_before;
+         ++i) {
+      REQUIRE(write_doc(
+          *volume, CacheKey("sync-write-wrap-alt-fill-" + std::to_string(i)),
+          filler));
+    }
+    REQUIRE(volume->stats().wrap_count > wraps_before);
+    REQUIRE(write_alt(newer));
+  };
+  Volume::s_fsync_hook_for_test.store(&hook);
+  struct Clear {
+    ~Clear() { Volume::s_fsync_hook_for_test.store(nullptr); }
+  } clear;
+
+  (void)write_alt(older);
+  Volume::s_fsync_hook_for_test.store(nullptr);
+
+  const CompressionAwareSelector selector;
+  AlternateSelectionContext ctx;
+  ctx.prefer_compressed = true;
+  auto rh = volume->read_alternate_sync(key, selector, ctx);
+  REQUIRE(rh.has_value());
+  REQUIRE(rh->content().size() == kDocBytes);
+  REQUIRE(rh->content()[0] == std::byte{0x22});
 }

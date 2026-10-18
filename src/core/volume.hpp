@@ -1466,6 +1466,11 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // latency dominate the write path on any filesystem and measure where on
   // that path the flush runs.
   static inline std::atomic<uint32_t> s_fsync_pause_us_for_test{0};
+  // When set, called (on the flushing thread, with no volume lock held)
+  // right before the real flush, so a test can run other writes, even wrap
+  // the stripe, while a commit sits in its unlocked durability flush.
+  static inline std::atomic<const std::function<void()> *>
+      s_fsync_hook_for_test{nullptr};
 #endif
 
   // Pause points of the handle-call / close() handshake (see HandleCall in
