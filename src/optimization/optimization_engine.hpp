@@ -25,7 +25,8 @@ struct OptimizationStats {
   uint64_t completed = 0;
   uint64_t cancelled = 0;
   uint64_t failed = 0;
-  uint64_t skipped = 0;  // Skipped due to min_hits_before_optimize
+  uint64_t skipped = 0;     // Skipped due to min_hits_before_optimize
+  uint64_t duplicates = 0;  // Refused: the same item id was already running
 
   WorkQueueStats queue_stats;
   ThreadPoolStats pool_stats;

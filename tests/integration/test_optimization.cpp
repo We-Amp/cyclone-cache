@@ -810,6 +810,8 @@ TEST_CASE("OptimizationEngine refuses duplicate in-flight work items",
   std::this_thread::sleep_for(std::chrono::milliseconds(300));
   const int entries_while_running =
       plugin->entries.load(std::memory_order_acquire);
+  // The refusal is counted, not silently dropped.
+  const uint64_t duplicates_while_running = engine->stats().duplicates;
 
   // Release worker 1 and let the write complete.
   plugin->released.store(true, std::memory_order_release);
@@ -828,6 +830,7 @@ TEST_CASE("OptimizationEngine refuses duplicate in-flight work items",
   cleanup_temp(cache_path);
 
   REQUIRE(entries_while_running == 1);
+  REQUIRE(duplicates_while_running == 1);
   REQUIRE(reran);
 }
 

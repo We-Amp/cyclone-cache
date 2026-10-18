@@ -289,6 +289,7 @@ void OptimizationEngine::process_work_item(WorkItem item) {
 
   // Create cancellation token
   auto cancelled = std::make_shared<std::atomic<bool>>(false);
+  bool refused = false;
   {
     std::lock_guard lock(_active_work_mutex);
     // dequeue() erased this id from the queue's dedup set, so the same id can
@@ -299,8 +300,13 @@ void OptimizationEngine::process_work_item(WorkItem item) {
     // write.  The next on_write_complete() re-queues the id once this
     // instance has finished.
     if (!_active_work.try_emplace(item.id, cancelled).second) {
-      return;
+      refused = true;
     }
+  }
+  if (refused) {
+    std::lock_guard stats_lock(_stats_mutex);
+    ++_stats.duplicates;
+    return;
   }
 
   // Everything below runs embedder-supplied plugin code (transform,
