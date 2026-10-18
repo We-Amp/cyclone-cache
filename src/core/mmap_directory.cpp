@@ -1128,31 +1128,38 @@ bool MmapDirectory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
 
   DirEntry *bucket = &_entries[bucket_idx * kEntriesPerBucket];
 
-  // Acquire cross-process phase lock FIRST, then bucket writer lock.
-  // This ensures no phase toggle can happen between reading current_phase
-  // and writing the entry with that phase — preventing the ABA race where
-  // another process's evict_if_needed() invalidates our freshly-written entry.
+  // Acquire the bucket writer lock FIRST (the sleepy, per-holder-budgeted
+  // wait holds nothing else), then the phase lock.  The phase lock is
+  // stripe-wide: held across the bucket wait, one hot or wedged bucket
+  // serialized every insert of the stripe behind it and queued the wrap
+  // path's phase publication (set_current_phase, under the write lock)
+  // behind it too.  Taken second, it is held only for the short bracket
+  // below and no waiter of it is ever waiting on anything else.
+  //
+  // The ABA protection the phase bracket exists for is order-independent:
+  // current_phase is read and every entry store happens under the phase
+  // lock, so no phase toggle can interleave between them and invalidate the
+  // freshly-written entry's phase.  The bucket bracket still covers the
+  // entry stores themselves (the seqlock readers watch).
   //
   // Both waits are capped: behind live holders that keep changing, give up
   // and publish nothing (*busy) rather than stall the writer.
+  uint32_t writer_token = 0;
+  if (!acquire_writer(bucket_idx, writer_token, /*capped=*/true)) {
+    if (busy != nullptr) {
+      *busy = true;
+    }
+    return false;
+  }
   PhaseLockToken phase_token;
   if (!acquire_phase_lock(phase_token, /*capped=*/true)) {
+    release_writer(bucket_idx, writer_token);
     if (busy != nullptr) {
       *busy = true;
     }
     return false;
   }
   bool cur_phase = current_phase();
-
-  // Acquire writer lock (CAS even → odd, waits if another writer holds it).
-  uint32_t writer_token = 0;
-  if (!acquire_writer(bucket_idx, writer_token, /*capped=*/true)) {
-    release_phase_lock(phase_token);
-    if (busy != nullptr) {
-      *busy = true;
-    }
-    return false;
-  }
 
   if (admission != nullptr) {
     // Boundaries are loaded HERE, inside the bracket and under phase_lock:
@@ -1595,9 +1602,10 @@ void MmapDirectory::reset_reader_state_exclusive() {
 // release nor another holder.  The header has no room to publish the
 // holder's PID for a liveness proof like the write lock's, so the budget is
 // what separates "descheduled" from "stuck": it is set well above the
-// longest live hold measured under CPU oversubscription, and above
-// kBucketWriterBudget, which bounds the holder's own nested wait on a
-// bucket (see the PR for #27).
+// longest live hold measured under CPU oversubscription (the bracket the
+// lock covers is the insert's phase read + entry stores, microseconds;
+// insert() takes the lock AFTER its bucket wait, so no holder of it is ever
+// parked on a bucket -- see the PR for #27).
 //
 // Why presuming is acceptable here, unlike the write lock: what can a
 // usurped holder that is still executing do?  Its insert already read the
