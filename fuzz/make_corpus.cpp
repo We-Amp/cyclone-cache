@@ -35,6 +35,9 @@
 #include "cyclone/config.hpp"
 #include "cyclone/key.hpp"
 #include "volume_template.hpp"
+#ifdef CYCLONE_HTTP_PLUGIN
+#include "plugin/http/http_metadata.hpp"
+#endif
 
 using namespace cyclone;
 namespace fs = std::filesystem;
@@ -172,6 +175,52 @@ void gen_c_api_seeds(const fs::path &root) {
   }
 }
 
+void gen_async_seeds(const fs::path &root) {
+  fs::path dir = root / "fuzz_c_api_async";
+  auto b = [](std::initializer_list<int> l) {
+    std::vector<std::byte> v;
+    for (int x : l) v.push_back(static_cast<std::byte>(x));
+    return v;
+  };
+  // read k0 (parks a fetch), read k0 again (coalesces), complete with data.
+  write_seed(dir, "coalesce_complete.bin",
+             b({0, 0, 0, 0, 1, 0, 1, 3, 'a', 'b', 'c'}));
+  // read, drain with a short deadline, then complete the late fetch.
+  write_seed(dir, "drain_then_late_done.bin",
+             b({0, 1, 3, 1, 1, 0, 1, 2, 'h', 'i'}));
+  // write, read (hit), handler off, read (miss, no handler).
+  write_seed(dir, "write_hit_handler_off.bin",
+             b({2, 2, 2, 'x', 'y', 0, 2, 4, 1, 0, 2}));
+}
+
+#ifdef CYCLONE_HTTP_PLUGIN
+void gen_http_seeds(const fs::path &root) {
+  HttpCacheAlt alt;
+  alt.set_request_method("GET");
+  alt.set_request_url("http://example.com/a");
+  alt.set_request_header("Accept-Encoding", "gzip");
+  alt.set_status_code(200);
+  alt.set_response_header("Vary", "Accept-Encoding");
+  alt.set_response_header("Cache-Control", "max-age=60");
+  alt.set_response_header("Content-Type", "text/html");
+  alt.set_request_time(1700000000);
+  alt.set_response_time(1700000001);
+  auto blob = alt.serialize();
+  write_seed(root / "fuzz_http_metadata", "valid.bin", blob);
+
+  // 2-byte split selector, the metadata blob, then the request headers.
+  std::string headers =
+      "Accept-Encoding: gzip, br\r\nAccept: text/html;q=0.8\r\n";
+  std::vector<std::byte> input;
+  size_t split = blob.size();
+  input.push_back(static_cast<std::byte>((split >> 8) & 0xFF));
+  input.push_back(static_cast<std::byte>(split & 0xFF));
+  input.insert(input.end(), blob.begin(), blob.end());
+  for (char c : headers) input.push_back(static_cast<std::byte>(c));
+  write_seed(root / "fuzz_http_alternate", "vary_accept.bin", input);
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -180,6 +229,10 @@ int main(int argc, char **argv) {
   gen_document_seeds(root);
   gen_volume_seeds(root);
   gen_c_api_seeds(root);
+  gen_async_seeds(root);
+#ifdef CYCLONE_HTTP_PLUGIN
+  gen_http_seeds(root);
+#endif
   std::printf("done\n");
   return 0;
 }
