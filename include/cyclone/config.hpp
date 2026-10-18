@@ -278,8 +278,8 @@ struct OptimizationConfig {
     if (min_threads > effective_max_threads()) {
       return false;
     }
-    if (enable_load_shedding && (!(baseline_ops_per_sec > 0.0) ||
-                                 !(baseline_bytes_per_sec > 0.0))) {
+    if (enable_load_shedding &&
+        (!(baseline_ops_per_sec > 0.0) || !(baseline_bytes_per_sec > 0.0))) {
       return false;
     }
     return true;

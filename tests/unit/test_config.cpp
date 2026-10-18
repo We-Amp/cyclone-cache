@@ -183,9 +183,7 @@ TEST_CASE("OptimizationConfig clamps a zero scale check interval",
 }
 
 TEST_CASE("OptimizationConfig validation", "[config]") {
-  SECTION("defaults are valid") {
-    REQUIRE(OptimizationConfig{}.is_valid());
-  }
+  SECTION("defaults are valid") { REQUIRE(OptimizationConfig{}.is_valid()); }
 
   SECTION("a non-positive scale check interval is invalid") {
     OptimizationConfig opt;
