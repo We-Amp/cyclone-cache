@@ -229,6 +229,62 @@ TEST_CASE("HttpAlternatePlugin ignores variants with undecodable metadata",
   REQUIRE(plugin->check_freshness(variants[1], fctx) == FreshnessResult::Fresh);
 }
 
+TEST_CASE("HttpAlternatePlugin does not select unacceptable variants",
+          "[http][alternate]") {
+  auto plugin = create_http_alternate_plugin();
+
+  HttpCacheAlt html;
+  html.set_response_header("Content-Type", "text/html");
+  auto html_meta = html.serialize();
+  HttpCacheAlt png;
+  png.set_response_header("Content-Type", "image/png");
+  auto png_meta = png.serialize();
+
+  auto select = [&](const std::string &headers, bool both) {
+    VariantCollection variants;
+    variants.add(CacheVariant{CacheKey("html"),
+                              Metadata(std::span<const std::byte>(html_meta)),
+                              0,
+                              {},
+                              {},
+                              0});
+    if (both) {
+      variants.add(CacheVariant{CacheKey("png"),
+                                Metadata(std::span<const std::byte>(png_meta)),
+                                0,
+                                {},
+                                {},
+                                0});
+    }
+    LookupContext ctx;
+    ctx.request_headers = std::span<const std::byte>(
+        reinterpret_cast<const std::byte *>(headers.data()), headers.size());
+    return plugin->select_variant(variants, ctx);
+  };
+
+  SECTION("explicit q=0 on the only variant") {
+    REQUIRE_FALSE(select("Accept: text/html;q=0\r\n", false).has_value());
+    REQUIRE_FALSE(select("Accept: text/html;q=0.0\r\n", false).has_value());
+  }
+  SECTION("media type that does not match the only variant") {
+    REQUIRE_FALSE(select("Accept: image/png\r\n", false).has_value());
+  }
+  SECTION("q=0 variant loses to an acceptable one") {
+    auto r = select("Accept: text/html;q=0, image/png;q=0.1\r\n", true);
+    REQUIRE(r.has_value());
+    REQUIRE(*r == 1);
+  }
+  SECTION("nothing acceptable among several variants") {
+    REQUIRE_FALSE(
+        select("Accept: text/html;q=0, image/png;q=0\r\n", true).has_value());
+  }
+  SECTION("acceptable variant is still selected") {
+    auto r = select("Accept: text/html;q=0.5\r\n", false);
+    REQUIRE(r.has_value());
+    REQUIRE(*r == 0);
+  }
+}
+
 TEST_CASE("HttpAlternatePlugin info", "[http]") {
   auto plugin = create_http_alternate_plugin();
   REQUIRE(plugin != nullptr);

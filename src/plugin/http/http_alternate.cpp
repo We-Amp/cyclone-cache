@@ -113,7 +113,7 @@ std::optional<size_t> HttpAlternatePlugin::select_variant(
   }
 
   size_t best_index = 0;
-  float best_quality = -1.0f;
+  float best_quality = 0.0f;
 
   for (size_t i = 0; i < variants.size(); ++i) {
     const auto &variant = variants[i];
@@ -161,13 +161,14 @@ std::optional<size_t> HttpAlternatePlugin::select_variant(
       }
     }
 
+    // A quality of zero means "not acceptable" (RFC 9110 12.4.2).
     if (quality > best_quality) {
       best_quality = quality;
       best_index = i;
     }
   }
 
-  if (best_quality < 0.0f) {
+  if (best_quality <= 0.0f) {
     return std::nullopt;
   }
 
