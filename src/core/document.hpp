@@ -162,9 +162,9 @@ struct Document {
   // canonical fixed header followed by its payload (header bytes +
   // content).  The canonical header is the 132-byte wire header with the
   // fields the cache stamps after the checksum is computed or updates in
-  // place set to zero: write_serial (the pass stamp), the checksum itself, hit_count,
-  // next_alternate_offset and last_access.  Every other field -- magic,
-  // the lengths, both keys, header_len, doc_type, the version, flags,
+  // place set to zero: write_serial (the pass stamp), the checksum itself,
+  // hit_count, next_alternate_offset and last_access.  Every other field --
+  // magic, the lengths, both keys, header_len, doc_type, the version, flags,
   // sync_serial, pin_until, frag_offset, alternate_id and the reserved
   // bytes -- is covered, so a change to any of them fails verification.
   // Returns the CRC-32C state after the canonical header, to be continued
