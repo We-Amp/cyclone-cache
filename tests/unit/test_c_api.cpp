@@ -2097,6 +2097,37 @@ TEST_CASE("C API: a throwing read_cb does not leave a write-back pending",
   destroyer.join();
 }
 
+TEST_CASE(
+    "C API: a throwing miss handler leaves no read registered, so its "
+    "read_cb is never called",
+    "[c_api][miss_callback][shutdown]") {
+  // The miss handler must not throw (see cyclone_c.h), but one written in
+  // C++ might.  The read then returns an error, which promises that read_cb
+  // will not be called: the read must not stay registered and be answered
+  // later (at destroy, perhaps after the caller freed read_user_data).
+  TempCacheDir tmp;
+  CycloneCacheHandle *cache = make_async_cache(tmp.path());
+  auto throwing_handler = [](const char *, size_t, void *,
+                             CycloneMissDoneCallback, void *) {
+    throw std::runtime_error("miss handler failed");
+  };
+  REQUIRE(cyclone_cache_set_miss_handler(cache, throwing_handler, nullptr) ==
+          CYCLONE_OK);
+
+  std::atomic<int> calls{0};
+  auto counting_read = [](void *ud, const char *, size_t, CycloneError) {
+    static_cast<std::atomic<int> *>(ud)->fetch_add(1);
+  };
+  CHECK(cyclone_cache_read_async(cache, "handler-throws", 14, counting_read,
+                                 &calls) == CYCLONE_INTERNAL_ERROR);
+  CHECK(calls.load() == 0);
+
+  // Nothing is in flight: a drain is immediate, and destroy answers no one.
+  CHECK(cyclone_cache_drain_pending(cache, 1000) == CYCLONE_OK);
+  cyclone_cache_destroy(cache);
+  CHECK(calls.load() == 0);
+}
+
 #if defined(__GLIBC__) && defined(__GLIBCXX__)
 TEST_CASE("C API: a thread cancelled inside drain_pending unwinds cleanly",
           "[c_api][shutdown]") {

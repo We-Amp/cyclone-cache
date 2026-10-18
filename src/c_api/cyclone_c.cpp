@@ -710,14 +710,60 @@ static CycloneError read_async_impl(CycloneCacheHandle *cache, const char *key,
     // Release ownership: the handler takes the raw pointer and must
     // eventually pass it to internal_miss_done (which transfers it
     // into completed_contexts).
-    handler(key, key_len, handler_ud, internal_miss_done, ctx.release());
+    MissDoneContext *raw_ctx = ctx.release();
+    try {
+      handler(key, key_len, handler_ud, internal_miss_done, raw_ctx);
+    } catch (...) {
+      // A miss handler must not throw (see cyclone_c.h).  If it did, the
+      // fetch it was asked for may never complete, so the read must not
+      // stay registered: the error returned below promises that read_cb
+      // will not be called, and a registered waiter would be answered
+      // later, at drain or destroy, perhaps after the caller freed
+      // read_user_data.  So unregister this read, and answer the reads that
+      // coalesced onto the fetch meanwhile with an error.  The context
+      // stays with the handler, which may still pass it to done; a late
+      // done finds no waiters and answers no one.  If done already ran
+      // (the handler threw after calling it), this read has been answered:
+      // report success, as read_cb has been called.
+      std::vector<std::pair<CycloneReadCallback, void *>> others;
+      bool unregistered = false;
+      {
+        std::lock_guard<std::mutex> lock(cache->in_flight_mu);
+        auto it = cache->in_flight.find(key_str);
+        if (it != cache->in_flight.end()) {
+          auto &waiters = it->second.waiters;
+          for (auto w = waiters.begin(); w != waiters.end(); ++w) {
+            if (w->first == read_cb && w->second == read_user_data) {
+              waiters.erase(w);
+              unregistered = true;
+              break;
+            }
+          }
+          if (unregistered) {
+            others = std::move(waiters);
+            cache->in_flight.erase(it);
+            if (cache->in_flight.empty()) {
+              cache->in_flight_drained.notify_all();
+            }
+          }
+        }
+      }
+      for (auto &[cb, ud] : others) {
+        cb(ud, nullptr, 0, CYCLONE_INTERNAL_ERROR);
+      }
+      if (!unregistered) {
+        return CYCLONE_OK;
+      }
+      throw;
+    }
   }
 
   return CYCLONE_OK;
 }
 
 // A non-OK return means the read was neither answered nor registered, and
-// read_cb will not be called later. If read_cb itself throws (a contract
+// read_cb will not be called later (a throwing miss handler included: the
+// read is unregistered first). If read_cb itself throws (a contract
 // violation), it has already been called when the error is returned.
 CycloneError cyclone_cache_read_async(CycloneCacheHandle *cache,
                                       const char *key, size_t key_len,

@@ -638,7 +638,11 @@ typedef void (*CycloneReadCallback)(void *, const char *, size_t, CycloneError);
  * - Cache shutting down: invokes read_cb with CYCLONE_NOT_INITIALIZED.
  * Returns CYCLONE_OK when read_cb has been or will be called.  Any other
  * return (CYCLONE_INVALID_ARGUMENT, CYCLONE_INTERNAL_ERROR) means read_cb
- * has not been called and will not be.
+ * has not been called and will not be, with one exception: callbacks must
+ * not throw, and a read_cb that throws has already been called when
+ * CYCLONE_INTERNAL_ERROR is returned.  A miss handler that throws makes
+ * the call return CYCLONE_INTERNAL_ERROR without calling read_cb; reads
+ * that coalesced onto its fetch meanwhile get CYCLONE_INTERNAL_ERROR.
  */
 CycloneError cyclone_cache_read_async(CycloneCacheHandle *cache,
                                       const char *key, size_t key_len,
