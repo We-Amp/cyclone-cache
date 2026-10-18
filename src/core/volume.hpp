@@ -1153,8 +1153,10 @@ class Volume;
 // outlives them keeps the Volume object and the mapping alive until it
 // closes (an upgrade over the weak scheme, where such a handle's spans
 // dangled and only destruction/renew were safe).  Volumes not owned by a
-// Cache (direct construction in tests) have no anchors and keep the
-// original per-read weak_ptr path.
+// Cache (direct construction) have no anchors: each disk-hit handle then
+// holds its own strong reference to the MappedFile, so its spans stay
+// valid after the Volume closes or is destroyed as well, and a weak_ptr to
+// the Volume for release and renew.
 struct VolumeReadAnchor {
   std::shared_ptr<Volume> volume;
   std::shared_ptr<MappedFile> mapped_file;
@@ -1671,7 +1673,7 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // set_read_anchors().  set_read_anchors(nullptr, 0) detaches (done under
   // the cache's exclusive gate before close()); count must be a power of
   // two.  Volumes without installed anchors serve reads through the
-  // legacy weak_ptr path.
+  // per-handle path (a MappedFile pin plus a Volume weak_ptr).
   static constexpr size_t kReadAnchorShards = 64;
   [[nodiscard]] std::vector<std::shared_ptr<VolumeReadAnchor>>
   make_read_anchors();

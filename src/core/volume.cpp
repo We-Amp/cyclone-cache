@@ -768,10 +768,12 @@ class VolumeReadHandleImpl : public ReadHandleImpl {
   // per-thread-shard lifetime anchor (see VolumeReadAnchor in
   // volume.hpp).  Set on disk-hit reads of a Cache-owned Volume; pins the
   // Volume AND the MappedFile for the handle's lifetime through one
-  // thread-affine refcount.  When null (direct Volume use in tests), the
-  // legacy weak_ptr members below carry the lifetime instead.
+  // thread-affine refcount.  When null (a Volume not owned by a Cache),
+  // the members below carry the lifetime instead: mapped_file pins the
+  // mapping the spans alias, as the anchor does, and volume_weak reaches
+  // the Volume while it lives.
   std::shared_ptr<VolumeReadAnchor> anchor;
-  std::weak_ptr<MappedFile> mapped_file_weak;  // legacy path (no anchor)
+  std::shared_ptr<MappedFile> mapped_file;  // no-anchor path: strong pin
   std::span<std::byte> mapping;
   Document doc;
   std::vector<std::byte> ram_buffer;  // Owns RAM cache data (spans point here)
@@ -783,8 +785,8 @@ class VolumeReadHandleImpl : public ReadHandleImpl {
   // volume_weak PINS the Volume for the duration of a renew (see
   // renew_lease below) so the raw `stripe` and the mapping outlive a
   // client-paced drain that races Cache::stop() — the borrow-lifetime
-  // use-after-free the old raw Volume* left open (mapped_file_weak kept
-  // the mapping alive but NOT the Volume or its _stripes).  epoch_start is
+  // use-after-free the old raw Volume* left open (the mapping pin alone
+  // does not keep the Volume or its _stripes alive).  epoch_start is
   // the served document's exposure threshold (BorrowEpoch); the checked
   // renew fails (so the embedder copies/aborts) iff G passed it.
   std::weak_ptr<Volume> volume_weak;
@@ -824,14 +826,11 @@ class VolumeReadHandleImpl : public ReadHandleImpl {
         vol->release_borrow(stripe, borrow);
       }
     }
-    // Only unmap if MappedFile still exists (cache not stopped)
-    if (auto mf = mapped_file_weak.lock()) {
-      if (!mapping.empty()) {
-        mf->unmap_region(mapping);
-      }
+    // The pinned MappedFile owns the mapping whether or not the Volume
+    // still exists; the last handle to drop it releases the whole mapping.
+    if (mapped_file && !mapping.empty()) {
+      mapped_file->unmap_region(mapping);
     }
-    // If weak_ptr is expired, the mapping was already cleaned up by MappedFile
-    // destructor
   }
 
   [[nodiscard]] std::span<const std::byte> header() const override {
@@ -857,8 +856,8 @@ class VolumeReadHandleImpl : public ReadHandleImpl {
     const std::byte* base = nullptr;
     if (anchor) {
       base = anchor->mapped_file->persistent_base();
-    } else if (auto mf = mapped_file_weak.lock()) {
-      base = mf->persistent_base();
+    } else if (mapped_file) {
+      base = mapped_file->persistent_base();
     }
     if (base == nullptr) return kNoFileOffset;
     return static_cast<uint64_t>(
@@ -873,7 +872,7 @@ class VolumeReadHandleImpl : public ReadHandleImpl {
     // `stripe` we deref, and its _mapped_file mapping) for the duration of
     // the call.  A client-paced zero-copy drain can outlive Cache::stop();
     // locking the Volume weak_ptr guarantees `stripe` is not freed
-    // mid-renew (the prior raw Volume* + mapped_file_weak.lock() kept the
+    // mid-renew (the prior raw Volume* + a mapping pin kept the
     // mapping but NOT the Volume/_stripes -> a use-after-free under nginx
     // reload / worker exit).  Expired == cache torn down: nothing to renew.
     if (anchor) {  // strong pin, Volume always reachable
@@ -3200,10 +3199,11 @@ std::expected<ReadHandle, CacheError> Volume::read_sync(const CacheKey& key) {
           auto impl = std::make_shared<VolumeReadHandleImpl>();
           // pin Volume + MappedFile through this thread's shard
           // anchor — one refcount RMW on a thread-affine control block — with
-          // the two per-read weak_ptrs as the anchor-less fallback.
+          // a per-read mapping pin and Volume weak_ptr as the anchor-less
+          // fallback.
           impl->anchor = read_anchor();
           if (!impl->anchor) {
-            impl->mapped_file_weak = _mapped_file;
+            impl->mapped_file = _mapped_file;
             impl->volume_weak = weak_from_this();  // pin for lease renew
           }
           impl->mapping = *mapped;
@@ -7390,7 +7390,7 @@ std::expected<ReadHandle, CacheError> Volume::read_alternate_sync(
           // same thread-shard anchor pin as read_sync.
           impl->anchor = read_anchor();
           if (!impl->anchor) {
-            impl->mapped_file_weak = _mapped_file;
+            impl->mapped_file = _mapped_file;
             impl->volume_weak = weak_from_this();  // pin for lease renew
           }
           impl->mapping = *selected_mapped;

@@ -1438,6 +1438,44 @@ TEST_CASE("A stale write handle on a bare Volume is refused after reopen",
   volume->close();
 }
 
+TEST_CASE("A read handle on a bare Volume keeps its mapping after close",
+          "[lifecycle][read][borrow]") {
+  // ReadHandle's lifetime contract holds without a Cache too: a disk-hit
+  // handle keeps the mapping it reads from alive, so header() and content()
+  // stay valid after the Volume closes or is destroyed.
+  for (const bool destroy : {false, true}) {
+    CAPTURE(destroy);
+    TempCacheDir tmp;
+    VolumeConfig vol_config;
+    vol_config.path = tmp.path();
+    vol_config.size = static_cast<size_t>(8 * 1024 * 1024);
+    auto volume = std::make_shared<Volume>(vol_config);
+    REQUIRE(volume->open().has_value());
+    const CacheKey key("read-handle-on-a-bare-volume");
+    std::vector<std::byte> body(16384);
+    for (size_t i = 0; i < body.size(); ++i) {
+      body[i] = static_cast<std::byte>((i * 37 + 11) & 0xFF);
+    }
+    auto wh = volume->write_sync(key, body.size());
+    REQUIRE(wh.has_value());
+    REQUIRE(wh->write_sync(std::span<const std::byte>(body)).has_value());
+    REQUIRE(wh->close_sync().has_value());
+
+    auto rh = volume->read_sync(key);
+    REQUIRE(rh.has_value());
+    REQUIRE_FALSE(rh->is_ram_cache_hit());
+
+    volume->close();
+    if (destroy) {
+      volume.reset();
+    }
+    const auto content = rh->content();
+    REQUIRE(content.size() == body.size());
+    CHECK(std::memcmp(content.data(), body.data(), body.size()) == 0);
+    CHECK_FALSE(rh->renew_lease());
+  }
+}
+
 TEST_CASE("Concurrent stop with in-flight writes must not crash",
           "[lifecycle][concurrency]") {
   // Writers hold a filled write handle and commit it around the moment the
