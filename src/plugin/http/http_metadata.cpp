@@ -368,9 +368,10 @@ std::optional<HttpCacheAlt> HttpCacheAlt::deserialize(
   if (data.size() - offset != 16) {
     return std::nullopt;
   }
-  alt._request_time = static_cast<std::time_t>(static_cast<int64_t>(get_le(8)));
+  alt._request_time =
+      clamp_time(static_cast<std::time_t>(static_cast<int64_t>(get_le(8))));
   alt._response_time =
-      static_cast<std::time_t>(static_cast<int64_t>(get_le(8)));
+      clamp_time(static_cast<std::time_t>(static_cast<int64_t>(get_le(8))));
 
   return alt;
 }

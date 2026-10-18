@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -407,25 +408,24 @@ TEST_CASE("HttpAlternatePlugin Vary matches names regardless of case",
   REQUIRE_FALSE(plugin->select_variant(variants, ctx).has_value());
 }
 
-TEST_CASE("HttpCacheAlt metadata uses a fixed little-endian layout",
-          "[http]") {
+TEST_CASE("HttpCacheAlt metadata uses a fixed little-endian layout", "[http]") {
   HttpCacheAlt alt;
   alt.set_request_method("GET");
   alt.set_request_url("/");
   alt.set_status_code(0x0102);
-  alt.set_request_time(static_cast<std::time_t>(0x1122334455667788LL));
-  alt.set_response_time(static_cast<std::time_t>(0x0102030405060708LL));
+  alt.set_request_time(static_cast<std::time_t>(0x0000000A0B0C0D0ELL));
+  alt.set_response_time(static_cast<std::time_t>(0x0000000102030405LL));
 
   auto data = alt.serialize();
   const std::vector<unsigned char> expected = {
-      0xA5,                                // format version
-      3,    0,    0,    0,    'G', 'E', 'T',  // method
-      1,    0,    0,    0,    '/',            // url
-      0,    0,    0,    0,                    // request headers
-      0x02, 0x01,                              // status
-      0,    0,    0,    0,                    // response headers
-      0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,  // request time
-      0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,  // response time
+      0xA5,                                            // format version
+      3,    0,    0,    0,    'G',  'E',  'T',         // method
+      1,    0,    0,    0,    '/',                     // url
+      0,    0,    0,    0,                             // request headers
+      0x02, 0x01,                                      // status
+      0,    0,    0,    0,                             // response headers
+      0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x00, 0x00, 0x00,  // request time
+      0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0x00, 0x00,  // response time
   };
   REQUIRE(data.size() == expected.size());
   REQUIRE(std::memcmp(data.data(), expected.data(), expected.size()) == 0);
@@ -434,9 +434,9 @@ TEST_CASE("HttpCacheAlt metadata uses a fixed little-endian layout",
   REQUIRE(parsed.has_value());
   REQUIRE(parsed->status_code() == 0x0102);
   REQUIRE(static_cast<long long>(parsed->request_time()) ==
-          0x1122334455667788LL);
+          0x0000000A0B0C0D0ELL);
   REQUIRE(static_cast<long long>(parsed->response_time()) ==
-          0x0102030405060708LL);
+          0x0000000102030405LL);
 }
 
 TEST_CASE("HttpCacheAlt deserialize treats an unversioned blob as a miss",
@@ -444,10 +444,32 @@ TEST_CASE("HttpCacheAlt deserialize treats an unversioned blob as a miss",
   // The earlier layout had no version byte and started with the method
   // length.
   const std::vector<unsigned char> old_blob = {
-      3, 0, 0, 0, 'G', 'E', 'T', 1, 0, 0, 0, '/', 0, 0, 0, 0, 0xC8, 0,
-      0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0};
+      3, 0, 0, 0, 'G', 'E', 'T', 1, 0, 0, 0, '/', 0, 0, 0, 0, 0xC8, 0, 0,
+      0, 0, 0, 1, 0,   0,   0,   0, 0, 0, 0, 2,   0, 0, 0, 0, 0,    0, 0};
   auto bytes = std::as_bytes(std::span(old_blob));
   REQUIRE_FALSE(HttpCacheAlt::deserialize(bytes).has_value());
+}
+
+TEST_CASE("HttpCacheAlt extreme stored times do not overflow", "[http]") {
+  for (long long extreme : {std::numeric_limits<long long>::min(),
+                            std::numeric_limits<long long>::min() + 1,
+                            std::numeric_limits<long long>::max()}) {
+    HttpCacheAlt alt;
+    alt.set_response_header("Cache-Control", "max-age=60");
+    alt.set_response_header("Age", "5");
+    alt.set_response_header("Date", "Sun, 06 Nov 1994 08:49:37 GMT");
+    alt.set_request_time(static_cast<std::time_t>(extreme));
+    alt.set_response_time(static_cast<std::time_t>(extreme));
+
+    // Through the blob, as a stored entry would arrive.
+    auto parsed = HttpCacheAlt::deserialize(alt.serialize());
+    REQUIRE(parsed.has_value());
+    REQUIRE(parsed->age().count() >= 0);
+    (void)parsed->freshness_lifetime();
+    (void)parsed->is_fresh();
+    (void)alt.age();
+    (void)alt.is_fresh();
+  }
 }
 
 TEST_CASE("HttpCacheAlt deserialize rejects truncated input", "[http]") {
@@ -936,10 +958,10 @@ TEST_CASE("HttpAlternatePlugin Vary keeps case-sensitive values exact",
   // Surrounding whitespace is not part of a field value.
   REQUIRE(vary_selects("X-Tenant", "X-Tenant", "Acme", "X-Tenant:  Acme \r\n"));
   // Other headers keep their case and order.
-  REQUIRE_FALSE(vary_selects("X-Tenant", "X-Tenant", "Acme",
-                             "X-Tenant: acme\r\n"));
-  REQUIRE_FALSE(vary_selects("Cookie", "Cookie", "a=1; b=2",
-                             "Cookie: b=2; a=1\r\n"));
+  REQUIRE_FALSE(
+      vary_selects("X-Tenant", "X-Tenant", "Acme", "X-Tenant: acme\r\n"));
+  REQUIRE_FALSE(
+      vary_selects("Cookie", "Cookie", "a=1; b=2", "Cookie: b=2; a=1\r\n"));
 }
 
 TEST_CASE("HttpAlternatePlugin eviction_priority", "[http]") {

@@ -29,8 +29,10 @@ class HttpCacheAlt {
   void set_status_code(uint16_t code) { _status_code = code; }
   void set_response_header(std::string_view name, std::string_view value);
 
-  void set_request_time(std::time_t t) { _request_time = t; }
-  void set_response_time(std::time_t t) { _response_time = t; }
+  // Times are clamped to [0, year 9999] so age and freshness arithmetic cannot
+  // overflow, whatever a stored blob or a caller supplies.
+  void set_request_time(std::time_t t) { _request_time = clamp_time(t); }
+  void set_response_time(std::time_t t) { _response_time = clamp_time(t); }
 
   [[nodiscard]] std::string_view request_method() const {
     return _request_method;
@@ -62,6 +64,11 @@ class HttpCacheAlt {
       std::span<const std::byte> data);
 
  private:
+  static constexpr std::time_t kMaxTime = 253402300799;  // 9999-12-31T23:59:59Z
+  static constexpr std::time_t clamp_time(std::time_t t) {
+    return t < 0 ? 0 : (t > kMaxTime ? kMaxTime : t);
+  }
+
   std::string _request_method;
   std::string _request_url;
   std::map<std::string, std::string> _request_headers;

@@ -8,8 +8,8 @@
 #include <cctype>
 #include <cmath>
 #include <sstream>
-#include <vector>
 #include <string>
+#include <vector>
 
 #include "cyclone/plugin/plugin.hpp"
 #include "http_metadata.hpp"
@@ -304,8 +304,8 @@ std::string_view trim_vary_ows(std::string_view s) {
   while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) {
     s.remove_prefix(1);
   }
-  while (!s.empty() && (s.back() == ' ' || s.back() == '\t' ||
-                        s.back() == '\r')) {
+  while (!s.empty() &&
+         (s.back() == ' ' || s.back() == '\t' || s.back() == '\r')) {
     s.remove_suffix(1);
   }
   return s;
@@ -351,8 +351,8 @@ std::vector<std::string> canonical_token_set(std::string_view value) {
         if (c == ' ' || c == '\t') {
           continue;
         }
-        canonical.push_back(static_cast<char>(
-            std::tolower(static_cast<unsigned char>(c))));
+        canonical.push_back(
+            static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
       }
       tokens.push_back(std::move(canonical));
     }
