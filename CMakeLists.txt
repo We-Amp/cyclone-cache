@@ -224,6 +224,7 @@ if(CYCLONE_BUILD_TESTS)
     tests/integration/test_plain_publish_race.cpp
     tests/integration/test_usurped_fill.cpp
     tests/integration/test_seqlock_read_wait.cpp
+    tests/integration/test_sync_on_write_overlap.cpp
     tests/integration/test_phase_lock_scope.cpp
     tests/integration/test_write_reserve.cpp
     tests/integration/test_tail_fill.cpp

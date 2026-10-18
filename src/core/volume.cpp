@@ -4225,7 +4225,7 @@ std::expected<Volume::WriteSlot, CacheError> Volume::allocate_write_slot(
   // the reserved span passed the positional guard, handed out a zero-copy
   // borrow, and was then torn by the pwrite.  We now reserve here, RETURN WITH
   // THE LOCK HELD, and let commit_write_slot() advance the cursor + release
-  // only after the fill is durable.
+  // only after the fill completes.
   bool has_write_lock = false;
   MmapDirectory::WriteLockToken write_token;
   if (stripe->use_mmap_directory && stripe->mmap_directory) {
@@ -4405,7 +4405,7 @@ std::expected<Volume::WriteSlot, CacheError> Volume::allocate_write_slot(
     // A reader loads G (seq_cst) before it loads the cursor (acquire):
     //  - G reads the post-wrap value: it synchronizes with the store, so
     //    the cursor load sees this store or a later one.  Later stores are
-    //    commit_write_slot's, published only after the fill is durable, so
+    //    commit_write_slot's, published only after the fill completes, so
     //    the guard never covers unfilled bytes (F6 holds).  Everything
     //    at/after data_area_start is rejected until then.
     //  - G reads the pre-wrap value: borrow_still_valid's later G load (or
@@ -4530,11 +4530,13 @@ std::expected<Volume::WriteSlot, CacheError> Volume::allocate_write_slot(
 std::expected<void, CacheError> Volume::commit_write_slot(Stripe* stripe,
                                                           const WriteSlot& slot,
                                                           bool fill_ok) {
-  // F6: advance the guard-visible write cursor to cover the now-durable fill,
-  // then release the cross-process write lock.  Runs AFTER the caller's pwrite
-  // (+ optional sync_on_write fsync), so the cursor never covers un-filled
-  // bytes.  On fill failure NOTHING is advanced (invariant: the guard/shared
-  // cursor never exceeds the durably-written frontier) -- the reserved span is
+  // F6: advance the guard-visible write cursor to cover the completed fill,
+  // then release the cross-process write lock.  Runs AFTER the caller's
+  // pwrite, so the cursor never covers un-filled bytes.  (The optional
+  // sync_on_write fsync runs AFTER this, before the caller's directory
+  // insert: the cursor needs the fill, the ENTRY needs durability.)  On fill
+  // failure NOTHING is advanced (invariant: the guard/shared cursor never
+  // exceeds the filled frontier) -- the reserved span is
   // simply left un-advanced and reused by the next writer, which holds
   // stripe->mutex and (multi-process) re-syncs its local cursor from the
   // unchanged shared cursor.
@@ -4545,7 +4547,7 @@ std::expected<void, CacheError> Volume::commit_write_slot(Stripe* stripe,
 
   if (!slot.holds_write_lock) {
     // Single-process (non-mmap) stripe: stripe->write_pos IS the guard cursor.
-    // Publish the advance only now, after the fill is durable.
+    // Publish the advance only now, after the fill completes.
     if (fill_ok) {
       stripe->write_pos.store(slot.new_write_pos, std::memory_order_release);
     }
@@ -4907,7 +4909,7 @@ std::expected<void, CacheError> Volume::commit_write_impl(
 
   // Write data: the head, then the tail behind it.  F6: the cross-process
   // write lock is STILL HELD across this pwrite (released by
-  // commit_write_slot below, after the fill is durable) -- no peer can
+  // commit_write_slot below, after the fill completes) -- no peer can
   // allocate an overlapping range, and the guard-visible cursor is advanced
   // only once the bytes exist.
   // The tail fill's zeros go behind the document in the same write (see
@@ -4953,20 +4955,7 @@ std::expected<void, CacheError> Volume::commit_write_impl(
     *written = WrittenRange{write_offset, doc_size};
   }
 
-  // Sync to ensure data is visible to mmap readers (if configured).
-  // ORDERING INVARIANT (power loss): this data sync MUST happen before the
-  // cursor advance / directory insert below.  A directory entry may only ever
-  // be published after the document bytes it points at are durable, so an entry
-  // that survives a power loss always points at durable data.  Do not reorder.
-  // (On Windows the data region was already flushed via MappedFile::sync right
-  // after the memcpy above.)  See the durability contract on sync_directory().
-  if (fill_ok && _config.sync_on_write) {
-#ifndef _WIN32
-    fsync_fd();
-#endif
-  }
-
-  // F6: advance the guard-visible write cursor to cover the now-durable fill
+  // F6: advance the guard-visible write cursor to cover the completed fill
   // and release the cross-process write lock.  On a mid-pwrite usurp this
   // returns Busy (lock is the usurper's) and we skip the insert -- though our
   // already-landed pwrite may have torn the usurper's span (detectable-only
@@ -4979,6 +4968,37 @@ std::expected<void, CacheError> Volume::commit_write_impl(
   }
   if (!fill_ok) {
     return make_unexpected(CacheError::IoError);
+  }
+
+  // Durability flush (sync_on_write).  POSIX only: on Windows the data
+  // region was already flushed via MappedFile::sync right after the memcpy
+  // in the fill block above.
+  //
+  // OUTSIDE both the cross-process write lock (released by
+  // commit_write_slot above) and the stripe mutex: the flush is device
+  // latency (milliseconds on a busy device), and under those locks every
+  // writer of the stripe -- other processes' writers, this process's writer
+  // threads -- serializes behind it, feeding the write-lock escalation
+  // budget.  The stripe mutex is re-taken for the election + insert below,
+  // which re-synchronizes this writer with same-process peers exactly as it
+  // already does with cross-process peers (the write lock was released
+  // before the insert before this change too).
+  //
+  // ORDERING INVARIANT (power loss), unchanged: the flush must complete
+  // before the DIRECTORY INSERT below.  A directory entry may only ever be
+  // published after the document bytes it points at are durable, so an
+  // entry that survives a power loss always points at durable data.  Do not
+  // move it past the insert.  The cursor advance above, however, needs only
+  // the COMPLETED pwrite (F6: the bytes exist, read-coherent in the page
+  // cache), not the flush -- with sync_on_write off the cursor already
+  // advances over merely-pwritten bytes and durability is the periodic
+  // sync's job.  See the durability contract on sync_directory().
+  if (_config.sync_on_write) {
+#ifndef _WIN32
+    lock.unlock();
+    fsync_fd();
+    lock.lock();
+#endif
   }
 
   // Calculate offset relative to stripe start for directory entry
@@ -5139,8 +5159,8 @@ std::expected<void, CacheError> Volume::commit_write_impl(
     }
     writer_seam(WriterSeam::kBeforePlainPublish);
 
-    // Update directory — publishes the entry.  MUST stay after the data sync
-    // above; see the ordering-invariant comment there.
+    // Update directory — publishes the entry.  MUST stay after the
+    // durability flush above; see the ordering-invariant comment there.
     StripeAdmission admission(*this, *stripe);
     bool insert_busy = false;
     bool insert_stale = false;
@@ -6460,7 +6480,7 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
   }
 
   // Write data.  F6: the cross-process write lock is STILL HELD across this
-  // pwrite (released by commit_write_slot below, after the fill is durable).
+  // pwrite (released by commit_write_slot below, after the fill completes).
   // If the fill fails, the reserved region becomes a harmless "gap" (the cursor
   // is NOT advanced past it), reclaimed at the next wrap-around.
   // Tail fill, as in commit_write (see Volume::kTailFillPage).
@@ -6499,20 +6519,9 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
     *written_range = WrittenRange{write_offset, fill.size()};
   }
 
-  // Sync if configured.
-  // ORDERING INVARIANT (power loss): this data sync MUST happen before the
-  // cursor advance / directory insert below -- an entry that survives a power
-  // loss must always point at durable data.  Do not reorder.  See
-  // commit_write() and the durability contract on sync_directory().
-  if (fill_ok && _config.sync_on_write) {
-#ifndef _WIN32
-    fsync_fd();
-#endif
-  }
-
-  // F6: advance the guard-visible cursor + release the write lock now that the
-  // fill is durable (Busy on a mid-pwrite usurp -> skip the insert; IoError on
-  // fill failure).
+  // F6: advance the guard-visible cursor + release the write lock now that
+  // the fill is complete (Busy on a mid-pwrite usurp -> skip the insert;
+  // IoError on fill failure).
   auto committed = commit_write_slot(stripe, slot, fill_ok);
   slot_releaser.disarm();  // lock released (or usurped) by commit_write_slot
   if (!committed) {
@@ -6521,6 +6530,23 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
   if (!fill_ok) {
     return make_unexpected(CacheError::IoError);
   }
+
+  // Durability flush (sync_on_write): POSIX only (Windows flushed the fill
+  // region in the fill block above).  Outside both the cross-process write
+  // lock and the stripe mutex, exactly as in commit_write -- see the full
+  // comment there.  ORDERING INVARIANT (power loss), unchanged: it must
+  // complete before the directory insert below -- an entry that survives a
+  // power loss must always point at durable data -- while the cursor
+  // advance above needs only the completed pwrite.  See the durability
+  // contract on sync_directory().
+  if (_config.sync_on_write) {
+#ifndef _WIN32
+    lock.unlock();
+    fsync_fd();
+    lock.lock();
+#endif
+  }
+
   if (carry_forward) {
     carry_seam(CarrySeam::kFilled);
   }
@@ -6535,7 +6561,8 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
   }
 
   // Update directory to point to new head — publishes the entry.  MUST stay
-  // after the data sync above; see the ordering-invariant comment there.
+  // after the durability flush above; see the ordering-invariant comment
+  // there.
   // insert() uses its own per-bucket seqlock for synchronization.
   // head_relative_offset was verified by full first_key comparison in the
   // probe above, so only that entry may be updated in place — a same-tag
@@ -8212,6 +8239,13 @@ std::expected<void, CacheError> Volume::update_hit_count_sync(
 }
 
 int Volume::fsync_fd() const {
+#ifdef CYCLONE_TEST_SEAMS
+  const uint32_t pause_us =
+      s_fsync_pause_us_for_test.load(std::memory_order_relaxed);
+  if (pause_us != 0) {
+    std::this_thread::sleep_for(std::chrono::microseconds(pause_us));
+  }
+#endif
   _fsyncs.fetch_add(1, std::memory_order_relaxed);
   return CYCLONE_FSYNC(_fd);
 }

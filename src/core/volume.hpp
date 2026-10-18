@@ -1455,6 +1455,14 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // compare lease stamps across processes must not use it.
   static inline std::atomic<uint64_t> s_steady_clock_ns_for_test{0};
 
+#ifdef CYCLONE_TEST_SEAMS
+  // TEST-SEAM BUILDS ONLY.  When nonzero, fsync_fd() sleeps this many
+  // microseconds before the real flush, so a test can make device flush
+  // latency dominate the write path on any filesystem and measure where on
+  // that path the flush runs.
+  static inline std::atomic<uint32_t> s_fsync_pause_us_for_test{0};
+#endif
+
   // Pause points of the handle-call / close() handshake (see HandleCall in
   // the private section).  Same rules as the reader seams: test-seam
   // builds only.
