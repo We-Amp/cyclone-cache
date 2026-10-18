@@ -1020,6 +1020,21 @@ Task<std::expected<bool, CacheError>> Cache::exists(const CacheKey &key,
   co_return co_await volume->exists(key);
 }
 
+std::expected<ReadHandle, CacheError> Cache::read_sync_unrecorded(
+    const CacheKey &key, Tier tier) {
+  auto guard = lock_and_select(key, tier);
+  if (!guard) return make_unexpected(guard.error());
+  return guard->second->read_sync(key);
+}
+
+std::expected<WriteHandle, CacheError> Cache::write_alternate_sync_unrecorded(
+    const CacheKey &key, AlternateId alternate_id, uint64_t content_length,
+    Tier tier) {
+  auto guard = lock_and_select(key, tier);
+  if (!guard) return make_unexpected(guard.error());
+  return guard->second->write_alternate_sync(key, alternate_id, content_length);
+}
+
 std::expected<ReadHandle, CacheError> Cache::read_sync(const CacheKey &key,
                                                        Tier tier) {
   auto guard = lock_and_select(key, tier);

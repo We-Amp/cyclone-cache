@@ -1188,3 +1188,57 @@ TEST_CASE("OptimizationEngine load shedding is opt-in",
     }
   }
 }
+
+// The engine's own source read and alternate write are background work, not
+// cache traffic: counting them as load would let the engine's activity push
+// the estimate up and shed itself.  Only the embedder's operations count.
+TEST_CASE("OptimizationEngine does not record its own cache operations as load",
+          "[optimization][integration][regression]") {
+  auto cache_path = temp_cache_path();
+
+  CacheConfig config;
+  config.optimization_config.set_enabled(true)
+      .set_min_threads(1)
+      .set_min_hits_before_optimize(0)
+      .set_scale_check_interval(std::chrono::milliseconds(20));
+
+  auto cache_result = Cache::create(config);
+  REQUIRE(cache_result.has_value());
+  auto &cache = *cache_result;
+  REQUIRE(cache->add_volume(cache_path + "/vol1", 10_MB).has_value());
+  REQUIRE(cache->start().has_value());
+
+  auto *engine = cache->optimization_engine();
+  REQUIRE(engine != nullptr);
+  auto plugin = std::make_shared<TestOptimizationPlugin>();
+  engine->register_plugin(plugin);
+
+  // One embedder write, then one optimization of it.
+  auto key = CacheKey::from_url("http://test.com/engine-not-load");
+  std::vector<std::byte> content(100, std::byte{0x42});
+  auto write_result = cache->write_sync(key, content.size());
+  REQUIRE(write_result.has_value());
+  REQUIRE(write_result->write_sync(content).has_value());
+  REQUIRE(write_result->close_sync().has_value());
+  std::vector<std::byte> header = {std::byte{0x01}};
+  engine->on_write_complete(key, header, content.size(), AlternateId::Original,
+                            10);
+
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (engine->stats().completed < 1 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  const uint64_t completed = engine->stats().completed;
+
+  // Let the monitor fold the counters in at least twice more.
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+  const auto metrics = engine->stats().load_metrics;
+
+  cache->stop();
+  cleanup_temp(cache_path);
+
+  REQUIRE(completed == 1);
+  REQUIRE(metrics.write_ops == 1);
+  REQUIRE(metrics.read_ops == 0);
+}

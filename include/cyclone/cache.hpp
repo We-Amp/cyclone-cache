@@ -503,9 +503,20 @@ class Cache {
   [[nodiscard]] const OptimizationEngine *optimization_engine() const;
 
  private:
+  friend class OptimizationEngine;
+
   [[nodiscard]] std::expected<
       std::pair<std::shared_lock<std::shared_mutex>, Volume *>, CacheError>
   lock_and_select(const CacheKey &key, Tier tier) const;
+
+  // read_sync() / write_alternate_sync() for the optimization engine's own
+  // work: identical, except that they are not reported to the engine's load
+  // monitor (background work is not cache load).
+  std::expected<ReadHandle, CacheError> read_sync_unrecorded(
+      const CacheKey &key, Tier tier = Tier::kDefault);
+  std::expected<WriteHandle, CacheError> write_alternate_sync_unrecorded(
+      const CacheKey &key, AlternateId alternate_id, uint64_t content_length,
+      Tier tier = Tier::kDefault);
 
   // add_volume() body without locking; callers hold _impl->mutex exclusively.
   std::expected<void, CacheError> add_volume_locked(const VolumeConfig &config);

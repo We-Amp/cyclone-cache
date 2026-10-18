@@ -348,7 +348,8 @@ void OptimizationEngine::process_work_item(WorkItem item) {
       ForkGatedPass pass(_running);
       if (pass) {
         read_pass_entered = true;
-        auto read_result = _cache->read_sync(item.id.key);
+        // Not reported as load: this is the engine's own work.
+        auto read_result = _cache->read_sync_unrecorded(item.id.key);
         if (read_result) {
           source.emplace(std::move(*read_result));
         }
@@ -406,7 +407,7 @@ void OptimizationEngine::process_work_item(WorkItem item) {
       return;
     }
 
-    auto write_result = _cache->write_alternate_sync(
+    auto write_result = _cache->write_alternate_sync_unrecorded(
         item.id.key, transform_result->alternate_id,
         transform_result->content.size());
 
