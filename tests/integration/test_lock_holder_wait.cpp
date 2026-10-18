@@ -179,8 +179,9 @@ TEST_CASE(
   CAPTURE(std::chrono::duration_cast<std::chrono::microseconds>(waited));
   REQUIRE(waited >= kHold - 5ms);  // It did wait for the holder
   REQUIRE(MmapDirectory::s_phase_lock_recoveries_for_test.load() == recoveries);
-  // Two acquisitions (the peer's, the insert's), no recovery.
-  REQUIRE(dir->phase_lock_gen_for_test() == static_cast<uint16_t>(gen + 2));
+  // Three acquisitions (the peer's, the insert's waiting one, then the one
+  // of its retried bracket), no recovery.
+  REQUIRE(dir->phase_lock_gen_for_test() == static_cast<uint16_t>(gen + 3));
   REQUIRE(dir->phase_lock_value_for_test() == 0);
   REQUIRE(read_content(*local, key) == content);
 }
@@ -214,8 +215,9 @@ TEST_CASE(
   REQUIRE(waited >= kBudget);
   REQUIRE(MmapDirectory::s_phase_lock_recoveries_for_test.load() ==
           recoveries + 1);
-  // The peer's acquisition, the recovery, the insert's acquisition.
-  REQUIRE(dir->phase_lock_gen_for_test() == static_cast<uint16_t>(gen + 3));
+  // The peer's acquisition, the recovery, the insert's waiting acquisition,
+  // then the one of its retried bracket.
+  REQUIRE(dir->phase_lock_gen_for_test() == static_cast<uint16_t>(gen + 4));
   REQUIRE(read_content(*local, key) == second);
 
   // A new holder takes the lock under a later generation's token ...
