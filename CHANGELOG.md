@@ -5,7 +5,77 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- **Embedding processes could be terminated or corrupted through the C API.**
+  No exported C function lets a C++ exception escape any more (allocation
+  failure is reported as `CYCLONE_INTERNAL_ERROR`), a fetch completing after
+  `cyclone_cache_drain_pending` timed out and `cyclone_cache_destroy` ran no
+  longer touches freed memory (drain now returns `CYCLONE_TIMEOUT`), and a
+  read callback rejected by the in-flight limit may re-enter the cache without
+  deadlocking. **Update recommended.**
+- **Memory-safety fault in the CLFUS RAM cache.** Promoting an entry from
+  history while the cache was under eviction pressure could use freed memory.
+  **Update recommended.**
+- **Damaged or stale cache contents could be served.** Documents whose stored
+  checksum reads zero are verified like any other, documents whose length or
+  type fields disagree read as a miss, cached verification results are
+  re-checked and cleared on reopen, a RAM-tier copy is revalidated before it is
+  published, and with on-disk format v9 the checksum also covers the fixed
+  document header. In multi-process mode, a writer whose cross-process lock was
+  taken over can no longer have its late bytes served, and two processes
+  writing the same key at once no longer leave two entries. **Update
+  recommended.**
+- **A crash-torn persisted write cursor could let stale entries be served after
+  restart.** The exclusive open now repairs it and readers clamp it.
+  **Update recommended.**
+- **Bounded resource use under pressure.** Memory used to track completed C API
+  misses is bounded, the RAM cache keeps to its byte budget on overwrites, and
+  hit recording under pressure no longer runs inline on the read path.
+
 ### Fixed
+
+- C API: library errors map to distinct codes (new, appended:
+  `CYCLONE_TIMEOUT`, `CYCLONE_NOT_OWNED`, `CYCLONE_INCOMPATIBLE_VERSION`;
+  existing values are unchanged). Without a miss handler, `read_async` reports
+  I/O errors and corruption instead of a miss. A fetched value is stored before
+  coalesced readers are notified. A C read handle no longer pins the disk
+  region it was read from.
+- `read_alternate_sync` reads an alternate whose header bytes exceed 64 KiB in
+  full instead of failing or truncating it.
+- A read handle from a `Volume` that no `Cache` owns keeps its mapping alive
+  after the volume closes, and refuses stale calls after a reopen.
+- `open()` refuses a volume too small for its stripe directories with
+  `InvalidArgument` instead of accepting it and failing every write.
+- A read-only peer recovers a shared directory bucket left held by a process
+  that died mid-update after the same 250 ms a writer waits, instead of
+  reporting `Busy` for that bucket's keys until a write came. Opening a
+  directory that another process is still initialising, or one left by a crash
+  during initialisation, is rejected.
+- Hit counts are recorded only on stripes the process owns. `Cache::stop()` in
+  a forked child is detected by fork epoch as well as process id. Without fork
+  handlers a process no longer claims a liveness slot a child would share.
+- The optimization engine: the adaptive pool scales back up after a scale-down
+  and no longer hangs across stop and start, the engine can be stopped and
+  started again, a work item whose target is already in flight is refused and
+  counted, an exception from an optimization plugin no longer ends the
+  process, pausing or stopping takes effect immediately, and a cancelled
+  optimization thread no longer leaves counts or in-flight records wrong.
+- HTTP plugin: header names are matched case-insensitively; entries without a
+  freshness lifetime are stale instead of fresh forever (`max-age`,
+  `s-maxage`, `Expires`, the `Age` header and heuristic freshness for
+  cacheable statuses are honoured, `no-cache` always revalidates, and a stale
+  shared-cache entry with `s-maxage` or `proxy-revalidate` revalidates);
+  truncated or malformed metadata is rejected as a whole; variants the client
+  marks unacceptable are not selected and the most specific negotiation range
+  wins; Vary matching on the four negotiation headers ignores order, case and
+  optional whitespace; out-of-range stored times no longer overflow.
+- `ReadHandle::read()` and `read_all()` copy the content out instead of always
+  returning `NotInitialized`.
+- Smaller fixes: a reused SHA-256 context hashes correctly, error codes from a
+  failed cache-file open are accurate, a failed flush to stable storage is
+  reported on Windows, RAM-cache hit counters saturate, and a misaligned
+  document in a corrupt cache file reads as invalid.
 
 - **Stopping a cache while another thread closed or renewed a read handle
   could touch freed memory.** Closing a disk-hit `ReadHandle`, renewing its
@@ -310,6 +380,35 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   lockstep rule as the earlier tail appends).
 
 ### Changed
+
+- **On-disk format v9** also binds each document to the cross-process write it
+  came from, in a field that existing v9 volumes store as zero. Upgrading
+  starts cold, as for any format change; during a rolling restart the old and
+  new versions use separate files.
+- **HTTP plugin metadata** uses a versioned, platform-independent layout;
+  entries stored by earlier versions miss once and are replaced. Metadata
+  written by this version is not read correctly by earlier versions.
+- **Load shedding is opt-in** (`OptimizationConfig::enable_load_shedding`,
+  default off). Its inputs are now fed from real cache traffic.
+- `OptimizationConfig::priority_aging_interval` (default 10 s, 0 disables):
+  queued optimization work gains priority while it waits, so low-priority work
+  is not starved. `Cache::start()` returns `InvalidConfiguration` for an
+  invalid optimization configuration.
+- Writes with `sync_on_write` no longer serialize every writer of a stripe
+  behind the device flush; a directory insert no longer holds the stripe-wide
+  phase lock while it waits on a busy bucket; directory reads under CPU
+  oversubscription stop spinning after 0.5 ms; hit recording past
+  `max_pending_entries` hands the sweep to the flush thread, dropping and
+  counting (`CacheStats::hit_overload_drops`) hits beyond twice the limit; a
+  volume whose whole-file mapping fails reports
+  `volumes_without_whole_file_map` and warns once per open; optimization
+  statistics no longer take locks on the per-task path; LRU RAM-cache hits no
+  longer serialize on the write lock.
+- A plain write, like an alternate write, gives up with `Busy` after 32 lost
+  publish rounds.
+- `ReadHandle` gains a data member: code using the C++ API must be rebuilt.
+  The C ABI is unchanged apart from the appended error codes.
+- The unused internal I/O executor is removed; nothing public changes.
 
 - **The bundled SHA-256 is now the default key hash; OpenSSL is opt-in.**
   `CYCLONE_USE_BUNDLED_SHA256` defaults to `ON` (it was `OFF`). A build that
