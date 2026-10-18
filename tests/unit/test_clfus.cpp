@@ -363,6 +363,41 @@ TEST_CASE("CLFUS overwriting an entry in place enforces the byte budget",
   REQUIRE(result->size() == large.size());
 }
 
+TEST_CASE("CLFUS overwrite does not evict the entry it just wrote", "[clfus]") {
+  // Eviction requeues hit-bearing tail entries to the FRONT of the active
+  // list, and every requeue pushes the just-updated front entry one step
+  // toward the tail.  With enough requeues it reaches the tail itself and
+  // is evicted by its own put() while put() reports success.  The updated
+  // entry must stay off the list while eviction makes room for it.
+  auto cache = RamCache::create(RamCacheType::CLFUS, 10000);
+
+  CacheKey a("overwrite-evict-a");
+  CacheKey b("overwrite-evict-b");
+  CacheKey c("overwrite-evict-c");
+  std::vector<std::byte> small(3000, std::byte{0x01});
+  std::vector<std::byte> large(4500, std::byte{0x02});
+
+  cache->put(a, AlternateId::Original, small);
+  cache->put(a, AlternateId::Original, small);
+  cache->put(b, AlternateId::Original, small);
+  cache->put(b, AlternateId::Original, small);
+  cache->put(c, AlternateId::Original, small);
+  cache->put(c, AlternateId::Original, small);
+
+  for (int i = 0; i < 10; ++i) {
+    cache->get(b, AlternateId::Original);
+    cache->get(c, AlternateId::Original);
+  }
+
+  REQUIRE(cache->put(a, AlternateId::Original, large));
+
+  auto result = cache->get(a, AlternateId::Original);
+  REQUIRE(result.has_value());
+  REQUIRE(result->size() == large.size());
+  REQUIRE((*result)[0] == std::byte{0x02});
+  REQUIRE(cache->bytes_used() <= cache->max_bytes());
+}
+
 TEST_CASE("CLFUS promoting the oldest history entry under eviction pressure",
           "[clfus]") {
   // One segment (cache below the per-segment budget floor), history at its

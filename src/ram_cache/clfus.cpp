@@ -276,20 +276,26 @@ bool RamCacheCLFUS::Segment::put(const RamCacheKey& rk,
 
     if (entry.in_cache) {
       _bytes_used -= entry.data.size();
+
+      // A growing overwrite can push the segment past its budget; enforce
+      // it like insert and promotion do.  The entry must be off the list
+      // while that runs: eviction requeues hit-bearing victims to the
+      // FRONT, and enough requeues push the just-updated entry to the
+      // back where it is evicted by its own put().  Off both lists it
+      // cannot be picked (the size check at the top of put() means it
+      // alone never exceeds the budget).
+      EntryList rescued;
+      rescued.splice(rescued.begin(), _active_lru, existing->second);
+
+      evict_if_needed(data.size());
+
+      _active_lru.splice(_active_lru.begin(), rescued, rescued.begin());
+      _entry_map[entry.key] = _active_lru.begin();
+
       entry.data.assign(data.begin(), data.end());
       entry.stamp = stamp;
       _bytes_used += entry.data.size();
       ++entry.hits;
-
-      if (existing->second != _active_lru.begin()) {
-        _active_lru.splice(_active_lru.begin(), _active_lru, existing->second);
-      }
-
-      // A growing overwrite can push the segment past its budget; enforce
-      // it like insert and promotion do.  The just-updated entry sits at
-      // the front, and the size check at the top of put() means it alone
-      // never exceeds the budget, so eviction cannot pick it.
-      evict_if_needed(0);
       return true;
     } else {
       if (entry.value() > _average_value ||
