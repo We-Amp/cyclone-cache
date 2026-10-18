@@ -31,8 +31,12 @@ class HttpCacheAlt {
 
   // Times are clamped to [0, year 9999] so age and freshness arithmetic cannot
   // overflow, whatever a stored blob or a caller supplies.
-  void set_request_time(std::time_t t) { _request_time = clamp_time(t); }
-  void set_response_time(std::time_t t) { _response_time = clamp_time(t); }
+  void set_request_time(std::time_t t) {
+    _request_time = clamp_time(static_cast<int64_t>(t));
+  }
+  void set_response_time(std::time_t t) {
+    _response_time = clamp_time(static_cast<int64_t>(t));
+  }
 
   [[nodiscard]] std::string_view request_method() const {
     return _request_method;
@@ -49,6 +53,8 @@ class HttpCacheAlt {
   [[nodiscard]] std::time_t response_time() const { return _response_time; }
 
   [[nodiscard]] std::chrono::seconds age() const;
+  // Same, against a caller supplied clock reading (seconds since the epoch).
+  [[nodiscard]] std::chrono::seconds age(std::time_t now) const;
   [[nodiscard]] std::optional<std::chrono::seconds> max_age() const;
   // Freshness lifetime for a shared cache: s-maxage, else max-age, else
   // Expires, else a heuristic (only with Last-Modified and a status that is
@@ -57,6 +63,7 @@ class HttpCacheAlt {
   // class only answers how long a stored entry stays fresh.
   [[nodiscard]] std::optional<std::chrono::seconds> freshness_lifetime() const;
   [[nodiscard]] bool is_fresh() const;
+  [[nodiscard]] bool is_fresh(std::time_t now) const;
 
   [[nodiscard]] std::vector<std::byte> serialize() const;
   // Returns nullopt unless the whole input is a well-formed serialized blob.
@@ -64,9 +71,13 @@ class HttpCacheAlt {
       std::span<const std::byte> data);
 
  private:
-  static constexpr std::time_t kMaxTime = 253402300799;  // 9999-12-31T23:59:59Z
-  static constexpr std::time_t clamp_time(std::time_t t) {
-    return t < 0 ? 0 : (t > kMaxTime ? kMaxTime : t);
+  static_assert(
+      sizeof(std::time_t) >= 8,
+      "metadata times are 64 bit; a narrower time_t cannot hold them");
+  static constexpr int64_t kMaxTime = 253402300799;  // 9999-12-31T23:59:59Z
+  // Clamps in 64 bit before the value becomes a time_t.
+  static constexpr std::time_t clamp_time(int64_t t) {
+    return static_cast<std::time_t>(t < 0 ? 0 : (t > kMaxTime ? kMaxTime : t));
   }
 
   std::string _request_method;

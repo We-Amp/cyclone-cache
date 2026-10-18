@@ -368,17 +368,18 @@ std::optional<HttpCacheAlt> HttpCacheAlt::deserialize(
   if (data.size() - offset != 16) {
     return std::nullopt;
   }
-  alt._request_time =
-      clamp_time(static_cast<std::time_t>(static_cast<int64_t>(get_le(8))));
-  alt._response_time =
-      clamp_time(static_cast<std::time_t>(static_cast<int64_t>(get_le(8))));
+  alt._request_time = clamp_time(static_cast<int64_t>(get_le(8)));
+  alt._response_time = clamp_time(static_cast<int64_t>(get_le(8)));
 
   return alt;
 }
 
 std::chrono::seconds HttpCacheAlt::age() const {
-  auto now = std::chrono::system_clock::now();
-  auto now_time_t = std::chrono::system_clock::to_time_t(now);
+  return age(
+      std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
+}
+
+std::chrono::seconds HttpCacheAlt::age(std::time_t now_time_t) const {
   // An age is never negative (a response time in the future reads as zero).
   if (now_time_t < _response_time) {
     return std::chrono::seconds(0);
@@ -514,10 +515,14 @@ std::optional<std::chrono::seconds> HttpCacheAlt::freshness_lifetime() const {
 }
 
 bool HttpCacheAlt::is_fresh() const {
+  return is_fresh(
+      std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
+}
+
+bool HttpCacheAlt::is_fresh(std::time_t now) const {
   // A response time in the future cannot be trusted (clock change or damaged
   // metadata); such an entry is stale rather than fresh for its whole span.
-  if (_response_time >
-      std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())) {
+  if (_response_time > now) {
     return false;
   }
   // Without a usable freshness lifetime the entry is stale.
@@ -525,7 +530,7 @@ bool HttpCacheAlt::is_fresh() const {
   if (!life) {
     return false;
   }
-  return age() < *life;
+  return age(now) < *life;
 }
 
 }  // namespace cyclone
