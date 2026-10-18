@@ -1687,9 +1687,16 @@ class Volume : public std::enable_shared_from_this<Volume> {
       std::span<const std::byte> content, uint64_t handle_generation);
 
   // Called by WriteHandle for alternates (internal use)
-  // Lost publish rounds it runs again before it reports Busy (see the
-  // definition): each lost round leaves a written document behind.
+  // Lost publish rounds a write runs again before it reports Busy: an
+  // alternate write (each lost round leaves a written document behind; see
+  // commit_alternate_write) and a plain one (which re-elects and publishes
+  // the same document; see commit_write_impl).
   static constexpr unsigned kMaxStalePublishRetries = 32;
+  // The sleep before lost round `retries` (1-based) of a stale-publish
+  // retry: none for the first, then a uniform draw below a ceiling that
+  // doubles from 2 us to 256 us, so writers of one key stop meeting in
+  // lockstep.  The caller holds no lock while it sleeps.
+  static void stale_publish_backoff(unsigned retries);
   std::expected<void, CacheError> commit_alternate_write(
       Stripe *stripe, const CacheKey &key, AlternateId alternate_id,
       std::span<const std::byte> header, std::span<const std::byte> content,

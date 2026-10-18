@@ -5074,6 +5074,14 @@ std::expected<void, CacheError> Volume::commit_write_impl(
   // by someone else's finished operation, and no lock is held across the
   // rounds' publishes that another writer would need to finish its own.
   //
+  // BOUNDED like the alternate path's retries (kMaxStalePublishRetries,
+  // with the same jittered backoff, slept with the stripe mutex released):
+  // a writer that keeps losing on one hot key gives up as Busy and
+  // publishes nothing, and the key holds what the faster writers
+  // published.  A lost round here costs no space (the document is
+  // published as is, not written again), so the bound is about latency:
+  // the caller gets an answer.
+  //
   // EVERY round first checks that no wrap has run since the commit
   // (snap_at_commit): the document's bytes belong to the pass they were
   // written in, and a wrap -- during the flush, or between rounds -- may
@@ -5084,6 +5092,7 @@ std::expected<void, CacheError> Volume::commit_write_impl(
   // publish.
   bool collision_evicted = false;
   bool bucket_full_evicted = false;
+  unsigned stale_retries = 0;
   for (;;) {
     if (wrapped_since(stripe, snap_at_commit)) {
       return make_unexpected(CacheError::Busy);
@@ -5202,7 +5211,17 @@ std::expected<void, CacheError> Volume::commit_write_impl(
       break;
     }
     if (insert_stale) {
-      continue;  // the bucket changed since the election: elect again
+      // The bucket changed since the election: elect again, up to the bound.
+      if (stale_retries == kMaxStalePublishRetries) {
+        return make_unexpected(CacheError::Busy);  // Nothing published
+      }
+      ++stale_retries;
+      if (stale_retries > 1) {
+        lock.unlock();
+        stale_publish_backoff(stale_retries);
+        lock.lock();
+      }
+      continue;
     }
     // A capped lock wait that gave up published nothing: the document stays
     // unreachable, like any fill whose insert never ran (the Busy above).
@@ -5640,26 +5659,28 @@ std::expected<void, CacheError> Volume::commit_alternate_write(
       }
       ++stale_retries;
       _alternate_publish_retries.fetch_add(1, std::memory_order_relaxed);
-      if (stale_retries > 1) {
-        // A uniform draw below a ceiling that doubles from 2 us to 256 us.
-        // No lock is held here (see above).
-        thread_local uint64_t t_backoff_state = checksum_revalidation_seed();
-        uint64_t x = t_backoff_state;
-        x ^= x << 13U;
-        x ^= x >> 7U;
-        x ^= x << 17U;
-        t_backoff_state = x;
-        const uint64_t ceiling_us = uint64_t{1}
-                                    << std::min(stale_retries - 1, 8U);
-        wait_detail::sleep_for(
-            std::chrono::microseconds((x >> 32U) % (ceiling_us + 1)));
-      }
+      stale_publish_backoff(stale_retries);  // No lock is held here.
       continue;
     }
     break;
   }
   start_write_behind(written);  // stripe mutex released by now
   return result;
+}
+
+void Volume::stale_publish_backoff(unsigned retries) {
+  if (retries <= 1) {
+    return;
+  }
+  thread_local uint64_t t_backoff_state = checksum_revalidation_seed();
+  uint64_t x = t_backoff_state;
+  x ^= x << 13U;
+  x ^= x >> 7U;
+  x ^= x << 17U;
+  t_backoff_state = x;
+  const uint64_t ceiling_us = uint64_t{1} << std::min(retries - 1, 8U);
+  wait_detail::sleep_for(
+      std::chrono::microseconds((x >> 32U) % (ceiling_us + 1)));
 }
 
 uint64_t Volume::carry_byte_budget(const Stripe* stripe,

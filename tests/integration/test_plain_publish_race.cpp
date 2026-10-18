@@ -231,3 +231,70 @@ TEST_CASE("Racing plain overwrites of an existing key leave one entry",
   CHECK(entries_for(*a.volume, key) == 1);
   CHECK(read_plain(*a.volume, key) == std::optional<std::string>("third"));
 }
+
+namespace {
+
+// Writes `key` through `writer` while `other` publishes the same key inside
+// each of the writer's first `losses` publish windows, so each of those
+// rounds is lost.  Returns the writer's result and the rounds it ran.
+struct LossOutcome {
+  CacheError result = CacheError::InternalError;
+  int rounds = 0;
+};
+
+LossOutcome write_losing(Volume &writer, Volume &other, const CacheKey &key,
+                         int losses) {
+  LossOutcome out;
+  std::atomic<int> rounds{0};
+  const std::thread::id self = std::this_thread::get_id();
+  SeamGuard guard;
+  Volume::s_writer_seam_for_test = [&](Volume::WriterSeam at) {
+    if (at != Volume::WriterSeam::kBeforePlainPublish ||
+        std::this_thread::get_id() != self) {
+      return;
+    }
+    const int round = rounds.fetch_add(1);
+    if (round < losses) {
+      // The other view has its own stripe mutex: it publishes while this
+      // writer holds its own, exactly as another process would.
+      Volume::WriterSeamHook saved = std::move(Volume::s_writer_seam_for_test);
+      Volume::s_writer_seam_for_test = {};
+      (void)write_plain(other, key, "from the other view");
+      Volume::s_writer_seam_for_test = std::move(saved);
+    }
+  };
+  out.result = write_plain(writer, key, "from the losing writer");
+  out.rounds = rounds.load();
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE(
+    "A plain write that keeps losing its publish gives up as Busy after the "
+    "retry bound",
+    "[publishrace][multiprocess]") {
+  const TempCacheDir dir("plainrace-bound");
+  ProcessView a;
+  ProcessView b;
+  REQUIRE(a.open(dir.path()));
+  REQUIRE(b.open(dir.path()));
+  const CacheKey key("http://example.test/plain/bounded.css");
+
+  SECTION("a few lost rounds still publish") {
+    const LossOutcome out = write_losing(*a.volume, *b.volume, key, 5);
+    CHECK(out.result == CacheError::Success);
+    CHECK(out.rounds == 6);
+    CHECK(read_plain(*a.volume, key) ==
+          std::optional<std::string>("from the losing writer"));
+    CHECK(entries_for(*a.volume, key) == 1);
+  }
+  SECTION("past the bound the write publishes nothing") {
+    const LossOutcome out = write_losing(*a.volume, *b.volume, key, 1000);
+    CHECK(out.result == CacheError::Busy);
+    CHECK(out.rounds == static_cast<int>(Volume::kMaxStalePublishRetries) + 1);
+    CHECK(read_plain(*a.volume, key) ==
+          std::optional<std::string>("from the other view"));
+    CHECK(entries_for(*a.volume, key) == 1);
+  }
+}
