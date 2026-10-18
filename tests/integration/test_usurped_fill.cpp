@@ -177,6 +177,58 @@ struct SeamGuard {
   }
 };
 
+// Parks a write of `text` by `stalled` in the tear gate (write lock held,
+// reservation made, nothing written), runs `while_parked` -- which takes the
+// lock over with its first write -- then lets the stalled fill land.
+// Returns the stalled write's result.  Never asserts.
+struct Takeover {
+  bool parked = false;
+  CacheError stalled_result = CacheError::InternalError;
+};
+
+Takeover run_takeover(Volume &stalled, const CacheKey &key,
+                      std::optional<AlternateId> id, const std::string &text,
+                      const std::function<void()> &while_parked) {
+  Takeover out;
+  SeamGuard guard;
+  std::atomic<std::thread::id> stalled_id{};
+  std::atomic<bool> parked{false};
+  std::atomic<bool> release{false};
+  Volume::s_write_tear_gate_for_test = [&](uint64_t, uint64_t) {
+    if (std::this_thread::get_id() != stalled_id.load() ||
+        parked.exchange(true)) {
+      return;
+    }
+    while (!release.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  };
+  std::atomic<CacheError> stalled_result{CacheError::InternalError};
+  std::thread stalled_thread([&] {
+    stalled_id.store(std::this_thread::get_id());
+    stalled_result.store(write_doc(stalled, key, id, text));
+  });
+  out.parked = wait_for([&] { return parked.load(); });
+  if (out.parked) {
+    // Take the lock over after a few waits instead of the production
+    // escalation deadline.
+    MmapDirectory::s_write_lock_max_live_waits_for_test.store(4);
+    while_parked();
+    MmapDirectory::s_write_lock_max_live_waits_for_test.store(0);
+  }
+  release.store(true);
+  stalled_thread.join();
+  out.stalled_result = stalled_result.load();
+  return out;
+}
+
+// Same length, so the late fill covers the published document exactly.
+const std::string kNewer = "newer version written by the next lock holder";
+const std::string kOlder = [] {
+  std::string older = "older version written by the stalled holder";
+  return older + std::string(kNewer.size() - older.size(), '.');
+}();
+
 }  // namespace
 
 TEST_CASE(
@@ -195,63 +247,29 @@ TEST_CASE(
     REQUIRE(usurper.open(dir.path()));
     REQUIRE(stalled.volume->stats().stripe_count == 1);
     const std::string file = dir.path();  // a bare Volume opens this file
-
     const CacheKey key("http://example.test/usurped/fill.css");
-    // Same length, so the late fill covers the published document exactly.
-    const std::string older = "older version written by the stalled holder";
-    const std::string newer = "newer version written by the next lock holder";
-    const std::string older_same =
-        older + std::string(newer.size() - older.size(), '.');
-    REQUIRE(older_same.size() == newer.size());
-
-    SeamGuard guard;
-    std::atomic<std::thread::id> stalled_id{};
-    std::atomic<bool> parked{false};
-    std::atomic<bool> release{false};
-    Volume::s_write_tear_gate_for_test = [&](uint64_t, uint64_t) {
-      if (std::this_thread::get_id() != stalled_id.load() ||
-          parked.exchange(true)) {
-        return;
-      }
-      while (!release.load()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      }
-    };
-
-    std::atomic<CacheError> stalled_result{CacheError::InternalError};
-    std::thread stalled_thread([&] {
-      stalled_id.store(std::this_thread::get_id());
-      stalled_result.store(write_doc(*stalled.volume, key, id, older_same));
-    });
-    const bool was_parked = wait_for([&] { return parked.load(); });
 
     CacheError usurper_result = CacheError::InternalError;
     Served published;
-    if (was_parked) {
-      // Take the lock over after a few waits instead of the production
-      // escalation deadline.
-      MmapDirectory::s_write_lock_max_live_waits_for_test.store(4);
-      usurper_result = write_doc(*usurper.volume, key, id, newer);
-      MmapDirectory::s_write_lock_max_live_waits_for_test.store(0);
+    const Takeover t = run_takeover(*stalled.volume, key, id, kOlder, [&] {
+      usurper_result = write_doc(*usurper.volume, key, id, kNewer);
       published = read_doc(*usurper.volume, key, id);
-    }
-    release.store(true);
-    stalled_thread.join();
+    });
 
-    REQUIRE(was_parked);
+    REQUIRE(t.parked);
     REQUIRE(usurper_result == CacheError::Success);
-    REQUIRE(published.text == std::optional<std::string>(newer));
+    REQUIRE(published.text == std::optional<std::string>(kNewer));
     REQUIRE(published.content_offset != ReadHandle::kNoFileOffset);
     // The stalled holder's commit was refused...
-    CHECK(stalled_result.load() == CacheError::Busy);
+    CHECK(t.stalled_result == CacheError::Busy);
     // ...but its fill landed over the published document.
-    REQUIRE(pread_text(file, published.content_offset, newer.size()) ==
-            older_same);
+    REQUIRE(pread_text(file, published.content_offset, kNewer.size()) ==
+            kOlder);
 
     // Neither view serves the older document.
     for (Volume *view : {stalled.volume.get(), usurper.volume.get()}) {
       const Served now = read_doc(*view, key, id);
-      CHECK(now.text != std::optional<std::string>(older_same));
+      CHECK(now.text != std::optional<std::string>(kOlder));
     }
 
     // The next write of the key lands and is served.
@@ -260,5 +278,30 @@ TEST_CASE(
     CHECK(read_doc(*stalled.volume, key, id).text ==
           std::optional<std::string>("third"));
   }
+}
+
+TEST_CASE(
+    "A key whose only entry does not bind its document removes as NotFound",
+    "[multiprocess][writelock][usurp][remove]") {
+  const TempCacheDir dir("usurped-fill-remove");
+  ProcessView stalled;
+  ProcessView usurper;
+  REQUIRE(stalled.open(dir.path()));
+  REQUIRE(usurper.open(dir.path()));
+  const CacheKey key("http://example.test/usurped/remove.css");
+  CacheError usurper_result = CacheError::InternalError;
+  const Takeover t =
+      run_takeover(*stalled.volume, key, std::nullopt, kOlder, [&] {
+        usurper_result = write_doc(*usurper.volume, key, std::nullopt, kNewer);
+      });
+  REQUIRE(t.parked);
+  REQUIRE(usurper_result == CacheError::Success);
+  REQUIRE_FALSE(read_doc(*usurper.volume, key, std::nullopt).text.has_value());
+
+  // Consistent with the read: there is nothing of this key to remove.
+  const auto removed = usurper.volume->remove_sync(key);
+  REQUIRE_FALSE(removed.has_value());
+  CHECK(removed.error() == CacheError::NotFound);
+  CHECK_FALSE(read_doc(*stalled.volume, key, std::nullopt).text.has_value());
 }
 #endif  // !_WIN32

@@ -3328,6 +3328,7 @@ std::expected<void, CacheError> Volume::remove_sync(const CacheKey& key) {
     uint64_t dir_offset;  // DirEntry::offset() (relative to stripe start)
     uint64_t approx_size;
     AdmitClass cls;
+    DirEntry entry;  // for the fill-serial binding (entry_binds)
   };
   std::array<Candidate, Directory::kEntriesPerBucket> candidates;
   size_t num_candidates = 0;
@@ -3339,8 +3340,8 @@ std::expected<void, CacheError> Volume::remove_sync(const CacheKey& key) {
           stripe, key, snap, [&] { num_candidates = 0; },
           [&](const DirEntry& dir_entry, AdmitClass cls) {
             if (num_candidates < candidates.size()) {
-              candidates[num_candidates++] = {dir_entry.offset(),
-                                              dir_entry.approx_size(), cls};
+              candidates[num_candidates++] = {
+                  dir_entry.offset(), dir_entry.approx_size(), cls, dir_entry};
             }
             return true;  // Continue — collect all matching entries
           })) {
@@ -3393,8 +3394,12 @@ std::expected<void, CacheError> Volume::remove_sync(const CacheKey& key) {
     }
 
     CacheKey stored_key = reader.first_key();
+    // Live only if the entry binds the document (entry_binds), as for every
+    // read: an entry over another fill's bytes resolves nothing, so the key
+    // it alone names removes as NotFound -- the entry still goes.
     const bool stamp_ok =
-        stamp_admits(stripe, snap, candidate.cls, reader.document());
+        stamp_admits(stripe, snap, candidate.cls, reader.document()) &&
+        entry_binds(candidate.entry, reader.document());
     _mapped_file->unmap_region(*mapped);
 
     if (stored_key != key) {
