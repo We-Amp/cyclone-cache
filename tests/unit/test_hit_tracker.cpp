@@ -750,3 +750,28 @@ TEST_CASE("HitTracker::stop() joins an in-flight flush thread (no leak)",
   // Exactly one callback ran, on the background thread, and it completed.
   REQUIRE(callback_invocations.load(std::memory_order_relaxed) == 1);
 }
+
+TEST_CASE("HitTracker batch-done callback follows real flush results",
+          "[hit_tracker]") {
+  HitTrackerConfig config;
+  config.enable_background_flush = false;
+  HitTracker tracker(config);
+
+  std::atomic<bool> store_ok{false};
+  int batch_done = 0;
+  tracker.set_batch_done_callback([&]() { ++batch_done; });
+  tracker.start([&](const CacheKey &, AlternateId, uint32_t, int64_t) {
+    return store_ok.load();
+  });
+
+  CacheKey key("failing-flush");
+  tracker.record_hit(key);
+  tracker.flush_now();
+  CHECK(batch_done == 0);
+  CHECK(tracker.flush_failures() == 1);
+
+  store_ok = true;
+  tracker.record_hit(key);
+  tracker.flush_now();
+  CHECK(batch_done == 1);
+}

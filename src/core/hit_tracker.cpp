@@ -132,9 +132,12 @@ void HitTracker::flush_now() {
     if (_flush_callback) {
       for (const auto& [tracking_key, record] : snapshot) {
         if (record.delta > 0) {
-          _flush_callback(tracking_key.key, tracking_key.alternate_id,
-                          record.delta, record.last_access_ms);
-          any_flushed = true;
+          if (_flush_callback(tracking_key.key, tracking_key.alternate_id,
+                              record.delta, record.last_access_ms)) {
+            any_flushed = true;
+          } else {
+            _flush_failures.fetch_add(1, std::memory_order_relaxed);
+          }
         }
       }
     }
@@ -165,7 +168,10 @@ void HitTracker::flush_key(const CacheKey& key, AlternateId alternate_id) {
   }
 
   if (found && _flush_callback && record.delta > 0) {
-    _flush_callback(key, alternate_id, record.delta, record.last_access_ms);
+    if (!_flush_callback(key, alternate_id, record.delta,
+                         record.last_access_ms)) {
+      _flush_failures.fetch_add(1, std::memory_order_relaxed);
+    }
   }
 }
 
@@ -193,8 +199,10 @@ void HitTracker::flush_all_alternates(const CacheKey& key) {
   if (_flush_callback) {
     for (const auto& [tracking_key, record] : to_flush) {
       if (record.delta > 0) {
-        _flush_callback(tracking_key.key, tracking_key.alternate_id,
-                        record.delta, record.last_access_ms);
+        if (!_flush_callback(tracking_key.key, tracking_key.alternate_id,
+                             record.delta, record.last_access_ms)) {
+          _flush_failures.fetch_add(1, std::memory_order_relaxed);
+        }
       }
     }
   }

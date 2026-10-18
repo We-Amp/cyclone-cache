@@ -59,7 +59,7 @@ using HitFlushCallback =
                        uint32_t hit_delta, int64_t last_access_ms)>;
 
 // Callback invoked once at the end of flush_now() after all per-key callbacks
-// complete (only when at least one key was flushed).  Allows batching a single
+// complete (only when at least one key was flushed successfully).  Allows batching a single
 // fsync per flush cycle instead of per-key.
 using HitFlushBatchDoneCallback = std::function<void()>;
 
@@ -120,6 +120,11 @@ class HitTracker {
   // Get total pending hits across all entries
   uint64_t total_pending_hits() const;
 
+  // Number of hit deltas the flush callback reported as not stored.
+  uint64_t flush_failures() const {
+    return _flush_failures.load(std::memory_order_relaxed);
+  }
+
   const Config& config() const { return _config; }
 
   // Stripe geometry, exposed so a test can pick one key per stripe.
@@ -131,6 +136,7 @@ class HitTracker {
 
   Config _config;
   HitFlushCallback _flush_callback;
+  std::atomic<uint64_t> _flush_failures{0};
   HitFlushBatchDoneCallback _batch_done_callback;
 
   // Sharded pending-hit accumulation.  record_hit() runs on EVERY cache read,
