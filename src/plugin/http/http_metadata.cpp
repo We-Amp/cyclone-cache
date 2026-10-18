@@ -183,6 +183,10 @@ std::optional<HttpCacheAlt> HttpCacheAlt::deserialize(
 std::chrono::seconds HttpCacheAlt::age() const {
   auto now = std::chrono::system_clock::now();
   auto now_time_t = std::chrono::system_clock::to_time_t(now);
+  // An age is never negative (a response time in the future reads as zero).
+  if (now_time_t < _response_time) {
+    return std::chrono::seconds(0);
+  }
   return std::chrono::seconds(now_time_t - _response_time);
 }
 
@@ -215,6 +219,12 @@ std::optional<std::chrono::seconds> HttpCacheAlt::max_age() const {
 }
 
 bool HttpCacheAlt::is_fresh() const {
+  // A response time in the future cannot be trusted (clock change or damaged
+  // metadata); such an entry is stale rather than fresh for its whole span.
+  if (_response_time >
+      std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())) {
+    return false;
+  }
   auto ma = max_age();
   if (ma) {
     return age() < *ma;

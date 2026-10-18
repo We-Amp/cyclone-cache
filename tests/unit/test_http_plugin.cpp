@@ -70,6 +70,26 @@ TEST_CASE("HttpCacheAlt freshness calculation", "[http]") {
   REQUIRE(max_age->count() == 3600);
 }
 
+TEST_CASE("HttpCacheAlt future response time is never fresh", "[http]") {
+  HttpCacheAlt alt;
+  alt.set_response_time(std::time(nullptr) + 86400);
+  alt.set_response_header("Cache-Control", "max-age=60");
+
+  REQUIRE(alt.age().count() >= 0);
+  REQUIRE_FALSE(alt.is_fresh());
+
+  auto plugin = create_http_alternate_plugin();
+  auto meta = alt.serialize();
+  CacheVariant variant{CacheKey("future"),
+                       Metadata(std::span<const std::byte>(meta)),
+                       0,
+                       {},
+                       {},
+                       0};
+  FreshnessContext fctx;
+  REQUIRE(plugin->check_freshness(variant, fctx) != FreshnessResult::Fresh);
+}
+
 TEST_CASE("HttpCacheAlt stale entry", "[http]") {
   HttpCacheAlt alt;
   auto past = std::time(nullptr) - 7200;
