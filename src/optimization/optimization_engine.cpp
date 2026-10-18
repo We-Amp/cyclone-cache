@@ -318,6 +318,24 @@ void OptimizationEngine::process_work_item(WorkItem item) {
     return;
   }
 
+  // Erase this instance's in-flight token on every way out, including the
+  // forced unwind a thread cancellation raises (which must propagate): a
+  // token left behind would refuse every later item for this id.  Only the
+  // entry that is still this instance's goes: the token is erased early,
+  // after the transform, and a later same-id instance may hold a fresh one.
+  struct TokenGuard {
+    OptimizationEngine &engine;
+    const WorkItemId &id;
+    const std::shared_ptr<std::atomic<bool>> &token;
+    ~TokenGuard() {
+      std::lock_guard lock(engine._active_work_mutex);
+      auto it = engine._active_work.find(id);
+      if (it != engine._active_work.end() && it->second == token) {
+        engine._active_work.erase(it);
+      }
+    }
+  } token_guard{*this, item.id, cancelled};
+
   // Everything below runs embedder-supplied plugin code (transform,
   // on_cancelled) and cache operations that may throw (allocation failure).
   // An exception escaping the worker would terminate the host process, and an
@@ -448,17 +466,8 @@ void OptimizationEngine::process_work_item(WorkItem item) {
     throw;
 #endif
   } catch (...) {
-    // Count the item as failed and drop it like any failed transform.  Erase
-    // the token only if it is still this instance's: the write phase runs
-    // after the token was already erased, and a later same-id instance may
-    // hold a fresh one.
-    {
-      std::lock_guard lock(_active_work_mutex);
-      auto it = _active_work.find(item.id);
-      if (it != _active_work.end() && it->second == cancelled) {
-        _active_work.erase(it);
-      }
-    }
+    // Count the item as failed and drop it like any failed transform; the
+    // token guard releases the in-flight token.
     _stat.failed.fetch_add(1, std::memory_order_relaxed);
   }
 }

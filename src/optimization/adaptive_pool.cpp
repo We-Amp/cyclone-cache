@@ -194,7 +194,30 @@ ThreadPoolStats AdaptiveThreadPool::stats() const {
 }
 
 void AdaptiveThreadPool::worker_loop(uint64_t generation) {
-  // spawn_worker() already counted this worker as live.
+  // spawn_worker() already counted this worker as live.  The guard settles
+  // the live and active counts and registers the exit on EVERY way out of
+  // this function, including the forced unwind a thread cancellation raises
+  // through a task (which must propagate): a cancelled worker would
+  // otherwise stay counted as live, and as running a task, until stop().
+  struct ExitGuard {
+    AdaptiveThreadPool &pool;
+    uint64_t generation;
+    bool task_active = false;
+    bool live_released = false;
+    ~ExitGuard() {
+      if (task_active) {
+        pool._hot.active.fetch_sub(1, std::memory_order_relaxed);
+      }
+      if (!live_released) {
+        pool._hot.live.fetch_sub(1, std::memory_order_relaxed);
+      }
+      // Register the exit so the spawn paths can reap this entry from
+      // _workers; the thread object is joined there, not here.
+      std::lock_guard lock(pool._workers_mutex);
+      pool._finished_workers.push_back(generation);
+    }
+  } guard{*this, generation};
+
   while (!_stopping.load(std::memory_order_acquire)) {
     // Check if we should self-terminate (scaling down)
     size_t live = _hot.live.load(std::memory_order_acquire);
@@ -203,13 +226,8 @@ void AdaptiveThreadPool::worker_loop(uint64_t generation) {
       // Try to be the one to exit
       if (_hot.live.compare_exchange_strong(live, live - 1,
                                             std::memory_order_acq_rel)) {
-        // Register the exit so the spawn paths can reap this entry from
-        // _workers; the thread object is joined there, not here.
-        {
-          std::lock_guard lock(_workers_mutex);
-          _finished_workers.push_back(generation);
-        }
-        return;  // Exit this worker
+        guard.live_released = true;
+        return;  // Exit this worker (the guard registers the exit)
       }
       // Another thread won the race, continue
     }
@@ -250,6 +268,7 @@ void AdaptiveThreadPool::worker_loop(uint64_t generation) {
     }
 
     _hot.active.fetch_add(1, std::memory_order_relaxed);
+    guard.task_active = true;
     _hot.tasks_started.fetch_add(1, std::memory_order_relaxed);
 
     try {
@@ -266,13 +285,8 @@ void AdaptiveThreadPool::worker_loop(uint64_t generation) {
       _hot.tasks_failed.fetch_add(1, std::memory_order_relaxed);
     }
 
+    guard.task_active = false;
     _hot.active.fetch_sub(1, std::memory_order_relaxed);
-  }
-
-  _hot.live.fetch_sub(1, std::memory_order_relaxed);
-  {
-    std::lock_guard lock(_workers_mutex);
-    _finished_workers.push_back(generation);
   }
 }
 

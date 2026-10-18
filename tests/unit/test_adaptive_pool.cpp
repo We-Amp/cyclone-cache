@@ -763,9 +763,17 @@ TEST_CASE("AdaptiveThreadPool lets a thread cancellation unwind a worker",
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    // The cancelled worker is gone: it must not stay counted as live or as
+    // running a task until stop().
+    const bool counts_restored =
+        pool.thread_count() == 0 && pool.active_count() == 0 &&
+        pool.stats().current_threads == 0 && pool.stats().active_threads == 0;
     provider.signal_stop();
     pool.stop();
-    std::_Exit(reached.load() ? 0 : 2);
+    if (!reached.load()) {
+      std::_Exit(2);
+    }
+    std::_Exit(counts_restored ? 0 : 3);
   }
   int status = 0;
   REQUIRE(waitpid(child, &status, 0) == child);

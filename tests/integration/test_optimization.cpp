@@ -1081,6 +1081,7 @@ class ThreadExitingPlugin : public OptimizationPlugin {
   std::expected<TransformResult, CacheError> transform(
       AlternateId /*target_alternate*/,
       const OptimizationContext & /*ctx*/) override {
+    calls.fetch_add(1, std::memory_order_acq_rel);
     reached.store(true, std::memory_order_release);
     pthread_exit(nullptr);
   }
@@ -1089,6 +1090,7 @@ class ThreadExitingPlugin : public OptimizationPlugin {
   }
 
   std::atomic<bool> reached{false};
+  std::atomic<int> calls{0};
 
  private:
   bool _exit_in_plan;
@@ -1106,8 +1108,8 @@ int run_thread_exit_scenario(bool exit_in_plan) {
   if (child == 0) {
     CacheConfig config;
     config.optimization_config.set_enabled(true)
-        .set_min_threads(1)
-        .set_max_threads(1)
+        .set_min_threads(2)
+        .set_max_threads(2)
         .set_min_hits_before_optimize(0);
     auto cache_result = Cache::create(config);
     if (!cache_result.has_value()) {
@@ -1145,8 +1147,29 @@ int run_thread_exit_scenario(bool exit_in_plan) {
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     const bool reached = plugin->reached.load();
+    int rc = reached ? 0 : 2;
+    if (reached && !exit_in_plan) {
+      // The cancelled worker no longer counts as live or as running a task,
+      // and its in-flight token is gone: the same item is accepted again by
+      // the surviving worker instead of being refused as a duplicate.
+      auto pool = engine->stats().pool_stats;
+      if (pool.current_threads != 1 || pool.active_threads != 0) {
+        rc = 4;
+      }
+      engine->on_write_complete(key, header, content.size(),
+                                AlternateId::Original, 10);
+      auto wait_until =
+          std::chrono::steady_clock::now() + std::chrono::seconds(10);
+      while (plugin->calls.load(std::memory_order_acquire) < 2 &&
+             std::chrono::steady_clock::now() < wait_until) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+      if (plugin->calls.load() < 2 || engine->stats().duplicates != 0) {
+        rc = rc != 0 ? rc : 5;
+      }
+    }
     cache->stop();
-    std::_Exit(reached ? 0 : 2);
+    std::_Exit(rc);
   }
   int status = 0;
   if (waitpid(child, &status, 0) != child) {
