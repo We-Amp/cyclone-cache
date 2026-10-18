@@ -284,6 +284,12 @@ bool RamCacheCLFUS::Segment::put(const RamCacheKey& rk,
       if (existing->second != _active_lru.begin()) {
         _active_lru.splice(_active_lru.begin(), _active_lru, existing->second);
       }
+
+      // A growing overwrite can push the segment past its budget; enforce
+      // it like insert and promotion do.  The just-updated entry sits at
+      // the front, and the size check at the top of put() means it alone
+      // never exceeds the budget, so eviction cannot pick it.
+      evict_if_needed(0);
       return true;
     } else {
       if (entry.value() > _average_value ||

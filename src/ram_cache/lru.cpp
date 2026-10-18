@@ -122,6 +122,12 @@ bool RamCacheLRU::put_if(const CacheKey& key, AlternateId id,
     if (existing->second != _lru.begin()) {
       _lru.splice(_lru.begin(), _lru, existing->second);
     }
+
+    // A growing overwrite can push the cache past its budget; enforce it
+    // like insert does.  The just-updated entry sits at the front, and the
+    // size check at the top of put_if() means it alone never exceeds the
+    // budget, so eviction cannot pick it.
+    evict_if_needed(0);
     return true;
   }
 

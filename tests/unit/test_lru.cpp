@@ -64,6 +64,30 @@ TEST_CASE("LRU update existing", "[lru]") {
   REQUIRE((*result)[0] == std::byte{0x22});
 }
 
+TEST_CASE("LRU overwriting an entry in place enforces the byte budget",
+          "[lru]") {
+  // A growing overwrite adjusts the accounted bytes but must also evict:
+  // a workload that only overwrites existing keys can otherwise push the
+  // cache past its configured budget without limit.
+  auto cache = RamCache::create(RamCacheType::LRU, 10000);
+
+  CacheKey a("overwrite-a");
+  CacheKey b("overwrite-b");
+  std::vector<std::byte> small(100, std::byte{0x01});
+  std::vector<std::byte> large(9950, std::byte{0x02});
+
+  cache->put(a, AlternateId::Original, small);
+  cache->put(b, AlternateId::Original, small);
+  REQUIRE(cache->bytes_used() == 200);
+
+  REQUIRE(cache->put(a, AlternateId::Original, large));
+
+  REQUIRE(cache->bytes_used() <= cache->max_bytes());
+  auto result = cache->get(a, AlternateId::Original);
+  REQUIRE(result.has_value());
+  REQUIRE(result->size() == large.size());
+}
+
 TEST_CASE("LRU remove", "[lru]") {
   auto cache =
       RamCache::create(RamCacheType::LRU, static_cast<size_t>(1024 * 1024));
