@@ -5,6 +5,16 @@
 
 #include <algorithm>
 
+// Thread cancellation on glibc is a forced unwind (abi::__forced_unwind),
+// which must not be swallowed: the runtime aborts the process if it is.  The
+// catch-all guards below rethrow it.
+#if defined(__GLIBCXX__) && __has_include(<cxxabi.h>)
+#include <cxxabi.h>
+#define CYCLONE_OPT_FORCED_UNWIND 1
+#else
+#define CYCLONE_OPT_FORCED_UNWIND 0
+#endif
+
 namespace cyclone {
 
 AdaptiveThreadPool::AdaptiveThreadPool(const OptimizationConfig &config,
@@ -255,6 +265,10 @@ void AdaptiveThreadPool::worker_loop(uint64_t generation) {
       task();
       std::lock_guard stats_lock(_stats_mutex);
       ++_stats.tasks_completed;
+#if CYCLONE_OPT_FORCED_UNWIND
+    } catch (abi::__forced_unwind &) {
+      throw;
+#endif
     } catch (...) {
       // Tasks run embedder-supplied code (plugin transforms); an exception
       // escaping worker_loop would terminate the host process.  Record the

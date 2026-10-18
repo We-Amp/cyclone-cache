@@ -15,6 +15,14 @@
 #include "cyclone/plugin/optimization.hpp"
 #include "optimization/optimization_engine.hpp"
 
+#if defined(__GLIBCXX__) && defined(__linux__)
+#include <pthread.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <cstdlib>
+#endif
+
 using namespace cyclone;
 namespace fs = std::filesystem;
 
@@ -989,3 +997,133 @@ TEST_CASE("OptimizationEngine load monitor observes cache traffic",
   REQUIRE(metrics.read_ops >= kReads);
   REQUIRE(metrics.read_bytes >= kContentSize);
 }
+
+#if defined(__GLIBCXX__) && defined(__linux__)
+namespace {
+
+// Plugin that ends its calling thread with pthread_exit(), which on glibc
+// unwinds the thread with a forced unwind exception, from planning or from
+// transform().
+class ThreadExitingPlugin : public OptimizationPlugin {
+ public:
+  explicit ThreadExitingPlugin(bool exit_in_plan)
+      : _exit_in_plan(exit_in_plan) {}
+
+  [[nodiscard]] PluginInfo info() const override {
+    return {"thread-exiting", "1.0.0", 106};
+  }
+
+  OptimizationPlan plan_optimization(const CacheKey & /*key*/,
+                                     std::span<const std::byte> /*header*/,
+                                     uint64_t /*content_length*/,
+                                     AlternateId written_alternate,
+                                     uint32_t /*hit_count*/) override {
+    if (_exit_in_plan) {
+      reached.store(true, std::memory_order_release);
+      pthread_exit(nullptr);
+    }
+    OptimizationPlan plan;
+    if (written_alternate == AlternateId::Original) {
+      plan.add(AlternateId::Gzip, 5, true, 1_KB);
+    }
+    return plan;
+  }
+
+  std::expected<TransformResult, CacheError> transform(
+      AlternateId /*target_alternate*/,
+      const OptimizationContext & /*ctx*/) override {
+    reached.store(true, std::memory_order_release);
+    pthread_exit(nullptr);
+  }
+
+  void on_cancelled(const CacheKey & /*key*/, AlternateId /*target*/) override {
+  }
+
+  std::atomic<bool> reached{false};
+
+ private:
+  bool _exit_in_plan;
+};
+
+// Runs one engine scenario in a child process: a swallowed forced unwind
+// aborts the process, which the parent observes as a signal exit.
+int run_thread_exit_scenario(bool exit_in_plan) {
+  const pid_t child = fork();
+  if (child < 0) {
+    return -1;
+  }
+  if (child == 0) {
+    auto cache_path = temp_cache_path();
+    CacheConfig config;
+    config.optimization_config.set_enabled(true)
+        .set_min_threads(1)
+        .set_max_threads(1)
+        .set_min_hits_before_optimize(0);
+    auto cache_result = Cache::create(config);
+    if (!cache_result.has_value()) {
+      std::_Exit(3);
+    }
+    auto &cache = *cache_result;
+    if (!cache->add_volume(cache_path + "/vol1", 10_MB).has_value() ||
+        !cache->start().has_value()) {
+      std::_Exit(3);
+    }
+    auto *engine = cache->optimization_engine();
+    auto plugin = std::make_shared<ThreadExitingPlugin>(exit_in_plan);
+    engine->register_plugin(plugin);
+
+    auto key = CacheKey::from_url("http://test.com/thread-exit");
+    std::vector<std::byte> content(100, std::byte{0x42});
+    auto write_result = cache->write_sync(key, content.size());
+    if (!write_result.has_value() ||
+        !write_result->write_sync(content).has_value() ||
+        !write_result->close_sync().has_value()) {
+      std::_Exit(3);
+    }
+    std::vector<std::byte> header = {std::byte{0x01}};
+    // Planning runs on the caller's thread: use a thread that may end.
+    std::thread caller([&] {
+      engine->on_write_complete(key, header, content.size(),
+                                AlternateId::Original, 10);
+    });
+    caller.join();
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!plugin->reached.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    const bool reached = plugin->reached.load();
+    cache->stop();
+    cleanup_temp(cache_path);
+    std::_Exit(reached ? 0 : 2);
+  }
+  int status = 0;
+  if (waitpid(child, &status, 0) != child) {
+    return -1;
+  }
+  return status;
+}
+
+}  // namespace
+
+// Regression: thread cancellation on glibc is a forced unwind, which must
+// propagate; the engine's catch-all guards swallowed it and the runtime then
+// aborts the process.
+TEST_CASE("OptimizationEngine lets a thread cancellation unwind planning",
+          "[optimization][integration][regression]") {
+  const int status = run_thread_exit_scenario(true);
+  INFO("child status " << status);
+  REQUIRE(WIFEXITED(status));
+  REQUIRE(WEXITSTATUS(status) == 0);
+}
+
+TEST_CASE("OptimizationEngine lets a thread cancellation unwind a transform",
+          "[optimization][integration][regression]") {
+  const int status = run_thread_exit_scenario(false);
+  INFO("child status " << status);
+  REQUIRE(WIFEXITED(status));
+  REQUIRE(WEXITSTATUS(status) == 0);
+}
+#endif

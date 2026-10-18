@@ -10,6 +10,16 @@
 #include "../core/fork_gate.hpp"
 #include "cyclone/cache.hpp"
 
+// Thread cancellation on glibc is a forced unwind (abi::__forced_unwind),
+// which must not be swallowed: the runtime aborts the process if it is.  The
+// catch-all guards below rethrow it.
+#if defined(__GLIBCXX__) && __has_include(<cxxabi.h>)
+#include <cxxabi.h>
+#define CYCLONE_OPT_FORCED_UNWIND 1
+#else
+#define CYCLONE_OPT_FORCED_UNWIND 0
+#endif
+
 namespace cyclone {
 
 // OptimizationContext implementation
@@ -210,6 +220,10 @@ void OptimizationEngine::on_write_complete(const CacheKey &key,
           ++_stats.queued;
         }
       }
+#if CYCLONE_OPT_FORCED_UNWIND
+    } catch (abi::__forced_unwind &) {
+      throw;
+#endif
     } catch (...) {
       std::lock_guard stats_lock(_stats_mutex);
       ++_stats.failed;
@@ -421,6 +435,10 @@ void OptimizationEngine::process_work_item(WorkItem item) {
 
     std::lock_guard stats_lock(_stats_mutex);
     ++_stats.completed;
+#if CYCLONE_OPT_FORCED_UNWIND
+  } catch (abi::__forced_unwind &) {
+    throw;
+#endif
   } catch (...) {
     // Count the item as failed and drop it like any failed transform.  Erase
     // the token only if it is still this instance's: the write phase runs

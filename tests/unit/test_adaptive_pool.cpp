@@ -15,6 +15,12 @@
 
 #include "optimization/adaptive_pool.hpp"
 
+#if defined(__GLIBCXX__) && defined(__linux__)
+#include <pthread.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 using namespace cyclone;
 
 namespace {
@@ -671,3 +677,42 @@ TEST_CASE("AdaptiveThreadPool restart cycles with scaling never deadlock",
   REQUIRE(rounds_done.load() == kRounds);
   REQUIRE(pool.thread_count() == 0);
 }
+
+#if defined(__GLIBCXX__) && defined(__linux__)
+// Regression: thread cancellation on glibc unwinds the thread with a forced
+// unwind exception, which must propagate.  The worker loop's catch-all
+// swallowed it, and the runtime aborts the process when that happens.  Run in
+// a child process so the outcome is observable as an exit status.
+TEST_CASE("AdaptiveThreadPool lets a thread cancellation unwind a worker",
+          "[pool][optimization][regression]") {
+  const pid_t child = fork();
+  REQUIRE(child >= 0);
+  if (child == 0) {
+    OptimizationConfig config;
+    config.min_threads = 1;
+    config.max_threads = 1;
+    MockTaskProvider provider;
+    AdaptiveThreadPool pool(config, provider);
+    pool.start();
+    std::atomic<bool> reached{false};
+    provider.add_task([&] {
+      reached.store(true, std::memory_order_release);
+      pthread_exit(nullptr);
+    });
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!reached.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    provider.signal_stop();
+    pool.stop();
+    std::_Exit(reached.load() ? 0 : 2);
+  }
+  int status = 0;
+  REQUIRE(waitpid(child, &status, 0) == child);
+  INFO("child status " << status);
+  REQUIRE(WIFEXITED(status));
+  REQUIRE(WEXITSTATUS(status) == 0);
+}
+#endif
