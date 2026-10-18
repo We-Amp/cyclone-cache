@@ -1409,6 +1409,8 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // EVERY step of the carry.  Same shape and cost as the hooks above; fires
   // with the stripe mutex held.
   enum class CarrySeam : uint8_t {
+    kSourcesChosen,  // retained nodes chosen, none copied yet (fires only
+                     // when there is something to copy)
     kSourcesCopied,  // retained nodes copied and validated; nothing reserved
     kFilled,         // chain + head durable and the cursor published; the
                      // directory insert (the publish) has not run
@@ -2627,6 +2629,12 @@ class Volume : public std::enable_shared_from_this<Volume> {
     uint64_t rel = 0;  // stripe-relative offset
     uint32_t len = 0;  // Document::len from the walked header
     uint8_t id = 0;    // alternate id
+    // The fill serial the walk bound the node by (its head entry's or the
+    // link it was reached through; Document::fill_serial).  The copy is
+    // carried only if it still carries it: bytes that landed at the offset
+    // since the walk are another fill's, and re-stamping them with the new
+    // slot's serial would make them the key's.
+    uint16_t serial = 0;
   };
   // The carried documents, ready to be written directly below the new head:
   // OLDEST first (the lowest offset, so every link points downward), each
@@ -2643,9 +2651,9 @@ class Volume : public std::enable_shared_from_this<Volume> {
   // kMaxAlternatesPerKey - 1 of them and at most carry_byte_budget() bytes:
   // the Original first, then newest first.  Each kept node is copied out of
   // the mapping, re-validated on the copy (magic, version, length, key, id,
-  // stamp, CRC) and, after all copies, re-checked for exposure against a
-  // fresh G; a node that fails any leg is dropped (counted).  Runs under
-  // the stripe mutex.
+  // stamp, fill serial, CRC) and, after all copies, re-checked for exposure
+  // against a fresh G; a node that fails any leg is dropped (counted).  Runs
+  // under the stripe mutex.
   [[nodiscard]] CarryPlan carry_retained_chain(
       const Stripe *stripe, const CacheKey &key, const StripeSnapshot &snap,
       std::span<const CarrySource> chain, uint8_t write_id,

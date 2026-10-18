@@ -5717,6 +5717,9 @@ Volume::CarryPlan Volume::carry_retained_chain(
   size_t copied_n = 0;
   plan.bytes.reserve(planned);
   const auto want_stamp = static_cast<uint32_t>(snap.pass - 1);
+  if (kept != 0) {
+    carry_seam(CarrySeam::kSourcesChosen);
+  }
   for (size_t c = n; c-- > 0;) {
     if (!keep[c]) {
       continue;
@@ -5744,7 +5747,8 @@ Volume::CarryPlan Volume::carry_retained_chain(
     const bool ok =
         reader.is_servable() && doc.len == src.len &&
         doc.alternate_id == src.id && doc.write_serial == want_stamp &&
-        reader.first_key() == key && doc.verify_checksum(reader.payload());
+        doc.fill_serial == src.serial && reader.first_key() == key &&
+        doc.verify_checksum(reader.payload());
     if (!ok) {
       plan.bytes.resize(start);
       ++plan.dropped;
@@ -6249,7 +6253,8 @@ std::expected<void, CacheError> Volume::commit_alternate_write_once(
   if (carry_forward) {
     std::array<CarrySource, Document::kMaxChainTraversalDepth> sources{};
     for (size_t i = 0; i < node_count; ++i) {
-      sources[i] = CarrySource{nodes[i].rel_offset, nodes[i].len, nodes[i].id};
+      sources[i] = CarrySource{nodes[i].rel_offset, nodes[i].len, nodes[i].id,
+                               Document::link_serial(nodes[i].link)};
     }
     carry = carry_retained_chain(
         stripe, key, snap,
