@@ -220,6 +220,45 @@ TEST_CASE("HttpCacheAlt s-maxage takes precedence", "[http]") {
   }
 }
 
+TEST_CASE("HttpCacheAlt accepts all HTTP date formats", "[http]") {
+  // Response received at Sun, 06 Nov 1994 08:49:37 GMT.
+  const std::time_t base = 784111777;
+  auto lifetime = [&](const char *expires) {
+    HttpCacheAlt alt;
+    alt.set_response_time(base);
+    alt.set_response_header("Expires", expires);
+    return alt.freshness_lifetime();
+  };
+
+  SECTION("IMF-fixdate") {
+    auto l = lifetime("Sun, 06 Nov 1994 09:49:37 GMT");
+    REQUIRE(l.has_value());
+    REQUIRE(l->count() == 3600);
+  }
+  SECTION("obsolete RFC 850 date") {
+    auto l = lifetime("Sunday, 06-Nov-94 09:49:37 GMT");
+    REQUIRE(l.has_value());
+    REQUIRE(l->count() == 3600);
+  }
+  SECTION("asctime date") {
+    auto l = lifetime("Sun Nov  6 09:49:37 1994");
+    REQUIRE(l.has_value());
+    REQUIRE(l->count() == 3600);
+    l = lifetime("Sun Nov 16 09:49:37 1994");
+    REQUIRE(l.has_value());
+    REQUIRE(l->count() == 3600 + 10 * 86400);
+  }
+  SECTION("two digit years within fifty years of now map to this century") {
+    auto l = lifetime("Sunday, 06-Nov-94 09:49:37 GMT");
+    REQUIRE(l->count() == 3600);  // 94 reads as 1994, not 2094
+  }
+  SECTION("garbage is rejected") {
+    REQUIRE(lifetime("Sun, 06 Nov 1994 09:49:37 PST")->count() == 0);
+    REQUIRE(lifetime("Sunday, 06-Foo-94 09:49:37 GMT")->count() == 0);
+    REQUIRE(lifetime("Sun Nov  6 09:49:37")->count() == 0);
+  }
+}
+
 TEST_CASE("HttpCacheAlt honours Expires", "[http]") {
   auto now = std::time(nullptr);
 

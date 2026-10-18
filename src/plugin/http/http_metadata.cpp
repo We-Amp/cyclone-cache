@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <ctime>
 #include <sstream>
 
 namespace cyclone {
@@ -56,42 +57,13 @@ std::string_view trim(std::string_view s) {
   return s;
 }
 
-// Parses an IMF-fixdate ("Sun, 06 Nov 1994 08:49:37 GMT") to seconds since
-// the Unix epoch. Returns nullopt for anything else.
-std::optional<int64_t> parse_http_date(std::string_view v) {
-  v = trim(v);
-  if (v.size() != 29 || v[3] != ',' || v[4] != ' ' || v[7] != ' ' ||
-      v[11] != ' ' || v[16] != ' ' || v[19] != ':' || v[22] != ':' ||
-      v[25] != ' ' || v.substr(26) != "GMT") {
-    return std::nullopt;
-  }
-  auto num = [&v](size_t pos, size_t len) -> int {
-    int r = 0;
-    for (size_t i = pos; i < pos + len; ++i) {
-      if (v[i] < '0' || v[i] > '9') {
-        return -1;
-      }
-      r = r * 10 + (v[i] - '0');
-    }
-    return r;
-  };
-  static constexpr std::string_view kMonths[] = {"Jan", "Feb", "Mar", "Apr",
-                                                 "May", "Jun", "Jul", "Aug",
-                                                 "Sep", "Oct", "Nov", "Dec"};
-  int month = 0;
-  for (int m = 0; m < 12; ++m) {
-    if (iequals(v.substr(8, 3), kMonths[m])) {
-      month = m + 1;
-      break;
-    }
-  }
-  int day = num(5, 2);
-  int year = num(12, 4);
-  int hour = num(17, 2);
-  int minute = num(20, 2);
-  int second = num(23, 2);
-  if (month == 0 || day < 1 || day > 31 || year < 1970 || hour < 0 ||
-      hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 60) {
+// Seconds since the Unix epoch for a UTC calendar time, or nullopt when a
+// field is out of range.
+std::optional<int64_t> to_epoch(int year, int month, int day, int hour,
+                                int minute, int second) {
+  if (month < 1 || month > 12 || day < 1 || day > 31 || year < 1970 ||
+      hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 ||
+      second > 60) {
     return std::nullopt;
   }
   // Days since 1970-01-01 for a proleptic Gregorian date.
@@ -102,6 +74,114 @@ std::optional<int64_t> parse_http_date(std::string_view v) {
   int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
   int64_t days = era * 146097 + doe - 719468;
   return days * 86400 + hour * 3600 + minute * 60 + second;
+}
+
+int parse_month(std::string_view v) {
+  static constexpr std::string_view kMonths[] = {"Jan", "Feb", "Mar", "Apr",
+                                                 "May", "Jun", "Jul", "Aug",
+                                                 "Sep", "Oct", "Nov", "Dec"};
+  for (int m = 0; m < 12; ++m) {
+    if (iequals(v, kMonths[m])) {
+      return m + 1;
+    }
+  }
+  return 0;
+}
+
+// Parses a run of exactly `len` digits, or `-1`.
+int parse_digits(std::string_view v, size_t pos, size_t len) {
+  if (pos + len > v.size()) {
+    return -1;
+  }
+  int r = 0;
+  for (size_t i = pos; i < pos + len; ++i) {
+    if (v[i] < '0' || v[i] > '9') {
+      return -1;
+    }
+    r = r * 10 + (v[i] - '0');
+  }
+  return r;
+}
+
+// "hh:mm:ss" at `pos`; returns false when malformed.
+bool parse_clock(std::string_view v, size_t pos, int &h, int &m, int &s) {
+  if (pos + 8 > v.size() || v[pos + 2] != ':' || v[pos + 5] != ':') {
+    return false;
+  }
+  h = parse_digits(v, pos, 2);
+  m = parse_digits(v, pos + 3, 2);
+  s = parse_digits(v, pos + 6, 2);
+  return h >= 0 && m >= 0 && s >= 0;
+}
+
+// Parses an HTTP-date in any of the three formats of RFC 9110 5.6.7 to
+// seconds since the Unix epoch: IMF-fixdate ("Sun, 06 Nov 1994 08:49:37
+// GMT"), the obsolete RFC 850 form ("Sunday, 06-Nov-94 08:49:37 GMT") and
+// asctime ("Sun Nov  6 08:49:37 1994"). Returns nullopt for anything else.
+std::optional<int64_t> parse_http_date(std::string_view v) {
+  v = trim(v);
+  int day = -1;
+  int month = 0;
+  int year = -1;
+  int h = -1;
+  int mi = -1;
+  int sec = -1;
+
+  size_t comma = v.find(',');
+  if (comma != std::string_view::npos) {
+    std::string_view rest = trim(v.substr(comma + 1));
+    if (rest.size() == 24) {
+      // IMF-fixdate: "06 Nov 1994 08:49:37 GMT"
+      if (rest[2] != ' ' || rest[6] != ' ' || rest[11] != ' ' ||
+          rest[20] != ' ' || rest.substr(21) != "GMT") {
+        return std::nullopt;
+      }
+      day = parse_digits(rest, 0, 2);
+      month = parse_month(rest.substr(3, 3));
+      year = parse_digits(rest, 7, 4);
+      if (!parse_clock(rest, 12, h, mi, sec)) {
+        return std::nullopt;
+      }
+    } else if (rest.size() == 22) {
+      // RFC 850: "06-Nov-94 08:49:37 GMT"
+      if (rest[2] != '-' || rest[6] != '-' || rest[9] != ' ' ||
+          rest[18] != ' ' || rest.substr(19) != "GMT") {
+        return std::nullopt;
+      }
+      day = parse_digits(rest, 0, 2);
+      month = parse_month(rest.substr(3, 3));
+      int yy = parse_digits(rest, 7, 2);
+      if (yy < 0 || !parse_clock(rest, 10, h, mi, sec)) {
+        return std::nullopt;
+      }
+      // A two digit year more than 50 years ahead of now is in the past.
+      int current_year = static_cast<int>(
+          1970 + static_cast<int64_t>(std::time(nullptr)) / 31556952);
+      year = (current_year / 100) * 100 + yy;
+      if (year > current_year + 50) {
+        year -= 100;
+      }
+    } else {
+      return std::nullopt;
+    }
+  } else {
+    // asctime: "Sun Nov  6 08:49:37 1994"
+    if (v.size() != 24 || v[3] != ' ' || v[7] != ' ' || v[10] != ' ' ||
+        v[19] != ' ') {
+      return std::nullopt;
+    }
+    month = parse_month(v.substr(4, 3));
+    day = v[8] == ' ' ? parse_digits(v, 9, 1) : parse_digits(v, 8, 2);
+    if (!parse_clock(v, 11, h, mi, sec)) {
+      return std::nullopt;
+    }
+    year = parse_digits(v, 20, 4);
+  }
+
+  if (month == 0 || day < 0 || year < 0) {
+    return std::nullopt;
+  }
+  return to_epoch(year, month, day, h, mi, sec);
 }
 
 // Statuses that may be cached without explicit freshness information
