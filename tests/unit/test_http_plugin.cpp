@@ -407,6 +407,49 @@ TEST_CASE("HttpAlternatePlugin Vary matches names regardless of case",
   REQUIRE_FALSE(plugin->select_variant(variants, ctx).has_value());
 }
 
+TEST_CASE("HttpCacheAlt metadata uses a fixed little-endian layout",
+          "[http]") {
+  HttpCacheAlt alt;
+  alt.set_request_method("GET");
+  alt.set_request_url("/");
+  alt.set_status_code(0x0102);
+  alt.set_request_time(static_cast<std::time_t>(0x1122334455667788LL));
+  alt.set_response_time(static_cast<std::time_t>(0x0102030405060708LL));
+
+  auto data = alt.serialize();
+  const std::vector<unsigned char> expected = {
+      0xA5,                                // format version
+      3,    0,    0,    0,    'G', 'E', 'T',  // method
+      1,    0,    0,    0,    '/',            // url
+      0,    0,    0,    0,                    // request headers
+      0x02, 0x01,                              // status
+      0,    0,    0,    0,                    // response headers
+      0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,  // request time
+      0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,  // response time
+  };
+  REQUIRE(data.size() == expected.size());
+  REQUIRE(std::memcmp(data.data(), expected.data(), expected.size()) == 0);
+
+  auto parsed = HttpCacheAlt::deserialize(data);
+  REQUIRE(parsed.has_value());
+  REQUIRE(parsed->status_code() == 0x0102);
+  REQUIRE(static_cast<long long>(parsed->request_time()) ==
+          0x1122334455667788LL);
+  REQUIRE(static_cast<long long>(parsed->response_time()) ==
+          0x0102030405060708LL);
+}
+
+TEST_CASE("HttpCacheAlt deserialize treats an unversioned blob as a miss",
+          "[http]") {
+  // The earlier layout had no version byte and started with the method
+  // length.
+  const std::vector<unsigned char> old_blob = {
+      3, 0, 0, 0, 'G', 'E', 'T', 1, 0, 0, 0, '/', 0, 0, 0, 0, 0xC8, 0,
+      0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0};
+  auto bytes = std::as_bytes(std::span(old_blob));
+  REQUIRE_FALSE(HttpCacheAlt::deserialize(bytes).has_value());
+}
+
 TEST_CASE("HttpCacheAlt deserialize rejects truncated input", "[http]") {
   HttpCacheAlt alt;
   alt.set_request_method("GET");

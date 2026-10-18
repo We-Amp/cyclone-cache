@@ -238,23 +238,33 @@ std::optional<std::string_view> HttpCacheAlt::get_response_header(
   return std::nullopt;
 }
 
+namespace {
+
+// Metadata layout: one format-version byte, then fixed-width little-endian
+// fields independent of the host's byte order and time_t width. Blobs written
+// before the version byte existed are not read; they decode as a miss.
+constexpr uint8_t kFormatVersion = 0xA5;
+
+void put_le(std::vector<std::byte> &out, uint64_t v, size_t bytes) {
+  for (size_t i = 0; i < bytes; ++i) {
+    out.push_back(static_cast<std::byte>((v >> (8 * i)) & 0xFF));
+  }
+}
+
+}  // namespace
+
 std::vector<std::byte> HttpCacheAlt::serialize() const {
   std::vector<std::byte> result;
+  result.push_back(static_cast<std::byte>(kFormatVersion));
 
   auto write_string = [&result](std::string_view s) {
-    auto len = static_cast<uint32_t>(s.size());
-    size_t offset = result.size();
-    result.resize(offset + sizeof(len) + len);
-    std::memcpy(result.data() + offset, &len, sizeof(len));
-    std::memcpy(result.data() + offset + sizeof(len), s.data(), len);
+    put_le(result, static_cast<uint32_t>(s.size()), 4);
+    const auto *p = reinterpret_cast<const std::byte *>(s.data());
+    result.insert(result.end(), p, p + s.size());
   };
 
   auto write_headers = [&](const std::map<std::string, std::string> &headers) {
-    auto count = static_cast<uint32_t>(headers.size());
-    size_t offset = result.size();
-    result.resize(offset + sizeof(count));
-    std::memcpy(result.data() + offset, &count, sizeof(count));
-
+    put_le(result, static_cast<uint32_t>(headers.size()), 4);
     for (const auto &[name, value] : headers) {
       write_string(name);
       write_string(value);
@@ -264,19 +274,11 @@ std::vector<std::byte> HttpCacheAlt::serialize() const {
   write_string(_request_method);
   write_string(_request_url);
   write_headers(_request_headers);
-
-  result.resize(result.size() + sizeof(_status_code));
-  std::memcpy(result.data() + result.size() - sizeof(_status_code),
-              &_status_code, sizeof(_status_code));
-
+  put_le(result, _status_code, 2);
   write_headers(_response_headers);
-
-  result.resize(result.size() + sizeof(_request_time) + sizeof(_response_time));
-  size_t offset =
-      result.size() - sizeof(_request_time) - sizeof(_response_time);
-  std::memcpy(result.data() + offset, &_request_time, sizeof(_request_time));
-  std::memcpy(result.data() + offset + sizeof(_request_time), &_response_time,
-              sizeof(_response_time));
+  put_le(result, static_cast<uint64_t>(static_cast<int64_t>(_request_time)), 8);
+  put_le(result, static_cast<uint64_t>(static_cast<int64_t>(_response_time)),
+         8);
 
   return result;
 }
@@ -286,14 +288,28 @@ std::optional<HttpCacheAlt> HttpCacheAlt::deserialize(
   HttpCacheAlt alt;
   size_t offset = 0;
 
+  if (data.empty() || static_cast<uint8_t>(data[0]) != kFormatVersion) {
+    return std::nullopt;
+  }
+  offset = 1;
+
+  auto get_le = [&data, &offset](size_t bytes) -> uint64_t {
+    uint64_t v = 0;
+    for (size_t i = 0; i < bytes; ++i) {
+      v |= static_cast<uint64_t>(static_cast<uint8_t>(data[offset + i]))
+           << (8 * i);
+    }
+    offset += bytes;
+    return v;
+  };
+
   // Every reader returns false on truncated input; the caller abandons the
   // whole parse so no later field is read from a desynchronised offset.
-  auto read_u32 = [&data, &offset](uint32_t &out) -> bool {
+  auto read_u32 = [&data, &offset, &get_le](uint32_t &out) -> bool {
     if (data.size() - offset < sizeof(out)) {
       return false;
     }
-    std::memcpy(&out, data.data() + offset, sizeof(out));
-    offset += sizeof(out);
+    out = static_cast<uint32_t>(get_le(sizeof(out)));
     return true;
   };
 
@@ -340,26 +356,21 @@ std::optional<HttpCacheAlt> HttpCacheAlt::deserialize(
     return std::nullopt;
   }
 
-  if (data.size() - offset < sizeof(alt._status_code)) {
+  if (data.size() - offset < 2) {
     return std::nullopt;
   }
-  std::memcpy(&alt._status_code, data.data() + offset,
-              sizeof(alt._status_code));
-  offset += sizeof(alt._status_code);
+  alt._status_code = static_cast<uint16_t>(get_le(2));
 
   if (!read_headers(alt._response_headers)) {
     return std::nullopt;
   }
 
-  if (data.size() - offset !=
-      sizeof(alt._request_time) + sizeof(alt._response_time)) {
+  if (data.size() - offset != 16) {
     return std::nullopt;
   }
-  std::memcpy(&alt._request_time, data.data() + offset,
-              sizeof(alt._request_time));
-  offset += sizeof(alt._request_time);
-  std::memcpy(&alt._response_time, data.data() + offset,
-              sizeof(alt._response_time));
+  alt._request_time = static_cast<std::time_t>(static_cast<int64_t>(get_le(8)));
+  alt._response_time =
+      static_cast<std::time_t>(static_cast<int64_t>(get_le(8)));
 
   return alt;
 }
