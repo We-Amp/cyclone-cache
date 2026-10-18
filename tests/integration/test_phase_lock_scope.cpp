@@ -161,3 +161,42 @@ TEST_CASE(
 
   (void)stuck.release();
 }
+
+TEST_CASE(
+    "Phase lock scope: a stuck phase lock does not leave the inserting "
+    "bucket odd for its readers",
+    "[mmap_directory][concurrent][regression]") {
+  // The phase lock is held by a live-but-stuck peer for the whole test (its
+  // budget is stretched so nobody recovers it).  An insert on `key` parks
+  // behind it.  While it waits it must hold nothing: a reader of the same
+  // bucket must still see the entry stored earlier, promptly.
+  BudgetOverride budgets(/*bucket_us=*/0,
+                         /*phase_us=*/uint64_t{10} * 1000 * 1000);
+  TestDir d;
+  const CacheKey key("phase-scope-reader");
+  REQUIRE(d.dir.insert(key, 4096, 512));
+
+  auto phase_holder = d.dir.acquire_phase_lock_for_test();
+  std::atomic<bool> started{false};
+  bool inserted = true;
+  std::thread waiter([&] {
+    started.store(true);
+    bool busy = false;
+    inserted = d.dir.insert(key, 8192, 512, MmapDirectory::kMatchAnyTag,
+                            nullptr, nullptr, nullptr, {}, &busy);
+  });
+  while (!started.load()) {
+    std::this_thread::yield();
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto found = d.dir.probe(key);
+  const auto elapsed = std::chrono::steady_clock::now() - t0;
+  REQUIRE(found.has_value());
+  REQUIRE(elapsed < std::chrono::milliseconds(20));
+
+  d.dir.release_phase_lock_for_test(phase_holder);
+  waiter.join();
+  (void)inserted;
+}

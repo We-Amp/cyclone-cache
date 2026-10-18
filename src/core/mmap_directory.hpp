@@ -806,22 +806,25 @@ class MmapDirectory {
   // Measured on macOS (10 cores): two processes writing one volume as
   // process 0 of 1, 2 writer threads each, plus CPU hogs.  Live holders held
   // a bucket for at most 0.6 ms with 12 hogs, but up to 56 ms with 24-48
-  // hogs (2.8-5.2 runnable threads per core); the phase lock, whose holder
-  // also waits on a bucket, up to 112 ms.  The budgets sit well above
-  // that: recovering a live holder costs a spurious miss, while a larger
-  // budget only lengthens the one-time stall after a process died holding
-  // the lock.  The phase-lock budget must exceed the bucket budget plus a
-  // live phase hold, since the holder (insert) waits on a bucket inside it.
+  // hogs (2.8-5.2 runnable threads per core); the phase lock up to 112 ms
+  // (measured while its holder still waited on a bucket inside it).  The
+  // budgets sit well above that: recovering a live holder costs a spurious
+  // miss, while a larger budget only lengthens the one-time stall after a
+  // process died holding the lock.
   static constexpr std::chrono::milliseconds kBucketWriterBudget{250};
   static constexpr std::chrono::milliseconds kPhaseLockBudget{1000};
   // The write lock never presumes a live holder stuck: it recovers the lock
   // from a holder PROVEN dead, and takes over a holder it cannot prove dead
   // only after this last-resort escalation budget.
   static constexpr std::chrono::milliseconds kWriteLockEscalationBudget{5000};
-  // A phase-lock holder waits on a bucket; a write-lock holder (wrap) waits
-  // on the phase lock.  An inner wait must end well inside the outer budget.
-  static_assert(kPhaseLockBudget >= 2 * kBucketWriterBudget);
+  // A write-lock holder (wrap) waits on the phase lock, so that inner wait
+  // must end well inside the outer budget.  A phase-lock holder never waits
+  // on a bucket: insert() takes the bucket first and only TRIES the phase
+  // lock while it is held.
   static_assert(kWriteLockEscalationBudget >= 2 * kPhaseLockBudget);
+  // Times insert() retries its bucket bracket after finding the phase lock
+  // busy (each retry follows a capped wait holding nothing).
+  static constexpr int kInsertPhaseAttempts = 4;
   // The write lock consults the holder's liveness (WriterLiveness::probe,
   // one fcntl / LockFileEx) only once one holder has kept it this long, far
   // past any ordinary contention, so a waiter does not probe on every short
@@ -1103,6 +1106,10 @@ class MmapDirectory {
 
   /// acquire_phase_lock's contended path, out of line.
   bool acquire_phase_lock_slow(PhaseLockToken &token, bool capped);
+
+  /// One attempt at the phase lock, never waiting (insert() calls it while
+  /// holding a bucket odd).
+  [[nodiscard]] bool try_acquire_phase_lock(PhaseLockToken &token);
 
   /// True iff the write-lock holder seen as {value, generation, pid} holds
   /// a WriterLiveness slot (its token encodes one) whose lock the OS reports

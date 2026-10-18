@@ -221,7 +221,7 @@ holder's budget plus the 2 ms confirmation:
 | Lock | Longest capped wait |
 |------|---------------------|
 | Bucket seqlock | About 0.5 s. |
-| Phase lock | About 1.25 s. An insert takes the bucket, then the phase lock, so one insert can wait about 1.75 s in all — but the waits are sequential: the phase lock is never held across the bucket wait, so a wedged bucket stalls only its own bucket's inserts, not the stripe's. |
+| Phase lock | About 1.25 s. An insert takes the bucket and only tries the phase lock while it holds it; when the phase lock is busy it releases the bucket, waits for the phase lock holding nothing (this wait, up to about 1.25 s), and retries a bounded number of times. A wedged bucket or phase lock therefore never keeps another bucket, or readers of this one, waiting behind a held bucket. |
 | Write lock | About 0.3 s behind a dead holder. About 5.25 s behind a live holder it cannot prove dead, the pathological case the escalation exists for. |
 
 Three waits stay uncapped, because giving up there would leave work half
@@ -249,14 +249,11 @@ During an upgrade overlap, the pair therefore behaves like the older build,
 and no worse than before.
 
 A build from before the lock-order swap takes the phase lock before its
-bucket, later builds the bucket before the phase lock. Two inserts on the
-same bucket from different-version processes can therefore wait on each
-other's lock (the old one holds the phase and wants the bucket, the new one
-the reverse) until the bucket's per-holder budget force-releases it (~250 ms)
-and both proceed. The late stores of a force-released bracket are the
-documented, reader-verified residual above — a retry or a miss, never
-foreign bytes — so the overlap degrades the same way contention with a
-descheduled writer does.
+bucket, later builds the bucket before the phase lock. A later build only
+tries the phase lock while it holds a bucket, and releases the bucket when
+the try fails, so two inserts on the same bucket from different-version
+processes never wait on each other's lock: the later build backs off, waits
+for the phase lock holding nothing, and retries.
 
 ### Writer liveness
 

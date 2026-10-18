@@ -1144,20 +1144,36 @@ bool MmapDirectory::insert(const CacheKey &key, uint64_t offset, uint64_t size,
   //
   // Both waits are capped: behind live holders that keep changing, give up
   // and publish nothing (*busy) rather than stall the writer.
+  //
+  // The bucket is held odd (readers of it spin, other writers wait on it
+  // under a 250 ms per-holder budget) so the phase lock is only TRIED while
+  // it is held: waiting for it there could outlast that budget and have a
+  // live holder force-released, and readers of the bucket would see it odd
+  // for the whole wait.  When the phase lock is busy, the bucket is released,
+  // the capped (recovering) wait for the phase lock runs holding nothing,
+  // and the bracket is retried from the bucket, a bounded number of times.
   uint32_t writer_token = 0;
-  if (!acquire_writer(bucket_idx, writer_token, /*capped=*/true)) {
-    if (busy != nullptr) {
-      *busy = true;
-    }
-    return false;
-  }
   PhaseLockToken phase_token;
-  if (!acquire_phase_lock(phase_token, /*capped=*/true)) {
-    release_writer(bucket_idx, writer_token);
-    if (busy != nullptr) {
-      *busy = true;
+  for (int attempt = 0;; ++attempt) {
+    if (!acquire_writer(bucket_idx, writer_token, /*capped=*/true)) {
+      if (busy != nullptr) {
+        *busy = true;
+      }
+      return false;
     }
-    return false;
+    if (try_acquire_phase_lock(phase_token)) {
+      break;
+    }
+    release_writer(bucket_idx, writer_token);
+    PhaseLockToken waited;
+    if (attempt >= kInsertPhaseAttempts ||
+        !acquire_phase_lock(waited, /*capped=*/true)) {
+      if (busy != nullptr) {
+        *busy = true;
+      }
+      return false;
+    }
+    release_phase_lock(waited);
   }
   bool cur_phase = current_phase();
 
@@ -1604,8 +1620,8 @@ void MmapDirectory::reset_reader_state_exclusive() {
 // what separates "descheduled" from "stuck": it is set well above the
 // longest live hold measured under CPU oversubscription (the bracket the
 // lock covers is the insert's phase read + entry stores, microseconds;
-// insert() takes the lock AFTER its bucket wait, so no holder of it is ever
-// parked on a bucket -- see the PR for #27).
+// insert() only TRIES the lock while it holds a bucket, so no holder of it is
+// ever parked on a bucket).
 //
 // Why presuming is acceptable here, unlike the write lock: what can a
 // usurped holder that is still executing do?  Its insert already read the
@@ -1633,6 +1649,13 @@ bool MmapDirectory::acquire_phase_lock(PhaseLockToken &token, bool capped) {
     return true;
   }
   return acquire_phase_lock_slow(token, capped);
+}
+
+bool MmapDirectory::try_acquire_phase_lock(PhaseLockToken &token) {
+  uint8_t observed = 0;
+  return try_take_token_lock(std::atomic_ref<uint8_t>(_header->phase_lock),
+                             std::atomic_ref<uint16_t>(_header->phase_lock_gen),
+                             token.generation, token.value, observed);
 }
 
 bool MmapDirectory::acquire_phase_lock_slow(PhaseLockToken &token,
