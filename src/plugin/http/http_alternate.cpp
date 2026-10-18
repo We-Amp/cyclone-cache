@@ -8,6 +8,8 @@
 #include <cctype>
 #include <cmath>
 #include <sstream>
+#include <vector>
+#include <string>
 
 #include "cyclone/plugin/plugin.hpp"
 #include "http_metadata.hpp"
@@ -296,6 +298,81 @@ std::string_view HttpAlternatePlugin::parse_header_value(
   return {};
 }
 
+namespace {
+
+std::string_view trim_vary_ows(std::string_view s) {
+  while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) {
+    s.remove_prefix(1);
+  }
+  while (!s.empty() && (s.back() == ' ' || s.back() == '\t' ||
+                        s.back() == '\r')) {
+    s.remove_suffix(1);
+  }
+  return s;
+}
+
+// Content negotiation headers whose values are comma separated lists that
+// are case-insensitive by definition.
+bool is_token_list_header(std::string_view name) {
+  static constexpr std::string_view kNames[] = {
+      "accept", "accept-encoding", "accept-language", "accept-charset"};
+  for (std::string_view candidate : kNames) {
+    if (name.size() != candidate.size()) {
+      continue;
+    }
+    bool same = true;
+    for (size_t i = 0; i < name.size(); ++i) {
+      if (std::tolower(static_cast<unsigned char>(name[i])) != candidate[i]) {
+        same = false;
+        break;
+      }
+    }
+    if (same) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Lowercased list elements with whitespace around ';' and '=' removed, as a
+// sorted set.
+std::vector<std::string> canonical_token_set(std::string_view value) {
+  std::vector<std::string> tokens;
+  size_t pos = 0;
+  while (pos <= value.size()) {
+    size_t end = value.find(',', pos);
+    if (end == std::string_view::npos) {
+      end = value.size();
+    }
+    std::string_view element = trim_vary_ows(value.substr(pos, end - pos));
+    if (!element.empty()) {
+      std::string canonical;
+      for (char c : element) {
+        if (c == ' ' || c == '\t') {
+          continue;
+        }
+        canonical.push_back(static_cast<char>(
+            std::tolower(static_cast<unsigned char>(c))));
+      }
+      tokens.push_back(std::move(canonical));
+    }
+    pos = end + 1;
+  }
+  std::sort(tokens.begin(), tokens.end());
+  tokens.erase(std::unique(tokens.begin(), tokens.end()), tokens.end());
+  return tokens;
+}
+
+bool vary_values_match(std::string_view name, std::string_view cached,
+                       std::string_view request) {
+  if (is_token_list_header(name)) {
+    return canonical_token_set(cached) == canonical_token_set(request);
+  }
+  return trim_vary_ows(cached) == trim_vary_ows(request);
+}
+
+}  // namespace
+
 bool HttpAlternatePlugin::check_vary_match(
     const HttpCacheAlt &cached, std::span<const std::byte> request_headers) {
   auto vary = cached.get_response_header("Vary");
@@ -330,7 +407,7 @@ bool HttpAlternatePlugin::check_vary_match(
       auto request_value = parse_header_value(request_headers, header_name);
 
       std::string_view cv = cached_value.value_or("");
-      if (cv != request_value) {
+      if (!vary_values_match(header_name, cv, request_value)) {
         return false;
       }
     }

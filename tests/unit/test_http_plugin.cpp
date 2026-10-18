@@ -889,6 +889,59 @@ TEST_CASE("HttpAlternatePlugin Vary star rejects all", "[http]") {
   REQUIRE_FALSE(result.has_value());
 }
 
+namespace {
+
+bool vary_selects(const char *vary, const char *name, const char *cached_value,
+                  const std::string &request_headers) {
+  auto plugin = create_http_alternate_plugin();
+  HttpCacheAlt alt;
+  alt.set_response_header("Vary", vary);
+  alt.set_request_header(name, cached_value);
+  auto meta = alt.serialize();
+
+  VariantCollection variants;
+  variants.add(CacheVariant{CacheKey("vary-value"),
+                            Metadata(std::span<const std::byte>(meta)),
+                            0,
+                            {},
+                            {},
+                            0});
+  LookupContext ctx;
+  ctx.request_headers = std::span<const std::byte>(
+      reinterpret_cast<const std::byte *>(request_headers.data()),
+      request_headers.size());
+  return plugin->select_variant(variants, ctx).has_value();
+}
+
+}  // namespace
+
+TEST_CASE("HttpAlternatePlugin Vary compares list headers as token sets",
+          "[http]") {
+  // Order, optional whitespace and case do not change the token set.
+  REQUIRE(vary_selects("Accept-Encoding", "Accept-Encoding", "gzip, br",
+                       "Accept-Encoding: br,gzip\r\n"));
+  REQUIRE(vary_selects("Accept-Encoding", "Accept-Encoding", "gzip, br",
+                       "Accept-Encoding:   GZIP ,  BR \r\n"));
+  REQUIRE(vary_selects("Accept-Language", "Accept-Language", "en;q=0.5, nl",
+                       "Accept-Language: NL, en ; q=0.5\r\n"));
+  // A different set still differs.
+  REQUIRE_FALSE(vary_selects("Accept-Encoding", "Accept-Encoding", "gzip, br",
+                             "Accept-Encoding: gzip\r\n"));
+  REQUIRE_FALSE(vary_selects("Accept-Encoding", "Accept-Encoding", "gzip",
+                             "Accept-Encoding: gzip, br\r\n"));
+}
+
+TEST_CASE("HttpAlternatePlugin Vary keeps case-sensitive values exact",
+          "[http]") {
+  // Surrounding whitespace is not part of a field value.
+  REQUIRE(vary_selects("X-Tenant", "X-Tenant", "Acme", "X-Tenant:  Acme \r\n"));
+  // Other headers keep their case and order.
+  REQUIRE_FALSE(vary_selects("X-Tenant", "X-Tenant", "Acme",
+                             "X-Tenant: acme\r\n"));
+  REQUIRE_FALSE(vary_selects("Cookie", "Cookie", "a=1; b=2",
+                             "Cookie: b=2; a=1\r\n"));
+}
+
 TEST_CASE("HttpAlternatePlugin eviction_priority", "[http]") {
   auto plugin = create_http_alternate_plugin();
 
