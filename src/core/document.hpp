@@ -34,7 +34,9 @@ struct Document {
           // anyway -- consumers take a cold cache, never a misparse.
           // Version 9: the checksum also covers the fixed header: every
           // field that never changes after the write (see
-          // checksum_header_seed).  A v8 checksum covered header bytes +
+          // checksum_header_seed); fill_serial (formerly sync_serial) and
+          // the serial packed into next_alternate_offset bind a document to
+          // the write that filled it.  A v8 checksum covered header bytes +
           // content only, so v8 documents would fail verification; the
           // same fingerprinted-filename separation applies.
   static constexpr uint8_t kVersionMinor = 0;

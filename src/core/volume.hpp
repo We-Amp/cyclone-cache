@@ -129,7 +129,11 @@ struct VolumeHeader {
   // Version 9: the document checksum also covers the fixed document header
   //   (every field that never changes after the write; the fields updated
   //   in place -- pass stamp, hit count, chain link, access time -- stay
-  //   outside).  No byte of the layout moved, but every pre-v9 checksum
+  //   outside).  The document's sync_serial became fill_serial, the
+  //   directory entry's unused next word its 16-bit twin, and
+  //   next_alternate_offset carries the successor's serial in bits 48-63:
+  //   a read uses a document only when the serial it was reached through
+  //   agrees.  No byte of the layout moved, but every pre-v9 checksum
   //   covers less and would fail verification, so the bump leaves those
   //   rings behind exactly as v7 and v8 did: COLD CACHE on upgrade, and the
   //   superseded v8 file stays on disk until it is reclaimed

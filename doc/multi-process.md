@@ -248,13 +248,6 @@ other in normal locking, because both treat any nonzero lock value as held.
 During an upgrade overlap, the pair therefore behaves like the older build,
 and no worse than before.
 
-A build from before the lock-order swap takes the phase lock before its
-bucket, later builds the bucket before the phase lock. A later build only
-tries the phase lock while it holds a bucket, and releases the bucket when
-the try fails, so two inserts on the same bucket from different-version
-processes never wait on each other's lock: the later build backs off, waits
-for the phase lock holding nothing, and retries.
-
 ### Writer liveness
 
 A write-lock holder that dies must be recovered quickly, and a live one must
@@ -819,7 +812,7 @@ lockstep). Version history:
 | v6 | `hit_count` / `next_alternate_offset` / `last_access` laid out naturally aligned, so the in-place header RMW sites can store them atomically |
 | v7 | alternate chains are depth-bounded at write time; the bump leaves pre-bound (over-deep, possibly cyclic) chains behind rather than repairing them |
 | v8 | the document checksum is CRC-32C (Castagnoli) instead of CRC-32/ISO-HDLC, so it has hardware instructions on x86-64 as well as ARMv8; pre-v8 checksums were computed over a different polynomial and the bump leaves those rings behind |
-| v9 | the document checksum also covers the fixed document header: every field that never changes after the write (the in-place pass stamp, hit count, chain link and access time stay outside); pre-v9 checksums cover less and the bump leaves those rings behind |
+| v9 | the document checksum also covers the fixed document header (every field that never changes after the write); no byte of the layout moved, but every pre-v9 checksum covers less and would fail verification, so the bump leaves those rings behind. The document's `sync_serial` became `fill_serial` and the directory entry's unused `next` word its 16-bit twin, and `next_alternate_offset` carries the successor's serial in bits 48-63 above its 40-bit offset: all carry the serial of the write that filled the document, and a read uses a document only when the serial of the entry or link it was reached through agrees |
 
 ### Automatic Migration
 
