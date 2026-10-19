@@ -86,7 +86,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     (void)e.phase();
     (void)e.head();
     (void)e.pinned();
-    (void)e.next();
+    (void)e.fill_serial();
     (void)e.is_empty();
     (void)e.approx_size();
   }
