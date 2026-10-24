@@ -13,6 +13,16 @@
 #include "cyclone/key.hpp"
 #include "support/temp_cache.hpp"
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #if defined(__linux__)
 #include <fcntl.h>
 #include <unistd.h>
@@ -392,3 +402,61 @@ TEST_CASE(
   REQUIRE(open_and_roundtrip(false) == 0);
   REQUIRE(open_and_roundtrip(true) == 1);
 }
+
+#ifdef _WIN32
+TEST_CASE("MappedFile handles allow another open to delete the file",
+          "[mapped_file][windows]") {
+  for (auto mode :
+       {MappedFile::OpenMode::ReadOnly, MappedFile::OpenMode::ReadWrite}) {
+    auto path = create_temp_file(4096);
+    auto mf = MappedFile::create();
+    REQUIRE(mf->open(path.string(), mode).has_value());
+    const auto map_mode = mode == MappedFile::OpenMode::ReadOnly
+                              ? MappedFile::MapMode::ReadOnly
+                              : MappedFile::MapMode::ReadWrite;
+    REQUIRE(mf->map_whole_file(map_mode).has_value());
+    REQUIRE(mf->persistent_base() != nullptr);
+    REQUIRE(static_cast<unsigned char>(mf->persistent_base()[0]) == 'X');
+
+    // Deleting needs every open handle to allow FILE_SHARE_DELETE.
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    REQUIRE_FALSE(ec);
+
+    // The mapping stays readable after the name is gone.
+    REQUIRE(static_cast<unsigned char>(mf->persistent_base()[0]) == 'X');
+
+    mf->close();
+    std::filesystem::remove(path, ec);
+  }
+}
+
+TEST_CASE("A live Volume can be renamed and deleted by path",
+          "[mapped_file][volume][windows]") {
+  TempCacheDir tmp;
+  VolumeConfig config;
+  config.path = tmp.path();
+  config.size = static_cast<size_t>(10 * 1024 * 1024);
+  Volume volume(config);
+  REQUIRE(volume.open().has_value());
+
+  CacheKey key("rename-delete-live-volume");
+  std::vector<std::byte> payload(256, std::byte{0x5A});
+  auto wh = volume.write_sync(key, payload.size());
+  REQUIRE(wh.has_value());
+  REQUIRE(wh->write_sync(std::span<const std::byte>(payload)).has_value());
+  REQUIRE(wh->close_sync().has_value());
+
+  // Both the descriptor and the mapping of the open volume must allow delete
+  // sharing, or these path-based calls fail with a sharing violation.
+  const std::filesystem::path original(config.path);
+  const std::filesystem::path aside = original.string() + ".aside";
+  REQUIRE(MoveFileExW(original.wstring().c_str(), aside.wstring().c_str(), 0) !=
+          0);
+  REQUIRE(DeleteFileW(aside.wstring().c_str()) != 0);
+
+  auto rh = volume.read_sync(key);
+  REQUIRE(rh.has_value());
+  REQUIRE(rh->content().size() == payload.size());
+}
+#endif

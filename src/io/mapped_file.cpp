@@ -486,24 +486,33 @@ class Win32MappedFile : public MappedFile {
           std::make_error_code(std::errc::device_or_resource_busy));
     }
 
+    // Every open allows FILE_SHARE_DELETE, read-only ones included, so no
+    // reader blocks another process from removing or renaming the file while
+    // it stays open and mapped (POSIX-like unlink-while-mapped). A cache
+    // purge by another process relies on this; the descriptor Volume holds
+    // for the same file uses the same share mode. Where POSIX delete
+    // semantics are unavailable (Windows older than 10 1709 / Server 2019, or
+    // a non-NTFS filesystem), a deleted name stays reserved until the last
+    // handle closes; callers that need the name back rename the file aside
+    // first.
     DWORD access = GENERIC_READ;
-    DWORD share = FILE_SHARE_READ;
+    DWORD share = FILE_SHARE_READ | FILE_SHARE_DELETE;
     DWORD creation = OPEN_EXISTING;
 
     switch (mode) {
       case OpenMode::ReadOnly:
         access = GENERIC_READ;
-        share = FILE_SHARE_READ | FILE_SHARE_WRITE;
+        share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
         creation = OPEN_EXISTING;
         break;
       case OpenMode::ReadWrite:
         access = GENERIC_READ | GENERIC_WRITE;
-        share = FILE_SHARE_READ | FILE_SHARE_WRITE;
+        share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
         creation = OPEN_EXISTING;
         break;
       case OpenMode::Create:
         access = GENERIC_READ | GENERIC_WRITE;
-        share = FILE_SHARE_READ | FILE_SHARE_WRITE;
+        share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
         creation = OPEN_ALWAYS;
         break;
     }
