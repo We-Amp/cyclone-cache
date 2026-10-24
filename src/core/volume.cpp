@@ -111,6 +111,55 @@ using ssize_t = SSIZE_T;
 
 namespace cyclone {
 
+#ifdef _WIN32
+namespace {
+// Opens a volume file as a CRT descriptor whose underlying handle allows
+// FILE_SHARE_DELETE.  The CRT _open/::open path cannot request delete sharing,
+// and the descriptor lives as long as the volume, so it would keep another
+// process from removing or renaming a live volume.  Same semantics as the
+// former `_open(path, O_RDWR [| O_CREAT [| O_EXCL]] | O_BINARY |
+// _O_NOINHERIT)`: read/write access, a non-inheritable handle (no
+// SECURITY_ATTRIBUTES), CREATE_NEW / OPEN_ALWAYS / OPEN_EXISTING for
+// exclusive-create / create / open-existing, and errno set on failure (EEXIST
+// for an existing file).  The handle stays usable by LockFileEx through
+// _get_osfhandle.
+int open_volume_fd(const char* path, bool create, bool exclusive) {
+  const DWORD creation =
+      create ? (exclusive ? CREATE_NEW : OPEN_ALWAYS) : OPEN_EXISTING;
+  HANDLE h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         nullptr, creation, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) {
+    switch (GetLastError()) {
+      case ERROR_FILE_EXISTS:
+      case ERROR_ALREADY_EXISTS:
+        errno = EEXIST;
+        break;
+      case ERROR_FILE_NOT_FOUND:
+      case ERROR_PATH_NOT_FOUND:
+        errno = ENOENT;
+        break;
+      case ERROR_ACCESS_DENIED:
+      case ERROR_SHARING_VIOLATION:
+      case ERROR_LOCK_VIOLATION:
+        errno = EACCES;
+        break;
+      default:
+        errno = EIO;
+        break;
+    }
+    return -1;
+  }
+  const int fd = _open_osfhandle(reinterpret_cast<intptr_t>(h), _O_BINARY);
+  if (fd < 0) {
+    CloseHandle(h);
+    errno = EMFILE;
+  }
+  return fd;
+}
+}  // namespace
+#endif
+
 namespace {
 
 #ifndef _WIN32
@@ -1766,8 +1815,8 @@ std::expected<void, CacheError> Volume::open() {
   // creates the file; others see EEXIST and open the existing file.
   bool created_new = false;
 #ifdef _WIN32
-  _fd = CYCLONE_OPEN(_config.path.c_str(), CYCLONE_OPEN_FLAGS | O_EXCL,
-                     CYCLONE_OPEN_MODE);
+  _fd = open_volume_fd(_config.path.c_str(), /*create=*/true,
+                       /*exclusive=*/true);
 #else
   _fd = CYCLONE_OPEN(_config.path.c_str(),
                      O_RDWR | O_CREAT | O_EXCL | CYCLONE_NOINHERIT,
@@ -1780,8 +1829,13 @@ std::expected<void, CacheError> Volume::open() {
     // another process's initialization.  We re-add O_CREAT as a fallback so
     // that the call matches the original semantics for corner cases (e.g. the
     // file was deleted between our two open() calls).
+#ifdef _WIN32
+    _fd = open_volume_fd(_config.path.c_str(), /*create=*/true,
+                         /*exclusive=*/false);
+#else
     _fd = CYCLONE_OPEN(_config.path.c_str(), CYCLONE_OPEN_FLAGS,
                        CYCLONE_OPEN_MODE);
+#endif
   }
 
   if (_fd < 0) {

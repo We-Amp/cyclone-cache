@@ -21,6 +21,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Windows: every handle a volume keeps on its file (the mapped file and the
+  volume descriptor) allows delete sharing, so another process can remove or
+  rename a cache volume while it is open and mapped.
 - C API: library errors map to distinct codes (new, appended:
   `CYCLONE_TIMEOUT`, `CYCLONE_NOT_OWNED`, `CYCLONE_INCOMPATIBLE_VERSION`;
   existing values are unchanged). Without a miss handler, `read_async` reports
