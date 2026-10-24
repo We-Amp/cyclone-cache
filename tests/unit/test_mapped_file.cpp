@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <system_error>
 
 #include "../../src/core/volume.hpp"
@@ -458,5 +459,56 @@ TEST_CASE("A live Volume can be renamed and deleted by path",
   auto rh = volume.read_sync(key);
   REQUIRE(rh.has_value());
   REQUIRE(rh->content().size() == payload.size());
+}
+
+TEST_CASE("Volume files open through wide-character paths",
+          "[mapped_file][volume][windows]") {
+  namespace fs = std::filesystem;
+  // The ASCII-named parent is removed by TempCacheDir even when a REQUIRE
+  // fails, and the non-ASCII directory lives only inside it, so no other test
+  // that scans the shared temp root can see it. Paths are built from wide
+  // literals so the test never goes through the ANSI code page.
+  TempCacheDir tmp("wide");
+  const fs::path dir = tmp.dir() / fs::path(
+                                       L"\u03c4\u03b5\u03c3\u03c4_"
+                                       L"\u30ad\u30e3\u30c3\u30b7\u30e5");
+  REQUIRE(fs::create_directory(dir));
+
+  const auto to_utf8 = [](const fs::path &p) {
+    const auto u8 = p.u8string();
+    return std::string(reinterpret_cast<const char *>(u8.data()), u8.size());
+  };
+
+  // MappedFile: create the file under the non-ASCII name, fill it, reopen it.
+  const fs::path mapped = dir / fs::path(L"mapped.dat");
+  {
+    auto mf = MappedFile::create();
+    REQUIRE(
+        mf->open(to_utf8(mapped), MappedFile::OpenMode::Create).has_value());
+    mf->close();
+  }
+  REQUIRE(fs::exists(mapped));
+  {
+    std::ofstream out(mapped, std::ios::binary);
+    const std::string data(4096, 'W');
+    out.write(data.data(), static_cast<std::streamsize>(data.size()));
+    REQUIRE(out.good());
+  }
+  {
+    auto mf = MappedFile::create();
+    REQUIRE(
+        mf->open(to_utf8(mapped), MappedFile::OpenMode::ReadOnly).has_value());
+    REQUIRE(mf->file_size() == 4096);
+    REQUIRE(mf->map_whole_file(MappedFile::MapMode::ReadOnly).has_value());
+    REQUIRE(static_cast<unsigned char>(mf->persistent_base()[0]) == 'W');
+    mf->close();
+  }
+
+  // Volume: the descriptor open accepts the same kind of path.
+  VolumeConfig config;
+  config.path = to_utf8(dir / fs::path(L"volume.dat"));
+  config.size = static_cast<size_t>(10 * 1024 * 1024);
+  Volume volume(config);
+  REQUIRE(volume.open().has_value());
 }
 #endif
