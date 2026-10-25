@@ -3,9 +3,28 @@
 
 #pragma once
 
-#ifdef _WIN32
-
+#include <filesystem>
 #include <string>
+
+namespace cyclone {
+
+// Cache paths travel as UTF-8 std::string. std::filesystem::path(std::string)
+// and path::string() convert through the ANSI code page on Windows, which
+// mangles names outside that page, so every conversion goes through these two.
+// On POSIX they are a byte copy.
+inline std::filesystem::path utf8_to_path(const std::string& utf8) {
+  return std::filesystem::path(std::u8string(
+      reinterpret_cast<const char8_t*>(utf8.data()), utf8.size()));
+}
+
+inline std::string path_to_utf8(const std::filesystem::path& p) {
+  const std::u8string u8 = p.u8string();
+  return std::string(reinterpret_cast<const char*>(u8.data()), u8.size());
+}
+
+}  // namespace cyclone
+
+#ifdef _WIN32
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN

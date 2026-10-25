@@ -1329,9 +1329,9 @@ std::string fingerprint_base_stem(const std::string& stem) {
 
 std::string resolve_unsized_cache_path(const std::string& path) {
   namespace fs = std::filesystem;
-  const fs::path p(path);
-  const std::string stem = p.stem().string();
-  const std::string ext = p.extension().string();
+  const fs::path p = utf8_to_path(path);
+  const std::string stem = path_to_utf8(p.stem());
+  const std::string ext = path_to_utf8(p.extension());
   const std::string prefix =
       stem + "-" + std::to_string(VolumeHeader::kFormatVersionMajor) + "-";
   const size_t expected_size = prefix.size() + 16 + ext.size();
@@ -1342,7 +1342,7 @@ std::string resolve_unsized_cache_path(const std::string& path) {
   fs::file_time_type best_mtime{};
   for (fs::directory_iterator it(dir, ec), end; it != end && !ec;
        it.increment(ec)) {
-    const std::string name = it->path().filename().string();
+    const std::string name = path_to_utf8(it->path().filename());
     if (name.size() != expected_size ||
         name.compare(0, prefix.size(), prefix) != 0) {
       continue;
@@ -1367,7 +1367,7 @@ std::string resolve_unsized_cache_path(const std::string& path) {
     if (mtime_ec) {
       continue;
     }
-    const std::string full = it->path().string();
+    const std::string full = path_to_utf8(it->path());
     if (best.empty() || mtime > best_mtime ||
         (mtime == best_mtime && full > best)) {
       best = full;
@@ -1380,9 +1380,9 @@ std::string resolve_unsized_cache_path(const std::string& path) {
 std::string fingerprint_cache_path(const std::string& path, size_t size,
                                    size_t stripe_size, bool mmap_directory) {
   namespace fs = std::filesystem;
-  const fs::path p(path);
-  const std::string stem = p.stem().string();
-  const std::string ext = p.extension().string();
+  const fs::path p = utf8_to_path(path);
+  const std::string stem = path_to_utf8(p.stem());
+  const std::string ext = path_to_utf8(p.extension());
 
   // Unsized mode: a size below the header floor (notably the documented
   // size == 0 "resolve from the file at open()" mode, see Cache::add_volume)
@@ -1461,8 +1461,8 @@ std::string fingerprint_cache_path(const std::string& path, size_t size,
   // bare relative name).  Multi-dot inputs (e.g. cyclone.dat.small) split on
   // the LAST dot, giving stem "cyclone.dat" + ext ".small" -> a distinct,
   // correct "cyclone.dat-<fmt>-<hash>.small".
-  const fs::path result = p.parent_path() / (new_stem + ext);
-  return result.string();
+  const fs::path result = p.parent_path() / utf8_to_path(new_stem + ext);
+  return path_to_utf8(result);
 }
 
 #ifndef _WIN32
@@ -1614,13 +1614,14 @@ void gc_superseded_volumes(const std::vector<Volume*>& live_volumes,
     if (auto id = v->backing_identity()) {
       keep.insert(*id);
     }
-    const fs::path vpath(
-        v->config().path);  // public accessor (_config private)
+    const fs::path vpath =
+        utf8_to_path(v->config().path);  // public accessor (_config private)
     fs::path parent = vpath.parent_path();
     if (parent.empty()) {
       parent = fs::path(".");
     }
-    dir_base_stems[parent].insert(fingerprint_base_stem(vpath.stem().string()));
+    dir_base_stems[parent].insert(
+        fingerprint_base_stem(path_to_utf8(vpath.stem())));
   }
   // Fail closed if we learned no live identity or no directory/base stem:
   // without a keep-set we cannot prove a candidate is not one of the live
@@ -1650,7 +1651,7 @@ void gc_superseded_volumes(const std::vector<Volume*>& live_volumes,
       // --- Classify (cheap, no fd) --------------------------------------
       // (a) fingerprint NAME shape: strip the FINAL extension, require the
       //     remainder to end "-<digits>-<16 hex>".  (I4: legacy names fail.)
-      const std::string stem = f.stem().string();
+      const std::string stem = path_to_utf8(f.stem());
       if (!stem_is_fingerprinted(stem)) {
         continue;
       }
