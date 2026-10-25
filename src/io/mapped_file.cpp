@@ -8,6 +8,7 @@
 #include <climits>
 
 #include "cyclone/detail/expected_compat.hpp"
+#include "win_path.hpp"
 
 #if defined(CYCLONE_PLATFORM_WINDOWS) || defined(_WIN32)
 #define CYCLONE_USE_WIN32_MMAP
@@ -517,8 +518,8 @@ class Win32MappedFile : public MappedFile {
         break;
     }
 
-    _file_handle = CreateFileA(path.c_str(), access, share, nullptr, creation,
-                               FILE_ATTRIBUTE_NORMAL, nullptr);
+    _file_handle =
+        create_file_utf8(path, access, share, creation, FILE_ATTRIBUTE_NORMAL);
 
     if (_file_handle == INVALID_HANDLE_VALUE) {
       return make_unexpected(

@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "../io/mapped_file.hpp"
+#include "../io/win_path.hpp"
 #include "../ram_cache/ram_cache.hpp"
 #include "cyclone/detail/expected_compat.hpp"
 #include "document.hpp"
@@ -123,12 +124,13 @@ namespace {
 // exclusive-create / create / open-existing, and errno set on failure (EEXIST
 // for an existing file).  The handle stays usable by LockFileEx through
 // _get_osfhandle.
-int open_volume_fd(const char* path, bool create, bool exclusive) {
+int open_volume_fd(const std::string& path, bool create, bool exclusive) {
   const DWORD creation =
       create ? (exclusive ? CREATE_NEW : OPEN_ALWAYS) : OPEN_EXISTING;
-  HANDLE h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE,
-                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                         nullptr, creation, FILE_ATTRIBUTE_NORMAL, nullptr);
+  HANDLE h =
+      create_file_utf8(path, GENERIC_READ | GENERIC_WRITE,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                       creation, FILE_ATTRIBUTE_NORMAL);
   if (h == INVALID_HANDLE_VALUE) {
     switch (GetLastError()) {
       case ERROR_FILE_EXISTS:
@@ -1815,7 +1817,7 @@ std::expected<void, CacheError> Volume::open() {
   // creates the file; others see EEXIST and open the existing file.
   bool created_new = false;
 #ifdef _WIN32
-  _fd = open_volume_fd(_config.path.c_str(), /*create=*/true,
+  _fd = open_volume_fd(_config.path, /*create=*/true,
                        /*exclusive=*/true);
 #else
   _fd = CYCLONE_OPEN(_config.path.c_str(),
@@ -1830,7 +1832,7 @@ std::expected<void, CacheError> Volume::open() {
     // that the call matches the original semantics for corner cases (e.g. the
     // file was deleted between our two open() calls).
 #ifdef _WIN32
-    _fd = open_volume_fd(_config.path.c_str(), /*create=*/true,
+    _fd = open_volume_fd(_config.path, /*create=*/true,
                          /*exclusive=*/false);
 #else
     _fd = CYCLONE_OPEN(_config.path.c_str(), CYCLONE_OPEN_FLAGS,
