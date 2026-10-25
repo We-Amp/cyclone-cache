@@ -11,6 +11,7 @@
 
 #include "../../src/core/volume.hpp"
 #include "../../src/io/mapped_file.hpp"
+#include "../../src/io/win_path.hpp"
 #include "cyclone/key.hpp"
 #include "support/temp_cache.hpp"
 
@@ -474,17 +475,12 @@ TEST_CASE("Volume files open through wide-character paths",
                                        L"\u30ad\u30e3\u30c3\u30b7\u30e5");
   REQUIRE(fs::create_directory(dir));
 
-  const auto to_utf8 = [](const fs::path &p) {
-    const auto u8 = p.u8string();
-    return std::string(reinterpret_cast<const char *>(u8.data()), u8.size());
-  };
-
   // MappedFile: create the file under the non-ASCII name, fill it, reopen it.
   const fs::path mapped = dir / fs::path(L"mapped.dat");
   {
     auto mf = MappedFile::create();
-    REQUIRE(
-        mf->open(to_utf8(mapped), MappedFile::OpenMode::Create).has_value());
+    REQUIRE(mf->open(path_to_utf8(mapped), MappedFile::OpenMode::Create)
+                .has_value());
     mf->close();
   }
   REQUIRE(fs::exists(mapped));
@@ -496,19 +492,60 @@ TEST_CASE("Volume files open through wide-character paths",
   }
   {
     auto mf = MappedFile::create();
-    REQUIRE(
-        mf->open(to_utf8(mapped), MappedFile::OpenMode::ReadOnly).has_value());
+    REQUIRE(mf->open(path_to_utf8(mapped), MappedFile::OpenMode::ReadOnly)
+                .has_value());
     REQUIRE(mf->file_size() == 4096);
     REQUIRE(mf->map_whole_file(MappedFile::MapMode::ReadOnly).has_value());
     REQUIRE(static_cast<unsigned char>(mf->persistent_base()[0]) == 'W');
     mf->close();
   }
 
-  // Volume: the descriptor open accepts the same kind of path.
+  // Volume: build the cache path with the same helper the cache layer uses,
+  // write a key, close, reopen and read it back. The in-memory directory of a
+  // single-process volume is rebuilt empty on every open, so the round trip
+  // uses the persistent (memory-mapped) directory that survives a reopen.
+  MultiProcessConfig mp;
+  mp.set_enabled(true).set_process_index(0).set_total_processes(1);
   VolumeConfig config;
-  config.path = to_utf8(dir / fs::path(L"volume.dat"));
-  config.size = static_cast<size_t>(10 * 1024 * 1024);
-  Volume volume(config);
-  REQUIRE(volume.open().has_value());
+  config.size = static_cast<size_t>(64) * 1024 * 1024;
+  const std::string base_path = path_to_utf8(dir / fs::path(L"volume.dat"));
+  config.path = fingerprint_cache_path(base_path, config.size, 0, true);
+  CAPTURE(base_path, config.path);
+  REQUIRE(config.path != base_path);
+  REQUIRE(utf8_to_path(config.path).parent_path() == dir);
+  // The same input must always name the same file.
+  REQUIRE(fingerprint_cache_path(base_path, config.size, 0, true) ==
+          config.path);
+
+  CacheKey key("wide-path-round-trip");
+  const std::vector<std::byte> payload(512, std::byte{0x37});
+  {
+    Volume volume(config, mp);
+    REQUIRE(volume.open().has_value());
+    auto wh = volume.write_sync(key, payload.size());
+    REQUIRE(wh.has_value());
+    REQUIRE(wh->write_sync(std::span<const std::byte>(payload)).has_value());
+    REQUIRE(wh->close_sync().has_value());
+    auto same = volume.read_sync(key);
+    INFO("read-back on the still-open volume succeeded: " << same.has_value());
+  }
+  const bool exists_after_close = fs::exists(utf8_to_path(config.path));
+  std::error_code size_ec;
+  const auto size_after_close =
+      fs::file_size(utf8_to_path(config.path), size_ec);
+  CAPTURE(exists_after_close, size_after_close, size_ec.message());
+  REQUIRE(exists_after_close);
+
+  // The unsized resolver finds the fingerprinted file in the same directory.
+  REQUIRE(resolve_unsized_cache_path(base_path) == config.path);
+
+  {
+    Volume volume(config, mp);
+    REQUIRE(volume.open().has_value());
+    auto rh = volume.read_sync(key);
+    INFO("reopened volume read_sync has_value: " << rh.has_value());
+    REQUIRE(rh.has_value());
+    REQUIRE(rh->content().size() == payload.size());
+  }
 }
 #endif

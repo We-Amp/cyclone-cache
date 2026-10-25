@@ -24,6 +24,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Windows: cache and volume paths with non-ASCII characters (for example a
   localized user or folder name) are opened through the wide-character file
   API, so UTF-8 paths are no longer mangled by the ANSI code page.
+- Windows: the cache layer builds and reads back volume paths as UTF-8
+  end to end, so a cache directory with non-ASCII characters is no longer
+  mangled by the ANSI code page before the file is opened.
 - Windows: every handle a volume keeps on its file (the mapped file and the
   volume descriptor) allows delete sharing, so another process can remove or
   rename a cache volume while it is open and mapped.
