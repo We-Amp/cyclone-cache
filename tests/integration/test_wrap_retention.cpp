@@ -2082,17 +2082,32 @@ TEST_CASE(
 
 namespace {
 
+// One day on the hammer's test clock: the readers tick it by milliseconds, so
+// it cannot reach this within the run.
+constexpr std::chrono::milliseconds kHammerLease{24 * 60 * 60 * 1000};
+
 struct HammerResult {
   uint64_t served = 0;
   uint64_t held_checks = 0;
   uint64_t torn_seen = 0;
   uint64_t forced_tears = 0;  // documented: holds past a forced step
   bool mismatch = false;
+  uint64_t forced_steps = 0;  // writer's wraps_forced_past_lease at the end
+  bool timed_out = false;     // the hang guard fired before the work was done
 };
 
 // `writer` and `reader` may be the same Cache (single process) or two views
 // of one file (cross-view).
-HammerResult hammer(Cache &writer, Cache &reader, std::chrono::milliseconds run,
+//
+// Time is the test's (`clock`, a LeaseTestClock): it moves only when a reader
+// holding a borrow ticks it (1 ms per renew), so a lease never lapses and the
+// ceiling passes by progress, not by how fast the host runs the threads.  The
+// run ends on work done (the ring wrapped, enough borrows served and held),
+// not on elapsed time; the 60 s wall limit is only a hang guard (a fired
+// guard fails the case).  A long hold spans ~150 renews of CPU time while the
+// clock jumps 150 ms, so one reader's ticks can also force-reset another
+// reader's short hold (counted as a forced tear, by contract).
+HammerResult hammer(Cache &writer, Cache &reader, LeaseTestClock &clock,
                     unsigned readers) {
   std::atomic<uint64_t> latest{0};
   std::atomic<bool> stop{false};
@@ -2167,7 +2182,7 @@ HammerResult hammer(Cache &writer, Cache &reader, std::chrono::milliseconds run,
           const bool long_hold = next() % 16 == 0;
           for (int k = 0; k < (long_hold ? 150 : 16) && !stop.load(); ++k) {
             if (long_hold) {
-              std::this_thread::sleep_for(std::chrono::milliseconds(1));
+              clock.advance(std::chrono::milliseconds(1));
             }
             const LeaseRenewal lr = rh->renew_lease_strict();
             if (lr == LeaseRenewal::kTorn) {
@@ -2185,22 +2200,27 @@ HammerResult hammer(Cache &writer, Cache &reader, std::chrono::milliseconds run,
       }
     });
   }
-  // At least `run`, and until the ring has wrapped twice (sanitizer builds
-  // write far slower), capped at 60 s.
+  // Until the ring has wrapped several times and the readers have served and
+  // held enough borrows; wall time only bounds a hang.
   const auto start = std::chrono::steady_clock::now();
-  while (
-      std::chrono::steady_clock::now() - start < run ||
-      (writer.stats().write_buffer_wraps < 2 &&
-       std::chrono::steady_clock::now() - start < std::chrono::seconds(60))) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  while ((writer.stats().write_buffer_wraps < 4 || served.load() < 2000 ||
+          held_checks.load() < 200 ||
+          writer.stats().wraps_forced_past_lease < 1) &&
+         std::chrono::steady_clock::now() - start < std::chrono::seconds(60)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
+  const bool timed_out = writer.stats().write_buffer_wraps < 4 ||
+                         served.load() < 2000 || held_checks.load() < 200 ||
+                         writer.stats().wraps_forced_past_lease < 1;
   stop.store(true);
   w.join();
   for (auto &t : rs) {
     t.join();
   }
-  return {served.load(), held_checks.load(), torn_seen.load(),
-          forced_tears.load(), mismatch.load()};
+  return {served.load(),    held_checks.load(),
+          torn_seen.load(), forced_tears.load(),
+          mismatch.load(),  writer.stats().wraps_forced_past_lease,
+          timed_out};
 }
 
 }  // namespace
@@ -2211,20 +2231,22 @@ TEST_CASE(
     "[retention][hammer][concurrent]") {
   const bool retention = GENERATE(false, true);
   CAPTURE(retention);
-  // A lease long enough never to lapse mid-check even under a sanitizer (a
-  // lapsed lease is unprotected by contract), and a SHORT ceiling: held
-  // borrows gate advances and wraps, and the long holds get forced past,
-  // all within the run.
-  RetentionVolume v("ret18", retention, std::chrono::milliseconds(2000),
+  // A lease that the test clock never reaches (a lapsed lease is unprotected
+  // by contract), and a SHORT ceiling: held borrows gate advances and wraps,
+  // and the long holds tick the clock past it, forcing steps, all within the
+  // run.
+  LeaseTestClock clock;
+  RetentionVolume v("ret18", retention, kHammerLease,
                     std::chrono::milliseconds(60));
-  const auto result =
-      hammer(*v.cache, *v.cache, std::chrono::milliseconds(1500), 4);
+  const auto result = hammer(*v.cache, *v.cache, clock, 4);
   CAPTURE(result.served, result.held_checks, result.torn_seen,
-          result.forced_tears);
+          result.forced_tears, result.forced_steps);
+  REQUIRE_FALSE(result.timed_out);
   REQUIRE_FALSE(result.mismatch);
   REQUIRE(result.served > 0);
   const auto st = v.cache->stats();
-  REQUIRE(st.write_buffer_wraps >= 1);
+  REQUIRE(st.write_buffer_wraps >= 4);
+  CHECK(st.wraps_forced_past_lease > 0);
   if (retention) {
     REQUIRE(st.frontier_advances > 0);
   }
@@ -2237,9 +2259,10 @@ TEST_CASE(
     "[retention][hammer][concurrent][multiprocess]") {
   const bool retention = GENERATE(false, true);
   CAPTURE(retention);
+  LeaseTestClock clock;
   TempCacheDir tmp("ret18mp");
   auto open_view = [&](uint32_t index) {
-    auto config = retention_config(retention, std::chrono::milliseconds(2000),
+    auto config = retention_config(retention, kHammerLease,
                                    std::chrono::milliseconds(60), false);
     config.set_multi_process(index, 2);
     auto c = Cache::create(config);
@@ -2250,12 +2273,14 @@ TEST_CASE(
   };
   auto writer = open_view(0);  // owns the single stripe
   auto reader = open_view(1);
-  const auto result =
-      hammer(*writer, *reader, std::chrono::milliseconds(1500), 4);
+  const auto result = hammer(*writer, *reader, clock, 4);
   CAPTURE(result.served, result.held_checks, result.torn_seen,
-          result.forced_tears);
+          result.forced_tears, result.forced_steps);
+  REQUIRE_FALSE(result.timed_out);
   REQUIRE_FALSE(result.mismatch);
   REQUIRE(result.served > 0);
+  REQUIRE(writer->stats().write_buffer_wraps >= 4);
+  CHECK(writer->stats().wraps_forced_past_lease > 0);
   reader->stop();
   writer->stop();
 }
