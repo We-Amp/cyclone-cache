@@ -14,9 +14,7 @@ name: CI
 # The build mirrors the private lanes: bundled SHA-256 (no OpenSSL/vcpkg
 # dependency) and Catch2 via FetchContent.  One extra Linux job builds the
 # OpenSSL key-hash backend instead (see openssl-backend below).  Tests run
-# as a single process (the binary directly, not `ctest -j`): the Catch2
-# cases share a fixed on-disk temp path, so parallel test processes race on
-# file sharing.
+# through `ctest -j`: every test process uses its own private temp directory.
 
 on:
   push:
@@ -186,16 +184,13 @@ jobs:
       - name: Test
         shell: bash
         run: |
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            bin=./build/Release/cyclone-tests.exe
-          else
-            bin=./build/cyclone-tests
-          fi
+          jobs=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
           set +e
-          "$bin" 2>&1 | tee test-output.txt
+          ctest --test-dir build -C Release --output-on-failure -j "$jobs" \
+            2>&1 | tee test-output.txt
           rc=${PIPESTATUS[0]}
           set -e
-          echo "cyclone-tests exit code: $rc"
+          echo "ctest exit code: $rc"
           if [ "$rc" -ne 0 ]; then
             # One annotation per failed assertion: its location and the
             # assertion that follows the FAILED: line (CRs stripped: Windows
@@ -262,10 +257,11 @@ jobs:
       - name: Test
         run: |
           set +e
-          ./build/cyclone-tests 2>&1 | tee test-output.txt
+          ctest --test-dir build --output-on-failure -j "$(nproc)" \
+            2>&1 | tee test-output.txt
           rc=${PIPESTATUS[0]}
           set -e
-          echo "cyclone-tests exit code: $rc"
+          echo "ctest exit code: $rc"
           if [ "$rc" -ne 0 ]; then
             grep -A1 -E ': FAILED:$' test-output.txt | grep -v '^--$' |
               paste - - | head -n 20 |

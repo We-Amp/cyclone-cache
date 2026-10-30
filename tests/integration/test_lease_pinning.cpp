@@ -240,16 +240,15 @@ StripeRetentionOutcome run_stripe_retention(size_t vol_size_mb,
                                             size_t stripe_size,
                                             size_t chunk_size, bool retention) {
   std::string cache_path = create_temp_file("stripe_retention", vol_size_mb);
+  LeaseTestClock clock;  // time stands still: the lease cannot lapse
   CacheConfig config;
   config.wrap_retention = retention;
   config.ram_cache_size = 0;  // Force disk (mmap-borrow) hits.
   config.enable_checksum = false;
-  // Pin the lease and the anti-starvation ceiling well past the flood's
-  // wall-clock so the victim's single stamp never lapses mid-test (sanitizer
-  // builds run the flood far slower) — this isolates the STRIPE-granularity
-  // behaviour from lease timing.
-  config.read_lease_duration = std::chrono::milliseconds(600000);
-  config.lease_wrap_ceiling = std::chrono::milliseconds(600000);
+  // The test owns the clock (below), so the victim's single stamp and the
+  // anti-starvation ceiling never lapse mid-test, however slow the host runs
+  // the flood: this isolates the STRIPE-granularity behaviour from lease
+  // timing without a wall-clock margin.
   auto cache_result = Cache::create(config);
   REQUIRE(cache_result.has_value());
   auto &cache = *cache_result;
