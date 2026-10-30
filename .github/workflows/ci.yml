@@ -14,7 +14,8 @@ name: CI
 # The build mirrors the private lanes: bundled SHA-256 (no OpenSSL/vcpkg
 # dependency) and Catch2 via FetchContent.  One extra Linux job builds the
 # OpenSSL key-hash backend instead (see openssl-backend below).  Tests run
-# through `ctest -j`: every test process uses its own private temp directory.
+# through `ctest -j` (single-process on macOS), each test with a 300 s timeout:
+# every test process uses its own private temp directory.
 
 on:
   push:
@@ -184,9 +185,15 @@ jobs:
       - name: Test
         shell: bash
         run: |
-          jobs=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+          # macOS stays single-process: parallel runs on its 3-core runner
+          # hung once (follow-up tracked in the issue tracker).
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            jobs=1
+          else
+            jobs=$(nproc)
+          fi
           set +e
-          ctest --test-dir build -C Release --output-on-failure -j "$jobs" \
+          ctest --test-dir build -C Release --output-on-failure --timeout 300 -j "$jobs" \
             2>&1 | tee test-output.txt
           rc=${PIPESTATUS[0]}
           set -e
@@ -257,7 +264,7 @@ jobs:
       - name: Test
         run: |
           set +e
-          ctest --test-dir build --output-on-failure -j "$(nproc)" \
+          ctest --test-dir build --output-on-failure --timeout 300 -j "$(nproc)" \
             2>&1 | tee test-output.txt
           rc=${PIPESTATUS[0]}
           set -e
