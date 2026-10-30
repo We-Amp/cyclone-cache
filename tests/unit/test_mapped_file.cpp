@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2024-2026 We-Amp B.V.
 
+#include <atomic>
 #include <catch2/catch_test_macros.hpp>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <string>
 #include <system_error>
 
 #include "../../src/core/volume.hpp"
@@ -35,7 +37,12 @@ using namespace cyclone;
 namespace {
 
 std::filesystem::path create_temp_file(size_t size) {
-  auto path = std::filesystem::temp_directory_path() / "cyclone_test_XXXXXX";
+  // One private directory per test process (removed at exit), and a counter
+  // per call: parallel test processes (`ctest -j`) never share a file.
+  static const TempCacheDir dir("mapped_file");
+  static std::atomic<int> counter{0};
+  auto path = std::filesystem::path(
+      dir.path("cyclone_test_" + std::to_string(counter.fetch_add(1))));
   std::string path_str = path.string();
 
   FILE *f = std::fopen(path_str.c_str(), "wb");

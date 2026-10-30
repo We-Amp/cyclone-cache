@@ -176,14 +176,12 @@ headers, stats, and the coroutine API (`Task<T>::sync_wait()`).
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DCYCLONE_USE_BUNDLED_SHA256=ON
 cmake --build build -j
-./build/cyclone-tests                 # run the test binary directly (see note)
+ctest --test-dir build -j --output-on-failure   # all tests, in parallel
+./build/cyclone-tests                 # or run the test binary directly
 ./build/cyclone-tests "[security]"    # one tag; --list-tags shows them all
 ```
 
 On Windows the binary is `build\Release\cyclone-tests.exe`.
-
-Run the test binary directly rather than `ctest -j`: the Catch2 cases share a
-fixed on-disk temp path, so parallel test *processes* race on it.
 
 `CMakePresets.json` carries per-platform presets — `linux-x64`,
 `linux-arm64`, `macos-arm64`, `macos-x64`, `macos-universal`, `windows-x64`,

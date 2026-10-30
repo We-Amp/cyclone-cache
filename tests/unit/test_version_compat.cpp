@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2024-2026 We-Amp B.V.
 
+#include <atomic>
 #include <catch2/catch_test_macros.hpp>
 #include <cstddef>
 #include <cstdint>
@@ -15,6 +16,7 @@
 #include "core/volume.hpp"
 #include "cyclone/cache.hpp"
 #include "cyclone/key.hpp"
+#include "support/temp_cache.hpp"
 
 using namespace cyclone;
 
@@ -22,11 +24,12 @@ namespace {
 
 std::string create_temp_file(size_t size_mb = 10, bool multi_process = false,
                              size_t stripe_size = 0) {
+  // Private per-process directory (removed at exit) plus a per-call counter:
+  // parallel test processes (`ctest -j`) never share a file.
+  static const TempCacheDir dir("version");
   static std::atomic<int> counter{0};
   const std::string base =
-      (std::filesystem::temp_directory_path() /
-       ("cyclone_version_test_" + std::to_string(counter++) + ".dat"))
-          .string();
+      dir.path("cyclone_version_test_" + std::to_string(counter++) + ".dat");
   // Resolve the SAME structural-fingerprint filename the cache will open (see
   // fingerprint_cache_path), so the raw header inspection / corruption below
   // targets the file the cache actually uses.  fingerprint_cache_path is
@@ -587,9 +590,8 @@ TEST_CASE("Old-format documents miss instead of being misparsed",
 // =============================================================================
 
 TEST_CASE("Truncated header file triggers reset", "[version][edge]") {
-  std::string cache_path =
-      (std::filesystem::temp_directory_path() / "truncated_header_test.dat")
-          .string();
+  static const TempCacheDir dir("truncated");
+  std::string cache_path = dir.path("truncated_header_test.dat");
 
   // Create a file smaller than header size
   {
