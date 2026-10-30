@@ -275,10 +275,11 @@ if(CYCLONE_BUILD_TESTS)
   # A test case that skips itself (SKIP(), e.g. the allocation-failure tests
   # under ThreadSanitizer) reports "1 skipped" in its summary: report that to
   # ctest as skipped by matching the summary, not the exit code, which also
-  # equals the number of failed assertions. The separator is matched as [^ ]
-  # because a literal pipe breaks the post-build command on Windows.
+  # equals the number of failed assertions. The separator is matched as a
+  # single "." because a literal pipe breaks the post-build command on Windows
+  # and so does a "^" (cmd drops it, which left the skip mapping inert).
   catch_discover_tests(cyclone-tests PROPERTIES SKIP_REGULAR_EXPRESSION
-                     "test cases: +1 [^ ] +1 skipped")
+                     "test cases: +1 . +1 skipped")
 
   # Helper peer for the spawn-based reset-gate tests.  A separate image (never
   # a re-exec of cyclone-tests): Catch2WithMain owns that binary's main(),
