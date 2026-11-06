@@ -685,6 +685,10 @@ void directory_fast_phase_bounded_under_oversubscription() {
 
   const unsigned cores = std::thread::hardware_concurrency();
   const size_t hogs = cores == 0 ? 8 : 2 * cores;
+  // The case runs on its own ([serial], registered with RUN_SERIAL), so no
+  // sibling test process adds load, and the bound is not load-scaled:
+  // measuring the host load right before the hogs changes the scenario and
+  // hides the unbounded fast phase.
   CpuHogs busy(hogs);
 
   d.begin(key);  // The bucket stays odd for the whole probe
@@ -715,7 +719,8 @@ void directory_fast_phase_bounded_under_oversubscription() {
 TEST_CASE(
     "Seqlock read wait: the clock-free fast phase is bounded by wall time "
     "under CPU oversubscription",
-    "[directory][mmap_directory][concurrent][lockfree][regression]") {
+    "[directory][mmap_directory][concurrent][lockfree][regression]"
+    "[serial]") {
   SECTION("Directory") {
     directory_fast_phase_bounded_under_oversubscription<InMemoryDir>();
   }

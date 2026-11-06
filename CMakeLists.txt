@@ -278,8 +278,17 @@ if(CYCLONE_BUILD_TESTS)
   # equals the number of failed assertions. The separator is matched as a
   # single "." because a literal pipe breaks the post-build command on Windows
   # and so does a "^" (cmd drops it, which left the skip mapping inert).
-  catch_discover_tests(cyclone-tests PROPERTIES SKIP_REGULAR_EXPRESSION
+  # Cases tagged [serial] carry a wall-clock bound calibrated for a host the
+  # case has to itself (it manufactures the oversubscription it measures
+  # against): ctest must not run sibling test processes beside them.  They
+  # are discovered separately and registered with RUN_SERIAL; every other
+  # property, the skip mapping included, is the same for both halves.
+  catch_discover_tests(cyclone-tests TEST_SPEC "~[serial]"
+                     PROPERTIES SKIP_REGULAR_EXPRESSION
                      "test cases: +1 . +1 skipped")
+  catch_discover_tests(cyclone-tests TEST_SPEC "[serial]"
+                     PROPERTIES SKIP_REGULAR_EXPRESSION
+                     "test cases: +1 . +1 skipped" RUN_SERIAL TRUE)
 
   # Helper peer for the spawn-based reset-gate tests.  A separate image (never
   # a re-exec of cyclone-tests): Catch2WithMain owns that binary's main(),

@@ -36,6 +36,7 @@
 #include "../../src/core/mmap_directory.hpp"
 #include "support/liveness_file.hpp"
 #include "support/signal_child.hpp"
+#include "support/wall_load.hpp"
 #endif
 
 #ifdef _WIN32
@@ -1087,6 +1088,13 @@ TEST_CASE("Volume::open waits for a concurrent creator's initialization",
   // creator-holds-lock window.  Take the SAME fcntl lock the child will
   // contend on.
   constexpr off_t kInitLockByte = 0x7FFFFFFFFFFFFFFELL;
+  // The finish deadline below is a pure hang guard -- once the creator's
+  // lock is released the child either completes or has hung -- so it may
+  // follow the load on the host without hiding a defect.  Taken before the
+  // child exists, it scales for load this test did not create.  The 500 ms
+  // window in which the child must NOT complete stays fixed: that one is
+  // the assertion.
+  const auto finish_bound = scaled_by_load(std::chrono::seconds(15));
   auto init_lock = [&](int fd, int type) {
     struct flock fl{};
     fl.l_type = static_cast<short>(type);
@@ -1145,8 +1153,7 @@ TEST_CASE("Volume::open waits for a concurrent creator's initialization",
   REQUIRE(init_lock(creator_fd, F_UNLCK) == 0);
 
   bool completed = completed_while_locked;
-  const auto finish_deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(15);
+  const auto finish_deadline = std::chrono::steady_clock::now() + finish_bound;
   while (!completed && std::chrono::steady_clock::now() < finish_deadline) {
     ssize_t n = ::read(pipe_fds[0], &child_result, 1);
     if (n == 1) {
