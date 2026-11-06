@@ -24,6 +24,7 @@
 #include "support/wall_load.hpp"
 
 #ifndef _WIN32
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -531,14 +532,48 @@ TEST_CASE("Cache handles missing file on restart", "[lifecycle][error]") {
   }
 }
 
-TEST_CASE("Cache handles read-only file gracefully", "[lifecycle][error]") {
+#ifndef _WIN32
+TEST_CASE("Cache handles read-only cache directory gracefully",
+          "[lifecycle][error]") {
+  // The backing file is created by start() -> Volume::open() under a
+  // structural-fingerprint name derived from the configured path (see
+  // fingerprint_cache_path), so making the configured FILE read-only can
+  // never apply: the file does not exist yet, and the library opens a
+  // different name anyway.  Making the DIRECTORY read-only denies creating
+  // the backing file whatever name the library resolves for it.
   TempCacheDir tmp;
   std::string cache_path = tmp.path();
 
-  // Make file read-only (platform-specific)
-#ifndef _WIN32
-  chmod(cache_path.c_str(), 0444);
-#endif
+  // Restore the directory mode however the case ends (a failed REQUIRE
+  // unwinds destructors; SKIP raises too), so the TempCacheDir destructor
+  // can remove it.  A fatal signal is the one exit this cannot cover; it
+  // leaves a uniquely-named read-only directory behind, which cannot
+  // interfere with later runs.
+  struct stat dir_st;
+  REQUIRE(::stat(tmp.dir().c_str(), &dir_st) == 0);
+  const mode_t dir_mode = dir_st.st_mode & 07777;
+  struct RestoreDirMode {
+    std::string path;
+    mode_t mode;
+    ~RestoreDirMode() { ::chmod(path.c_str(), mode); }
+  } restore_dir_mode{tmp.dir().string(), dir_mode};
+
+  // Permission bits are not enforced for root (and on some filesystems), so
+  // creating a file in a read-only directory may still succeed; then there
+  // is no read-only path to exercise here.  Probe with the exact condition
+  // the case relies on and skip rather than pass vacuously.
+  REQUIRE(::chmod(tmp.dir().c_str(), 0555) == 0);
+  const int probe_fd =
+      ::open(tmp.path("perm_probe").c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+  REQUIRE(::chmod(tmp.dir().c_str(), dir_mode) == 0);
+  if (probe_fd >= 0) {
+    REQUIRE(::close(probe_fd) == 0);
+    REQUIRE(::unlink(tmp.path("perm_probe").c_str()) == 0);
+    SKIP(
+        "creating a file in a read-only directory is not denied here "
+        "(e.g. the test runs as root), so the error path cannot be "
+        "exercised");
+  }
 
   CacheConfig config;
   auto cache_result = Cache::create(config);
@@ -549,15 +584,27 @@ TEST_CASE("Cache handles read-only file gracefully", "[lifecycle][error]") {
   vol_config.path = cache_path;
   vol_config.size = static_cast<size_t>(10 * 1024 * 1024);
 
-  // Should fail gracefully due to read-only
-  auto add_result = cache->add_volume(vol_config);
-  // Either fails (expected) or somehow succeeds
+  // add_volume() only records the configuration; the backing file is
+  // created at start(), which is where the read-only directory must be
+  // refused.
+  REQUIRE(cache->add_volume(vol_config).has_value());
+  REQUIRE(::chmod(tmp.dir().c_str(), 0555) == 0);
 
-  // Restore permissions for cleanup
-#ifndef _WIN32
-  chmod(cache_path.c_str(), 0644);
-#endif
+  // Creating the volume file in a read-only directory must surface an
+  // error (not crash, not hang, not silently continue).
+  auto start_result = cache->start();
+  REQUIRE_FALSE(start_result.has_value());
+  CHECK(start_result.error() == CacheError::IoError);
+  CHECK_FALSE(cache->is_running());
+
+  // Give the directory its mode back before the cache is torn down and
+  // destroyed.
+  REQUIRE(::chmod(tmp.dir().c_str(), dir_mode) == 0);
+
+  // The failed cache still tears down cleanly.
+  cache->stop();
 }
+#endif  // _WIN32
 
 // =============================================================================
 // Destructor Safety Tests
