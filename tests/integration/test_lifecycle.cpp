@@ -21,6 +21,7 @@
 #include "cyclone/key.hpp"
 #include "support/signal_child.hpp"
 #include "support/temp_cache.hpp"
+#include "support/wall_load.hpp"
 
 #ifndef _WIN32
 #include <sys/stat.h>
@@ -710,6 +711,13 @@ TEST_CASE("Cache destructor stops all background threads within bound",
   config.optimization_config.scale_check_interval =
       std::chrono::milliseconds(50);
 
+  // Both sections below bound the joins by wall time.  A leak shows up as
+  // a join that never returns, so the bound is a hang guard: it may follow
+  // the load on the host without hiding the defect.  Taken once here,
+  // before any section spins up threads, so it scales for load this test
+  // did not create.
+  const auto join_bound = scaled_by_load(std::chrono::seconds(8));
+
   SECTION("explicit stop() joins all threads quickly") {
     auto cache_result = Cache::create(config);
     REQUIRE(cache_result.has_value());
@@ -759,8 +767,9 @@ TEST_CASE("Cache destructor stops all background threads within bound",
     INFO("Cache::stop() took " << elapsed_ms << " ms");
 
     // Each component bounds its join at ~5s; with all three the worst-case
-    // serial bound is well under this generous 8s ceiling on loaded CI.
-    REQUIRE(elapsed < std::chrono::seconds(8));
+    // serial bound is well under this generous 8s ceiling, scaled to the
+    // host load.
+    REQUIRE(elapsed < join_bound);
     REQUIRE_FALSE(cache->is_running());
   }
 
@@ -807,7 +816,7 @@ TEST_CASE("Cache destructor stops all background threads within bound",
 
     // Destructor completed; if any background thread had survived teardown the
     // join would have stalled and pushed us past this bound.
-    REQUIRE(elapsed < std::chrono::seconds(8));
+    REQUIRE(elapsed < join_bound);
   }
 }
 

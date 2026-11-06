@@ -5,6 +5,8 @@
 // found during staging deployment (ghost directory entries after reset, chain
 // corruption error propagation, concurrent reset + write races).
 
+#include <array>
+#include <atomic>
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
 #include <cstddef>
@@ -22,6 +24,7 @@
 #include "cyclone/config.hpp"
 #include "cyclone/key.hpp"
 #include "support/signal_child.hpp"
+#include "support/wall_load.hpp"
 
 #ifdef _WIN32
 #include <process.h>
@@ -1424,6 +1427,10 @@ TEST_CASE("Concurrent insert and phase toggle preserve entries",
   std::atomic<int> writes_ok{0};
   std::atomic<int> reads_ok{0};
   std::atomic<int> reads_miss{0};
+  // The evictor's completed big writes: without a floor on them the writer
+  // can reach its floor while the evictor is still opening its cache, and
+  // then no phase toggle ever ran concurrently with a write.
+  std::atomic<int> evictor_writes{0};
 
   // Thread A: writes entries with unique keys
   auto writer_fn = [&]() {
@@ -1488,22 +1495,42 @@ TEST_CASE("Concurrent insert and phase toggle preserve entries",
       CacheKey key("evict-" + std::to_string(counter++));
       auto wh = (*cache)->write_sync(key, big_data.size());
       if (wh.has_value()) {
-        wh->write_sync(big_data);
-        wh->close_sync();
+        if (wh->write_sync(big_data).has_value()) {
+          wh->close_sync();
+          ++evictor_writes;
+        }
       }
     }
 
     (*cache)->stop();
   };
 
+  // Wait for work, not wall time.  The writer must land enough entries,
+  // and the evictor enough big ones to cycle the 2 MiB volume at least
+  // twice (64 KiB x 64 = 4 MiB), or the two never actually overlap a
+  // toggle and the read-back rate below proves nothing.  The deadline is
+  // a hang guard, scaled to the host load and taken before the threads
+  // start so it covers only load this case did not create.
+  constexpr int kMinWriterWrites = 200;
+  constexpr int kMinEvictorWrites = 64;
+  const auto wait_bound = scaled_by_load(std::chrono::seconds(60));
+  const auto deadline = std::chrono::steady_clock::now() + wait_bound;
+
   std::thread writer(writer_fn);
   std::thread evictor(evictor_fn);
 
-  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  while ((writes_ok.load() < kMinWriterWrites ||
+          evictor_writes.load() < kMinEvictorWrites) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
   stop.store(true);
 
   writer.join();
   evictor.join();
+
+  REQUIRE(writes_ok.load() >= kMinWriterWrites);
+  REQUIRE(evictor_writes.load() >= kMinEvictorWrites);
 
   // With the phase_lock fix, immediate read-after-write should succeed
   // at a high rate.  Some misses are expected from legitimate eviction
@@ -1541,6 +1568,10 @@ TEST_CASE("Eviction under concurrent writes from two threads",
 
   std::atomic<bool> stop{false};
   std::atomic<int> total_writes{0};
+  // Per-thread completed writes: the case needs BOTH threads writing, and
+  // enough bytes to cover the 2 MiB volume, or it can pass without a
+  // single eviction ever happening.
+  std::array<std::atomic<int>, 2> thread_writes{};
 
   auto writer_fn = [&](int thread_id) {
     CacheConfig config;
@@ -1563,23 +1594,40 @@ TEST_CASE("Eviction under concurrent writes from two threads",
         wh->write_sync(data);
         wh->close_sync();
         ++total_writes;
+        ++thread_writes[thread_id - 1];
       }
     }
 
     (*cache)->stop();
   };
 
+  // Wait for work, not wall time: 2 threads x 512 x 8 KiB = 8 MiB, four
+  // times the 2 MiB volume, so the ring must wrap (evict) whatever speed
+  // the host manages.  The deadline is a hang guard, scaled to the host
+  // load and taken before the threads start so it covers only load this
+  // case did not create.
+  constexpr int kMinWritesPerThread = 512;
+  const auto wait_bound = scaled_by_load(std::chrono::seconds(60));
+  const auto deadline = std::chrono::steady_clock::now() + wait_bound;
+
   std::thread t1(writer_fn, 1);
   std::thread t2(writer_fn, 2);
 
-  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  while ((thread_writes[0].load() < kMinWritesPerThread ||
+          thread_writes[1].load() < kMinWritesPerThread) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
   stop.store(true);
 
   t1.join();
   t2.join();
 
-  // No crashes, no deadlocks.  Both threads should have completed writes.
+  // No crashes, no deadlocks.  Both threads wrote, and enough to cycle
+  // the volume several times over: evictions had to happen.
   REQUIRE(total_writes.load() > 0);
+  REQUIRE(thread_writes[0].load() >= kMinWritesPerThread);
+  REQUIRE(thread_writes[1].load() >= kMinWritesPerThread);
 
   cleanup_temp_file(path);
 }

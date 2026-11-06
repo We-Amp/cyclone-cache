@@ -68,6 +68,7 @@
 #include "optimization/optimization_engine.hpp"
 #include "support/signal_child.hpp"
 #include "support/temp_cache.hpp"
+#include "support/wall_load.hpp"
 
 #if defined(__SANITIZE_THREAD__)
 #define CYCLONE_FORK_STORM_TSAN 1
@@ -902,8 +903,9 @@ class ForkingPlugin : public OptimizationPlugin {
 
 // The optimization engine with two workers and a plugin that forks in
 // transform(), while an application thread forks as well and the hit-count
-// flush and directory sync run at 1 ms.
-int scenario_plugin_forks(int transforms_wanted) {
+// flush and directory sync run at 1 ms.  `watchdog_patience` comes from the
+// caller, scaled to the host load before this scenario's threads exist.
+int scenario_plugin_forks(int transforms_wanted, Ms watchdog_patience) {
   TempCacheDir dir("fork_plugin");
   CacheConfig cache_config;
   cache_config.set_ram_cache_size(0);
@@ -934,7 +936,7 @@ int scenario_plugin_forks(int transforms_wanted) {
 
   std::atomic<bool> done{false};
   std::thread watchdog(
-      [&] { watch_progress(progress, done, Ms{5000} * kSanitizerSlowdown); });
+      [&] { watch_progress(progress, done, watchdog_patience); });
 
   std::atomic<bool> stop_forking{false};
   std::atomic<long> outside_forks{0};
@@ -1019,8 +1021,17 @@ TEST_CASE(
   // process started there is an ordinary fork from outside a pass: it
   // waits for the passes in flight like any other, on every platform,
   // including those whose C library runs fork handlers one fork at a time.
-  const int code = run_in_subprocess([] { return scenario_plugin_forks(300); },
-                                     Ms{120'000} * kSanitizerSlowdown);
+  // Both bounds below are pure hang guards -- the scenario either keeps
+  // making progress or it has hung -- so they may follow the load without
+  // hiding a defect.  Each is taken here, before the scenario's threads
+  // exist, so it scales for load this test did not create.
+  const Ms watchdog_patience = scaled_by_load(Ms{5000} * kSanitizerSlowdown);
+  const Ms budget = scaled_by_load(Ms{120'000} * kSanitizerSlowdown);
+  const int code = run_in_subprocess(
+      [watchdog_patience] {
+        return scenario_plugin_forks(300, watchdog_patience);
+      },
+      budget);
   INFO("scenario exit code " << code
                              << " (0 ok; 50 hung; 51 finished wrong; -1 "
                              << "killed at the deadline)");

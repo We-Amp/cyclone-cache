@@ -36,6 +36,7 @@
 #include "support/lease_test_clock.hpp"
 #include "support/spawned_peer.hpp"
 #include "support/temp_cache.hpp"
+#include "support/wall_load.hpp"
 
 using namespace cyclone;
 
@@ -2104,11 +2105,14 @@ struct HammerResult {
 // ceiling passes by progress, not by how fast the host runs the threads.  The
 // run ends on work done (the ring wrapped, enough borrows served and held),
 // not on elapsed time; the 60 s wall limit is only a hang guard (a fired
-// guard fails the case).  A long hold spans ~150 renews of CPU time while the
-// clock jumps 150 ms, so one reader's ticks can also force-reset another
+// guard fails the case), scaled to the host load.  The measurement is taken
+// inside hammer() before it starts its own threads, so it covers only load
+// the case did not create.  A long hold spans ~150 renews of CPU time while
+// the clock jumps 150 ms, so one reader's ticks can also force-reset another
 // reader's short hold (counted as a forced tear, by contract).
 HammerResult hammer(Cache &writer, Cache &reader, LeaseTestClock &clock,
                     unsigned readers) {
+  const auto hang_limit = scaled_by_load(std::chrono::seconds(60));
   std::atomic<uint64_t> latest{0};
   std::atomic<bool> stop{false};
   std::atomic<bool> mismatch{false};
@@ -2206,7 +2210,7 @@ HammerResult hammer(Cache &writer, Cache &reader, LeaseTestClock &clock,
   while ((writer.stats().write_buffer_wraps < 4 || served.load() < 2000 ||
           held_checks.load() < 200 ||
           writer.stats().wraps_forced_past_lease < 1) &&
-         std::chrono::steady_clock::now() - start < std::chrono::seconds(60)) {
+         std::chrono::steady_clock::now() - start < hang_limit) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
   const bool timed_out = writer.stats().write_buffer_wraps < 4 ||

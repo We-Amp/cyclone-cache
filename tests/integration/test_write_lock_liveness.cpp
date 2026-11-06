@@ -31,6 +31,7 @@
 #include "core/volume.hpp"
 #include "cyclone/config.hpp"
 #include "support/temp_cache.hpp"
+#include "support/wall_load.hpp"
 
 #ifdef _WIN32
 #include <fcntl.h>
@@ -588,6 +589,21 @@ TEST_CASE(
   auto held = dir_b->acquire_write_lock(/*capped=*/false);
   REQUIRE(held.acquired);
 
+  // The per-child deadline below is a pure hang guard -- a child either
+  // takes the write-lock path and exits at once, or the liveness mutex it
+  // inherited is locked and it never comes back -- so it may follow the
+  // load on the host without hiding the defect.  Taken before the probing
+  // threads start, it scales for load this case did not create, and the
+  // probes' own contention stays what the calibrated bound already allows
+  // for.
+  const auto child_deadline = scaled_by_load(Ms{2000});
+  // Belt and braces for a child the scheduler loses entirely: an alarm
+  // comfortably past the parent's deadline, so a child that hangs is
+  // killed and counted here as hung, never reaped as a bad SIGALRM exit.
+  const auto child_alarm_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                 child_deadline + Ms{2000})
+                                 .count();
+
   std::atomic<bool> stop{false};
   std::vector<std::thread> waiters;
   for (int i = 0; i < 16; ++i) {
@@ -603,19 +619,18 @@ TEST_CASE(
   std::this_thread::sleep_for(Ms{100});  // past the 50 ms probe gate
 
   constexpr int kForks = 300;
-  constexpr auto kChildDeadline = Ms{2000};
   int hung = 0;
   int bad_exit = 0;
   for (int n = 0; n < kForks && hung == 0; ++n) {
     const pid_t child = ::fork();
     REQUIRE(child >= 0);
     if (child == 0) {
-      ::alarm(5);  // belt and braces: never outlive the parent's deadline
+      ::alarm(static_cast<unsigned>(child_alarm_s));
       auto t = dir_a->try_acquire_write_lock();
       _exit(t.liveness_slot >= 0 ? 0 : 3);
     }
     int status = 0;
-    const auto deadline = Clock::now() + kChildDeadline;
+    const auto deadline = Clock::now() + child_deadline;
     pid_t done = 0;
     while ((done = ::waitpid(child, &status, WNOHANG)) == 0 &&
            Clock::now() < deadline) {
