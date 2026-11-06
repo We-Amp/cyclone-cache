@@ -39,8 +39,9 @@ class LeaseTestClock {
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch())
             .count();
-    _now_ns = real_ns > 0 ? static_cast<uint64_t>(real_ns) : 1;
-    publish();
+    cyclone::Volume::s_steady_clock_ns_for_test.store(
+        real_ns > 0 ? static_cast<uint64_t>(real_ns) : 1,
+        std::memory_order_release);
   }
   ~LeaseTestClock() {
     cyclone::Volume::s_steady_clock_ns_for_test.store(
@@ -49,21 +50,21 @@ class LeaseTestClock {
   LeaseTestClock(const LeaseTestClock &) = delete;
   LeaseTestClock &operator=(const LeaseTestClock &) = delete;
 
-  // Moves the clock forward.  Call it from the test's own thread.
+  // Moves the clock forward.  Safe from any thread: a concurrent test may
+  // let its own threads pace the clock (one tick per unit of work) so a
+  // ceiling passes by progress, not by wall time.
   void advance(std::chrono::nanoseconds by) {
-    _now_ns += static_cast<uint64_t>(by.count());
-    publish();
+    // Relaxed on purpose: the test clock must add no synchronization between
+    // threads, or ThreadSanitizer stops seeing the lease protocol's own
+    // ordering.
+    cyclone::Volume::s_steady_clock_ns_for_test.fetch_add(
+        static_cast<uint64_t>(by.count()), std::memory_order_relaxed);
   }
 
-  [[nodiscard]] uint64_t now_ns() const { return _now_ns; }
-
- private:
-  void publish() const {
-    cyclone::Volume::s_steady_clock_ns_for_test.store(
-        _now_ns, std::memory_order_release);
+  [[nodiscard]] uint64_t now_ns() const {
+    return cyclone::Volume::s_steady_clock_ns_for_test.load(
+        std::memory_order_acquire);
   }
-
-  uint64_t _now_ns = 0;
 };
 
 #endif  // CYCLONE_TESTS_SUPPORT_LEASE_TEST_CLOCK_HPP
