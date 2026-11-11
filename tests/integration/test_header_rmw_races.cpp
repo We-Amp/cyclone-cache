@@ -101,6 +101,28 @@ MultiProcessConfig mp_enabled() {
   return mp;
 }
 
+// Runs the race for at least kMinRace, then keeps it running until both
+// sides have made progress (`progressed`), giving up at kProgressBound, and
+// finally raises `stop`.  The progress assertions after each race check that
+// the race window was exercised at all; that is a scheduling outcome, not a
+// correctness property.  A fixed window can end before a starved writer
+// thread completes its first operation on a loaded host (ctest -j on a small
+// hosted runner), so the window is bounded by work done instead.  The bound
+// is a hang guard: no progress in that long is a real failure.
+constexpr auto kMinRace = std::chrono::milliseconds(300);
+constexpr auto kProgressBound = std::chrono::seconds(60);
+
+template <typename Progressed>
+void run_race(std::atomic<bool> &stop, Progressed progressed) {
+  const auto start = std::chrono::steady_clock::now();
+  std::this_thread::sleep_for(kMinRace);
+  while (!progressed() &&
+         std::chrono::steady_clock::now() - start < kProgressBound) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  stop.store(true, std::memory_order_relaxed);
+}
+
 }  // namespace
 
 TEST_CASE("Concurrent hit-count RMW never races or corrupts a reader",
@@ -158,15 +180,15 @@ TEST_CASE("Concurrent hit-count RMW never races or corrupts a reader",
     });
   }
 
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
-  stop.store(true, std::memory_order_relaxed);
+  run_race(stop, [&] { return updates.load() > 0 && reads.load() > 0; });
   writer.join();
   for (auto &r : readers) {
     r.join();
   }
 
   REQUIRE_FALSE(corruption.load());
-  // Both sides made progress, so the race window was genuinely exercised.
+  // Both sides made progress within the hang bound, so the race window was
+  // genuinely exercised.
   REQUIRE(updates.load() > 0);
   REQUIRE(reads.load() > 0);
 
@@ -233,8 +255,7 @@ TEST_CASE(
     });
   }
 
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
-  stop.store(true, std::memory_order_relaxed);
+  run_race(stop, [&] { return repoints.load() > 0 && reads.load() > 0; });
   writer.join();
   for (auto &r : readers) {
     r.join();
