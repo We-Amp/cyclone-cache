@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -70,6 +71,12 @@ struct HitTrackerConfig {
   uint32_t flush_threshold{10000};     // Flush key if hits exceed this
   bool enable_background_flush{true};  // Enable background flush thread
   size_t max_pending_entries{100000};  // Max entries before forced flush
+  // Longest the flush thread waits while nothing is pending.  An idle
+  // tracker does no sweep and takes no lock: the thread blocks until a hit
+  // makes the set non-empty, an over-limit hand-off, stop(), or this
+  // timeout, whichever comes first.  Only a safety net: the first pending
+  // hit wakes the thread directly, so this bounds nothing a caller sees.
+  std::chrono::milliseconds max_idle_wait{60000};
 };
 
 // In-memory hit tracker with periodic flush to disk.
@@ -140,6 +147,11 @@ class HitTracker {
 
   const Config& config() const { return _config; }
 
+  // Number of times the background flush thread has woken from a wait
+  // (test and diagnostics hook: an idle tracker should wake at most once
+  // per max_idle_wait).
+  uint64_t wakeups() const { return _wakeups.load(std::memory_order_relaxed); }
+
   // Stripe geometry, exposed so a test can pick one key per stripe.
   static constexpr size_t stripe_count() noexcept { return kNumStripes; }
   static size_t stripe_of(const CacheKey& key) { return stripe_index(key); }
@@ -154,8 +166,8 @@ class HitTracker {
   size_t hard_pending_cap() const { return 2 * _config.max_pending_entries; }
 
   // How long an overflow past the hard cap may go undrained before hits
-  // are dropped: comfortably above the flush thread's sleep slice (100 ms,
-  // the worst case before a handed-off sweep starts), far below any
+  // are dropped: comfortably above the time a handed-off sweep needs to
+  // start (the hand-off wakes the flush thread at once), far below any
   // acceptable unbounded-growth window.
   static constexpr uint64_t kOverCapGraceNs =
       uint64_t{250} * 1000 * 1000;  // 250 ms
@@ -166,12 +178,17 @@ class HitTracker {
 
   // What a reader that pushed the pending set past max_pending_entries
   // does about it.  With a flush thread, it only asks for an early sweep
-  // (the flag breaks the thread's sleep slices, so the sweep starts within
-  // ~100 ms) -- a full 4096-stripe sweep plus per-key callbacks never runs
-  // on the reading thread.  Without one, at most ONE reader at a time
+  // (the flag plus a wake-up, so the sweep starts at once) -- a full
+  // 4096-stripe sweep plus per-key callbacks never runs on the reading
+  // thread.  Without one, at most ONE reader at a time
   // sweeps (the exchange gate); the rest proceed, and the next over-limit
   // reader re-opens the gate.
   void flush_soon();
+
+  // Wakes the flush thread if it is waiting (see _wake_mutex).  A no-op
+  // without a flush thread, and in a forked child, where the thread does
+  // not exist and the wake mutex may have been inherited locked.
+  void wake_flush_thread();
 
   Config _config;
   HitFlushCallback _flush_callback;
@@ -238,6 +255,26 @@ class HitTracker {
 
   std::atomic<bool> _running{false};
   std::thread _flush_thread;
+
+  // The flush thread's wait.  It blocks on _wake_cv instead of polling, so
+  // an idle tracker costs no wake-ups.  A waker changes the state the
+  // thread waits on (_pending_entries leaving zero, _flush_soon, _running)
+  // first, then locks and unlocks _wake_mutex, then notifies, so a wake-up
+  // is never lost between the thread's predicate check and its wait.
+  // _wake_mutex is a LEAF lock held only around that check and the wait:
+  // never across a sweep, a callback or another lock.  Readers take it
+  // only when the pending set leaves zero (at most once per flush cycle)
+  // or on an over-limit hand-off, never on an ordinary hit.
+  std::mutex _wake_mutex;
+  std::condition_variable _wake_cv;
+  // True once the flush thread exists; _thread_epoch is the fork epoch it
+  // was started in (and _thread_pid its process).  A forked child sees
+  // another epoch or PID and never touches
+  // the wake mutex (see wake_flush_thread).
+  std::atomic<bool> _has_flush_thread{false};
+  uint32_t _thread_epoch = 0;
+  long _thread_pid = 0;
+  std::atomic<uint64_t> _wakeups{0};
 };
 
 // HitTracker is embedded in heap-allocated owners in production, but tests

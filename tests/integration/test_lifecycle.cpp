@@ -9,9 +9,13 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -30,6 +34,10 @@
 #include <unistd.h>
 
 #include <csignal>
+#endif
+
+#ifdef __linux__
+#include <dirent.h>  // /proc/self/task (idle wake-up test)
 #endif
 
 using namespace cyclone;
@@ -2051,4 +2059,170 @@ TEST_CASE(
   REQUIRE(WEXITSTATUS(status) == 0);
 }
 #endif  // !CYCLONE_LIFECYCLE_TSAN
+#endif  // _WIN32
+
+// =============================================================================
+// An idle cache handle does not poll
+// =============================================================================
+
+#ifdef __linux__
+namespace {
+
+std::set<std::string> current_thread_ids() {
+  std::set<std::string> ids;
+  if (DIR *dir = ::opendir("/proc/self/task")) {
+    while (const dirent *entry = ::readdir(dir)) {
+      if (entry->d_name[0] != '.') {
+        ids.insert(entry->d_name);
+      }
+    }
+    ::closedir(dir);
+  }
+  return ids;
+}
+
+// Sum of voluntary context switches (blocking waits that ended) of `ids`.
+uint64_t voluntary_switches(const std::set<std::string> &ids) {
+  uint64_t total = 0;
+  for (const auto &id : ids) {
+    std::ifstream status("/proc/self/task/" + id + "/status");
+    std::string line;
+    constexpr std::string_view kField = "voluntary_ctxt_switches:";
+    while (std::getline(status, line)) {
+      if (line.starts_with(kField)) {
+        total += std::stoull(line.substr(kField.size()));
+      }
+    }
+  }
+  return total;
+}
+
+}  // namespace
+
+TEST_CASE("An idle multi-process cache handle's threads do not poll",
+          "[lifecycle][idle]") {
+  // The configuration a server module opens: hit tracking plus the
+  // directory syncer.  Both threads used to wake every 100 ms when idle
+  // (about 20 wake-ups per second per handle).  Now the syncer wakes once
+  // per directory_sync_interval and an idle hit tracker once per
+  // max_idle_wait, so a few idle seconds see (almost) none.
+  TempCacheDir tmp;
+  CacheConfig config;
+  config.set_multi_process(0, 1);
+  auto cache_result = Cache::create(config);
+  REQUIRE(cache_result.has_value());
+  auto &cache = *cache_result;
+  VolumeConfig vol_config;
+  vol_config.path = tmp.path();
+  vol_config.size = static_cast<size_t>(32 * 1024 * 1024);
+  REQUIRE(cache->add_volume(vol_config).has_value());
+
+  const auto before_start = current_thread_ids();
+  REQUIRE(cache->start().has_value());
+  std::set<std::string> library_threads;
+  for (const auto &id : current_thread_ids()) {
+    if (!before_start.contains(id)) {
+      library_threads.insert(id);
+    }
+  }
+  REQUIRE(library_threads.size() >= 2);  // hit flusher + directory syncer
+
+  // Serve once, so the hit tracker has had something to flush, then let
+  // that flush finish.
+  CacheKey key("idle-handle");
+  {
+    auto wh = cache->write_sync(key, 64);
+    REQUIRE(wh.has_value());
+    std::vector<std::byte> data(64, std::byte{0x5a});
+    REQUIRE(wh->write_sync(std::span<const std::byte>(data)).has_value());
+    REQUIRE(wh->close_sync().has_value());
+  }
+  REQUIRE(cache->read_sync(key).has_value());
+  std::this_thread::sleep_for(config.hit_flush_interval +
+                              std::chrono::milliseconds(500));
+
+  const auto window = std::chrono::seconds(3);
+  const uint64_t before = voluntary_switches(library_threads);
+  std::this_thread::sleep_for(window);
+  const uint64_t woke = voluntary_switches(library_threads) - before;
+
+  INFO("library-thread wake-ups over " << window.count()
+                                       << " idle seconds: " << woke);
+  // Polling gave ~60 here.  Allow a little slack (a sync pass whose
+  // interval happens to end inside the window, a scheduler hiccup).
+  CHECK(woke <= 4);
+
+  cache->stop();
+}
+#endif  // __linux__
+
+#ifndef _WIN32
+TEST_CASE("A forked child's first hit does not touch the parent's flush wake",
+          "[lifecycle][fork][idle]") {
+  // The hit that makes the pending set leave zero wakes the flush thread.
+  // A forked child inherits the tracker but not the thread, and the wake
+  // mutex may have been copied while that thread held it: the child's hit
+  // must be recorded without touching it, and the child must exit at once.
+  TempCacheDir tmp;
+  CacheConfig config;
+  config.enable_hit_tracking = true;
+  config.hit_flush_interval = std::chrono::milliseconds(50);
+  auto cache_result = Cache::create(config);
+  REQUIRE(cache_result.has_value());
+  auto &cache = *cache_result;
+  VolumeConfig vol_config;
+  vol_config.path = tmp.path();
+  vol_config.size = static_cast<size_t>(20 * 1024 * 1024);
+  REQUIRE(cache->add_volume(vol_config).has_value());
+  REQUIRE(cache->start().has_value());
+
+  CacheKey key("fork-idle-hit");
+  {
+    auto wh = cache->write_sync(key, 64);
+    REQUIRE(wh.has_value());
+    std::vector<std::byte> data(64, std::byte{0x33});
+    REQUIRE(wh->write_sync(std::span<const std::byte>(data)).has_value());
+    REQUIRE(wh->close_sync().has_value());
+  }
+  // A hit, then long enough for its flush: the parent's tracker is idle
+  // again (nothing pending) when the child forks.
+  REQUIRE(cache->read_sync(key).has_value());
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+  pid_t pid = fork();
+  REQUIRE(pid >= 0);
+  if (pid == 0) {
+    // CHILD: two hits (the first leaves zero), then the inherited teardown.
+    const bool hit =
+        cache->read_sync(key).has_value() && cache->read_sync(key).has_value();
+    cache->stop();
+    _exit(hit ? 0 : 3);
+  }
+
+  bool exited = false;
+  int status = 0;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(15);
+  while (std::chrono::steady_clock::now() < deadline) {
+    pid_t r = ::waitpid(pid, &status, WNOHANG);
+    if (r == pid) {
+      exited = true;
+      break;
+    }
+    REQUIRE(r != -1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
+  if (!exited) {
+    signal_child(pid, SIGKILL);
+    ::waitpid(pid, &status, 0);
+  }
+
+  // The parent's own tracker still flushes and stops normally.
+  REQUIRE(cache->read_sync(key).has_value());
+  cache->stop();
+
+  REQUIRE(exited);
+  REQUIRE(WIFEXITED(status));
+  REQUIRE(WEXITSTATUS(status) == 0);
+}
 #endif  // _WIN32
