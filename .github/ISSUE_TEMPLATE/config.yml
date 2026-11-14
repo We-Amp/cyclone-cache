@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 We-Amp B.V.
+
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/We-Amp/cyclone-cache/security/advisories/new
+    about: Report vulnerabilities privately through GitHub or to security@modpagespeed.com, not in a public issue.
+  - name: Apache, nginx, IIS or Envoy module, or the module packages
+    url: https://github.com/We-Amp/mod_pagespeed/issues
+    about: Problems with the products that embed Cyclone Cache belong in their own repositories.
+  - name: pagespeed-optimizer worker, console, container images, Helm chart or ASP.NET Core middleware
+    url: https://github.com/We-Amp/pagespeed-optimizer/issues
+    about: Problems with the products that embed Cyclone Cache belong in their own repositories.
