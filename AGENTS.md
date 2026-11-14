@@ -19,3 +19,4 @@ duplicate its detail.** Must-not-miss facts:
   sync — make ALL Cyclone edits here. Confirm your checkout with
   `git rev-parse --show-toplevel`; never edit a `reference/` or `vendor/`
   copy.
+- **Security fixes are not opened as public pull requests or issues;** follow `SECURITY.md`.

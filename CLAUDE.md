@@ -428,6 +428,8 @@ if (!result) {
 
 ## Development Guidelines
 
+Security fixes are not opened as public pull requests or issues; follow `SECURITY.md`.
+
 ### Code Style
 
 - Google-based style enforced by `.clang-format` (`BasedOnStyle: Google`,
