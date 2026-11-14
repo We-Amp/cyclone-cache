@@ -2087,6 +2087,19 @@ namespace {
 // it cannot reach this within the run.
 constexpr std::chrono::milliseconds kHammerLease{24 * 60 * 60 * 1000};
 
+#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
+#define CYCLONE_HAMMER_SANITIZED 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
+#define CYCLONE_HAMMER_SANITIZED 1
+#endif
+#endif
+#ifdef CYCLONE_HAMMER_SANITIZED
+constexpr int kHammerSanitizerSlowdown = 5;
+#else
+constexpr int kHammerSanitizerSlowdown = 1;
+#endif
+
 struct HammerResult {
   uint64_t served = 0;
   uint64_t held_checks = 0;
@@ -2095,6 +2108,8 @@ struct HammerResult {
   bool mismatch = false;
   uint64_t forced_steps = 0;  // writer's wraps_forced_past_lease at the end
   bool timed_out = false;     // the hang guard fired before the work was done
+  uint64_t wraps = 0;         // writer's write_buffer_wraps at the end
+  uint64_t writes = 0;        // entries the writer completed
 };
 
 // `writer` and `reader` may be the same Cache (single process) or two views
@@ -2112,7 +2127,12 @@ struct HammerResult {
 // reader's short hold (counted as a forced tear, by contract).
 HammerResult hammer(Cache &writer, Cache &reader, LeaseTestClock &clock,
                     unsigned readers) {
-  const auto hang_limit = scaled_by_load(std::chrono::seconds(60));
+  // The work targets below take ~50 s of a 2-core host under ThreadSanitizer
+  // (an order of magnitude more than uninstrumented), so a fixed 60 s guard
+  // can expire on a slow runner with nothing wrong.  The guard scales with
+  // the instrumentation; every assertion stays as strict.
+  const auto hang_limit =
+      scaled_by_load(std::chrono::seconds(60) * kHammerSanitizerSlowdown);
   std::atomic<uint64_t> latest{0};
   std::atomic<bool> stop{false};
   std::atomic<bool> mismatch{false};
@@ -2224,7 +2244,8 @@ HammerResult hammer(Cache &writer, Cache &reader, LeaseTestClock &clock,
   return {served.load(),    held_checks.load(),
           torn_seen.load(), forced_tears.load(),
           mismatch.load(),  writer.stats().wraps_forced_past_lease,
-          timed_out};
+          timed_out,        writer.stats().write_buffer_wraps,
+          latest.load()};
 }
 
 }  // namespace
@@ -2244,7 +2265,8 @@ TEST_CASE(
                     std::chrono::milliseconds(60));
   const auto result = hammer(*v.cache, *v.cache, clock, 4);
   CAPTURE(result.served, result.held_checks, result.torn_seen,
-          result.forced_tears, result.forced_steps);
+          result.forced_tears, result.forced_steps, result.wraps,
+          result.writes);
   REQUIRE_FALSE(result.timed_out);
   REQUIRE_FALSE(result.mismatch);
   REQUIRE(result.served > 0);
@@ -2279,7 +2301,8 @@ TEST_CASE(
   auto reader = open_view(1);
   const auto result = hammer(*writer, *reader, clock, 4);
   CAPTURE(result.served, result.held_checks, result.torn_seen,
-          result.forced_tears, result.forced_steps);
+          result.forced_tears, result.forced_steps, result.wraps,
+          result.writes);
   REQUIRE_FALSE(result.timed_out);
   REQUIRE_FALSE(result.mismatch);
   REQUIRE(result.served > 0);
