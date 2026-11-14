@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -884,6 +885,23 @@ struct VolumeConfig {
   // CacheConfig fields of the same name (see their documentation there).
   std::chrono::milliseconds read_lease_duration{5000};
   std::chrono::milliseconds lease_wrap_ceiling{60000};
+
+  // The user (and group) the volume file must belong to.  POSIX only;
+  // ignored on Windows.  Unset (the default): no owner requirement.
+  //
+  // The volume must be a plain file owned by the configured user.  When
+  // set, open() uses the file only if `uid` owns it; a process running as
+  // root creates the file for `uid`:`gid` (and gives it a root-owned volume
+  // an earlier root run left behind).  Otherwise open() reports
+  // CacheError::VolumeFileRefused and does not use the file.
+  //
+  // Independent of this setting, a volume path that is not a plain file is
+  // reported and not used.
+  struct Owner {
+    uint32_t uid = 0;
+    uint32_t gid = 0;
+  };
+  std::optional<Owner> owner;
 };
 
 }  // namespace cyclone

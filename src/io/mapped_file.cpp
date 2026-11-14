@@ -99,7 +99,9 @@ class PosixMappedFile : public MappedFile {
     }
 
     // Close-on-exec: an exec'd child must not inherit the mapping's fd.
-    _fd = ::open(path.c_str(), flags | O_CLOEXEC, perms);
+    // O_NOFOLLOW: the volume must be a plain file owned by the configured
+    // user.
+    _fd = ::open(path.c_str(), flags | O_CLOEXEC | O_NOFOLLOW, perms);
     if (_fd < 0) {
       return make_unexpected(
           std::make_error_code(static_cast<std::errc>(errno)));

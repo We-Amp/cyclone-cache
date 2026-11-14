@@ -765,7 +765,10 @@ bool WriterLiveness::claim_locked(uint32_t fork_epoch) {
   int fd = -1;
   if (!fail) {
     do {
-      fd = ::open(_path.c_str(), O_RDONLY | O_CLOEXEC);
+      // The volume must be a plain file owned by the configured user: no
+      // symbolic link at the path, and no wait on a path that is not a file.
+      fd =
+          ::open(_path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     } while (fd < 0 && errno == EINTR);
   }
   if (fd >= 0) {
