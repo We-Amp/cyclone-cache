@@ -977,15 +977,29 @@ TEST_CASE("HitTracker idle flush thread wakes at most once per max_idle_wait",
     return true;
   });
 
-  const auto window = std::chrono::milliseconds(1000);
+  // The bound is taken from the window as MEASURED, not as requested: on a
+  // loaded runner sleep_for overshoots, and a longer window legitimately
+  // holds more idle timeouts.  Load cannot add wake-ups: each idle wait
+  // starts its own max_idle_wait when the thread gets to it, so a
+  // descheduled thread wakes less often, never more.  Only something that
+  // ends the wait early (a hit, a hand-off, a lost predicate) could, and
+  // nothing here does.
   const uint64_t before = tracker.wakeups();
-  std::this_thread::sleep_for(window);
+  const auto begin = std::chrono::steady_clock::now();
+  std::this_thread::sleep_for(std::chrono::milliseconds(2000));
   const uint64_t woke = tracker.wakeups() - before;
+  const auto elapsed = std::chrono::steady_clock::now() - begin;
+  const uint64_t timeouts_in_window =
+      static_cast<uint64_t>(elapsed / config.max_idle_wait);
 
-  INFO("idle wake-ups in " << window.count() << " ms: " << woke);
-  // window / max_idle_wait = 5, plus one for a wait that straddles the
-  // window's start.  Polling at the 10 ms flush interval would be ~100.
-  CHECK(woke <= 6);
+  INFO("idle wake-ups in "
+       << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()
+       << " ms: " << woke
+       << " (idle timeouts in that window: " << timeouts_in_window << ")");
+  // One wake per idle timeout in the window, plus one for a wait that
+  // straddles each end.  Polling at the 10 ms flush interval would be
+  // ~200 here.
+  CHECK(woke <= timeouts_in_window + 2);
   CHECK(callbacks.load() == 0);
 
   tracker.stop();

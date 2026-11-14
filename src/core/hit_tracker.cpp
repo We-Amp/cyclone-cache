@@ -162,9 +162,13 @@ void HitTracker::flush_soon() {
     // A flush thread exists: hand the sweep to it.  The flag ends its
     // wait at once, and is cleared by the thread BEFORE its sweep, so an
     // overflow arriving during the sweep re-arms the early wake instead of
-    // waiting out the flush interval.
-    _flush_soon.store(true, std::memory_order_seq_cst);
-    wake_flush_thread();
+    // waiting out the flush interval.  Only the reader that raises the
+    // flag wakes the thread: under sustained overload every further
+    // over-limit hit of the same cycle finds it already set and takes no
+    // lock.
+    if (!_flush_soon.exchange(true, std::memory_order_seq_cst)) {
+      wake_flush_thread();
+    }
     return;
   }
   // No flush thread: the sweep still has to run, or the bound only re-arms
