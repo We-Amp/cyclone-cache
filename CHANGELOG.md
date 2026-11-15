@@ -21,6 +21,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- An idle cache handle no longer wakes up about 20 times a second. The
+  hit-count flusher and the directory syncer block until there is work (a
+  hit, a hand-off, `stop()`) or their interval ends, instead of polling
+  every 100 ms, and the flusher skips its stripe sweep when nothing is
+  pending. Flush and sync intervals, and the final flush and sync on
+  `stop()`, are unchanged.
 - Windows: cache and volume paths with non-ASCII characters (for example a
   localized user or folder name) are opened through the wide-character file
   API, so UTF-8 paths are no longer mangled by the ANSI code page.

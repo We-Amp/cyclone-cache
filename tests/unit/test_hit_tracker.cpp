@@ -5,6 +5,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -570,8 +571,8 @@ TEST_CASE("HitTracker stop is idempotent", "[hit_tracker]") {
 
 TEST_CASE("HitTracker stop returns within a bounded time", "[hit_tracker]") {
   // Regression guard against an unbounded or never-waking join: the flush
-  // thread sleeps the flush interval in small (~100ms) increments while
-  // rechecking _running, so stop() must return well within a generous bound
+  // thread waits out the flush interval on a condition variable that
+  // stop() notifies, so stop() must return well within a generous bound
   // even when the configured flush interval is long.
   HitTrackerConfig config;
   config.enable_background_flush = true;
@@ -602,7 +603,7 @@ TEST_CASE("HitTracker stop returns within a bounded time", "[hit_tracker]") {
       std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
   INFO("stop() took " << elapsed_ms << " ms");
 
-  // Real bound is ~100ms wake + drain; 2s is generous slack for loaded CI.
+  // Real bound is the wake + drain; 2s is generous slack for loaded CI.
   REQUIRE(elapsed < std::chrono::seconds(2));
 
   // Final flush on stop() must still have drained the pending hit.
@@ -709,7 +710,7 @@ TEST_CASE("HitTracker::stop() joins an in-flight flush thread (no leak)",
 
   // Wait until the flush callback is actually in flight on the bg thread.
   // Generous deadline: on a loaded CI runner the first background flush (its
-  // loop sleeps in <=100 ms steps) need only START within this budget.
+  // flush interval is 20 ms) need only START within this budget.
   auto started_deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(20);
   while (!callback_started.load(std::memory_order_acquire) &&
@@ -953,4 +954,122 @@ TEST_CASE(
 
   release.store(true);
   tracker.stop();
+}
+
+// =============================================================================
+// Idle behaviour: the flush thread blocks instead of polling
+// =============================================================================
+
+TEST_CASE("HitTracker idle flush thread wakes at most once per max_idle_wait",
+          "[hit_tracker][idle]") {
+  // An idle tracker has nothing to sweep.  The flush thread used to wake
+  // every 100 ms (and sweep all 4096 stripes once per flush interval) even
+  // so; it now blocks until a hit, a hand-off, stop() or max_idle_wait.
+  HitTrackerConfig config;
+  config.enable_background_flush = true;
+  config.flush_interval = std::chrono::milliseconds(10);
+  config.max_idle_wait = std::chrono::milliseconds(200);
+
+  std::atomic<uint64_t> callbacks{0};
+  HitTracker tracker(config);
+  tracker.start([&](const CacheKey &, AlternateId, uint32_t, int64_t) {
+    callbacks.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  });
+
+  // The bound is taken from the window as MEASURED, not as requested: on a
+  // loaded runner sleep_for overshoots, and a longer window legitimately
+  // holds more idle timeouts.  Load cannot add wake-ups: each idle wait
+  // starts its own max_idle_wait when the thread gets to it, so a
+  // descheduled thread wakes less often, never more.  Only something that
+  // ends the wait early (a hit, a hand-off, a lost predicate) could, and
+  // nothing here does.
+  const uint64_t before = tracker.wakeups();
+  const auto begin = std::chrono::steady_clock::now();
+  std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+  const uint64_t woke = tracker.wakeups() - before;
+  const auto elapsed = std::chrono::steady_clock::now() - begin;
+  const uint64_t timeouts_in_window =
+      static_cast<uint64_t>(elapsed / config.max_idle_wait);
+
+  INFO("idle wake-ups in "
+       << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()
+       << " ms: " << woke
+       << " (idle timeouts in that window: " << timeouts_in_window << ")");
+  // One wake per idle timeout in the window, plus one for a wait that
+  // straddles each end.  Polling at the 10 ms flush interval would be
+  // ~200 here.
+  CHECK(woke <= timeouts_in_window + 2);
+  CHECK(callbacks.load() == 0);
+
+  tracker.stop();
+}
+
+TEST_CASE("HitTracker flushes a hit on an idle tracker within flush_interval",
+          "[hit_tracker][idle]") {
+  // The first hit after an idle period must wake the thread itself: with a
+  // long max_idle_wait, a flush that waited for the idle timeout would
+  // arrive a minute late.
+  HitTrackerConfig config;
+  config.enable_background_flush = true;
+  config.flush_interval = std::chrono::milliseconds(50);
+  config.max_idle_wait = std::chrono::seconds(60);
+
+  std::atomic<uint64_t> flushed{0};
+  HitTracker tracker(config);
+  tracker.start(
+      [&](const CacheKey &, AlternateId, uint32_t hit_delta, int64_t) {
+        flushed.fetch_add(hit_delta, std::memory_order_relaxed);
+        return true;
+      });
+
+  // Let the thread park in its idle wait.
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+  for (int round = 0; round < 3; ++round) {
+    const uint64_t target = flushed.load() + 1;
+    const auto begin = std::chrono::steady_clock::now();
+    tracker.record_hit(CacheKey("idle-wake-" + std::to_string(round)));
+    const auto deadline = begin + std::chrono::seconds(5);
+    while (flushed.load() < target &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - begin;
+    INFO("round " << round << ": flushed after "
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                         elapsed)
+                         .count()
+                  << " ms");
+    // Checked before stop(): only the background thread can flush here.
+    REQUIRE(flushed.load() == target);
+    // Not before the interval (hits still batch), and nowhere near the idle
+    // timeout.  The upper bound is slack for loaded CI runners.
+    CHECK(elapsed >= std::chrono::milliseconds(40));
+    CHECK(elapsed < std::chrono::seconds(5));
+    // Back to idle before the next round.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+
+  tracker.stop();
+}
+
+TEST_CASE("HitTracker stop() on an idle tracker does not wait max_idle_wait",
+          "[hit_tracker][idle]") {
+  HitTrackerConfig config;
+  config.enable_background_flush = true;
+  config.max_idle_wait = std::chrono::seconds(60);
+
+  HitTracker tracker(config);
+  tracker.start(
+      [](const CacheKey &, AlternateId, uint32_t, int64_t) { return true; });
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  const auto begin = std::chrono::steady_clock::now();
+  tracker.stop();
+  const auto elapsed = std::chrono::steady_clock::now() - begin;
+  INFO("stop() took "
+       << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()
+       << " ms");
+  REQUIRE(elapsed < std::chrono::seconds(2));
 }

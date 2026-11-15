@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -88,11 +89,20 @@ class DirectorySyncer {
     // sync pass stalled in msync/fsync past the deadline was abandoned
     // alive and then read a destroyed Volume's stripe vector
     // (ASan-confirmed heap-use-after-free at Volume::sync_directory).
-    // The join always completes: the loop re-checks _running at <=100 ms
-    // granularity and a sync pass is one finite msync+fsync sweep.  The
+    // The join always completes: the wake below ends the thread's wait at
+    // once and a sync pass is one finite msync+fsync sweep.  The
     // fork-inherited "thread does not exist in this process" case never
     // reaches here — Cache::stop() release()s the whole syncer on that
     // path.
+    //
+    // The thread blocks on _wake_cv until the next sync is due, so it has
+    // to be woken: _running is already false; lock and unlock, then
+    // notify, so the wake cannot fall between its predicate check and its
+    // wait.
+    {
+      std::lock_guard<std::mutex> lock(_wake_mutex);
+    }
+    _wake_cv.notify_all();
     if (_thread.joinable()) {
       _thread.join();
     }
@@ -104,12 +114,16 @@ class DirectorySyncer {
  private:
   void thread_func() {
     while (_running.load()) {
-      auto sleep_end = std::chrono::steady_clock::now() + _interval;
+      const auto sleep_end = std::chrono::steady_clock::now() + _interval;
 
-      // Sleep in small increments to check _running periodically.
-      while (_running.load() && std::chrono::steady_clock::now() < sleep_end) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(
-            std::min<int64_t>(100, _interval.count())));
+      // Wait out the interval in one blocking wait that stop() ends early,
+      // not in 100 ms polling slices: an idle handle then wakes once per
+      // sync, and the sync cadence (the power-loss window) is unchanged.
+      // The mutex is held only for the wait, never across a sync pass.
+      {
+        std::unique_lock<std::mutex> lock(_wake_mutex);
+        _wake_cv.wait_until(lock, sleep_end,
+                            [this] { return !_running.load(); });
       }
 
       if (!_running.load()) {
@@ -141,6 +155,10 @@ class DirectorySyncer {
   std::chrono::milliseconds _interval;
   std::function<void()> _sync_fn;
   std::atomic<bool> _running{false};
+  // Only the sync thread and stop() take _wake_mutex.  A forked child
+  // never does: Cache::stop() abandons the syncer there unstopped.
+  std::mutex _wake_mutex;
+  std::condition_variable _wake_cv;
   std::thread _thread;
 };
 

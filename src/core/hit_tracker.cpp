@@ -9,6 +9,10 @@
 
 #include "fork_gate.hpp"
 
+#ifndef _WIN32
+#include <unistd.h>  // getpid(): see wake_flush_thread
+#endif
+
 namespace cyclone {
 
 HitTracker::HitTracker(const Config& config) : _config(config) {}
@@ -26,6 +30,11 @@ void HitTracker::start(HitFlushCallback callback) {
     // Before the thread exists: its passes are fork-gated (see
     // flush_thread_func), which needs the handlers in place.
     install_fork_handlers();
+    _thread_epoch = fork_epoch();
+#ifndef _WIN32
+    _thread_pid = static_cast<long>(::getpid());
+#endif
+    _has_flush_thread.store(true, std::memory_order_release);
     _flush_thread = std::thread(&HitTracker::flush_thread_func, this);
   }
 }
@@ -47,11 +56,15 @@ void HitTracker::stop() {
   // heap-use-after-free class the DirectorySyncer teardown fix removed.
   // Under I/O pressure (a pwrite/fsync stall) the old 5 s deadline genuinely
   // timed out and abandoned a live thread.  The join always completes: the
-  // flush loop re-checks _running at <=100 ms granularity and a flush pass is
-  // one finite sweep.  The fork-inherited "thread does not exist in this
+  // wake below ends the thread's wait at once and a flush pass is one finite
+  // sweep.  The fork-inherited "thread does not exist in this
   // process" case never reaches here — Cache::stop() leaks the HitTracker
   // shared_ptr on that path so ~HitTracker (and thus stop()) never runs in the
   // child.
+  //
+  // The thread blocks on _wake_cv rather than sleeping, so it has to be
+  // woken: _running is already false, and the wake makes its wait return.
+  wake_flush_thread();
   if (_flush_thread.joinable()) {
     _flush_thread.join();
   }
@@ -68,6 +81,7 @@ void HitTracker::record_hit(const CacheKey& key, AlternateId alternate_id) {
   HitTrackingKey tracking_key{key, alternate_id};
   bool should_flush_key = false;
   bool over_limit = false;
+  bool became_pending = false;
 
   {
     Stripe& stripe = (*_stripes)[stripe_index(key)];
@@ -91,7 +105,9 @@ void HitTracker::record_hit(const CacheKey& key, AlternateId alternate_id) {
         return;
       }
       it = stripe.pending.emplace(tracking_key, HitRecord{}).first;
-      _pending_entries.fetch_add(1, std::memory_order_relaxed);
+      // The set leaving zero is what ends an idle flush thread's wait.
+      became_pending =
+          _pending_entries.fetch_add(1, std::memory_order_relaxed) == 0;
     }
     auto& record = it->second;
     record.delta++;
@@ -109,6 +125,9 @@ void HitTracker::record_hit(const CacheKey& key, AlternateId alternate_id) {
   // Everything below runs outside the stripe lock (leaf-lock rule).  The
   // over-limit response is a HAND-OFF, never a synchronous full flush on
   // the reading thread (see flush_soon).
+  if (became_pending) {
+    wake_flush_thread();
+  }
   if (over_limit) {
     flush_soon();
   } else if (should_flush_key) {
@@ -140,11 +159,16 @@ bool HitTracker::over_cap_past_grace() {
 void HitTracker::flush_soon() {
   if (_running.load(std::memory_order_acquire) &&
       _config.enable_background_flush) {
-    // A flush thread exists: hand the sweep to it.  The flag breaks its
-    // sleep slices immediately (<= 100 ms), and is cleared by the thread
-    // BEFORE its sweep, so an overflow arriving during the sweep re-arms
-    // the early wake instead of waiting out the flush interval.
-    _flush_soon.store(true, std::memory_order_seq_cst);
+    // A flush thread exists: hand the sweep to it.  The flag ends its
+    // wait at once, and is cleared by the thread BEFORE its sweep, so an
+    // overflow arriving during the sweep re-arms the early wake instead of
+    // waiting out the flush interval.  Only the reader that raises the
+    // flag wakes the thread: under sustained overload every further
+    // over-limit hit of the same cycle finds it already set and takes no
+    // lock.
+    if (!_flush_soon.exchange(true, std::memory_order_seq_cst)) {
+      wake_flush_thread();
+    }
     return;
   }
   // No flush thread: the sweep still has to run, or the bound only re-arms
@@ -156,6 +180,27 @@ void HitTracker::flush_soon() {
     flush_now();
     _flush_in_progress.store(false, std::memory_order_release);
   }
+}
+
+void HitTracker::wake_flush_thread() {
+  if (!_has_flush_thread.load(std::memory_order_acquire) ||
+      _thread_epoch != fork_epoch()) {
+    return;
+  }
+#ifndef _WIN32
+  // The PID covers a process whose fork handlers could not be registered
+  // (the epoch then never moves), as in Cache::stop().
+  if (_thread_pid != static_cast<long>(::getpid())) {
+    return;
+  }
+#endif
+  // Lock and unlock, then notify: the state change the caller made before
+  // this call is then either seen by the thread's predicate check or
+  // arrives as a notify while it waits (see _wake_mutex).
+  {
+    std::lock_guard<std::mutex> lock(_wake_mutex);
+  }
+  _wake_cv.notify_one();
 }
 
 uint32_t HitTracker::pending_hits(const CacheKey& key,
@@ -294,27 +339,53 @@ uint64_t HitTracker::total_pending_hits() const {
 }
 
 void HitTracker::flush_thread_func() {
+  // Never past max_idle_wait, and never a zero wait (a busy loop).
+  const auto idle_wait =
+      std::max(_config.max_idle_wait, std::chrono::milliseconds(1));
   while (_running.load()) {
-    // Sleep for the flush interval
-    auto sleep_time = _config.flush_interval;
-    auto sleep_end = std::chrono::steady_clock::now() + sleep_time;
+    {
+      // Waits only; no other lock is taken while _wake_mutex is held, so
+      // HitTracker stays a leaf lock.
+      std::unique_lock<std::mutex> lock(_wake_mutex);
 
-    // Sleep in slices of at most 100 ms so stop() stays prompt, but never
-    // past sleep_end: a fixed 100 ms slice stretched a 50 ms interval to
-    // 100 ms.  No lock is taken here, so HitTracker stays a leaf lock.
-    // _flush_soon (an over-limit reader's hand-off) ends the sleep at once:
-    // the sweep must start within one slice, not the flush interval.
-    while (_running.load()) {
-      const auto now = std::chrono::steady_clock::now();
-      if (now >= sleep_end || _flush_soon.load(std::memory_order_seq_cst)) {
-        break;
+      // Idle: nothing pending, so there is nothing to sweep.  Block until
+      // the first hit (record_hit wakes us when the set leaves zero), an
+      // over-limit hand-off, stop(), or the idle safety-net timeout.
+      _wake_cv.wait_for(lock, idle_wait, [this] {
+        return !_running.load() ||
+               _flush_soon.load(std::memory_order_seq_cst) ||
+               _pending_entries.load(std::memory_order_relaxed) > 0;
+      });
+      _wakeups.fetch_add(1, std::memory_order_relaxed);
+
+      // Something is pending: let hits accumulate for one flush interval,
+      // as the periodic sweep did, so a hit is flushed no later than
+      // flush_interval after it is recorded.  An over-limit hand-off
+      // (_flush_soon) or stop() ends the wait early.
+      if (_running.load() && !_flush_soon.load(std::memory_order_seq_cst) &&
+          _pending_entries.load(std::memory_order_relaxed) > 0) {
+        const auto sleep_end =
+            std::chrono::steady_clock::now() + _config.flush_interval;
+        _wake_cv.wait_until(lock, sleep_end, [this] {
+          return !_running.load() ||
+                 _flush_soon.load(std::memory_order_seq_cst);
+        });
+        _wakeups.fetch_add(1, std::memory_order_relaxed);
       }
-      std::this_thread::sleep_for(std::min<std::chrono::steady_clock::duration>(
-          std::chrono::milliseconds(100), sleep_end - now));
     }
 
     if (!_running.load()) {
       break;
+    }
+
+    // Nothing to sweep (an idle timeout, or flush_key drained the set
+    // meanwhile): skip the 4096-stripe sweep.  An empty sweep would call no
+    // callback; the only state it touches is the overflow grace stamp,
+    // which a sweep re-arms, so re-arm it here the same way.
+    if (_pending_entries.load(std::memory_order_relaxed) == 0 &&
+        !_flush_soon.load(std::memory_order_seq_cst)) {
+      _over_cap_since.store(0, std::memory_order_relaxed);
+      continue;
     }
 
     // The whole sweep is ONE fork-gated pass: it locks each of the stripe
