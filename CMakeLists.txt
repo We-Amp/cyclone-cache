@@ -237,6 +237,7 @@ if(CYCLONE_BUILD_TESTS)
     tests/integration/test_tail_fill.cpp
     tests/integration/test_write_behind.cpp
     tests/integration/test_cloexec.cpp
+    tests/integration/test_volume_file_checks.cpp
     tests/integration/test_lock_holder_wait.cpp
     tests/integration/test_write_lock_liveness.cpp
     tests/integration/test_exit_with_open_cache.cpp

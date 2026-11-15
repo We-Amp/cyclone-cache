@@ -56,7 +56,10 @@ enum class CacheError : std::uint8_t {
                          // to drain the peer.  This error string is the ONLY
                          // signal a refusal has -- the Cache never starts, so
                          // no stats reader can observe it.
-  ObjectTooLarge         // Write content exceeds the configured max_object_size
+  ObjectTooLarge,        // Write content exceeds the configured max_object_size
+  VolumeFileRefused      // The volume must be a plain file owned by the
+                         // configured user (VolumeConfig::owner); this one
+                         // is not, so it is not used.
 };
 
 class CacheErrorCategory : public std::error_category {
@@ -117,6 +120,9 @@ class CacheErrorCategory : public std::error_category {
         return "cache reset refused: another process still has this cache open";
       case CacheError::ObjectTooLarge:
         return "object exceeds configured max_object_size";
+      case CacheError::VolumeFileRefused:
+        return "cache volume not used: the volume must be a plain file owned "
+               "by the configured user";
       default:
         return "unknown error";
     }

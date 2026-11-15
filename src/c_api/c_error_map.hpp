@@ -29,6 +29,8 @@ inline CycloneError to_c_error(CacheError e) {
     case CacheError::NoSpace:
       return CYCLONE_NO_SPACE;
     case CacheError::IoError:
+    case CacheError::VolumeFileRefused:  // no C code of its own; the message
+                                         // (cyclone_get_last_error) says why
       return CYCLONE_IO_ERROR;
     case CacheError::Corrupted:
     case CacheError::ChainCorrupted:

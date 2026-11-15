@@ -1789,6 +1789,7 @@ TEST_CASE("C API: library errors map to distinct C codes", "[c_api][error]") {
   CHECK(to_c_error(CacheError::ResetRefusedLivePeer) ==
         CYCLONE_RESET_REFUSED_LIVE_PEER);
   CHECK(to_c_error(CacheError::ObjectTooLarge) == CYCLONE_OBJECT_TOO_LARGE);
+  CHECK(to_c_error(CacheError::VolumeFileRefused) == CYCLONE_IO_ERROR);
   CHECK(to_c_error(CacheError::InternalError) == CYCLONE_INTERNAL_ERROR);
   // A value outside the enumeration still maps to the catch-all.
   CHECK(to_c_error(static_cast<CacheError>(0xFF)) == CYCLONE_INTERNAL_ERROR);

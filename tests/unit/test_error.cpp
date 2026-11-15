@@ -58,6 +58,9 @@ TEST_CASE("CacheError message strings", "[error]") {
           "cache reset refused: another process still has this cache open");
   REQUIRE(cat.message(static_cast<int>(CacheError::ObjectTooLarge)) ==
           "object exceeds configured max_object_size");
+  REQUIRE(cat.message(static_cast<int>(CacheError::VolumeFileRefused)) ==
+          "cache volume not used: the volume must be a plain file owned "
+          "by the configured user");
 
   // Verify unknown/out-of-range values fall through to default
   REQUIRE(cat.message(100) ==

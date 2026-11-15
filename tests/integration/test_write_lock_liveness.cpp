@@ -140,6 +140,33 @@ TEST_CASE(
   close_fd(fd);
 }
 
+#ifndef _WIN32
+TEST_CASE(
+    "Write-lock liveness: a claim refuses a volume path that is not a plain "
+    "file",
+    "[writelock][liveness]") {
+  TempCacheDir tmp("wll_link");
+  const std::string path = tmp.path("slots.dat");
+  const std::string link = tmp.path("link.dat");
+  const int fd = open_rw(path);
+  REQUIRE(fd >= 0);
+  {
+    WriterLiveness direct;
+    if (!direct.attach(fd, path)) {
+      close_fd(fd);
+      SKIP("no slot locks on this platform or filesystem");
+    }
+    direct.detach();
+  }
+  REQUIRE(::symlink(path.c_str(), link.c_str()) == 0);
+  WriterLiveness through_link;
+  CHECK_FALSE(through_link.attach(fd, link));
+  CHECK(through_link.slot_of() == WriterLiveness::kNoSlot);
+  through_link.detach();
+  close_fd(fd);
+}
+#endif  // !_WIN32
+
 TEST_CASE(
     "Write-lock liveness: without its fork handlers a process claims no "
     "slot and says so",

@@ -93,7 +93,12 @@ using ssize_t = SSIZE_T;
 // master -> workers) is unaffected; an exec'd helper no longer keeps the
 // volume open, which would pin the file and hold its byte-range locks.
 #define CYCLONE_NOINHERIT O_CLOEXEC
-#define CYCLONE_OPEN_FLAGS (O_RDWR | O_CREAT | CYCLONE_NOINHERIT)
+// The volume must be a plain file owned by the configured user: the open
+// does not resolve a symbolic link at the volume path and does not wait on a
+// path that is not a file (see check_volume_file()).
+#define CYCLONE_VOLUME_OPEN_GUARD (O_NOFOLLOW | O_NONBLOCK)
+#define CYCLONE_OPEN_FLAGS \
+  (O_RDWR | O_CREAT | CYCLONE_NOINHERIT | CYCLONE_VOLUME_OPEN_GUARD)
 #define CYCLONE_OPEN_MODE 0666
 #endif
 
@@ -1681,7 +1686,8 @@ void gc_superseded_volumes(const std::vector<Volume*>& live_volumes,
       // O_RDWR (NOT O_RDONLY): an O_RDONLY fd rejects the F_WRLCK exclusive
       // probe with EBADF, which we would misread as "no lock support".  Any
       // open failure (any errno) -> skip.
-      const int fd = CYCLONE_OPEN(f.c_str(), O_RDWR | CYCLONE_NOINHERIT);
+      const int fd = CYCLONE_OPEN(
+          f.c_str(), O_RDWR | CYCLONE_NOINHERIT | CYCLONE_VOLUME_OPEN_GUARD);
       if (fd < 0) {
         continue;
       }
@@ -1799,6 +1805,73 @@ uint64_t Volume::checksum_revalidation_seed() noexcept {
   return z != 0 ? z : 1;
 }
 
+#ifndef _WIN32
+namespace {
+
+// The volume must be a plain file owned by the configured user.  Checked
+// on the descriptor just opened, before anything is read, written, resized
+// or mapped through it:
+//
+//   - a regular file with a single link;
+//   - with VolumeConfig::owner set, owned by that user.  A process running
+//     as root gives the owner a root-owned file it just created, or one that
+//     is empty or starts with a volume header (an earlier root run's), with
+//     fchown() on this descriptor.  Any other file is not used.
+//
+// Also clears the O_NONBLOCK of the open.  Prints the reason on stderr.
+std::expected<void, CacheError> check_volume_file(int fd,
+                                                  const VolumeConfig& config,
+                                                  bool created_new) {
+  const char* const path = config.path.c_str();
+  struct stat st{};
+  if (::fstat(fd, &st) != 0) {
+    return make_unexpected(CacheError::IoError);
+  }
+  if (!S_ISREG(st.st_mode) || st.st_nlink > 1) {
+    std::fprintf(stderr, "cyclone: not using volume %s: not a plain file\n",
+                 path);
+    return make_unexpected(CacheError::VolumeFileRefused);
+  }
+  if (config.owner.has_value()) {
+    const uid_t uid = static_cast<uid_t>(config.owner->uid);
+    const gid_t gid = static_cast<gid_t>(config.owner->gid);
+    if (st.st_uid != uid) {
+      bool give = st.st_uid == 0 && ::geteuid() == 0;
+      if (give && !created_new && st.st_size != 0) {
+        std::byte buf[VolumeHeader::kSize];
+        const ssize_t n = ::pread(fd, buf, sizeof(buf), 0);
+        give = n == static_cast<ssize_t>(sizeof(buf)) &&
+               VolumeHeader::deserialize(buf).is_valid();
+      }
+      if (!give) {
+        std::fprintf(stderr,
+                     "cyclone: not using volume %s: owned by uid %llu, "
+                     "expected uid %llu; delete the file to have it "
+                     "recreated\n",
+                     path, static_cast<unsigned long long>(st.st_uid),
+                     static_cast<unsigned long long>(uid));
+        return make_unexpected(CacheError::VolumeFileRefused);
+      }
+      if (::fchown(fd, uid, gid) != 0) {
+        std::fprintf(stderr,
+                     "cyclone: not using volume %s: could not give it to uid "
+                     "%llu: %s\n",
+                     path, static_cast<unsigned long long>(uid),
+                     std::strerror(errno));
+        return make_unexpected(CacheError::VolumeFileRefused);
+      }
+    }
+  }
+  const int flags = ::fcntl(fd, F_GETFL);
+  if (flags < 0 || ::fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) != 0) {
+    return make_unexpected(CacheError::IoError);
+  }
+  return {};
+}
+
+}  // namespace
+#endif
+
 std::expected<void, CacheError> Volume::open() {
   if (_fd >= 0) {
     return make_unexpected(CacheError::AlreadyOpen);
@@ -1821,9 +1894,10 @@ std::expected<void, CacheError> Volume::open() {
   _fd = open_volume_fd(_config.path, /*create=*/true,
                        /*exclusive=*/true);
 #else
-  _fd = CYCLONE_OPEN(_config.path.c_str(),
-                     O_RDWR | O_CREAT | O_EXCL | CYCLONE_NOINHERIT,
-                     CYCLONE_OPEN_MODE);
+  _fd = CYCLONE_OPEN(
+      _config.path.c_str(),
+      O_RDWR | O_CREAT | O_EXCL | CYCLONE_NOINHERIT | CYCLONE_VOLUME_OPEN_GUARD,
+      CYCLONE_OPEN_MODE);
 #endif
   if (_fd >= 0) {
     created_new = true;
@@ -1842,8 +1916,24 @@ std::expected<void, CacheError> Volume::open() {
   }
 
   if (_fd < 0) {
+#ifndef _WIN32
+    if (errno == ELOOP) {
+      // O_NOFOLLOW: the volume path is a symbolic link.
+      std::fprintf(stderr, "cyclone: not using volume %s: not a plain file\n",
+                   _config.path.c_str());
+      return make_unexpected(CacheError::VolumeFileRefused);
+    }
+#endif
     return make_unexpected(CacheError::IoError);
   }
+
+#ifndef _WIN32
+  if (auto checked = check_volume_file(_fd, _config, created_new); !checked) {
+    CYCLONE_CLOSE(_fd);
+    _fd = -1;
+    return checked;
+  }
+#endif
 
   _reset_gate_degraded.store(false, std::memory_order_relaxed);
   _whole_file_map_failed.store(false, std::memory_order_relaxed);
@@ -2123,6 +2213,19 @@ std::expected<void, CacheError> Volume::open_locked(bool created_new) {
   if (!open_result) {
     return make_unexpected(CacheError::IoError);
   }
+#ifndef _WIN32
+  // The volume must be a plain file owned by the configured user: the
+  // mapping opens the path again, so map only the file checked through _fd.
+  {
+    struct stat ours{};
+    struct stat mapped{};
+    if (::fstat(_fd, &ours) != 0 ||
+        ::fstat(static_cast<int>(_mapped_file->native_fd()), &mapped) != 0 ||
+        ours.st_dev != mapped.st_dev || ours.st_ino != mapped.st_ino) {
+      return make_unexpected(CacheError::IoError);
+    }
+  }
+#endif
 
   // Map the entire volume file persistently.  All subsequent map_region()
   // calls become pointer arithmetic (zero syscalls).  Failure is non-fatal:
