@@ -4,6 +4,6 @@
 #include <cstdio>
 
 int main() {
-  printf("%s\n", 42);
+  printf("%d\n", 42);
   return 0;
 }
